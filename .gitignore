@@ -1,0 +1,38 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+packages/*/dist/
+*.tsbuildinfo
+
+# Local agent/dev state
+.opencode/
+.claude/
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Local environment and machine-specific config
+.env
+.env.*
+!.env.example
+mise.local.toml
+anthropic-auth.json
+anthropic-auth.json.*
+
+# Local databases, logs, dumps, and temporary files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.tmp
+*.bak
+coverage/
+tmp/
+temp/
+
+# mitmproxy capture/extract artifacts (local diagnostics)
+*.flow
+*.flow.log
+captures/*.txt

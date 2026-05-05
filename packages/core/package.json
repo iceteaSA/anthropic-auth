@@ -1,0 +1,32 @@
+{
+  "name": "@cortexkit/anthropic-auth-core",
+  "version": "1.0.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cortexkit/anthropic-auth.git",
+    "directory": "packages/core"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc",
+    "types": "tsc",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "xxhash-wasm": "^1.1.0"
+  }
+}

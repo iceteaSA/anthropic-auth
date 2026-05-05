@@ -1,0 +1,5 @@
+pre-commit:
+  commands:
+    biome:
+      glob: "*.{ts,js,json}"
+      run: bunx biome check {staged_files}
