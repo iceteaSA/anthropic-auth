@@ -77,21 +77,15 @@ jobs:
       - name: Build
         run: bun run build
 
-      # Uses npm Trusted Publishing (OIDC) when configured on npmjs.com.
+      # Uses npm Trusted Publishing (OIDC) configured on npmjs.com.
       - name: Publish core package to npm
         run: npm publish --workspace @cortexkit/anthropic-auth-core --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish OpenCode package to npm
         run: npm publish --workspace @cortexkit/opencode-anthropic-auth --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish Pi package to npm
         run: npm publish --workspace @cortexkit/pi-anthropic-auth --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   github-release:
     name: Create GitHub Release
