@@ -20,6 +20,7 @@ import {
   isCache1hPersistentlyEnabled,
   isDumpPersistentlyEnabled,
   loadAccounts,
+  log,
   type OAuthQuotaSnapshot,
   parseCache1hCommandAction,
   parseDumpCommandAction,
@@ -76,6 +77,76 @@ type PluginSessionClient = {
   promptAsync?: (input: NotificationRequest) => Promise<unknown>
 }
 
+type PerfTrace = {
+  requestId: string
+  start: number
+  last: number
+  mark: (stage: string, data?: Record<string, unknown>) => void
+  done: (stage: string, data?: Record<string, unknown>) => void
+}
+
+let nextPerfRequestId = 1
+let eventLoopLagMonitorStarted = false
+
+function nowMs() {
+  return performance.now()
+}
+
+function roundMs(value: number) {
+  return Math.round(value * 10) / 10
+}
+
+function startEventLoopLagMonitor() {
+  if (eventLoopLagMonitorStarted || process.env.NODE_ENV === 'test') return
+  eventLoopLagMonitorStarted = true
+  const intervalMs = 100
+  const thresholdMs = 250
+  let expected = nowMs() + intervalMs
+  setInterval(() => {
+    const current = nowMs()
+    const lag = current - expected
+    expected = current + intervalMs
+    if (lag < thresholdMs) return
+    log('[perf] opencode event_loop_lag', {
+      lagMs: roundMs(lag),
+      thresholdMs,
+    })
+  }, intervalMs).unref?.()
+}
+
+function createPerfTrace(data?: Record<string, unknown>): PerfTrace {
+  const start = nowMs()
+  const trace: PerfTrace = {
+    requestId: String(nextPerfRequestId++),
+    start,
+    last: start,
+    mark(stage, stageData) {
+      const current = nowMs()
+      log('[perf] opencode request stage', {
+        requestId: trace.requestId,
+        stage,
+        deltaMs: roundMs(current - trace.last),
+        totalMs: roundMs(current - trace.start),
+        ...stageData,
+      })
+      trace.last = current
+    },
+    done(stage, stageData) {
+      const current = nowMs()
+      log('[perf] opencode request done', {
+        requestId: trace.requestId,
+        stage,
+        deltaMs: roundMs(current - trace.last),
+        totalMs: roundMs(current - trace.start),
+        ...stageData,
+      })
+      trace.last = current
+    },
+  }
+  log('[perf] opencode request start', { requestId: trace.requestId, ...data })
+  return trace
+}
+
 async function sendIgnoredMessage(
   ctx: Parameters<Plugin>[0],
   sessionId: string,
@@ -114,6 +185,7 @@ function throwHandledSentinel(): never {
 }
 
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
+  startEventLoopLagMonitor()
   const { client } = ctx
   const fallbackManager = new FallbackAccountManager()
   fallbackManager.startBackgroundRefresh()
@@ -427,26 +499,47 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             return storage?.quota?.enabled === true
           }
 
-          async function inspectStreamingRateLimit(response: Response) {
+          async function inspectStreamingRateLimit(
+            response: Response,
+            trace?: PerfTrace,
+          ) {
             if (!response.body || response.status !== 200) {
+              trace?.mark('inspect_stream_skip', { status: response.status })
+              return { response, rateLimited: false }
+            }
+            if (
+              response.headers.get('x-cortexkit-relay-optimistic') === 'true'
+            ) {
+              trace?.mark('inspect_stream_skip', {
+                status: response.status,
+                reason: 'optimistic_relay',
+              })
               return { response, rateLimited: false }
             }
 
+            const start = nowMs()
             const reader = response.body.getReader()
             const chunks: Uint8Array[] = []
             const decoder = new TextDecoder()
             let text = ''
+            let bytes = 0
 
             while (!text.includes('\n\n') && text.length < 65_536) {
               const { done, value } = await reader.read()
               if (done) break
               chunks.push(value)
+              bytes += value.byteLength
               text += decoder.decode(value, { stream: true })
               if (isStreamingRateLimitText(text)) break
             }
 
             if (isStreamingRateLimitText(text)) {
               await reader.cancel().catch(() => {})
+              trace?.mark('inspect_stream_first_event', {
+                ms: roundMs(nowMs() - start),
+                bytes,
+                rateLimited: true,
+              })
               return { response, rateLimited: true }
             }
 
@@ -467,6 +560,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               },
             })
 
+            trace?.mark('inspect_stream_first_event', {
+              ms: roundMs(nowMs() - start),
+              bytes,
+              rateLimited: false,
+            })
             return {
               response: new Response(stream, {
                 status: response.status,
@@ -481,17 +579,32 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             input: string | URL | Request,
             init: RequestInit | undefined,
             accessToken: string,
+            trace?: PerfTrace,
+            route = 'unknown',
           ) {
+            const start = nowMs()
             const requestHeaders = mergeHeaders(input, init)
             const subagentRequest = isSubagentRequest(requestHeaders)
             requestHeaders.delete('x-parent-session-id')
             setOAuthHeaders(requestHeaders, accessToken)
 
             let body = init?.body
+            const originalBytes =
+              typeof body === 'string' ? body.length : undefined
             if (body && typeof body === 'string') {
+              const rewriteStart = nowMs()
               body = await rewriteRequestBody(body, {
                 cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                 cache1hMode: getCache1hMode(),
+              })
+              trace?.mark('rewrite_body', {
+                route,
+                ms: roundMs(nowMs() - rewriteStart),
+                originalBytes,
+                rewrittenBytes: body.length,
+                cacheEnabled: !subagentRequest && isCache1hEnabled(),
+                cacheMode: getCache1hMode(),
+                subagent: subagentRequest,
               })
             }
 
@@ -505,6 +618,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
               })
 
+            const sendStart = nowMs()
             const response = await sendViaRelay({
               config: relayConfig,
               input: rewritten.input,
@@ -512,6 +626,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               headers: requestHeaders,
               body,
               fallback: directFetch,
+              optimisticResponse: relayConfig?.transport === 'websocket',
+            })
+            trace?.mark('send_headers_received', {
+              route,
+              ms: roundMs(nowMs() - sendStart),
+              status: response.status,
+              relayConfigured: relayConfig != null,
+              totalSendWithAccessMs: roundMs(nowMs() - start),
             })
 
             return response
@@ -573,6 +695,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             >,
             storage: Awaited<ReturnType<typeof loadAccounts>>,
             currentResponse?: Response,
+            trace?: PerfTrace,
           ) {
             if (!accounts.length) return currentResponse ?? null
 
@@ -582,11 +705,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             for (const [index, account] of accounts.entries()) {
               const access = account.access
               if (!access) continue
-              let response = await sendWithAccessToken(input, init, access)
+              let response = await sendWithAccessToken(
+                input,
+                init,
+                access,
+                trace,
+                `fallback_${index}`,
+              )
               lastResponse = response
               let fallbackAgain = shouldFallbackStatus(response.status, storage)
               if (!fallbackAgain) {
-                const inspected = await inspectStreamingRateLimit(response)
+                const inspected = await inspectStreamingRateLimit(
+                  response,
+                  trace,
+                )
                 response = inspected.response
                 lastResponse = response
                 fallbackAgain = inspected.rateLimited
@@ -610,17 +742,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             preselectedAccounts?: Awaited<
               ReturnType<FallbackAccountManager['getUsableFallbackAccounts']>
             >,
+            trace?: PerfTrace,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
+            const loadStart = nowMs()
             const storage = await loadAccounts()
+            trace?.mark('fallback_load_storage', {
+              ms: roundMs(nowMs() - loadStart),
+            })
             let currentResponse = mainResponse
             let shouldFallback = shouldFallbackStatus(
               currentResponse.status,
               storage,
             )
             if (!shouldFallback) {
-              const inspected = await inspectStreamingRateLimit(currentResponse)
+              const inspected = await inspectStreamingRateLimit(
+                currentResponse,
+                trace,
+              )
               currentResponse = inspected.response
               shouldFallback = inspected.rateLimited
             }
@@ -628,9 +768,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               return currentResponse
             }
 
-            const accounts =
-              preselectedAccounts ??
-              (await fallbackManager.getUsableFallbackAccounts())
+            let accounts = preselectedAccounts
+            if (!accounts) {
+              const accountsStart = nowMs()
+              accounts = await fallbackManager.getUsableFallbackAccounts()
+              trace?.mark('fallback_get_accounts', {
+                ms: roundMs(nowMs() - accountsStart),
+                accounts: accounts.length,
+              })
+            }
             return (
               (await tryUsableFallbackAccounts(
                 input,
@@ -638,6 +784,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 accounts,
                 storage,
                 currentResponse,
+                trace,
               )) ?? currentResponse
             )
           }
@@ -645,16 +792,41 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
+              const initialBody = init?.body
+              const trace = createPerfTrace({
+                bodyBytes:
+                  typeof initialBody === 'string'
+                    ? initialBody.length
+                    : undefined,
+                relayConfigured: relayConfig != null,
+              })
+              const authStart = nowMs()
               const auth = await getAuth()
-              if (auth.type !== 'oauth') return fetch(input, init)
+              trace.mark('get_auth', {
+                ms: roundMs(nowMs() - authStart),
+                authType: auth.type,
+                hasAccess: Boolean(auth.access),
+              })
+              if (auth.type !== 'oauth') {
+                const response = await fetch(input, init)
+                trace.done('non_oauth_passthrough', { status: response.status })
+                return response
+              }
               if (!auth.access || !auth.expires || auth.expires < Date.now()) {
+                const refreshStart = nowMs()
                 auth.access = await refreshMainAccessToken()
+                trace.mark('refresh_main_access', {
+                  ms: roundMs(nowMs() - refreshStart),
+                })
               }
 
               if (!auth.access) {
+                trace.done('missing_access_error')
                 throw new Error('OAuth access token is missing after refresh')
               }
+              const loadStart = nowMs()
               const storage = await loadAccounts()
+              trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
               let preselectedFallbackAccounts:
                 | Awaited<
                     ReturnType<
@@ -667,24 +839,43 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 mainQuotaRoutingEnabled(storage)
               ) {
                 try {
+                  const quotaStart = nowMs()
                   const mainQuota = await getMainQuotaForRouting(
                     auth.access,
                     storage,
                   )
+                  trace.mark('main_quota_for_routing', {
+                    ms: roundMs(nowMs() - quotaStart),
+                    passes: quotaSnapshotPassesPolicy(mainQuota, storage),
+                  })
                   if (!quotaSnapshotPassesPolicy(mainQuota, storage)) {
+                    const fallbackStart = nowMs()
                     preselectedFallbackAccounts =
                       await fallbackManager.getUsableFallbackAccounts()
+                    trace.mark('preselect_fallback_accounts', {
+                      ms: roundMs(nowMs() - fallbackStart),
+                      accounts: preselectedFallbackAccounts.length,
+                    })
                     const fallbackResponse = await tryUsableFallbackAccounts(
                       input,
                       init,
                       preselectedFallbackAccounts,
                       storage,
+                      undefined,
+                      trace,
                     )
                     if (fallbackResponse) {
+                      trace.done('return_preselected_fallback', {
+                        status: fallbackResponse.status,
+                      })
                       return createStrippedStream(fallbackResponse)
                     }
                   }
-                } catch {
+                } catch (error) {
+                  trace.mark('main_quota_for_routing_error', {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  })
                   // Main quota checks should optimize routing, not break requests.
                 }
               }
@@ -692,14 +883,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 input,
                 init,
                 auth.access,
+                trace,
+                'main',
               )
               const response = await tryFallbackAccounts(
                 input,
                 init,
                 mainResponse,
                 preselectedFallbackAccounts,
+                trace,
               )
 
+              trace.done('return_response', { status: response.status })
               return createStrippedStream(response)
             },
           }

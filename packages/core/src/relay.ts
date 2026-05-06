@@ -261,6 +261,14 @@ function shortAffinity(affinity: string) {
   return affinity.length > 12 ? `${affinity.slice(0, 12)}…` : affinity
 }
 
+function perfNowMs() {
+  return performance.now()
+}
+
+function formatMs(value: number) {
+  return Math.round(value * 10) / 10
+}
+
 function createRelayPayload(options: {
   input: string | URL | Request
   init: RequestInit | undefined
@@ -382,6 +390,15 @@ function decodeRelayChunk(base64: string) {
   return new Uint8Array(Buffer.from(base64, 'base64'))
 }
 
+function toBinaryChunk(data: unknown): Uint8Array {
+  if (data instanceof Uint8Array) return data
+  if (data instanceof ArrayBuffer) return new Uint8Array(data)
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+  }
+  return new Uint8Array(Buffer.from(String(data)))
+}
+
 function parseRelayControlMessage(data: string): RelayControlMessage {
   return JSON.parse(data) as RelayControlMessage
 }
@@ -398,6 +415,10 @@ type PendingWebSocketRequest = {
   timeout?: ReturnType<typeof setTimeout>
   resolveDone: () => void
   rejectDone: (error: unknown) => void
+  sentAt: number
+  optimisticResponse: boolean
+  acceptedAt?: number
+  responseStartedAt?: number
 }
 
 class PersistentRelaySession {
@@ -412,10 +433,17 @@ class PersistentRelaySession {
     private readonly affinity: string,
   ) {}
 
-  send(payload: RelayPayload, bodyText: string): Promise<RelaySendResult> {
+  send(
+    payload: RelayPayload,
+    bodyText: string,
+    optimisticResponse = false,
+  ): Promise<RelaySendResult> {
+    const enqueuedAt = perfNowMs()
     const start = this.queue
       .catch(() => {})
-      .then(() => this.startQueued(payload, bodyText))
+      .then(() =>
+        this.startQueued(payload, bodyText, enqueuedAt, optimisticResponse),
+      )
     const result = start.then(async ({ response, getPayload }) => ({
       response: await response,
       payload: getPayload(),
@@ -430,8 +458,15 @@ class PersistentRelaySession {
     return result
   }
 
-  private async startQueued(payload: RelayPayload, bodyText: string) {
+  private async startQueued(
+    payload: RelayPayload,
+    bodyText: string,
+    enqueuedAt: number,
+    optimisticResponse: boolean,
+  ) {
+    const connectStart = perfNowMs()
     await this.ensureConnected()
+    const connectedAt = perfNowMs()
     const localState = sessionState.get(this.affinity)
     const serverHash = this.serverState?.hash
     const requestPayload: RelayPayload = {
@@ -454,8 +489,12 @@ class PersistentRelaySession {
       requestPayload.patch = createRelayPatch(localState.body, bodyText)
     }
 
+    relayLog(
+      `perf websocket send_start session=${shortAffinity(this.affinity)} request=${requestPayload.id} mode=${requestPayload.mode} queueMs=${formatMs(connectedAt - enqueuedAt)} connectMs=${formatMs(connectedAt - connectStart)} bodyBytes=${bodyText.length} relayBytes=${JSON.stringify(requestPayload).length}`,
+    )
+
     let activePayload = requestPayload
-    const first = this.sendPayload(requestPayload, bodyText)
+    const first = this.sendPayload(requestPayload, bodyText, optimisticResponse)
     void first.done.catch(() => {})
     let activeDone = first.done
     const response = first.response.catch((error) => {
@@ -470,7 +509,7 @@ class PersistentRelaySession {
       fullSync.id = createRequestId()
       fullSync.revision = (this.serverState?.revision ?? 0) + 1
       activePayload = fullSync
-      const retry = this.sendPayload(fullSync, bodyText)
+      const retry = this.sendPayload(fullSync, bodyText, optimisticResponse)
       void retry.done.catch(() => {})
       activeDone = retry.done
       return retry.response
@@ -506,7 +545,8 @@ class PersistentRelaySession {
       socket.addEventListener('message', (event) => {
         try {
           if (typeof event.data !== 'string') {
-            throw new Error('unexpected binary relay control frame')
+            this.handleBinaryChunk(event.data)
+            return
           }
           const message = parseRelayControlMessage(event.data)
           if (message.type === 'ready') {
@@ -550,11 +590,16 @@ class PersistentRelaySession {
     await this.connecting
   }
 
-  private sendPayload(payload: RelayPayload, bodyText: string) {
+  private sendPayload(
+    payload: RelayPayload,
+    bodyText: string,
+    optimisticResponse: boolean,
+  ) {
     const socket = this.socket
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error('relay websocket is not connected')
     }
+    const sentAt = perfNowMs()
 
     let resolveDone!: () => void
     let rejectDone!: (error: unknown) => void
@@ -573,10 +618,18 @@ class PersistentRelaySession {
         responseStarted: false,
         resolveDone,
         rejectDone,
+        sentAt,
+        optimisticResponse,
       }
       this.pending = pending
       this.resetPendingTimeout(pending)
       socket.send(JSON.stringify(payload))
+      if (optimisticResponse) {
+        this.resolvePendingResponse(pending, 200, 'OK', {
+          'content-type': 'text/event-stream',
+          'x-cortexkit-relay-optimistic': 'true',
+        })
+      }
     })
     return { response, done }
   }
@@ -590,6 +643,37 @@ class PersistentRelaySession {
     }, 45_000)
   }
 
+  private handleBinaryChunk(data: unknown) {
+    const pending = this.pending
+    if (!pending?.responseStarted) return
+    pending.streamController?.enqueue(toBinaryChunk(data))
+  }
+
+  private resolvePendingResponse(
+    pending: PendingWebSocketRequest,
+    status: number,
+    statusText?: string,
+    headers?: Record<string, string>,
+  ) {
+    if (pending.responseStarted) return
+    pending.responseStarted = true
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        pending.streamController = controller
+      },
+      cancel: () => {
+        this.socket?.close()
+      },
+    })
+    pending.resolve(
+      new Response(stream, {
+        status,
+        statusText,
+        headers,
+      }),
+    )
+  }
+
   private handleMessage(message: RelayControlMessage) {
     if (message.type === 'keepalive') {
       if (this.pending) this.resetPendingTimeout(this.pending)
@@ -601,7 +685,12 @@ class PersistentRelaySession {
       return
 
     if (message.type === 'accepted') {
+      const acceptedAt = perfNowMs()
       pending.accepted = true
+      pending.acceptedAt = acceptedAt
+      relayLog(
+        `perf websocket accepted session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(acceptedAt - pending.sentAt)} mode=${pending.payload.mode}`,
+      )
       this.serverState = { hash: message.hash, revision: message.revision }
       updateLocalRelayState(
         this.affinity,
@@ -613,23 +702,26 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'response_start') {
-      pending.responseStarted = true
-      clearTimeout(pending.timeout)
-      const stream = new ReadableStream<Uint8Array>({
-        start: (controller) => {
-          pending.streamController = controller
-        },
-        cancel: () => {
-          this.socket?.close()
-        },
-      })
-      pending.resolve(
-        new Response(stream, {
-          status: message.status,
-          statusText: message.statusText,
-          headers: message.headers,
-        }),
+      const responseStartedAt = perfNowMs()
+      pending.responseStartedAt = responseStartedAt
+      relayLog(
+        `perf websocket response_start session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(responseStartedAt - pending.sentAt)} upstreamMs=${pending.acceptedAt == null ? 'unknown' : formatMs(responseStartedAt - pending.acceptedAt)} status=${message.status}`,
       )
+      clearTimeout(pending.timeout)
+      this.resolvePendingResponse(
+        pending,
+        message.status,
+        message.statusText,
+        message.headers,
+      )
+      if (pending.optimisticResponse && message.status >= 400) {
+        pending.streamController?.enqueue(
+          new TextEncoder().encode(
+            `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_upstream_error', message: `Relay upstream returned HTTP ${message.status}` } })}\n\n`,
+          ),
+        )
+        this.finishPending()
+      }
       return
     }
     if (message.type === 'chunk') {
@@ -652,6 +744,10 @@ class PersistentRelaySession {
   private finishPending() {
     const pending = this.pending
     if (!pending) return
+    const finishedAt = perfNowMs()
+    relayLog(
+      `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)}`,
+    )
     clearTimeout(pending.timeout)
     if (!pending.streamDone) {
       pending.streamDone = true
@@ -690,8 +786,10 @@ export async function sendViaRelay(options: {
   headers: Headers
   body: RequestInit['body'] | null | undefined
   fallback: () => Promise<Response>
+  optimisticResponse?: boolean
 }): Promise<Response> {
-  const { config, input, init, headers, body, fallback } = options
+  const { config, input, init, headers, body, fallback, optimisticResponse } =
+    options
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
 
   const affinity =
@@ -718,7 +816,11 @@ export async function sendViaRelay(options: {
     if (config.transport === 'websocket') {
       try {
         const session = getPersistentRelaySession(config, affinity)
-        result = await session.send(payload, bodyText)
+        result = await session.send(
+          payload,
+          bodyText,
+          optimisticResponse === true,
+        )
       } catch (error) {
         relayLog(
           `websocket relay failed session=${shortAffinity(affinity)}; trying http relay: ${error instanceof Error ? error.message : String(error)}`,
@@ -783,8 +885,18 @@ function applyPatch(base, patch) {
 }
 
 function applyPatchSet(base, patch) {
-  if (Array.isArray(patch)) return patch.reduce((body, item) => applyPatch(body, item), base)
-  return applyPatch(base, patch)
+  if (!Array.isArray(patch)) return applyPatch(base, patch)
+  if (patch.length === 0) return base
+
+  let result = ''
+  let cursor = 0
+  for (const item of patch) {
+    if (item.start < cursor) return { error: 'overlapping patch', status: 400 }
+    result += base.slice(cursor, item.start)
+    result += item.insert
+    cursor = item.start + item.deleteCount
+  }
+  return result + base.slice(cursor)
 }
 
 async function readState(env, affinity) {
@@ -844,31 +956,41 @@ function resolveBodyFromState(state, payload) {
   return { error: 'unknown mode', status: 400 }
 }
 
-async function prepareWebSocketUpstream(env, state, payload) {
+function deferWorkerTask(task) {
+  return new Promise((resolve) => setTimeout(resolve, 0)).then(task)
+}
+
+function checkpointWebSocketState(env, payload, body, nextState) {
+  return deferWorkerTask(async () => {
+    try {
+      if ((await hashBody(body)) !== payload.next_hash) {
+        throw new Error('hash mismatch')
+      }
+      await writeState(env, payload.affinity, nextState)
+    } catch (error) {
+      console.log(JSON.stringify({
+        relay: 'opencode-anthropic-auth',
+        transport: 'websocket',
+        event: 'checkpoint_write_failed',
+        affinity: String(payload.affinity).slice(0, 12),
+        message: error instanceof Error ? error.message : String(error),
+      }))
+    }
+  })
+}
+
+function prepareWebSocketUpstream(env, state, payload) {
   if (payload.protocol !== 2 || payload.type !== 'request' || !payload.id || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
     return { error: 'invalid payload', status: 400 }
   }
 
   const body = resolveBodyFromState(state, payload)
   if (body && typeof body === 'object' && 'error' in body) return body
-
-  if (typeof body !== 'string' || (await hashBody(body)) !== payload.next_hash) {
-    return { error: 'hash mismatch', status: 409 }
-  }
+  if (typeof body !== 'string') return { error: 'invalid body', status: 400 }
 
   const nextState = { body, hash: payload.next_hash, revision: payload.revision }
-  try {
-    await writeState(env, payload.affinity, nextState)
-  } catch (error) {
-    console.log(JSON.stringify({
-      relay: 'opencode-anthropic-auth',
-      transport: 'websocket',
-      event: 'checkpoint_write_failed',
-      affinity: String(payload.affinity).slice(0, 12),
-      message: error instanceof Error ? error.message : String(error),
-    }))
-  }
-  console.log(JSON.stringify({
+  const checkpoint = checkpointWebSocketState(env, payload, body, nextState)
+  const logAccepted = () => console.log(JSON.stringify({
     relay: 'opencode-anthropic-auth',
     transport: 'websocket',
     mode: payload.mode,
@@ -877,23 +999,13 @@ async function prepareWebSocketUpstream(env, state, payload) {
     bodyBytes: body.length,
   }))
 
-  return { body, state: nextState }
+  return { body, state: nextState, checkpoint, logAccepted }
 }
 
 function headersToObject(headers) {
   const result = {}
   for (const [key, value] of headers.entries()) result[key] = value
   return result
-}
-
-function bytesToBase64(bytes) {
-  let binary = ''
-  const chunkSize = 0x8000
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    const chunk = bytes.subarray(offset, offset + chunkSize)
-    binary += String.fromCharCode.apply(null, chunk)
-  }
-  return btoa(binary)
 }
 
 async function handleRelayPayload(env, payload) {
@@ -907,7 +1019,7 @@ async function handleRelayPayload(env, payload) {
   return { upstream }
 }
 
-async function handleWebSocket(socket, env, payload, getState, setState) {
+async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
   const heartbeat = setInterval(() => {
     try {
       socket.send(JSON.stringify({ protocol: 2, type: 'keepalive' }))
@@ -916,7 +1028,7 @@ async function handleWebSocket(socket, env, payload, getState, setState) {
     }
   }, 5000)
   try {
-    const result = await prepareWebSocketUpstream(env, getState(), payload)
+    const result = prepareWebSocketUpstream(env, getState(), payload)
     if (result.error) {
       socket.send(JSON.stringify({ protocol: 2, type: 'error', id: payload.id, status: result.status, message: result.error }))
       return
@@ -924,12 +1036,15 @@ async function handleWebSocket(socket, env, payload, getState, setState) {
 
     setState(result.state)
     socket.send(JSON.stringify({ protocol: 2, type: 'accepted', id: payload.id, hash: result.state.hash, revision: result.state.revision }))
+    ctx?.waitUntil?.(deferWorkerTask(result.logAccepted))
 
-    const upstream = await fetch(payload.upstream.url, {
+    const upstreamPromise = fetch(payload.upstream.url, {
       method: payload.upstream.method || 'POST',
       headers: payload.upstream.headers,
       body: result.body,
     })
+    ctx?.waitUntil?.(result.checkpoint)
+    const upstream = await upstreamPromise
     socket.send(JSON.stringify({
       protocol: 2,
       type: 'response_start',
@@ -944,7 +1059,7 @@ async function handleWebSocket(socket, env, payload, getState, setState) {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        socket.send(JSON.stringify({ protocol: 2, type: 'chunk', id: payload.id, base64: bytesToBase64(value) }))
+        socket.send(value)
       }
     }
     socket.send(JSON.stringify({ protocol: 2, type: 'done', id: payload.id }))
@@ -956,7 +1071,7 @@ async function handleWebSocket(socket, env, payload, getState, setState) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.headers.get('Upgrade') === 'websocket') {
       const url = new URL(request.url)
       const token = url.searchParams.get('token')
@@ -966,15 +1081,30 @@ export default {
       const pair = new WebSocketPair()
       const client = pair[0]
       const server = pair[1]
-      let state = await readState(env, affinity)
+      server.binaryType = 'arraybuffer'
+      let state = null
+      let ready = false
       server.accept()
-      server.send(JSON.stringify({
-        protocol: 2,
-        type: 'ready',
-        state: state ? { hash: state.hash, revision: state.revision } : null,
-      }))
+      const loadState = readState(env, affinity).then((loadedState) => {
+        state = loadedState
+        ready = true
+        server.send(JSON.stringify({
+          protocol: 2,
+          type: 'ready',
+          state: state ? { hash: state.hash, revision: state.revision } : null,
+        }))
+      }).catch((error) => {
+        server.send(JSON.stringify({ protocol: 2, type: 'error', status: 500, message: error instanceof Error ? error.message : String(error) }))
+        server.close(1011, 'state load failed')
+      })
+      ctx?.waitUntil?.(loadState)
+      if (!ctx?.waitUntil) void loadState
       let busy = false
       server.addEventListener('message', (event) => {
+        if (!ready) {
+          server.send(JSON.stringify({ protocol: 2, type: 'error', status: 425, message: 'relay state is not ready' }))
+          return
+        }
         if (busy) {
           server.send(JSON.stringify({ protocol: 2, type: 'error', status: 429, message: 'request already in flight' }))
           return
@@ -988,9 +1118,9 @@ export default {
         }
         payload.affinity = affinity
         busy = true
-        const run = handleWebSocket(server, env, payload, () => state, (nextState) => { state = nextState }).finally(() => { busy = false })
-        event.waitUntil?.(run)
-        if (!event.waitUntil) void run
+        const run = handleWebSocket(server, env, ctx, payload, () => state, (nextState) => { state = nextState }).finally(() => { busy = false })
+        ctx?.waitUntil?.(run)
+        if (!ctx?.waitUntil) void run
       })
       return new Response(null, { status: 101, webSocket: client })
     }

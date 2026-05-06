@@ -284,6 +284,173 @@ describe('relay client', () => {
     expect(sentPayloads[0]).toMatchObject({ mode: 'full_sync' })
   })
 
+  test('websocket optimistic response resolves immediately after local send', async () => {
+    const originalWebSocket = globalThis.WebSocket
+    let socket: OptimisticWebSocket | undefined
+    let payloadId = ''
+    let acceptedSent = false
+
+    class OptimisticWebSocket extends EventTarget {
+      binaryType = 'arraybuffer'
+
+      constructor() {
+        super()
+        socket = this
+        queueMicrotask(() => {
+          this.dispatchEvent(new Event('open'))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+            }),
+          )
+        })
+      }
+
+      send(data: string) {
+        const payload = JSON.parse(data)
+        payloadId = payload.id
+      }
+
+      close() {
+        this.dispatchEvent(new Event('close'))
+      }
+    }
+
+    globalThis.WebSocket = OptimisticWebSocket as unknown as typeof WebSocket
+    try {
+      const response = await sendViaRelay({
+        config: websocketConfig,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-ws-optimistic'),
+        body: 'body',
+        fallback: async () => new Response('direct'),
+        optimisticResponse: true,
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
+      expect(acceptedSent).toBe(false)
+
+      const textPromise = response.text()
+      acceptedSent = true
+      socket?.dispatchEvent(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            protocol: 2,
+            type: 'accepted',
+            id: payloadId,
+            hash: hashBody('body'),
+            revision: 1,
+          }),
+        }),
+      )
+      socket?.dispatchEvent(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            protocol: 2,
+            type: 'response_start',
+            id: payloadId,
+            status: 200,
+          }),
+        }),
+      )
+      socket?.dispatchEvent(
+        new MessageEvent('message', {
+          data: Buffer.from('event: message_stop\n\n'),
+        }),
+      )
+      socket?.dispatchEvent(
+        new MessageEvent('message', {
+          data: JSON.stringify({ protocol: 2, type: 'done', id: payloadId }),
+        }),
+      )
+      expect(await textPromise).toBe('event: message_stop\n\n')
+    } finally {
+      globalThis.WebSocket = originalWebSocket
+    }
+  })
+
+  test('websocket accepts binary chunk frames', async () => {
+    const originalWebSocket = globalThis.WebSocket
+
+    class BinaryChunkWebSocket extends EventTarget {
+      binaryType = 'arraybuffer'
+
+      constructor() {
+        super()
+        queueMicrotask(() => {
+          this.dispatchEvent(new Event('open'))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+            }),
+          )
+        })
+      }
+
+      send(data: string) {
+        const payload = JSON.parse(data)
+        queueMicrotask(() => {
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'accepted',
+                id: payload.id,
+                hash: payload.next_hash,
+                revision: payload.revision,
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'response_start',
+                id: payload.id,
+                status: 200,
+                headers: { 'content-type': 'text/event-stream' },
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: Buffer.from('event: message_stop\n\n'),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'done',
+                id: payload.id,
+              }),
+            }),
+          )
+        })
+      }
+
+      close() {
+        this.dispatchEvent(new Event('close'))
+      }
+    }
+
+    globalThis.WebSocket = BinaryChunkWebSocket as unknown as typeof WebSocket
+    try {
+      const response = await sendViaRelay({
+        config: websocketConfig,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-ws-binary'),
+        body: 'body',
+        fallback: async () => new Response('direct'),
+      })
+      expect(await response.text()).toBe('event: message_stop\n\n')
+    } finally {
+      globalThis.WebSocket = originalWebSocket
+    }
+  })
+
   test('websocket patch stays compact when cch and tail both change', async () => {
     const originalWebSocket = globalThis.WebSocket
     const sentPayloads: unknown[] = []
