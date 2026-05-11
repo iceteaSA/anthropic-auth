@@ -419,6 +419,8 @@ type PendingWebSocketRequest = {
   optimisticResponse: boolean
   acceptedAt?: number
   responseStartedAt?: number
+  retryAttempts: number
+  retryingBeforeResponse: boolean
 }
 
 class PersistentRelaySession {
@@ -579,6 +581,14 @@ class PersistentRelaySession {
           this.connecting = undefined
         }
         if (this.pending) {
+          if (this.pending.retryingBeforeResponse) return
+          if (
+            this.retryPendingBeforeResponse(
+              this.pending,
+              'closed before response',
+            )
+          )
+            return
           const error = new Error('relay websocket closed before response')
           this.failPending(error)
         }
@@ -620,6 +630,8 @@ class PersistentRelaySession {
         rejectDone,
         sentAt,
         optimisticResponse,
+        retryAttempts: 0,
+        retryingBeforeResponse: false,
       }
       this.pending = pending
       this.resetPendingTimeout(pending)
@@ -638,9 +650,69 @@ class PersistentRelaySession {
     clearTimeout(pending.timeout)
     pending.timeout = setTimeout(() => {
       if (this.pending !== pending) return
+      if (this.retryPendingBeforeResponse(pending, 'response timed out')) return
       this.failPending(new Error('relay websocket response timed out'))
       this.socket?.close()
     }, 45_000)
+  }
+
+  private retryPendingBeforeResponse(
+    pending: PendingWebSocketRequest,
+    reason: string,
+  ) {
+    if (pending.responseStartedAt != null) return false
+    if (pending.streamDone) return false
+    if (pending.retryAttempts >= 1) return false
+
+    pending.retryAttempts += 1
+    pending.retryingBeforeResponse = true
+    clearTimeout(pending.timeout)
+    const attempt = pending.retryAttempts
+    const originalId = pending.payload.id
+    relayLog(
+      `websocket ${reason}; reconnecting and retrying full_sync session=${shortAffinity(this.affinity)} request=${originalId} retry=${attempt}`,
+    )
+
+    this.socket?.close()
+    this.socket = undefined
+    this.serverState = undefined
+    this.connecting = undefined
+
+    void (async () => {
+      try {
+        await this.ensureConnected()
+        if (this.pending !== pending) return
+        const retryPayload = createFullSyncPayload(
+          pending.payload,
+          pending.bodyText,
+        )
+        retryPayload.protocol = 2
+        retryPayload.id = createRequestId()
+        retryPayload.revision = (this.serverState?.revision ?? 0) + 1
+
+        pending.payload = retryPayload
+        pending.accepted = false
+        pending.acceptedAt = undefined
+        pending.responseStartedAt = undefined
+        pending.sentAt = perfNowMs()
+        pending.retryingBeforeResponse = false
+
+        const socket = this.socket
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          throw new Error('relay websocket is not connected')
+        }
+        this.resetPendingTimeout(pending)
+        relayLog(
+          `perf websocket retry_send session=${shortAffinity(this.affinity)} request=${retryPayload.id} previous=${originalId} mode=full_sync retry=${attempt} bodyBytes=${pending.bodyText.length} relayBytes=${JSON.stringify(retryPayload).length}`,
+        )
+        socket.send(JSON.stringify(retryPayload))
+      } catch (error) {
+        pending.retryingBeforeResponse = false
+        if (this.pending === pending) this.failPending(error)
+      }
+    })()
+
+    return true
   }
 
   private handleBinaryChunk(data: unknown) {

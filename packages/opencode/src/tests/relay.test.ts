@@ -370,6 +370,106 @@ describe('relay client', () => {
     }
   })
 
+  test('websocket optimistic response reconnects and retries when socket closes before upstream response', async () => {
+    const originalWebSocket = globalThis.WebSocket
+    const sentPayloads: Array<{ id: string; mode: string }> = []
+    let socketCount = 0
+
+    class ClosingBeforeResponseWebSocket extends EventTarget {
+      binaryType = 'arraybuffer'
+      private readonly socketNumber: number
+
+      constructor() {
+        super()
+        socketCount += 1
+        this.socketNumber = socketCount
+        queueMicrotask(() => {
+          this.dispatchEvent(new Event('open'))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+            }),
+          )
+        })
+      }
+
+      send(data: string) {
+        const payload = JSON.parse(data)
+        sentPayloads.push(payload)
+        queueMicrotask(() => {
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'accepted',
+                id: payload.id,
+                hash: payload.next_hash,
+                revision: payload.revision,
+              }),
+            }),
+          )
+          if (this.socketNumber === 1) {
+            this.dispatchEvent(new Event('close'))
+            return
+          }
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'response_start',
+                id: payload.id,
+                status: 200,
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: Buffer.from('event: message_stop\n\n'),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'done',
+                id: payload.id,
+              }),
+            }),
+          )
+        })
+      }
+
+      close() {
+        this.dispatchEvent(new Event('close'))
+      }
+    }
+
+    globalThis.WebSocket =
+      ClosingBeforeResponseWebSocket as unknown as typeof WebSocket
+    try {
+      const response = await sendViaRelay({
+        config: websocketConfig,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-ws-reconnect-before-response'),
+        body: 'body',
+        fallback: async () => new Response('direct'),
+        optimisticResponse: true,
+      })
+      expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
+      expect(await response.text()).toBe('event: message_stop\n\n')
+    } finally {
+      globalThis.WebSocket = originalWebSocket
+    }
+
+    expect(socketCount).toBe(2)
+    expect(sentPayloads.map((payload) => payload.mode)).toEqual([
+      'full_sync',
+      'full_sync',
+    ])
+    expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
+  })
+
   test('websocket accepts binary chunk frames', async () => {
     const originalWebSocket = globalThis.WebSocket
 
