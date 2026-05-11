@@ -3,13 +3,12 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import { refreshClaudeOAuthToken } from './auth.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
   CLAUDE_CODE_VERSION,
-  CLIENT_ID,
   DEFAULT_CACHE_1H_MODE,
-  TOKEN_URL,
 } from './constants.ts'
 
 export const ACCOUNT_FILE_NAME = 'anthropic-auth.json'
@@ -78,12 +77,6 @@ export type AccountStorage = {
     transport?: 'http' | 'websocket'
   }
   accounts: OAuthAccount[]
-}
-
-type OAuthRefreshResponse = {
-  refresh_token?: string
-  access_token: string
-  expires_in: number
 }
 
 type OAuthUsageWindow = {
@@ -751,33 +744,16 @@ export class FallbackAccountManager {
 
     const sourceAccount = latestAccount ?? account
     const refreshToken = sourceAccount.refresh
-    const response = await this.fetchImpl(TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/plain, */*',
-        'User-Agent': 'axios/1.13.6',
-      },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: CLIENT_ID,
-      }),
+    const refreshed = await refreshClaudeOAuthToken({
+      refreshToken,
+      fetchImpl: this.fetchImpl,
+      now: this.now,
     })
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => '')
-      throw new Error(
-        `Fallback token refresh failed: ${response.status} — ${body}`,
-      )
-    }
-
-    const json = (await response.json()) as OAuthRefreshResponse
-    const refreshedAt = this.now()
-    sourceAccount.access = json.access_token
-    sourceAccount.refresh = json.refresh_token ?? refreshToken
-    sourceAccount.expires = refreshedAt + json.expires_in * 1000
-    sourceAccount.lastRefreshedAt = refreshedAt
+    sourceAccount.access = refreshed.access
+    sourceAccount.refresh = refreshed.refresh
+    sourceAccount.expires = refreshed.expires
+    sourceAccount.lastRefreshedAt =
+      refreshed.expires - refreshed.expiresIn * 1000
     sourceAccount.lastRefreshError = undefined
     updateStoredAccount(storage, sourceAccount)
     return sourceAccount

@@ -3,6 +3,7 @@ import {
   CLIENT_ID,
   CODE_CALLBACK_URL,
   OAUTH_SCOPES,
+  REFRESH_TOKEN_URL,
   TOKEN_URL,
 } from './constants.ts'
 import { generatePKCE } from './pkce.ts'
@@ -10,6 +11,65 @@ import { generatePKCE } from './pkce.ts'
 type CallbackParams = {
   code: string
   state: string
+}
+
+export class ClaudeOAuthRefreshError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly body: string,
+  ) {
+    super(`Claude OAuth refresh failed: ${status} — ${body}`)
+    this.name = 'ClaudeOAuthRefreshError'
+  }
+}
+
+export type ClaudeOAuthRefreshResult = {
+  access: string
+  refresh: string
+  expires: number
+  expiresIn: number
+}
+
+export async function refreshClaudeOAuthToken(input: {
+  refreshToken: string
+  fetchImpl?: typeof fetch
+  now?: () => number
+}): Promise<ClaudeOAuthRefreshResult> {
+  const fetchImpl = input.fetchImpl ?? fetch
+  const params = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: input.refreshToken,
+    client_id: CLIENT_ID,
+  })
+
+  const response = await fetchImpl(REFRESH_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+      'anthropic-beta': 'oauth-2025-04-20',
+    },
+    body: params.toString(),
+  })
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '')
+    throw new ClaudeOAuthRefreshError(response.status, body)
+  }
+
+  const json = (await response.json()) as {
+    access_token: string
+    refresh_token?: string
+    expires_in: number
+  }
+  const refreshedAt = input.now?.() ?? Date.now()
+
+  return {
+    access: json.access_token,
+    refresh: json.refresh_token ?? input.refreshToken,
+    expires: refreshedAt + json.expires_in * 1000,
+    expiresIn: json.expires_in,
+  }
 }
 
 export type AuthorizationResult = {

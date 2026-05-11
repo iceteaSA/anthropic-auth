@@ -5,7 +5,7 @@ import {
   CACHE_1H_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
-  CLIENT_ID,
+  ClaudeOAuthRefreshError,
   exchange,
   executeCache1hCommand,
   executeDumpCommand,
@@ -27,6 +27,7 @@ import {
   type QuotaAccountSummary,
   quotaSnapshotPassesPolicy,
   type RelayConfig,
+  refreshClaudeOAuthToken,
   sendViaRelay,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -34,7 +35,6 @@ import {
   setDumpEnabled,
   setDumpPersistentEnabled,
   shouldFallbackStatus,
-  TOKEN_URL,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
@@ -400,36 +400,28 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     // were rotated since the fetch() call was made.
                     const freshAuth = await getAuth()
 
-                    const response = await fetch(TOKEN_URL, {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                        Accept: 'application/json, text/plain, */*',
-                        'User-Agent': 'axios/1.13.6',
-                      },
-                      body: JSON.stringify({
-                        grant_type: 'refresh_token',
-                        refresh_token: freshAuth.refresh,
-                        client_id: CLIENT_ID,
-                      }),
-                    })
-
-                    if (!response.ok) {
-                      if (response.status >= 500 && attempt < maxRetries) {
-                        await response.body?.cancel()
-                        continue
-                      }
-
-                      const body = await response.text().catch(() => '')
+                    if (!freshAuth.refresh) {
                       throw new Error(
-                        `Token refresh failed: ${response.status} — ${body}`,
+                        'Token refresh failed: missing refresh token',
                       )
                     }
 
-                    const json = (await response.json()) as {
-                      refresh_token: string
-                      access_token: string
-                      expires_in: number
+                    let refreshed: Awaited<
+                      ReturnType<typeof refreshClaudeOAuthToken>
+                    >
+                    try {
+                      refreshed = await refreshClaudeOAuthToken({
+                        refreshToken: freshAuth.refresh,
+                      })
+                    } catch (error) {
+                      if (
+                        error instanceof ClaudeOAuthRefreshError &&
+                        error.status >= 500 &&
+                        attempt < maxRetries
+                      ) {
+                        continue
+                      }
+                      throw error
                     }
 
                     // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
@@ -439,13 +431,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       },
                       body: {
                         type: 'oauth',
-                        refresh: json.refresh_token,
-                        access: json.access_token,
-                        expires: Date.now() + json.expires_in * 1000,
+                        refresh: refreshed.refresh,
+                        access: refreshed.access,
+                        expires: refreshed.expires,
                       },
                     })
 
-                    return json.access_token
+                    return refreshed.access
                   } catch (error) {
                     const isNetworkError =
                       error instanceof Error &&

@@ -155,8 +155,14 @@ describe('FallbackAccountManager', () => {
 
     const fetchImpl = mock(
       (_input: string | URL | Request, init?: RequestInit) => {
-        const body = JSON.parse(String(init?.body))
-        expect(body.refresh_token).toBe('old-refresh')
+        const body = new URLSearchParams(String(init?.body))
+        expect(body.get('refresh_token')).toBe('old-refresh')
+        expect(new Headers(init?.headers).get('content-type')).toBe(
+          'application/x-www-form-urlencoded',
+        )
+        expect(new Headers(init?.headers).get('anthropic-beta')).toBe(
+          'oauth-2025-04-20',
+        )
         return Promise.resolve(
           new Response(
             JSON.stringify({
@@ -367,8 +373,17 @@ describe('FallbackAccountManager', () => {
 
     const fetchImpl = mock(
       (input: string | URL | Request, init?: RequestInit) => {
-        expect(String(input)).toContain('/v1/oauth/token')
-        expect(JSON.parse(String(init?.body)).refresh_token).toBe('old-refresh')
+        expect(String(input)).toBe(
+          'https://console.anthropic.com/v1/oauth/token',
+        )
+        const body = new URLSearchParams(String(init?.body))
+        expect(body.get('refresh_token')).toBe('old-refresh')
+        expect(new Headers(init?.headers).get('content-type')).toBe(
+          'application/x-www-form-urlencoded',
+        )
+        expect(new Headers(init?.headers).get('anthropic-beta')).toBe(
+          'oauth-2025-04-20',
+        )
         return Promise.resolve(
           new Response(
             JSON.stringify({
@@ -427,7 +442,15 @@ describe('FallbackAccountManager', () => {
           )
         }
 
-        expect(url).toContain('/v1/oauth/token')
+        expect(url).toBe('https://console.anthropic.com/v1/oauth/token')
+        const body = new URLSearchParams(String(init?.body))
+        expect(body.get('refresh_token')).toBe('refresh-token')
+        expect(new Headers(init?.headers).get('content-type')).toBe(
+          'application/x-www-form-urlencoded',
+        )
+        expect(new Headers(init?.headers).get('anthropic-beta')).toBe(
+          'oauth-2025-04-20',
+        )
         return Promise.resolve(
           new Response(
             JSON.stringify({
@@ -481,12 +504,12 @@ describe('FallbackAccountManager', () => {
     expect(result.errors).toEqual([
       {
         accountId: 'invalid-refresh',
-        message: 'Fallback token refresh failed: 400 — invalid_grant',
+        message: 'Claude OAuth refresh failed: 400 — invalid_grant',
       },
     ])
     const saved = await loadAccounts()
     expect(saved?.accounts[0]?.lastQuotaRefreshError?.message).toBe(
-      'Fallback token refresh failed: 400 — invalid_grant',
+      'Claude OAuth refresh failed: 400 — invalid_grant',
     )
   })
 })

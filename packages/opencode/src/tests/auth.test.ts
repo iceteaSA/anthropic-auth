@@ -5,6 +5,7 @@ import {
   CODE_CALLBACK_URL,
   exchange,
   OAUTH_SCOPES,
+  refreshClaudeOAuthToken,
 } from '@cortexkit/anthropic-auth-core'
 
 afterEach(() => {
@@ -146,5 +147,45 @@ describe('exchange', () => {
     )
     expect(result.type).toBe('failed')
     expect(fetchSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('refreshClaudeOAuthToken', () => {
+  test('uses Anthropic console form refresh path and preserves omitted refresh rotations', async () => {
+    let capturedUrl: string | undefined
+    let capturedBody: string | undefined
+    let capturedHeaders: Headers | undefined
+
+    const result = await refreshClaudeOAuthToken({
+      refreshToken: 'old-refresh',
+      now: () => 1_000,
+      fetchImpl: mock((input: string | URL | Request, init?: RequestInit) => {
+        capturedUrl = String(input)
+        capturedBody = String(init?.body)
+        capturedHeaders = new Headers(init?.headers)
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ access_token: 'new-access', expires_in: 3600 }),
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch,
+    })
+
+    expect(capturedUrl).toBe('https://console.anthropic.com/v1/oauth/token')
+    expect(capturedHeaders?.get('content-type')).toBe(
+      'application/x-www-form-urlencoded',
+    )
+    expect(capturedHeaders?.get('anthropic-beta')).toBe('oauth-2025-04-20')
+    const body = new URLSearchParams(capturedBody)
+    expect(body.get('grant_type')).toBe('refresh_token')
+    expect(body.get('refresh_token')).toBe('old-refresh')
+    expect(body.get('client_id')).toBe(CLIENT_ID)
+    expect(result).toEqual({
+      access: 'new-access',
+      refresh: 'old-refresh',
+      expires: 3_601_000,
+      expiresIn: 3600,
+    })
   })
 })

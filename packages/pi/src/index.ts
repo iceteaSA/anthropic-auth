@@ -1,8 +1,7 @@
 import {
   authorize,
-  CLIENT_ID,
   exchange,
-  TOKEN_URL,
+  refreshClaudeOAuthToken,
 } from '@cortexkit/anthropic-auth-core'
 import type { OAuthCredentials, OAuthLoginCallbacks } from '@mariozechner/pi-ai'
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent'
@@ -37,34 +36,14 @@ async function loginAnthropic(
 async function refreshAnthropicToken(
   credentials: OAuthCredentials,
 ): Promise<OAuthCredentials> {
-  const response = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/plain, */*',
-      'User-Agent': 'axios/1.13.6',
-    },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      client_id: CLIENT_ID,
-      refresh_token: credentials.refresh,
-    }),
+  const refreshed = await refreshClaudeOAuthToken({
+    refreshToken: credentials.refresh,
   })
 
-  if (!response.ok) {
-    throw new Error(`Anthropic OAuth refresh failed: ${await response.text()}`)
-  }
-
-  const json = (await response.json()) as {
-    access_token: string
-    refresh_token?: string
-    expires_in: number
-  }
-
   return {
-    refresh: json.refresh_token ?? credentials.refresh,
-    access: json.access_token,
-    expires: Date.now() + json.expires_in * 1000,
+    refresh: refreshed.refresh,
+    access: refreshed.access,
+    expires: refreshed.expires,
   }
 }
 
