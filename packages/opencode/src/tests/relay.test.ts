@@ -470,6 +470,96 @@ describe('relay client', () => {
     expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
   })
 
+  test('websocket reconnect retry works against a real local server', async () => {
+    const sentPayloads: Array<{ id: string; mode: string }> = []
+    let socketsOpened = 0
+    let directFallbackUsed = false
+
+    const server = Bun.serve<{ socketNumber: number }>({
+      port: 0,
+      fetch(request, server) {
+        const url = new URL(request.url)
+        if (url.pathname === '/ws') {
+          socketsOpened += 1
+          const upgraded = server.upgrade(request, {
+            data: { socketNumber: socketsOpened },
+          })
+          if (upgraded) return undefined
+          return new Response('upgrade failed', { status: 500 })
+        }
+        return new Response('unexpected request', { status: 404 })
+      },
+      websocket: {
+        open(socket) {
+          socket.send(
+            JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+          )
+        },
+        message(socket, data) {
+          const payload = JSON.parse(String(data))
+          sentPayloads.push(payload)
+          socket.send(
+            JSON.stringify({
+              protocol: 2,
+              type: 'accepted',
+              id: payload.id,
+              hash: payload.next_hash,
+              revision: payload.revision,
+            }),
+          )
+          if (socket.data.socketNumber === 1) {
+            socket.close(1011, 'test close before response')
+            return
+          }
+          socket.send(
+            JSON.stringify({
+              protocol: 2,
+              type: 'response_start',
+              id: payload.id,
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            }),
+          )
+          socket.send(new TextEncoder().encode('event: message_stop\n\n'))
+          socket.send(
+            JSON.stringify({ protocol: 2, type: 'done', id: payload.id }),
+          )
+        },
+      },
+    })
+
+    try {
+      const response = await sendViaRelay({
+        config: {
+          ...websocketConfig,
+          url: `http://127.0.0.1:${server.port}`,
+        },
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-ws-local-e2e'),
+        body: JSON.stringify({ messages: ['hello'] }),
+        fallback: async () => {
+          directFallbackUsed = true
+          return new Response('direct')
+        },
+        optimisticResponse: true,
+      })
+
+      expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
+      expect(await response.text()).toBe('event: message_stop\n\n')
+    } finally {
+      server.stop(true)
+    }
+
+    expect(directFallbackUsed).toBe(false)
+    expect(socketsOpened).toBe(2)
+    expect(sentPayloads.map((payload) => payload.mode)).toEqual([
+      'full_sync',
+      'full_sync',
+    ])
+    expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
+  })
+
   test('websocket accepts binary chunk frames', async () => {
     const originalWebSocket = globalThis.WebSocket
 
