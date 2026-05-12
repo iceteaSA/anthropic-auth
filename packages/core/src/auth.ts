@@ -3,7 +3,6 @@ import {
   CLIENT_ID,
   CODE_CALLBACK_URL,
   OAUTH_SCOPES,
-  REFRESH_TOKEN_URL,
   TOKEN_URL,
 } from './constants.ts'
 import { generatePKCE } from './pkce.ts'
@@ -36,20 +35,17 @@ export async function refreshClaudeOAuthToken(input: {
   now?: () => number
 }): Promise<ClaudeOAuthRefreshResult> {
   const fetchImpl = input.fetchImpl ?? fetch
-  const params = new URLSearchParams({
-    grant_type: 'refresh_token',
-    refresh_token: input.refreshToken,
-    client_id: CLIENT_ID,
-  })
-
-  const response = await fetchImpl(REFRESH_TOKEN_URL, {
+  const response = await fetchImpl(TOKEN_URL, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Type': 'application/json',
       Accept: 'application/json',
-      'anthropic-beta': 'oauth-2025-04-20',
     },
-    body: params.toString(),
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: input.refreshToken,
+      client_id: CLIENT_ID,
+    }),
   })
 
   if (!response.ok) {

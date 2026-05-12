@@ -878,10 +878,10 @@ describe('auth.loader', () => {
     // Should have called token endpoint first
     const tokenCall = fetchCalls.find((c) => c.url.includes('/v1/oauth/token'))
     expect(tokenCall).toBeDefined()
-    expect(tokenCall!.url).toBe('https://console.anthropic.com/v1/oauth/token')
-    const tokenBody = new URLSearchParams(tokenCall!.body!)
-    expect(tokenBody.get('grant_type')).toBe('refresh_token')
-    expect(tokenBody.get('refresh_token')).toBe('old-refresh')
+    expect(tokenCall!.url).toBe('https://platform.claude.com/v1/oauth/token')
+    const tokenBody = JSON.parse(tokenCall!.body!)
+    expect(tokenBody.grant_type).toBe('refresh_token')
+    expect(tokenBody.refresh_token).toBe('old-refresh')
 
     // Should have called client.auth.set with new tokens
     expect(mockClient.auth.set).toHaveBeenCalled()
@@ -1064,8 +1064,8 @@ describe('auth.loader', () => {
       const url = extractUrl(input)
 
       if (url.includes('/v1/oauth/token')) {
-        const body = new URLSearchParams(String(init?.body))
-        const refreshToken = body.get('refresh_token') ?? ''
+        const body = JSON.parse(String(init?.body))
+        const refreshToken = body.refresh_token ?? ''
 
         // Simulate refresh token rotation: first use succeeds, subsequent uses
         // return 401 because the old token has been invalidated
@@ -1190,9 +1190,9 @@ describe('auth.loader', () => {
     await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(tokenRequestBodies).toHaveLength(1)
-    const sentBody = new URLSearchParams(tokenRequestBodies[0] ?? '')
-    expect(sentBody.get('refresh_token')).toBe('rotated-refresh-from-storage')
-    expect(sentBody.get('refresh_token')).not.toBe('stale-refresh')
+    const sentBody = JSON.parse(tokenRequestBodies[0] ?? '{}')
+    expect(sentBody.refresh_token).toBe('rotated-refresh-from-storage')
+    expect(sentBody.refresh_token).not.toBe('stale-refresh')
   })
 
   test('fetch wrapper adds beta=true to /v1/messages URL', async () => {

@@ -155,13 +155,10 @@ describe('FallbackAccountManager', () => {
 
     const fetchImpl = mock(
       (_input: string | URL | Request, init?: RequestInit) => {
-        const body = new URLSearchParams(String(init?.body))
-        expect(body.get('refresh_token')).toBe('old-refresh')
+        const body = JSON.parse(String(init?.body))
+        expect(body.refresh_token).toBe('old-refresh')
         expect(new Headers(init?.headers).get('content-type')).toBe(
-          'application/x-www-form-urlencoded',
-        )
-        expect(new Headers(init?.headers).get('anthropic-beta')).toBe(
-          'oauth-2025-04-20',
+          'application/json',
         )
         return Promise.resolve(
           new Response(
@@ -373,16 +370,11 @@ describe('FallbackAccountManager', () => {
 
     const fetchImpl = mock(
       (input: string | URL | Request, init?: RequestInit) => {
-        expect(String(input)).toBe(
-          'https://console.anthropic.com/v1/oauth/token',
-        )
-        const body = new URLSearchParams(String(init?.body))
-        expect(body.get('refresh_token')).toBe('old-refresh')
+        expect(String(input)).toBe('https://platform.claude.com/v1/oauth/token')
+        const body = JSON.parse(String(init?.body))
+        expect(body.refresh_token).toBe('old-refresh')
         expect(new Headers(init?.headers).get('content-type')).toBe(
-          'application/x-www-form-urlencoded',
-        )
-        expect(new Headers(init?.headers).get('anthropic-beta')).toBe(
-          'oauth-2025-04-20',
+          'application/json',
         )
         return Promise.resolve(
           new Response(
@@ -442,14 +434,11 @@ describe('FallbackAccountManager', () => {
           )
         }
 
-        expect(url).toBe('https://console.anthropic.com/v1/oauth/token')
-        const body = new URLSearchParams(String(init?.body))
-        expect(body.get('refresh_token')).toBe('refresh-token')
+        expect(url).toBe('https://platform.claude.com/v1/oauth/token')
+        const body = JSON.parse(String(init?.body))
+        expect(body.refresh_token).toBe('refresh-token')
         expect(new Headers(init?.headers).get('content-type')).toBe(
-          'application/x-www-form-urlencoded',
-        )
-        expect(new Headers(init?.headers).get('anthropic-beta')).toBe(
-          'oauth-2025-04-20',
+          'application/json',
         )
         return Promise.resolve(
           new Response(

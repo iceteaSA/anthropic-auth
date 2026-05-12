@@ -151,7 +151,7 @@ describe('exchange', () => {
 })
 
 describe('refreshClaudeOAuthToken', () => {
-  test('uses Anthropic console form refresh path and preserves omitted refresh rotations', async () => {
+  test('uses Anthropic platform JSON refresh path and preserves omitted refresh rotations', async () => {
     let capturedUrl: string | undefined
     let capturedBody: string | undefined
     let capturedHeaders: Headers | undefined
@@ -172,15 +172,12 @@ describe('refreshClaudeOAuthToken', () => {
       }) as unknown as typeof fetch,
     })
 
-    expect(capturedUrl).toBe('https://console.anthropic.com/v1/oauth/token')
-    expect(capturedHeaders?.get('content-type')).toBe(
-      'application/x-www-form-urlencoded',
-    )
-    expect(capturedHeaders?.get('anthropic-beta')).toBe('oauth-2025-04-20')
-    const body = new URLSearchParams(capturedBody)
-    expect(body.get('grant_type')).toBe('refresh_token')
-    expect(body.get('refresh_token')).toBe('old-refresh')
-    expect(body.get('client_id')).toBe(CLIENT_ID)
+    expect(capturedUrl).toBe('https://platform.claude.com/v1/oauth/token')
+    expect(capturedHeaders?.get('content-type')).toBe('application/json')
+    const body = JSON.parse(capturedBody ?? '{}')
+    expect(body.grant_type).toBe('refresh_token')
+    expect(body.refresh_token).toBe('old-refresh')
+    expect(body.client_id).toBe(CLIENT_ID)
     expect(result).toEqual({
       access: 'new-access',
       refresh: 'old-refresh',
