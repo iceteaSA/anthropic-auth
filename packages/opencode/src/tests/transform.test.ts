@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 import {
   CLAUDE_CODE_IDENTITY,
+  FAST_MODE_BETA,
   OPENCODE_IDENTITY_PREFIX,
   REQUIRED_BETAS,
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
+  addFastModeBetaHeader,
   createStrippedStream,
   isInsecure,
   mergeBetaHeaders,
@@ -105,6 +107,18 @@ describe('mergeBetaHeaders', () => {
     const result = mergeBetaHeaders(headers)
     expect(result).toContain('beta-a')
     expect(result).toContain('beta-b')
+  })
+
+  test('adds fast mode beta without duplicating existing betas', () => {
+    const headers = new Headers({
+      'anthropic-beta': `beta-a, ${FAST_MODE_BETA}`,
+    })
+
+    addFastModeBetaHeader(headers)
+
+    const parts = headers.get('anthropic-beta')?.split(',') ?? []
+    expect(parts).toContain('beta-a')
+    expect(parts.filter((part) => part === FAST_MODE_BETA)).toHaveLength(1)
   })
 })
 
@@ -643,6 +657,44 @@ describe('rewriteRequestBody', () => {
     expect(result.system).toHaveLength(2)
     expect(result.system[0].text).toContain('x-anthropic-billing-header')
     expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('sets fast speed for supported Opus models when fast mode is enabled', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-7-20260201',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, { fastModeEnabled: true }),
+    )
+
+    expect(result.speed).toBe('fast')
+  })
+
+  test('does not set fast speed for unsupported models', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, { fastModeEnabled: true }),
+    )
+
+    expect(result.speed).toBeUndefined()
+  })
+
+  test('removes existing fast speed when fast mode is disabled', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-7',
+      speed: 'fast',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.speed).toBeUndefined()
   })
 
   test('returns original string on invalid JSON', async () => {

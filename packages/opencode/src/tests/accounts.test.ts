@@ -7,10 +7,12 @@ import {
   type AccountStorage,
   FallbackAccountManager,
   getCache1hPersistentMode,
+  isFastModePersistentlyEnabled,
   loadAccounts,
   saveAccounts,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
+  setFastModePersistentEnabled,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -134,6 +136,20 @@ describe('account storage', () => {
     saved = await loadAccounts()
 
     expect(saved?.claudeCache).toEqual({ enabled: false, mode: 'hybrid' })
+  })
+
+  test('persists claudeFast enabled state', async () => {
+    await setFastModePersistentEnabled(true)
+    let saved = await loadAccounts()
+
+    expect(saved?.claudeFast).toEqual({ enabled: true })
+    expect(isFastModePersistentlyEnabled(saved)).toBe(true)
+
+    await setFastModePersistentEnabled(false)
+    saved = await loadAccounts()
+
+    expect(saved?.claudeFast).toEqual({ enabled: false })
+    expect(isFastModePersistentlyEnabled(saved)).toBe(false)
   })
 })
 

@@ -25,6 +25,25 @@ export const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
 ]
+export const FAST_MODE_BETA = 'fast-mode-2026-02-01'
+
+export function mergeAnthropicBetas(
+  existing: string | null | undefined,
+  betas: string[],
+) {
+  const incoming = (existing ?? '')
+    .split(',')
+    .map((beta) => beta.trim())
+    .filter(Boolean)
+  return [...new Set([...incoming, ...betas])].join(',')
+}
+
+export function isFastModeSupportedModel(model: unknown) {
+  return (
+    typeof model === 'string' &&
+    (model.startsWith('claude-opus-4-6') || model.startsWith('claude-opus-4-7'))
+  )
+}
 
 export const OPENCODE_IDENTITY_PREFIX = 'You are OpenCode'
 export const CLAUDE_CODE_IDENTITY =

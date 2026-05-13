@@ -3,6 +3,9 @@ import {
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  FAST_MODE_BETA,
+  isFastModeSupportedModel,
+  mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
@@ -83,6 +86,14 @@ export function mergeBetaHeaders(headers: Headers): string {
     .filter(Boolean)
 
   return [...new Set([...REQUIRED_BETAS, ...incomingBetasList])].join(',')
+}
+
+export function addFastModeBetaHeader(headers: Headers): Headers {
+  headers.set(
+    'anthropic-beta',
+    mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
+  )
+  return headers
 }
 
 /**
@@ -487,7 +498,11 @@ function applyCache1hStrategy(
  */
 export async function rewriteRequestBody(
   body: string,
-  options: { cache1hEnabled?: boolean; cache1hMode?: Cache1hMode } = {},
+  options: {
+    cache1hEnabled?: boolean
+    cache1hMode?: Cache1hMode
+    fastModeEnabled?: boolean
+  } = {},
 ): Promise<string> {
   try {
     const parsed = JSON.parse(body)
@@ -516,6 +531,12 @@ export async function rewriteRequestBody(
       enabled: options.cache1hEnabled ?? false,
       mode: options.cache1hMode ?? 'explicit',
     })
+
+    if (options.fastModeEnabled && isFastModeSupportedModel(parsed.model)) {
+      parsed.speed = 'fast'
+    } else if (parsed.speed === 'fast') {
+      delete parsed.speed
+    }
 
     return await signRequestBody(prefixToolNames(parsed))
   } catch {

@@ -3,6 +3,7 @@ import {
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  isFastModeSupportedModel,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -40,6 +41,7 @@ export type AnthropicRequestBody = {
   tools?: Array<Record<string, unknown>>
   thinking?: { type: 'enabled'; budget_tokens: number }
   cache_control?: { type: 'ephemeral' }
+  speed?: 'fast'
 }
 
 function sanitize(text: string): string {
@@ -242,6 +244,7 @@ export async function buildAnthropicRequest(
   context: Context,
   options: SimpleStreamOptions | undefined,
   cache: { enabled: boolean; mode: Cache1hMode },
+  fastModeEnabled = false,
 ): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
   const messages = convertMessages(context.messages)
   const system = [
@@ -269,6 +272,10 @@ export async function buildAnthropicRequest(
 
   const tools = convertTools(context.tools)
   if (tools?.length) body.tools = tools
+
+  if (fastModeEnabled && isFastModeSupportedModel(modelId)) {
+    body.speed = 'fast'
+  }
 
   if (options?.reasoning) {
     const budgets: Record<string, number> = {

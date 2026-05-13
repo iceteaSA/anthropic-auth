@@ -19,14 +19,15 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Primary Claude Pro/Max OAuth | OpenCode `/connect anthropic` | Pi `/login anthropic` |
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
-| Commands | `/claude-cache`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-quota`, `/claude-dump` |
-| Fallback accounts, quota routing, relay, dumps | Supported | Supported through the same shared core and Pi sidecar |
+| Commands | `/claude-cache`, `/claude-fast`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Fallback accounts, quota routing, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
 ## What CortexKit adds over the original plugin
 
 - **Fallback Claude accounts**: keep each agent's normal Anthropic login as the primary account, then route to ordered fallback OAuth accounts on auth/quota/rate-limit failures.
 - **Quota-aware routing**: skip main or fallback accounts when their 5-hour or 7-day Claude quota falls below your configured minimum.
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
+- **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
 - **Claude-compatible request hardening**: final-body billing signing, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
@@ -40,7 +41,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
-- Add `/claude-cache`, `/claude-quota`, and `/claude-dump` commands.
+- Add `/claude-cache`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
 
 ## Install
@@ -174,6 +175,9 @@ Example:
   "dump": {
     "enabled": false
   },
+  "claudeFast": {
+    "enabled": false
+  },
   "relay": {
     "enabled": false,
     "url": "https://opencode-anthropic-relay.example.workers.dev",
@@ -185,7 +189,7 @@ Example:
 }
 ```
 
-The `claudeCache` block controls the `/claude-cache` command's persisted mode. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
+The `claudeCache` block controls the `/claude-cache` command's persisted mode, and `claudeFast` controls `/claude-fast`. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
 
 ## Fallback accounts
 
@@ -270,6 +274,20 @@ Modes:
 - `hybrid` (recommended) uses top-level automatic caching while keeping stable explicit anchors near the beginning of the request.
 
 In OpenCode, subagent requests do not receive 1-hour TTL caching. The plugin detects child sessions through OpenCode's `x-parent-session-id` header, strips that internal header before forwarding to Anthropic, and leaves default ephemeral caching in place for those requests.
+
+## Claude fast mode
+
+Both OpenCode and Pi packages can persistently request Anthropic fast mode for supported Opus models:
+
+```text
+/claude-fast
+/claude-fast on
+/claude-fast off
+```
+
+When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6` and `claude-opus-4-7`.
+
+Fast and standard speeds do not share prompt-cache prefixes, so switching this setting can cause cache misses.
 
 ### Estimate cache savings from OpenCode history
 

@@ -4,11 +4,13 @@ import {
   buildFallbackQuotaSummaries,
   CACHE_1H_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
+  CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   ClaudeOAuthRefreshError,
   exchange,
   executeCache1hCommand,
   executeDumpCommand,
+  executeFastModeCommand,
   FallbackAccountManager,
   fetchOAuthQuotaSnapshot,
   getCache1hMode,
@@ -19,11 +21,15 @@ import {
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
   isDumpPersistentlyEnabled,
+  isFastModeEnabled,
+  isFastModePersistentlyEnabled,
+  isFastModeSupportedModel,
   loadAccounts,
   log,
   type OAuthQuotaSnapshot,
   parseCache1hCommandAction,
   parseDumpCommandAction,
+  parseFastModeCommandAction,
   type QuotaAccountSummary,
   quotaSnapshotPassesPolicy,
   type RelayConfig,
@@ -34,11 +40,14 @@ import {
   setCache1hState,
   setDumpEnabled,
   setDumpPersistentEnabled,
+  setFastModeEnabled,
+  setFastModePersistentEnabled,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
+  addFastModeBetaHeader,
   createStrippedStream,
   isInsecure,
   mergeHeaders,
@@ -196,6 +205,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     mode: getCache1hPersistentMode(initialCache1hStorage),
   })
   setDumpEnabled(isDumpPersistentlyEnabled(initialCache1hStorage))
+  setFastModeEnabled(isFastModePersistentlyEnabled(initialCache1hStorage))
   let latestGetAuth:
     | (() => Promise<{
         type: string
@@ -296,6 +306,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return executeDumpCommand({ argumentsText, enabled })
   }
 
+  async function executePersistentFastModeCommand(argumentsText: string) {
+    const action = parseFastModeCommandAction(argumentsText)
+    if (action.type === 'enable' || action.type === 'disable') {
+      const enabled = action.type === 'enable'
+      await setFastModePersistentEnabled(enabled)
+      setFastModeEnabled(enabled)
+      return executeFastModeCommand({ argumentsText, enabled })
+    }
+
+    const storage = await loadAccounts()
+    const enabled = isFastModePersistentlyEnabled(storage)
+    setFastModeEnabled(enabled)
+    return executeFastModeCommand({ argumentsText, enabled })
+  }
+
   return {
     config: async (config: { command?: Record<string, unknown> }) => {
       config.command = {
@@ -314,6 +339,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           template: CLAUDE_DUMP_COMMAND_NAME,
           description:
             'Show or toggle Anthropic request dump capture for debugging.',
+        },
+        [CLAUDE_FAST_COMMAND_NAME]: {
+          template: CLAUDE_FAST_COMMAND_NAME,
+          description:
+            'Show or toggle Anthropic fast mode for supported Opus models.',
         },
       }
     },
@@ -345,6 +375,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ctx,
           input.sessionID,
           await executePersistentDumpCommand(input.arguments),
+        )
+        throwHandledSentinel()
+      }
+
+      if (input.command === CLAUDE_FAST_COMMAND_NAME) {
+        await sendIgnoredMessage(
+          ctx,
+          input.sessionID,
+          await executePersistentFastModeCommand(input.arguments),
         )
         throwHandledSentinel()
       }
@@ -585,10 +624,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               typeof body === 'string' ? body.length : undefined
             if (body && typeof body === 'string') {
               const rewriteStart = nowMs()
+              const fastModeRequested = (() => {
+                if (!isFastModeEnabled()) return false
+                try {
+                  return isFastModeSupportedModel(JSON.parse(body).model)
+                } catch {
+                  return false
+                }
+              })()
               body = await rewriteRequestBody(body, {
                 cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                 cache1hMode: getCache1hMode(),
+                fastModeEnabled: fastModeRequested,
               })
+              if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
               trace?.mark('rewrite_body', {
                 route,
                 ms: roundMs(nowMs() - rewriteStart),
@@ -596,6 +645,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 rewrittenBytes: body.length,
                 cacheEnabled: !subagentRequest && isCache1hEnabled(),
                 cacheMode: getCache1hMode(),
+                fastModeEnabled: fastModeRequested,
                 subagent: subagentRequest,
               })
             }

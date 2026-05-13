@@ -1,6 +1,6 @@
 # @cortexkit/anthropic-auth-core
 
-Shared Anthropic OAuth, quota, cache, relay, dump, and request-signing helpers used by CortexKit's OpenCode and Pi integrations.
+Shared Anthropic OAuth, quota, cache, fast mode, relay, dump, and request-signing helpers used by CortexKit's OpenCode and Pi integrations.
 
 User-facing packages:
 

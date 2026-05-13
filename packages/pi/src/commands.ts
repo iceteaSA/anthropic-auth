@@ -3,15 +3,19 @@ import {
   buildFallbackQuotaSummaries,
   executeCache1hCommand,
   executeDumpCommand,
+  executeFastModeCommand,
   getCache1hPersistentMode,
   isCache1hPersistentlyEnabled,
   isDumpPersistentlyEnabled,
+  isFastModePersistentlyEnabled,
   loadAccounts,
   parseCache1hCommandAction,
   parseDumpCommandAction,
+  parseFastModeCommandAction,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setDumpPersistentEnabled,
+  setFastModePersistentEnabled,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   ExtensionAPI,
@@ -92,6 +96,39 @@ export function registerCommands(pi: ExtensionAPI) {
       notify(
         ctx,
         executeDumpCommand({ argumentsText: args ?? '', enabled: nextEnabled }),
+        action.type === 'usage' ? 'warning' : 'info',
+      )
+    },
+  })
+
+  pi.registerCommand('claude-fast', {
+    description:
+      'Show or configure Anthropic fast mode for supported Opus models',
+    handler: async (args, ctx) => {
+      const path = getPiAccountStoragePath()
+      const storage = await loadAccounts(path)
+      const action = parseFastModeCommandAction(args ?? '')
+      const enabled = isFastModePersistentlyEnabled(storage)
+
+      const nextEnabled =
+        action.type === 'enable'
+          ? true
+          : action.type === 'disable'
+            ? false
+            : enabled
+
+      if (action.type === 'enable') {
+        await setFastModePersistentEnabled(true, path)
+      } else if (action.type === 'disable') {
+        await setFastModePersistentEnabled(false, path)
+      }
+
+      notify(
+        ctx,
+        executeFastModeCommand({
+          argumentsText: args ?? '',
+          enabled: nextEnabled,
+        }),
         action.type === 'usage' ? 'warning' : 'info',
       )
     },

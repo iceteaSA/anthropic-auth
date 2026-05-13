@@ -40,7 +40,7 @@ Pi state is stored separately from OpenCode at:
 
 Override the path with `PI_ANTHROPIC_AUTH_FILE`. The package also respects `PI_AGENT_DIR` when deriving the default sidecar path.
 
-The sidecar uses the same JSON shape as the OpenCode package, including `claudeCache`, `dump`, `relay`, and fallback `accounts` blocks.
+The sidecar uses the same JSON shape as the OpenCode package, including `claudeCache`, `claudeFast`, `dump`, `relay`, and fallback `accounts` blocks.
 
 ## Commands
 
@@ -56,10 +56,14 @@ The sidecar uses the same JSON shape as the OpenCode package, including `claudeC
 /claude-dump on
 /claude-dump off
 
+/claude-fast
+/claude-fast on
+/claude-fast off
+
 /claude-quota
 ```
 
-`/claude-quota` reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`.
+`/claude-quota` reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`. `/claude-fast on` adds Anthropic `speed: "fast"` plus the `fast-mode-2026-02-01` beta header for supported Opus models (`claude-opus-4-6` and `claude-opus-4-7`).
 
 ## Relay
 

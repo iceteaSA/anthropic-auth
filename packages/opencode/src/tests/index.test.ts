@@ -6,6 +6,7 @@ import {
   type AccountStorage,
   resetCache1hState,
   resetDumpState,
+  resetFastModeState,
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
@@ -183,6 +184,7 @@ describe('auth.loader', () => {
     globalThis.setTimeout = originalSetTimeout
     resetCache1hState()
     resetDumpState()
+    resetFastModeState()
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -379,6 +381,10 @@ describe('auth.loader', () => {
       template: 'claude-dump',
       description: expect.stringContaining('dump'),
     })
+    expect(config.command?.['claude-fast']).toMatchObject({
+      template: 'claude-fast',
+      description: expect.stringContaining('fast mode'),
+    })
 
     await expect(
       plugin['command.execute.before']({
@@ -422,6 +428,55 @@ describe('auth.loader', () => {
       await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
     )
     expect(saved.claudeCache).toEqual({ enabled: true, mode: 'explicit' })
+  })
+
+  test('registers and handles /claude-fast slash command with ignored status replies', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-fast',
+        arguments: 'on',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(mockClient.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: 'session-1' },
+      body: {
+        noReply: true,
+        parts: [
+          {
+            type: 'text',
+            ignored: true,
+            text: expect.stringContaining('## Claude Fast Mode Enabled'),
+          },
+        ],
+      },
+    })
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-fast',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls
+    const latestCall = promptCalls.at(-1)?.[0]
+    expect(latestCall?.body.parts[0]?.text).toContain('- Enabled: enabled')
+
+    const saved = JSON.parse(
+      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    )
+    expect(saved.claudeFast).toEqual({ enabled: true })
   })
 
   test('hidden slash-command replies preserve previous assistant model and variant', async () => {
@@ -664,6 +719,90 @@ describe('auth.loader', () => {
     expect(text).toContain('### fallback personal (fallback)')
     expect(text).toContain('5h: 75% remaining')
     expect(text).toContain('1w: 50% remaining')
+  })
+
+  test('persistent claudeFast setting makes fetch wrapper request fast mode', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeFast: { enabled: true },
+      }),
+    )
+
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-7',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders?.get('anthropic-beta')).toContain(
+      'fast-mode-2026-02-01',
+    )
+    expect(JSON.parse(capturedBody!).speed).toBe('fast')
+  })
+
+  test('persistent claudeFast setting skips unsupported models', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeFast: { enabled: true },
+      }),
+    )
+
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders?.get('anthropic-beta')).not.toContain(
+      'fast-mode-2026-02-01',
+    )
+    expect(JSON.parse(capturedBody!).speed).toBeUndefined()
   })
 
   test('/claude-cache on makes fetch wrapper set ttl on existing cache controls', async () => {

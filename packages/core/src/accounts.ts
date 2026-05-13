@@ -69,6 +69,9 @@ export type AccountStorage = {
   dump?: {
     enabled?: boolean
   }
+  claudeFast?: {
+    enabled?: boolean
+  }
   relay?: {
     enabled?: boolean
     url?: string
@@ -212,6 +215,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     quota: isRecord(value.quota) ? value.quota : undefined,
     claudeCache: isRecord(value.claudeCache) ? value.claudeCache : undefined,
     dump: isRecord(value.dump) ? value.dump : undefined,
+    claudeFast: isRecord(value.claudeFast) ? value.claudeFast : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
     accounts: value.accounts
       .map(normalizeAccount)
@@ -329,6 +333,27 @@ export async function setDumpPersistentEnabled(
   }
   storage.dump = {
     ...(storage.dump ?? {}),
+    enabled,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export function isFastModePersistentlyEnabled(storage: AccountStorage | null) {
+  return storage?.claudeFast?.enabled === true
+}
+
+export async function setFastModePersistentEnabled(
+  enabled: boolean,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.claudeFast = {
+    ...(storage.claudeFast ?? {}),
     enabled,
   }
   await saveAccounts(storage, path)

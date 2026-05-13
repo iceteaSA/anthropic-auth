@@ -6,7 +6,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Major Changes
 
-- Initial CortexKit release under `@cortexkit/opencode-anthropic-auth`, including multi-account fallback, quota-aware routing, Claude cache controls, final-body billing signing, and the optional user-owned Cloudflare relay.
+- Initial CortexKit release under `@cortexkit/opencode-anthropic-auth`, including multi-account fallback, quota-aware routing, Claude cache controls, Anthropic fast mode toggling, final-body billing signing, and the optional user-owned Cloudflare relay.
 
 ## 1.7.4
 

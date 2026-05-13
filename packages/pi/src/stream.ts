@@ -1,9 +1,12 @@
 import {
+  FAST_MODE_BETA,
   FallbackAccountManager,
   getCache1hPersistentMode,
   getRelayConfig,
   isCache1hPersistentlyEnabled,
+  isFastModePersistentlyEnabled,
   loadAccounts,
+  mergeAnthropicBetas,
   REQUIRED_BETAS,
   sendViaRelay,
   shouldFallbackStatus,
@@ -131,6 +134,7 @@ async function sendAnthropicRequest(options: {
   accessToken: string
   bodyText: string
   storagePath: string
+  fastModeUsed?: boolean
 }): Promise<Response> {
   const storage = await loadAccounts(options.storagePath)
   const headers = new Headers({
@@ -141,6 +145,12 @@ async function sendAnthropicRequest(options: {
     'user-agent': USER_AGENT,
     'x-app': 'cli',
   })
+  if (options.fastModeUsed) {
+    headers.set(
+      'anthropic-beta',
+      mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
+    )
+  }
   if (options.streamOptions?.sessionId) {
     headers.set('x-session-affinity', options.streamOptions.sessionId)
   }
@@ -192,6 +202,7 @@ async function executeWithFallback(options: {
   bodyText: string
   primaryAccessToken: string
   storagePath: string
+  fastModeUsed?: boolean
 }): Promise<Response> {
   const manager = new FallbackAccountManager({
     configPath: options.storagePath,
@@ -246,7 +257,7 @@ export function streamCortexKitAnthropic(
 
       const storagePath = getPiAccountStoragePath()
       const storage = await loadAccounts(storagePath)
-      const { bodyText } = await buildAnthropicRequest(
+      const { body, bodyText } = await buildAnthropicRequest(
         model.id,
         context,
         options,
@@ -254,6 +265,7 @@ export function streamCortexKitAnthropic(
           enabled: isCache1hPersistentlyEnabled(storage),
           mode: getCache1hPersistentMode(storage),
         },
+        isFastModePersistentlyEnabled(storage),
       )
       const response = await executeWithFallback({
         model,
@@ -262,6 +274,7 @@ export function streamCortexKitAnthropic(
         bodyText,
         primaryAccessToken: accessToken,
         storagePath,
+        fastModeUsed: body.speed === 'fast',
       })
 
       if (!response.ok) {
