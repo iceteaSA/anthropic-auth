@@ -231,7 +231,7 @@ function isRelayableAnthropicRequest(
   try {
     const url =
       input instanceof Request ? new URL(input.url) : new URL(input.toString())
-    return url.pathname === '/v1/messages'
+    return url.pathname === '/v1/messages' || url.pathname === '/messages'
   } catch {
     return false
   }

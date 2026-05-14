@@ -1,0 +1,11 @@
+{
+  "name": "@cortexkit/anthropic-auth-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test tests"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "1.14.50"
+  }
+}

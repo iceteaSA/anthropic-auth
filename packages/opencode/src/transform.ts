@@ -161,6 +161,37 @@ export function stripToolPrefix(text: string): string {
   )
 }
 
+function splitToolPrefixRewriteBuffer(buffer: string, flush = false) {
+  if (flush) return { ready: stripToolPrefix(buffer), pending: '' }
+
+  let keepFrom = buffer.length
+  const marker = '"name"'
+  const partialMarkerStart = Math.max(0, buffer.length - marker.length + 1)
+  for (let index = partialMarkerStart; index < buffer.length; index++) {
+    if (marker.startsWith(buffer.slice(index))) {
+      keepFrom = Math.min(keepFrom, index)
+      break
+    }
+  }
+
+  const lastName = buffer.lastIndexOf(marker)
+  if (lastName !== -1) {
+    const tail = buffer.slice(lastName)
+    if (/^"name"\s*(?::\s*(?:"[^"]*)?)?$/.test(tail)) {
+      keepFrom = Math.min(keepFrom, lastName)
+    }
+  }
+
+  if (keepFrom < buffer.length) {
+    return {
+      ready: stripToolPrefix(buffer.slice(0, keepFrom)),
+      pending: buffer.slice(keepFrom),
+    }
+  }
+
+  return { ready: stripToolPrefix(buffer), pending: '' }
+}
+
 /**
  * Check if TLS verification should be skipped for custom API endpoints.
  * Only effective when ANTHROPIC_BASE_URL is also set.
@@ -553,18 +584,25 @@ export function createStrippedStream(response: Response): Response {
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  let pending = ''
 
   const stream = new ReadableStream({
     async pull(controller) {
       const { done, value } = await reader.read()
       if (done) {
+        const flushed = splitToolPrefixRewriteBuffer(
+          `${pending}${decoder.decode()}`,
+          true,
+        )
+        if (flushed.ready) controller.enqueue(encoder.encode(flushed.ready))
         controller.close()
         return
       }
 
-      let text = decoder.decode(value, { stream: true })
-      text = stripToolPrefix(text)
-      controller.enqueue(encoder.encode(text))
+      const text = pending + decoder.decode(value, { stream: true })
+      const rewritten = splitToolPrefixRewriteBuffer(text)
+      pending = rewritten.pending
+      if (rewritten.ready) controller.enqueue(encoder.encode(rewritten.ready))
     },
   })
 

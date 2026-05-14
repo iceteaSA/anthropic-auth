@@ -446,6 +446,29 @@ describe('createStrippedStream', () => {
     expect(text).not.toContain('mcp_read')
   })
 
+  test('strips tool prefixes when name JSON is split across chunks', async () => {
+    const chunks = [
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","na',
+      'me":"mcp_Read","id":"toolu_1"}}\n\n',
+    ]
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk))
+        }
+        controller.close()
+      },
+    })
+
+    const stripped = createStrippedStream(new Response(stream, { status: 200 }))
+
+    const text = await stripped.text()
+    expect(text).toContain('"name": "read"')
+    expect(text).not.toContain('mcp_Read')
+  })
+
   test('preserves response status and headers', async () => {
     const stream = new ReadableStream({
       start(controller) {

@@ -23,6 +23,12 @@
         "xxhash-wasm": "^1.1.0",
       },
     },
+    "packages/e2e-tests": {
+      "name": "@cortexkit/anthropic-auth-e2e",
+      "dependencies": {
+        "@opencode-ai/sdk": "1.14.50",
+      },
+    },
     "packages/opencode": {
       "name": "@cortexkit/opencode-anthropic-auth",
       "version": "1.0.0",
@@ -147,6 +153,8 @@
 
     "@cortexkit/anthropic-auth-core": ["@cortexkit/anthropic-auth-core@workspace:packages/core"],
 
+    "@cortexkit/anthropic-auth-e2e": ["@cortexkit/anthropic-auth-e2e@workspace:packages/e2e-tests"],
+
     "@cortexkit/opencode-anthropic-auth": ["@cortexkit/opencode-anthropic-auth@workspace:packages/opencode"],
 
     "@cortexkit/pi-anthropic-auth": ["@cortexkit/pi-anthropic-auth@workspace:packages/pi"],
@@ -203,7 +211,7 @@
 
     "@opencode-ai/plugin": ["@opencode-ai/plugin@1.4.7", "", { "dependencies": { "@opencode-ai/sdk": "1.4.7", "effect": "4.0.0-beta.48", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.1.99", "@opentui/solid": ">=0.1.99" }, "optionalPeers": ["@opentui/core", "@opentui/solid"] }, "sha512-RbzMl7ILvQDHpZNvqzi6RCYaGcB3eBwNIMRZww467drLvMd1eOwr4/qAurrvYDsIIEctE6cKsrLuSGIKCW/Fxg=="],
 
-    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.4.7", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-onEtaooQyoDP5gTShQeQSf0Sd8V7949G9pPNyIyRXnVtFqyDIhUDLGtL/a/+EIW9x5s+Y6lDy/3oVoGMvQ0rQQ=="],
+    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.14.50", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-IrTKTFviR4Tj+u0BI8h8XgXIvEpxwkkHqBj6E0aEc4DBErpS3qh2Lkp1xt0OdtCYiLE3wZ1bAIiHOiO66H/7TA=="],
 
     "@protobufjs/aspromise": ["@protobufjs/aspromise@1.1.2", "", {}, "sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ=="],
 
@@ -658,6 +666,8 @@
     "@aws-crypto/sha256-browser/@smithy/util-utf8": ["@smithy/util-utf8@2.3.0", "", { "dependencies": { "@smithy/util-buffer-from": "^2.2.0", "tslib": "^2.6.2" } }, "sha512-R8Rdn8Hy72KKcebgLiv8jQcQkXoLMOGGv5uI1/k0l+snqkOzQ1R0ChUBCxWMlBsFMekWjq0wRudIweFs7sKT5A=="],
 
     "@aws-crypto/util/@smithy/util-utf8": ["@smithy/util-utf8@2.3.0", "", { "dependencies": { "@smithy/util-buffer-from": "^2.2.0", "tslib": "^2.6.2" } }, "sha512-R8Rdn8Hy72KKcebgLiv8jQcQkXoLMOGGv5uI1/k0l+snqkOzQ1R0ChUBCxWMlBsFMekWjq0wRudIweFs7sKT5A=="],
+
+    "@opencode-ai/plugin/@opencode-ai/sdk": ["@opencode-ai/sdk@1.4.7", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-onEtaooQyoDP5gTShQeQSf0Sd8V7949G9pPNyIyRXnVtFqyDIhUDLGtL/a/+EIW9x5s+Y6lDy/3oVoGMvQ0rQQ=="],
 
     "cli-highlight/chalk": ["chalk@4.1.2", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-oKnbhFyRIXpUuez8iBMmyEa4nbj4IOQyuhc/wy9kY7/WVPcwIO9VA668Pu8RkO7+0G76SLROeyw9CpQ061i4mA=="],
 
