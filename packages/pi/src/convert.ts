@@ -48,7 +48,18 @@ export type AnthropicRequestBody = {
 }
 
 function sanitize(text: string): string {
-  return text.replace(/[\uD800-\uDFFF]/g, '\uFFFD')
+  return text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
+}
+
+/**
+ * Sanitize a tool-call ID to match Anthropic's `^[a-zA-Z0-9_-]+$` pattern.
+ * Cross-provider IDs (e.g. OpenAI Codex `call_xxx|fc_xxx`) contain characters
+ * Anthropic rejects. Deterministic — same input always yields the same output.
+ */
+function sanitizeToolId(id: string): string {
+  if (!id) return 'tool_call_unknown'
+  const cleaned = id.replace(/[^a-zA-Z0-9_-]/g, '_')
+  return cleaned.length > 256 ? cleaned.slice(0, 256) : cleaned
 }
 
 function toClaudeCodeToolName(name: string): string {
@@ -134,7 +145,7 @@ function convertMessages(
         } else if (block.type === 'toolCall') {
           blocks.push({
             type: 'tool_use',
-            id: block.id,
+            id: sanitizeToolId(block.id),
             name: toClaudeCodeToolName(block.name),
             input: block.arguments,
           })
@@ -149,7 +160,7 @@ function convertMessages(
       const toolResults: Array<Record<string, unknown>> = []
       toolResults.push({
         type: 'tool_result',
-        tool_use_id: toolResult.toolCallId,
+        tool_use_id: sanitizeToolId(toolResult.toolCallId),
         content: convertTextAndImages(toolResult.content),
         is_error: toolResult.isError,
       })
@@ -162,7 +173,7 @@ function convertMessages(
         const next = messages[nextIndex] as ToolResultMessage
         toolResults.push({
           type: 'tool_result',
-          tool_use_id: next.toolCallId,
+          tool_use_id: sanitizeToolId(next.toolCallId),
           content: convertTextAndImages(next.content),
           is_error: next.isError,
         })
