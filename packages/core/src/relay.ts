@@ -808,6 +808,19 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'error') {
+      if (pending.optimisticResponse && pending.responseStarted) {
+        relayLog(
+          `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${message.status} message=${message.message || 'unknown'}`,
+        )
+        pending.streamController?.enqueue(
+          new TextEncoder().encode(
+            `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_error', message: message.message || 'relay error' } })}\n\n`,
+          ),
+        )
+        this.finishPending()
+        this.socket?.close()
+        return
+      }
       if (
         message.status === 409 &&
         this.retryPendingBeforeResponse(
@@ -847,7 +860,21 @@ class PersistentRelaySession {
     clearTimeout(pending.timeout)
     this.pending = undefined
     if (pending.responseStarted) {
-      pending.streamController?.error(error)
+      if (pending.optimisticResponse) {
+        const msg =
+          error instanceof Error ? error.message : 'relay connection error'
+        pending.streamController?.enqueue(
+          new TextEncoder().encode(
+            `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_error', message: msg } })}\n\n`,
+          ),
+        )
+        if (!pending.streamDone) {
+          pending.streamDone = true
+          pending.streamController?.close()
+        }
+      } else {
+        pending.streamController?.error(error)
+      }
     } else {
       pending.reject(error)
     }

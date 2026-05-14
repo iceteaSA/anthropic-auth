@@ -116,29 +116,41 @@ async function uploadRelayWorker(options: {
   relayToken: string
   plan: 'free' | 'paid'
 }) {
+  const bindings: Array<Record<string, unknown>> = [
+    {
+      type: 'kv_namespace',
+      name: 'RELAY_STATE',
+      namespace_id: options.kvNamespaceId,
+    },
+    {
+      type: 'secret_text',
+      name: 'RELAY_TOKEN',
+      text: options.relayToken,
+    },
+    {
+      type: 'plain_text',
+      name: 'RELAY_PLAN',
+      text: options.plan,
+    },
+  ]
+  if (options.plan === 'paid') {
+    bindings.push({
+      type: 'durable_object_namespace',
+      name: 'RELAY_SESSION',
+      class_name: 'RelaySession',
+    })
+  }
   const metadata: Record<string, unknown> = {
     main_module: 'worker.js',
     compatibility_date: '2026-04-28',
-    bindings: [
-      {
-        type: 'kv_namespace',
-        name: 'RELAY_STATE',
-        namespace_id: options.kvNamespaceId,
-      },
-      {
-        type: 'secret_text',
-        name: 'RELAY_TOKEN',
-        text: options.relayToken,
-      },
-      {
-        type: 'plain_text',
-        name: 'RELAY_PLAN',
-        text: options.plan,
-      },
-    ],
+    bindings,
   }
   if (options.plan === 'paid') {
     metadata.limits = { cpu_ms: 300000 }
+    metadata.migrations = {
+      new_classes: ['RelaySession'],
+      tag: 'v1',
+    }
   }
   const form = new FormData()
   form.set('metadata', JSON.stringify(metadata))
