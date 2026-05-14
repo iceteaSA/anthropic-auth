@@ -23,7 +23,7 @@ export type QuotaAccountSummary = {
 }
 
 function formatPercent(value: number) {
-  return `${Math.round(value * 10) / 10}%`
+  return `${value.toFixed(2)}%`
 }
 
 function formatAge(checkedAt: number, now: number) {

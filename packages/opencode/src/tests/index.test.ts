@@ -728,8 +728,8 @@ describe('auth.loader', () => {
     expect(text).toContain('## Claude Quotas')
     expect(text).toContain('### OpenCode anthropic (main)')
     expect(text).toContain('### fallback personal (fallback)')
-    expect(text).toContain('5h: 75% remaining')
-    expect(text).toContain('1w: 50% remaining')
+    expect(text).toContain('5h: 75.00% remaining')
+    expect(text).toContain('1w: 50.00% remaining')
   })
 
   test('persistent claudeFast setting makes fetch wrapper request fast mode', async () => {

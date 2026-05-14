@@ -238,11 +238,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const lines: string[] = []
     if (fh)
       lines.push(
-        `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
+        `5h  ${quotaBar(fh.usedPercent)}  ${fh.usedPercent.toFixed(2)}%`,
       )
     if (sd)
       lines.push(
-        `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
+        `1w  ${quotaBar(sd.usedPercent)}  ${sd.usedPercent.toFixed(2)}%`,
       )
     const message = lines.join('\n')
 
