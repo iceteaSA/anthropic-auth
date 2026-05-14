@@ -37,11 +37,9 @@ describe('quota summaries', () => {
     expect(summary).toContain('### OpenCode anthropic (main)')
     expect(summary).toContain('Last token refresh: 2m ago')
     expect(summary).toContain(
-      '5h: 75.00% remaining (25.00% used, resets in 1h 15m, checked just now)',
+      '5h: 75% remaining (25% used, resets in 1h 15m, checked just now)',
     )
-    expect(summary).toContain(
-      '1w: 50.00% remaining (50.00% used, checked 1m ago)',
-    )
+    expect(summary).toContain('1w: 50% remaining (50% used, checked 1m ago)')
   })
 
   test('formats reset timestamps as relative durations', () => {
@@ -70,12 +68,8 @@ describe('quota summaries', () => {
       ],
     })
 
-    expect(summary).toContain(
-      '5h: 100.00% remaining (0.00% used, resets in 10m',
-    )
-    expect(summary).toContain(
-      '1w: 100.00% remaining (0.00% used, resets not-a-date',
-    )
+    expect(summary).toContain('5h: 100% remaining (0% used, resets in 10m')
+    expect(summary).toContain('1w: 100% remaining (0% used, resets not-a-date')
   })
 
   test('builds fallback summaries from sidecar storage', () => {
