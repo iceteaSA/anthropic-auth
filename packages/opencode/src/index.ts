@@ -31,6 +31,7 @@ import {
   parseDumpCommandAction,
   parseFastModeCommandAction,
   type QuotaAccountSummary,
+  type QuotaFileData,
   quotaSnapshotPassesPolicy,
   type RelayConfig,
   refreshClaudeOAuthToken,
@@ -44,6 +45,8 @@ import {
   setFastModeEnabled,
   setFastModePersistentEnabled,
   shouldFallbackStatus,
+  TOKEN_URL,
+  writeQuotaFile,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
@@ -209,6 +212,55 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   setDumpEnabled(isDumpPersistentlyEnabled(initialCache1hStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialCache1hStorage))
+  let sessionRequestCount = 0
+
+  function writeQuotaFileInBackground(mainQuota: OAuthQuotaSnapshot | null) {
+    const data: QuotaFileData = {
+      updatedAt: Date.now(),
+      requestCount: sessionRequestCount,
+      main: mainQuota,
+    }
+    // Fire-and-forget — quota display is best-effort
+    void writeQuotaFile(data).catch(() => {})
+  }
+
+  function quotaBar(pct: number, width = 16): string {
+    const filled = Math.round((pct / 100) * width)
+    return '█'.repeat(filled) + '░'.repeat(width - filled)
+  }
+
+  function showQuotaToast(quota: OAuthQuotaSnapshot | null) {
+    if (!quota) return
+    const fh = quota.five_hour
+    const sd = quota.seven_day
+    if (!fh && !sd) return
+
+    const lines: string[] = []
+    if (fh)
+      lines.push(
+        `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
+      )
+    if (sd)
+      lines.push(
+        `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
+      )
+    const message = lines.join('\n')
+
+    const maxUsed = Math.max(fh?.usedPercent ?? 0, sd?.usedPercent ?? 0)
+    const variant = maxUsed >= 90 ? 'error' : maxUsed >= 70 ? 'warning' : 'info'
+
+    // biome-ignore lint/suspicious/noExplicitAny: SDK client.tui type not exposed to server plugins
+    void (client.tui as any)
+      ?.showToast?.({
+        body: {
+          title: 'Claude Quota',
+          message,
+          variant,
+          duration: variant === 'error' ? 8000 : 5000,
+        },
+      })
+      ?.catch?.(() => {})
+  }
   let latestGetAuth:
     | (() => Promise<{
         type: string
@@ -780,6 +832,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               refreshAfter: getQuotaNextRefreshAt(quota, storage, now),
               quota,
             }
+            writeQuotaFileInBackground(quota)
+            showQuotaToast(quota)
             return quota
           }
 
@@ -922,6 +976,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
+              sessionRequestCount++
               const initialBody = init?.body
               const trace = createPerfTrace({
                 bodyBytes:
@@ -1025,6 +1080,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               )
 
               trace.done('return_response', { status: response.status })
+
+              // Persist quota for TUI sidebar display.
+              // When quota routing is enabled, refreshMainQuotaCache already writes.
+              // When disabled, write the cached snapshot (if any) every 5 requests
+              // so the TUI file stays reasonably fresh.
+              if (
+                !mainQuotaRoutingEnabled(storage) &&
+                sessionRequestCount % 5 === 0
+              ) {
+                writeQuotaFileInBackground(mainQuotaCache?.quota ?? null)
+              }
+
               return createStrippedStream(response)
             },
           }
