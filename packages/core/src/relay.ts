@@ -968,6 +968,11 @@ export async function sendViaRelay(options: {
 }
 
 export const WORKER_SCRIPT = `
+function getPlanConfig(env) {
+  const paid = (env.RELAY_PLAN || '').toLowerCase() === 'paid'
+  return { paid, allowWebSocket: paid, logRequests: paid }
+}
+
 async function hashBody(body) {
   const bytes = new TextEncoder().encode(body)
   const digest = await crypto.subtle.digest('SHA-256', bytes)
@@ -1015,31 +1020,6 @@ async function resolveBody(env, payload) {
   return { error: 'unknown mode', status: 400 }
 }
 
-async function prepareUpstream(env, payload) {
-  if ((payload.protocol !== 1 && payload.protocol !== 2) || payload.type !== 'request' || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
-    return { error: 'invalid payload', status: 400 }
-  }
-
-  const body = await resolveBody(env, payload)
-  if (body && typeof body === 'object' && 'error' in body) return body
-
-  if (typeof body !== 'string' || (await hashBody(body)) !== payload.next_hash) {
-    return { error: 'hash mismatch', status: 409 }
-  }
-
-  await writeState(env, payload.affinity, { body, hash: payload.next_hash, revision: payload.revision })
-  console.log(JSON.stringify({
-    relay: 'opencode-anthropic-auth',
-    transport: 'relay',
-    mode: payload.mode,
-    revision: payload.revision,
-    affinity: String(payload.affinity).slice(0, 12),
-    bodyBytes: body.length,
-  }))
-
-  return { body }
-}
-
 function resolveBodyFromState(state, payload) {
   if (payload.mode === 'full_sync') return payload.body
   if (payload.mode === 'patch') {
@@ -1051,53 +1031,33 @@ function resolveBodyFromState(state, payload) {
   return { error: 'unknown mode', status: 400 }
 }
 
-function deferWorkerTask(task) {
-  return new Promise((resolve) => setTimeout(resolve, 0)).then(task)
-}
-
-function checkpointWebSocketState(env, payload, body, nextState) {
-  return deferWorkerTask(async () => {
-    try {
-      if ((await hashBody(body)) !== payload.next_hash) {
-        throw new Error('hash mismatch')
-      }
-      await writeState(env, payload.affinity, nextState)
-    } catch (error) {
-      console.log(JSON.stringify({
-        relay: 'opencode-anthropic-auth',
-        transport: 'websocket',
-        event: 'checkpoint_write_failed',
-        affinity: String(payload.affinity).slice(0, 12),
-        message: error instanceof Error ? error.message : String(error),
-      }))
-    }
-  })
-}
-
-async function prepareWebSocketUpstream(env, state, payload) {
-  if (payload.protocol !== 2 || payload.type !== 'request' || !payload.id || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
+async function prepareUpstream(env, payload, config) {
+  if ((payload.protocol !== 1 && payload.protocol !== 2) || payload.type !== 'request' || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
     return { error: 'invalid payload', status: 400 }
   }
 
-  const body = resolveBodyFromState(state, payload)
+  const body = await resolveBody(env, payload)
   if (body && typeof body === 'object' && 'error' in body) return body
-  if (typeof body !== 'string') return { error: 'invalid body', status: 400 }
-  if ((await hashBody(body)) !== payload.next_hash) {
+
+
+  if (typeof body !== 'string' || (await hashBody(body)) !== payload.next_hash) {
     return { error: 'hash mismatch', status: 409 }
   }
 
-  const nextState = { body, hash: payload.next_hash, revision: payload.revision }
-  const checkpoint = checkpointWebSocketState(env, payload, body, nextState)
-  const logAccepted = () => console.log(JSON.stringify({
-    relay: 'opencode-anthropic-auth',
-    transport: 'websocket',
-    mode: payload.mode,
-    revision: payload.revision,
-    affinity: String(payload.affinity).slice(0, 12),
-    bodyBytes: body.length,
-  }))
+  const stateWrite = writeState(env, payload.affinity, { body, hash: payload.next_hash, revision: payload.revision }).catch(() => {})
 
-  return { body, state: nextState, checkpoint, logAccepted }
+  if (config.logRequests) {
+    console.log(JSON.stringify({
+      relay: 'opencode-anthropic-auth',
+      transport: 'http',
+      mode: payload.mode,
+      revision: payload.revision,
+      affinity: String(payload.affinity).slice(0, 12),
+      bodyBytes: body.length,
+    }))
+  }
+
+  return { body, stateWrite }
 }
 
 function headersToObject(headers) {
@@ -1106,27 +1066,25 @@ function headersToObject(headers) {
   return result
 }
 
-async function handleRelayPayload(env, payload) {
-  const prepared = await prepareUpstream(env, payload)
-  if (prepared.error) return prepared
-  const upstream = await fetch(payload.upstream.url, {
-    method: payload.upstream.method || 'POST',
-    headers: payload.upstream.headers,
-    body: prepared.body,
-  })
-  return { upstream }
+function prepareWebSocketUpstream(state, payload) {
+  if (payload.protocol !== 2 || payload.type !== 'request' || !payload.id || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
+    return { error: 'invalid payload', status: 400 }
+  }
+
+  const body = resolveBodyFromState(state, payload)
+  if (body && typeof body === 'object' && 'error' in body) return body
+  if (typeof body !== 'string') return { error: 'invalid body', status: 400 }
+
+  return { body, state: { body, hash: payload.next_hash, revision: payload.revision } }
 }
 
-async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
+async function handleWebSocket(socket, env, ctx, payload, getState, setState, config) {
   const heartbeat = setInterval(() => {
-    try {
-      socket.send(JSON.stringify({ protocol: 2, type: 'keepalive' }))
-    } catch {
-      clearInterval(heartbeat)
-    }
-  }, 5000)
+    try { socket.send(JSON.stringify({ protocol: 2, type: 'keepalive' })) }
+    catch { clearInterval(heartbeat) }
+  }, 15000)
   try {
-    const result = await prepareWebSocketUpstream(env, getState(), payload)
+    const result = prepareWebSocketUpstream(getState(), payload)
     if (result.error) {
       socket.send(JSON.stringify({ protocol: 2, type: 'error', id: payload.id, status: result.status, message: result.error }))
       return
@@ -1134,15 +1092,41 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
 
     setState(result.state)
     socket.send(JSON.stringify({ protocol: 2, type: 'accepted', id: payload.id, hash: result.state.hash, revision: result.state.revision }))
-    ctx?.waitUntil?.(deferWorkerTask(result.logAccepted))
 
-    const upstreamPromise = fetch(payload.upstream.url, {
+    if (config.logRequests) {
+      console.log(JSON.stringify({
+        relay: 'opencode-anthropic-auth',
+        transport: 'websocket',
+        mode: payload.mode,
+        revision: payload.revision,
+        affinity: String(payload.affinity).slice(0, 12),
+        bodyBytes: result.body.length,
+      }))
+    }
+
+    const checkpoint = (async () => {
+      try {
+        if ((await hashBody(result.body)) !== payload.next_hash) throw new Error('hash mismatch')
+        await writeState(env, payload.affinity, result.state)
+      } catch (error) {
+        if (config.logRequests) {
+          console.log(JSON.stringify({
+            relay: 'opencode-anthropic-auth',
+            transport: 'websocket',
+            event: 'checkpoint_failed',
+            affinity: String(payload.affinity).slice(0, 12),
+            message: error instanceof Error ? error.message : String(error),
+          }))
+        }
+      }
+    })()
+    ctx?.waitUntil?.(checkpoint)
+
+    const upstream = await fetch(payload.upstream.url, {
       method: payload.upstream.method || 'POST',
       headers: payload.upstream.headers,
       body: result.body,
     })
-    ctx?.waitUntil?.(result.checkpoint)
-    const upstream = await upstreamPromise
     socket.send(JSON.stringify({
       protocol: 2,
       type: 'response_start',
@@ -1170,7 +1154,12 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
 
 export default {
   async fetch(request, env, ctx) {
+    const config = getPlanConfig(env)
+
     if (request.headers.get('Upgrade') === 'websocket') {
+      if (!config.allowWebSocket) {
+        return new Response('WebSocket transport requires Workers Paid plan. Use HTTP transport or upgrade your plan.', { status: 403 })
+      }
       const url = new URL(request.url)
       const token = url.searchParams.get('token')
       const affinity = url.searchParams.get('affinity')
@@ -1216,29 +1205,48 @@ export default {
         }
         payload.affinity = affinity
         busy = true
-        const run = handleWebSocket(server, env, ctx, payload, () => state, (nextState) => { state = nextState }).finally(() => { busy = false })
+        const run = handleWebSocket(server, env, ctx, payload, () => state, (nextState) => { state = nextState }, config).finally(() => { busy = false })
         ctx?.waitUntil?.(run)
         if (!ctx?.waitUntil) void run
       })
       return new Response(null, { status: 101, webSocket: client })
     }
 
-    if (request.method === 'GET') return new Response('ok')
+    if (request.method === 'GET') {
+      return Response.json({
+        status: 'ok',
+        plan: config.paid ? 'paid' : 'free',
+        transports: config.allowWebSocket ? ['http', 'websocket'] : ['http'],
+      })
+    }
     if (request.method !== 'POST') return new Response('method not allowed', { status: 405 })
     if (request.headers.get('x-relay-token') !== env.RELAY_TOKEN) {
       return new Response('unauthorized', { status: 401 })
     }
 
-    const payload = await request.json()
-    const result = await handleRelayPayload(env, payload)
-    if (result.error) return Response.json({ error: result.error }, { status: result.status })
+    try {
+      const payload = await request.json()
+      const prepared = await prepareUpstream(env, payload, config)
+      if (prepared.error) return Response.json({ error: prepared.error }, { status: prepared.status })
 
-    const upstream = result.upstream
-    return new Response(upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers: upstream.headers,
-    })
+      if (prepared.stateWrite) ctx.waitUntil(prepared.stateWrite)
+
+      const upstream = await fetch(payload.upstream.url, {
+        method: payload.upstream.method || 'POST',
+        headers: payload.upstream.headers,
+        body: prepared.body,
+      })
+      return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: upstream.headers,
+      })
+    } catch (error) {
+      return Response.json(
+        { error: error instanceof Error ? error.message : 'internal relay error' },
+        { status: 502 },
+      )
+    }
   },
 }
 `

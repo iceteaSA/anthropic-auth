@@ -114,8 +114,9 @@ async function uploadRelayWorker(options: {
   scriptName: string
   kvNamespaceId: string
   relayToken: string
+  plan: 'free' | 'paid'
 }) {
-  const metadata = {
+  const metadata: Record<string, unknown> = {
     main_module: 'worker.js',
     compatibility_date: '2026-04-28',
     bindings: [
@@ -129,7 +130,15 @@ async function uploadRelayWorker(options: {
         name: 'RELAY_TOKEN',
         text: options.relayToken,
       },
+      {
+        type: 'plain_text',
+        name: 'RELAY_PLAN',
+        text: options.plan,
+      },
     ],
+  }
+  if (options.plan === 'paid') {
+    metadata.limits = { cpu_ms: 300000 }
   }
   const form = new FormData()
   form.set('metadata', JSON.stringify(metadata))
@@ -182,18 +191,25 @@ async function relaySetup() {
   const scriptName =
     (await prompt('Worker name [opencode-anthropic-relay]: ')) ||
     'opencode-anthropic-relay'
+
+  const planInput = (
+    await prompt('Cloudflare Workers plan - free or paid ($5/mo) [free]: ')
+  ).toLowerCase()
+  const plan: 'free' | 'paid' = planInput === 'paid' ? 'paid' : 'free'
+
   const kvTitle = `${scriptName}-state`
   const relayToken = generateRelayToken()
 
   console.log('Creating Cloudflare KV namespace...')
   const namespace = await createKvNamespace(token, accountId, kvTitle)
-  console.log('Uploading relay Worker...')
+  console.log(`Uploading relay Worker (plan: ${plan})...`)
   await uploadRelayWorker({
     token,
     accountId,
     scriptName,
     kvNamespaceId: namespace.id,
     relayToken,
+    plan,
   })
   await enableWorkersDev(token, accountId, scriptName).catch((error) => {
     console.warn(
@@ -209,16 +225,21 @@ async function relaySetup() {
     defaultUrl ||
     requireText(await prompt('Relay Worker URL: '), 'Relay Worker URL')
 
+  const transport = plan === 'paid' ? 'websocket' : 'http'
   storage.relay = {
     enabled: true,
     url,
     token: relayToken,
     fallbackToDirect: true,
-    transport: 'http',
+    transport,
   }
   await saveAccounts(storage)
 
-  console.log(`Relay enabled at ${url}`)
+  console.log(`\nRelay enabled at ${url}`)
+  console.log(`Plan: ${plan}`)
+  console.log(
+    `Transport: ${transport}${plan === 'free' ? ' (WebSocket requires paid plan)' : ''}`,
+  )
   console.log(`Config saved to ${getAccountStoragePath()}.`)
 }
 
