@@ -214,11 +214,27 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   setFastModeEnabled(isFastModePersistentlyEnabled(initialCache1hStorage))
   let sessionRequestCount = 0
 
-  function writeQuotaFileInBackground(mainQuota: OAuthQuotaSnapshot | null) {
+  function writeQuotaFileInBackground(
+    mainQuota: OAuthQuotaSnapshot | null,
+    fallbackAccounts?: Array<{
+      id: string
+      label?: string
+      enabled?: boolean
+      quota?: OAuthQuotaSnapshot
+    }>,
+  ) {
     const data: QuotaFileData = {
       updatedAt: Date.now(),
       requestCount: sessionRequestCount,
       main: mainQuota,
+    }
+    if (fallbackAccounts?.length) {
+      data.fallbacks = fallbackAccounts.map((a) => ({
+        id: a.id,
+        label: a.label,
+        enabled: a.enabled,
+        quota: a.quota,
+      }))
     }
     // Fire-and-forget — quota display is best-effort
     void writeQuotaFile(data).catch(() => {})
@@ -229,25 +245,65 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return '█'.repeat(filled) + '░'.repeat(width - filled)
   }
 
-  function showQuotaToast(quota: OAuthQuotaSnapshot | null) {
-    if (!quota) return
-    const fh = quota.five_hour
-    const sd = quota.seven_day
-    if (!fh && !sd) return
+  function showQuotaToast(
+    quota: OAuthQuotaSnapshot | null,
+    fallbacks?: Array<{ label?: string; quota?: OAuthQuotaSnapshot }>,
+  ) {
+    const sections: string[] = []
+    let globalMaxUsed = 0
 
-    const lines: string[] = []
-    if (fh)
-      lines.push(
-        `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
-      )
-    if (sd)
-      lines.push(
-        `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
-      )
-    const message = lines.join('\n')
+    // Main account
+    if (quota) {
+      const fh = quota.five_hour
+      const sd = quota.seven_day
+      if (fh || sd) {
+        const lines: string[] = []
+        if (fh) {
+          lines.push(
+            `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
+        }
+        if (sd) {
+          lines.push(
+            `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
+        }
+        sections.push(lines.join('\n'))
+      }
+    }
 
-    const maxUsed = Math.max(fh?.usedPercent ?? 0, sd?.usedPercent ?? 0)
-    const variant = maxUsed >= 90 ? 'error' : maxUsed >= 70 ? 'warning' : 'info'
+    // Fallback accounts
+    if (fallbacks?.length) {
+      for (const fb of fallbacks) {
+        const q = fb.quota
+        if (!q) continue
+        const fh = q.five_hour
+        const sd = q.seven_day
+        if (!fh && !sd) continue
+        const name = fb.label || 'alt'
+        const lines: string[] = [`── ${name} ──`]
+        if (fh) {
+          lines.push(
+            `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
+        }
+        if (sd) {
+          lines.push(
+            `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
+        }
+        sections.push(lines.join('\n'))
+      }
+    }
+
+    if (!sections.length) return
+    const message = sections.join('\n')
+    const variant =
+      globalMaxUsed >= 90 ? 'error' : globalMaxUsed >= 70 ? 'warning' : 'info'
 
     // biome-ignore lint/suspicious/noExplicitAny: SDK client.tui type not exposed to server plugins
     void (client.tui as any)
@@ -832,8 +888,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               refreshAfter: getQuotaNextRefreshAt(quota, storage, now),
               quota,
             }
-            writeQuotaFileInBackground(quota)
-            showQuotaToast(quota)
+            const fallbacks =
+              storage?.accounts?.filter((a) => a.enabled !== false) ?? []
+            writeQuotaFileInBackground(quota, fallbacks)
+            showQuotaToast(quota, fallbacks)
             return quota
           }
 
@@ -1089,7 +1147,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 !mainQuotaRoutingEnabled(storage) &&
                 sessionRequestCount % 5 === 0
               ) {
-                writeQuotaFileInBackground(mainQuotaCache?.quota ?? null)
+                const fallbacks =
+                  storage?.accounts?.filter((a) => a.enabled !== false) ?? []
+                writeQuotaFileInBackground(
+                  mainQuotaCache?.quota ?? null,
+                  fallbacks,
+                )
               }
 
               return createStrippedStream(response)
