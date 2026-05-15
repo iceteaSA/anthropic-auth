@@ -34,6 +34,7 @@ import {
   quotaSnapshotPassesPolicy,
   type RelayConfig,
   refreshClaudeOAuthToken,
+  resolveClaudeCodeIdentity,
   sendViaRelay,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -617,9 +618,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             const requestHeaders = mergeHeaders(input, init)
             const subagentRequest = isSubagentRequest(requestHeaders)
             requestHeaders.delete('x-parent-session-id')
-            setOAuthHeaders(requestHeaders, accessToken)
-
             let body = init?.body
+            let modelForIdentity: string | undefined
+            if (body && typeof body === 'string') {
+              try {
+                const parsedBody = JSON.parse(body) as { model?: unknown }
+                if (typeof parsedBody.model === 'string') {
+                  modelForIdentity = parsedBody.model
+                }
+              } catch {}
+            }
+            const identity = await resolveClaudeCodeIdentity(
+              accessToken,
+              modelForIdentity,
+            )
+
             const originalBytes =
               typeof body === 'string' ? body.length : undefined
             if (body && typeof body === 'string') {
@@ -636,7 +649,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                 cache1hMode: getCache1hMode(),
                 fastModeEnabled: fastModeRequested,
+                identity,
               })
+              try {
+                setOAuthHeaders(requestHeaders, accessToken, {
+                  body: JSON.parse(body),
+                  identity,
+                })
+              } catch {
+                setOAuthHeaders(requestHeaders, accessToken, { identity })
+              }
               if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
               trace?.mark('rewrite_body', {
                 route,

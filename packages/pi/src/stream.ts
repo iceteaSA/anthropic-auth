@@ -1,4 +1,5 @@
 import {
+  applyClaudeCodeHeaders,
   FAST_MODE_BETA,
   FallbackAccountManager,
   getCache1hPersistentMode,
@@ -7,10 +8,9 @@ import {
   isFastModePersistentlyEnabled,
   loadAccounts,
   mergeAnthropicBetas,
-  REQUIRED_BETAS,
+  resolveClaudeCodeIdentity,
   sendViaRelay,
   shouldFallbackStatus,
-  USER_AGENT,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -132,20 +132,29 @@ async function sendAnthropicRequest(options: {
   context: Context
   streamOptions?: SimpleStreamOptions
   accessToken: string
-  bodyText: string
   storagePath: string
-  fastModeUsed?: boolean
 }): Promise<Response> {
   const storage = await loadAccounts(options.storagePath)
-  const headers = new Headers({
-    accept: 'application/json',
-    'content-type': 'application/json',
-    authorization: `Bearer ${options.accessToken}`,
-    'anthropic-beta': REQUIRED_BETAS.join(','),
-    'user-agent': USER_AGENT,
-    'x-app': 'cli',
+  const identity = await resolveClaudeCodeIdentity(
+    options.accessToken,
+    options.model.id,
+  )
+  const { body, bodyText } = await buildAnthropicRequest(
+    options.model.id,
+    options.context,
+    options.streamOptions,
+    {
+      enabled: isCache1hPersistentlyEnabled(storage),
+      mode: getCache1hPersistentMode(storage),
+    },
+    isFastModePersistentlyEnabled(storage),
+    identity,
+  )
+  const headers = applyClaudeCodeHeaders(new Headers(), options.accessToken, {
+    body,
+    identity,
   })
-  if (options.fastModeUsed) {
+  if (body.speed === 'fast') {
     headers.set(
       'anthropic-beta',
       mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
@@ -159,7 +168,7 @@ async function sendAnthropicRequest(options: {
   const init: RequestInit = {
     method: 'POST',
     headers,
-    body: options.bodyText,
+    body: bodyText,
     signal: options.streamOptions?.signal,
   }
 
@@ -168,7 +177,7 @@ async function sendAnthropicRequest(options: {
     input,
     init,
     headers,
-    body: options.bodyText,
+    body: bodyText,
     fallback: () => fetch(input, init),
   })
 }
@@ -199,10 +208,8 @@ async function executeWithFallback(options: {
   model: Model<Api>
   context: Context
   streamOptions?: SimpleStreamOptions
-  bodyText: string
   primaryAccessToken: string
   storagePath: string
-  fastModeUsed?: boolean
 }): Promise<Response> {
   const manager = new FallbackAccountManager({
     configPath: options.storagePath,
@@ -256,25 +263,12 @@ export function streamCortexKitAnthropic(
       if (!accessToken) throw new Error('Missing Anthropic OAuth access token')
 
       const storagePath = getPiAccountStoragePath()
-      const storage = await loadAccounts(storagePath)
-      const { body, bodyText } = await buildAnthropicRequest(
-        model.id,
-        context,
-        options,
-        {
-          enabled: isCache1hPersistentlyEnabled(storage),
-          mode: getCache1hPersistentMode(storage),
-        },
-        isFastModePersistentlyEnabled(storage),
-      )
       const response = await executeWithFallback({
         model,
         context,
         streamOptions: options,
-        bodyText,
         primaryAccessToken: accessToken,
         storagePath,
-        fastModeUsed: body.speed === 'fast',
       })
 
       if (!response.ok) {

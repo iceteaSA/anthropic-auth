@@ -1,9 +1,12 @@
 import {
+  applyClaudeCodeMetadata,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  type ClaudeCodeIdentity,
   isFastModeSupportedModel,
+  orderClaudeCodeBody,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -245,6 +248,7 @@ export async function buildAnthropicRequest(
   options: SimpleStreamOptions | undefined,
   cache: { enabled: boolean; mode: Cache1hMode },
   fastModeEnabled = false,
+  identity?: ClaudeCodeIdentity,
 ): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
   const messages = convertMessages(context.messages)
   const system = [
@@ -300,8 +304,9 @@ export async function buildAnthropicRequest(
 
   addEphemeralCacheControl(body)
   applyCacheMode(body, cache.enabled, cache.mode)
+  if (identity) applyClaudeCodeMetadata(body, identity)
 
-  const unsigned = JSON.stringify(body)
+  const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
   return { body, bodyText }
 }

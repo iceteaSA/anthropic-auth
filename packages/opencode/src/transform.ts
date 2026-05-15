@@ -1,18 +1,21 @@
 import {
+  applyClaudeCodeHeaders,
+  applyClaudeCodeMetadata,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  type ClaudeCodeIdentity,
   FAST_MODE_BETA,
   isFastModeSupportedModel,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
+  orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
   signRequestBody,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
-  USER_AGENT,
 } from '@cortexkit/anthropic-auth-core'
 
 /**
@@ -103,12 +106,12 @@ export function addFastModeBetaHeader(headers: Headers): Headers {
 export function setOAuthHeaders(
   headers: Headers,
   accessToken: string,
+  options: {
+    body?: Record<string, unknown> | null
+    identity?: ClaudeCodeIdentity
+  } = {},
 ): Headers {
-  headers.set('authorization', `Bearer ${accessToken}`)
-  headers.set('anthropic-beta', mergeBetaHeaders(headers))
-  headers.set('user-agent', USER_AGENT)
-  headers.delete('x-api-key')
-  return headers
+  return applyClaudeCodeHeaders(headers, accessToken, options)
 }
 
 /**
@@ -148,7 +151,7 @@ export function prefixToolNames(parsed: Record<string, unknown>): string {
     )
   }
 
-  return JSON.stringify(parsed)
+  return JSON.stringify(orderClaudeCodeBody(parsed))
 }
 
 /**
@@ -533,6 +536,7 @@ export async function rewriteRequestBody(
     cache1hEnabled?: boolean
     cache1hMode?: Cache1hMode
     fastModeEnabled?: boolean
+    identity?: ClaudeCodeIdentity
   } = {},
 ): Promise<string> {
   try {
@@ -568,6 +572,8 @@ export async function rewriteRequestBody(
     } else if (parsed.speed === 'fast') {
       delete parsed.speed
     }
+
+    if (options.identity) applyClaudeCodeMetadata(parsed, options.identity)
 
     return await signRequestBody(prefixToolNames(parsed))
   } catch {

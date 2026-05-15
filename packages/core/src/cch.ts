@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import xxhashInit from 'xxhash-wasm'
-import { CLAUDE_CODE_VERSION } from './constants.ts'
+import { CLAUDE_CODE_BUILD_HASH, CLAUDE_CODE_VERSION } from './constants.ts'
 
 type Message = {
   role?: string
@@ -72,6 +72,7 @@ export function computeVersionSuffix(
   version: string = CLAUDE_CODE_VERSION,
   date: Date = new Date(),
 ): string {
+  if (version === CLAUDE_CODE_VERSION) return CLAUDE_CODE_BUILD_HASH
   const dayStamp = date.toISOString().slice(0, 10)
   return createHash('sha256')
     .update(`${dayStamp}${version}`)
