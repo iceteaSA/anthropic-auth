@@ -805,6 +805,15 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'error') {
+      if (
+        message.status === 409 &&
+        this.retryPendingBeforeResponse(
+          pending,
+          message.message || 'state mismatch',
+        )
+      ) {
+        return
+      }
       const error =
         message.status === 409
           ? new RelayStateMismatchError(message.message || 'state mismatch')
@@ -1051,7 +1060,7 @@ function checkpointWebSocketState(env, payload, body, nextState) {
   })
 }
 
-function prepareWebSocketUpstream(env, state, payload) {
+async function prepareWebSocketUpstream(env, state, payload) {
   if (payload.protocol !== 2 || payload.type !== 'request' || !payload.id || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
     return { error: 'invalid payload', status: 400 }
   }
@@ -1059,6 +1068,9 @@ function prepareWebSocketUpstream(env, state, payload) {
   const body = resolveBodyFromState(state, payload)
   if (body && typeof body === 'object' && 'error' in body) return body
   if (typeof body !== 'string') return { error: 'invalid body', status: 400 }
+  if ((await hashBody(body)) !== payload.next_hash) {
+    return { error: 'hash mismatch', status: 409 }
+  }
 
   const nextState = { body, hash: payload.next_hash, revision: payload.revision }
   const checkpoint = checkpointWebSocketState(env, payload, body, nextState)
@@ -1100,7 +1112,7 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
     }
   }, 5000)
   try {
-    const result = prepareWebSocketUpstream(env, getState(), payload)
+    const result = await prepareWebSocketUpstream(env, getState(), payload)
     if (result.error) {
       socket.send(JSON.stringify({ protocol: 2, type: 'error', id: payload.id, status: result.status, message: result.error }))
       return

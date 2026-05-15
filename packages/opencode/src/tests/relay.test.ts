@@ -7,6 +7,7 @@ import {
   resetDumpState,
   sendViaRelay,
   setDumpEnabled,
+  WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 
 const config = {
@@ -24,6 +25,27 @@ function headers(affinity: string) {
     'x-session-affinity': affinity,
     authorization: 'Bearer access-token',
   })
+}
+
+function workerInternals() {
+  const source = WORKER_SCRIPT.replace(
+    /export default[\s\S]*$/,
+    'return { hashBody, applyPatchSet, prepareWebSocketUpstream }',
+  )
+  return new Function(source)() as {
+    hashBody: (body: string) => Promise<string>
+    applyPatchSet: (
+      base: string,
+      patch:
+        | { start: number; deleteCount: number; insert: string }
+        | Array<{ start: number; deleteCount: number; insert: string }>,
+    ) => string | { error: string; status: number }
+    prepareWebSocketUpstream: (
+      env: unknown,
+      state: { body: string; hash: string; revision: number } | null,
+      payload: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>
+  }
 }
 
 describe('relay client', () => {
@@ -757,6 +779,38 @@ describe('relay client', () => {
     expect(JSON.stringify(patchPayload).length).toBeLessThan(2_000)
   })
 
+  test('worker websocket reconstruction rejects hash mismatch before upstream fetch', async () => {
+    const { hashBody, prepareWebSocketUpstream } = workerInternals()
+    const state = {
+      body: 'stable-prefix stale-tail',
+      hash: await hashBody('stable-prefix stale-tail'),
+      revision: 1,
+    }
+    const payload = {
+      protocol: 2,
+      type: 'request',
+      id: 'req_hash_mismatch',
+      affinity: 'session-worker-hash-mismatch',
+      upstream: {
+        url: 'https://api.anthropic.com/v1/messages',
+        method: 'POST',
+      },
+      mode: 'patch',
+      base_hash: state.hash,
+      revision: 2,
+      next_hash: await hashBody('stable-prefix expected-tail'),
+      patch: {
+        start: 'stable-prefix '.length,
+        deleteCount: 'stale-tail'.length,
+        insert: 'wrong-tail',
+      },
+    }
+
+    const result = await prepareWebSocketUpstream({}, state, payload)
+
+    expect(result).toEqual({ error: 'hash mismatch', status: 409 })
+  })
+
   test('websocket retries state mismatch with full sync', async () => {
     const originalWebSocket = globalThis.WebSocket
     const sentPayloads: Array<{
@@ -857,6 +911,123 @@ describe('relay client', () => {
         body: 'second',
         fallback: async () => new Response('direct'),
       })
+    } finally {
+      globalThis.WebSocket = originalWebSocket
+    }
+
+    expect(sentPayloads.map((payload) => payload.mode)).toEqual([
+      'full_sync',
+      'patch',
+      'full_sync',
+    ])
+  })
+
+  test('websocket optimistic response retries hash mismatch before upstream response', async () => {
+    const originalWebSocket = globalThis.WebSocket
+    const sentPayloads: Array<{ id: string; mode: string }> = []
+    let rejectedPatch = false
+
+    class OptimisticMismatchWebSocket extends EventTarget {
+      binaryType = 'arraybuffer'
+
+      constructor() {
+        super()
+        queueMicrotask(() => {
+          this.dispatchEvent(new Event('open'))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+            }),
+          )
+        })
+      }
+
+      send(data: string) {
+        const payload = JSON.parse(data)
+        sentPayloads.push(payload)
+        queueMicrotask(() => {
+          if (payload.mode === 'patch' && !rejectedPatch) {
+            rejectedPatch = true
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'error',
+                  id: payload.id,
+                  status: 409,
+                  message: 'hash mismatch',
+                }),
+              }),
+            )
+            return
+          }
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'accepted',
+                id: payload.id,
+                hash: payload.next_hash,
+                revision: payload.revision,
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'response_start',
+                id: payload.id,
+                status: 200,
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: Buffer.from('event: message_stop\n\n'),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'done',
+                id: payload.id,
+              }),
+            }),
+          )
+        })
+      }
+
+      close() {
+        this.dispatchEvent(new Event('close'))
+      }
+    }
+
+    globalThis.WebSocket =
+      OptimisticMismatchWebSocket as unknown as typeof WebSocket
+    try {
+      await sendViaRelay({
+        config: websocketConfig,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-optimistic-mismatch'),
+        body: 'first',
+        fallback: async () => new Response('direct'),
+        optimisticResponse: true,
+      })
+      const response = await sendViaRelay({
+        config: websocketConfig,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-optimistic-mismatch'),
+        body: 'second',
+        fallback: async () => new Response('direct'),
+        optimisticResponse: true,
+      })
+
+      expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
+      expect(await response.text()).toBe('event: message_stop\n\n')
     } finally {
       globalThis.WebSocket = originalWebSocket
     }
