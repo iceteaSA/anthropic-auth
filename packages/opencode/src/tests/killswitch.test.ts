@@ -263,8 +263,9 @@ describe('killswitchRetryAfterSeconds', () => {
       },
     ]
     const seconds = killswitchRetryAfterSeconds(mainQuota, fallbacks, now)
-    expect(seconds).toBeGreaterThanOrEqual(299)
-    expect(seconds).toBeLessThanOrEqual(301)
+    // 300s until reset + 60s buffer
+    expect(seconds).toBeGreaterThanOrEqual(359)
+    expect(seconds).toBeLessThanOrEqual(361)
   })
 
   test('returns 300 fallback when no reset times available', () => {

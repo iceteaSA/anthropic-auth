@@ -536,7 +536,9 @@ export function killswitchRetryAfterSeconds(
     }
   }
   if (!resetTimes.length) return 300
-  return Math.max(1, Math.ceil((Math.min(...resetTimes) - now) / 1000))
+  // Add 60s buffer so clients don't retry at the exact reset boundary
+  // before quota has actually replenished
+  return Math.max(1, Math.ceil((Math.min(...resetTimes) - now) / 1000)) + 60
 }
 
 export function getKillswitchConfig(

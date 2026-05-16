@@ -78,6 +78,11 @@ type MainQuotaCache = {
   quota: OAuthQuotaSnapshot
 }
 
+type FallbackQuotaCacheEntry = {
+  refreshAfter: number
+  quota: OAuthQuotaSnapshot
+}
+
 type NotificationRequest = {
   path: { id: string }
   body: {
@@ -595,6 +600,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           let mainQuotaCache: MainQuotaCache | null = null
           let mainQuotaRefreshPromise: Promise<OAuthQuotaSnapshot> | null = null
           let mainQuotaRetryAfter = 0
+          const fallbackQuotaCache = new Map<string, FallbackQuotaCacheEntry>()
 
           async function refreshMainAccessToken() {
             if (!refreshPromise) {
@@ -982,6 +988,63 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             return mainQuotaCache.quota
           }
 
+          /**
+           * Refresh in-memory fallback quota cache.
+           * Only hits the Anthropic API for accounts whose cache entry is
+           * stale or missing — prevents spamming the usage endpoint.
+           */
+          async function refreshFallbackQuotaCache(
+            storage: Awaited<ReturnType<typeof loadAccounts>>,
+          ) {
+            const now = Date.now()
+            const accounts = (storage?.accounts ?? []).filter(
+              (a) => a.enabled !== false,
+            )
+            const checkInterval = getQuotaCheckIntervalMs(storage)
+            for (const account of accounts) {
+              const cached = fallbackQuotaCache.get(account.id)
+              if (cached && now < cached.refreshAfter) continue
+              // If no cache entry yet, check if the persisted quota is still
+              // fresh — avoids unnecessary API calls on first evaluation.
+              if (!cached && account.quota) {
+                const checkedAt = Math.max(
+                  account.quota.five_hour?.checkedAt ?? 0,
+                  account.quota.seven_day?.checkedAt ?? 0,
+                )
+                if (checkedAt > 0 && now - checkedAt < checkInterval) {
+                  fallbackQuotaCache.set(account.id, {
+                    refreshAfter: checkedAt + checkInterval,
+                    quota: account.quota,
+                  })
+                  continue
+                }
+              }
+              if (!account.access) continue
+              try {
+                const quota = await fetchOAuthQuotaSnapshot({
+                  accessToken: account.access,
+                })
+                fallbackQuotaCache.set(account.id, {
+                  refreshAfter: now + checkInterval,
+                  quota,
+                })
+              } catch {
+                // Best-effort — keep stale cache entry if fetch fails
+              }
+            }
+          }
+
+          /**
+           * Get the freshest quota for a fallback account: prefer in-memory
+           * cache, fall back to the persisted snapshot on the account object.
+           */
+          function getFallbackQuota(account: {
+            id: string
+            quota?: OAuthQuotaSnapshot
+          }): OAuthQuotaSnapshot | undefined {
+            return fallbackQuotaCache.get(account.id)?.quota ?? account.quota
+          }
+
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -1152,6 +1215,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   try {
                     const ksQuotaStart = nowMs()
                     await refreshMainQuotaCache(auth.access, storage)
+                    await refreshFallbackQuotaCache(storage)
                     trace.mark('killswitch_quota_refresh', {
                       ms: roundMs(nowMs() - ksQuotaStart),
                       reason: !mainQuotaCache?.quota
@@ -1181,7 +1245,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 const allFallbacksKilled =
                   fallbackAccounts.length === 0 ||
                   fallbackAccounts.every(
-                    (a) => !killswitchPassesPolicy(a.quota, storage, a.id),
+                    (a) =>
+                      !killswitchPassesPolicy(
+                        getFallbackQuota(a),
+                        storage,
+                        a.id,
+                      ),
                   )
 
                 log('[killswitch] check', {
