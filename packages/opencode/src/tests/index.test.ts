@@ -1793,4 +1793,293 @@ describe('auth.loader', () => {
     expect(response.status).toBe(429)
     expect(calls).toBe(1)
   })
+
+  test('registers and handles /killswitch slash command', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const config: { command?: Record<string, unknown> } = {}
+
+    await plugin.config(config)
+
+    expect(config.command?.killswitch).toMatchObject({
+      template: 'killswitch',
+      description: expect.stringContaining('killswitch'),
+    })
+
+    // Enable killswitch
+    await expect(
+      plugin['command.execute.before']({
+        command: 'killswitch',
+        arguments: 'on',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls
+    const text = promptCalls.at(-1)?.[0]?.body.parts[0]?.text
+    expect(text).toContain('Killswitch Enabled')
+
+    const saved = JSON.parse(
+      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    )
+    expect(saved.killswitch?.enabled).toBe(true)
+  })
+
+  test('/killswitch status shows cheatsheet', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+      }),
+    )
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'killswitch',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls
+    const text = promptCalls.at(-1)?.[0]?.body.parts[0]?.text
+    expect(text).toContain('## Killswitch')
+    expect(text).toContain('Status: **ON**')
+    expect(text).toContain('/killswitch on')
+    expect(text).toContain('/killswitch set')
+  })
+
+  test('/killswitch set persists per-account thresholds', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'alt-access',
+            refresh: 'alt-refresh',
+            expires: Date.now() + 60 * 60 * 1000,
+          },
+        ],
+        killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+      }),
+    )
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'killswitch',
+        arguments: 'set work-alt:3,8',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    const saved = JSON.parse(
+      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    )
+    expect(saved.killswitch?.accounts?.['work-alt']).toEqual({
+      five_hour: 3,
+      seven_day: 8,
+    })
+  })
+
+  test('killswitch blocks requests with synthetic 429 when all accounts below threshold', async () => {
+    const resetAt = new Date(Date.now() + 300_000).toISOString()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 98,
+                remainingPercent: 2,
+                resetsAt: resetAt,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 95,
+                remainingPercent: 5,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+        killswitch: {
+          enabled: true,
+          main: { five_hour: 10, seven_day: 10 },
+          accounts: { 'fallback-1': { five_hour: 10, seven_day: 10 } },
+        },
+      }),
+    )
+
+    let _messageFetchCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 97, resets_at: resetAt },
+              seven_day: { utilization: 92 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      _messageFetchCalls++
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    // First request triggers quota fetch and populates mainQuotaCache
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+    // Second request should be blocked by killswitch (cache is now populated)
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(429)
+    expect(response.headers.get('retry-after')).toBeTruthy()
+    const body = await response.json()
+    expect(body.error.type).toBe('rate_limit_error')
+    expect(body.error.message).toContain('Killswitch')
+  })
+
+  test('killswitch allows requests when at least one account passes threshold', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 30,
+                remainingPercent: 70,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 20,
+                remainingPercent: 80,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+        killswitch: {
+          enabled: true,
+          main: { five_hour: 10, seven_day: 10 },
+          accounts: { 'fallback-1': { five_hour: 10, seven_day: 10 } },
+        },
+      }),
+    )
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 97 },
+              seven_day: { utilization: 92 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    // First request populates cache
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+    // Second request — main killed but fallback-1 passes, so should proceed
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+  })
+
+  test('killswitch does not block when disabled', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        killswitch: {
+          enabled: false,
+          main: { five_hour: 10, seven_day: 10 },
+        },
+      }),
+    )
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 97 },
+              seven_day: { utilization: 92 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+  })
 })

@@ -233,6 +233,10 @@ globalThis.fetch = async (input, init) => {
       },
     )
 
+    // Worker name prompt + plan prompt — need small delay between so each
+    // readline instance gets its own line
+    proc.stdin.write('\n')
+    await new Promise((r) => setTimeout(r, 200))
     proc.stdin.write('\n')
     proc.stdin.end()
 

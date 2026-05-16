@@ -11,10 +11,12 @@ import {
   executeCache1hCommand,
   executeDumpCommand,
   executeFastModeCommand,
+  executeKillswitchCommand,
   FallbackAccountManager,
   fetchOAuthQuotaSnapshot,
   getCache1hMode,
   getCache1hPersistentMode,
+  getKillswitchConfig,
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
   getRelayConfig,
@@ -24,6 +26,10 @@ import {
   isFastModeEnabled,
   isFastModePersistentlyEnabled,
   isFastModeSupportedModel,
+  isKillswitchEnabled,
+  KILLSWITCH_COMMAND_NAME,
+  killswitchPassesPolicy,
+  killswitchRetryAfterSeconds,
   loadAccounts,
   log,
   type OAuthQuotaSnapshot,
@@ -44,6 +50,7 @@ import {
   setDumpPersistentEnabled,
   setFastModeEnabled,
   setFastModePersistentEnabled,
+  setKillswitchPersistent,
   shouldFallbackStatus,
   TOKEN_URL,
   writeQuotaFile,
@@ -472,6 +479,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           description:
             'Show or toggle Anthropic fast mode for supported Opus models.',
         },
+        [KILLSWITCH_COMMAND_NAME]: {
+          template: KILLSWITCH_COMMAND_NAME,
+          description:
+            'Manage killswitch — hard-block requests when quota drops below per-account thresholds.',
+        },
       }
     },
     'command.execute.before': async (input: {
@@ -512,6 +524,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           input.sessionID,
           await executePersistentFastModeCommand(input.arguments),
         )
+        throwHandledSentinel()
+      }
+
+      if (input.command === KILLSWITCH_COMMAND_NAME) {
+        const storage = await loadAccounts()
+        const config = getKillswitchConfig(storage)
+        const accountIds = (storage?.accounts ?? [])
+          .filter((a) => a.enabled !== false)
+          .map((a) => a.id)
+        const result = executeKillswitchCommand({
+          argumentsText: input.arguments,
+          config,
+          accountIds,
+        })
+        if (result.updatedConfig) {
+          await setKillswitchPersistent(result.updatedConfig)
+        }
+        await sendIgnoredMessage(ctx, input.sessionID, result.text)
         throwHandledSentinel()
       }
     },
@@ -1070,6 +1100,72 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               const loadStart = nowMs()
               const storage = await loadAccounts()
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
+
+              // Killswitch — hard-block before any API call if all accounts
+              // are below their configured thresholds.
+              if (isKillswitchEnabled(storage) && mainQuotaCache?.quota) {
+                const mainKilled = !killswitchPassesPolicy(
+                  mainQuotaCache.quota,
+                  storage,
+                )
+                const fallbackAccounts = (storage?.accounts ?? []).filter(
+                  (a) => a.enabled !== false,
+                )
+                const allFallbacksKilled =
+                  fallbackAccounts.length === 0 ||
+                  fallbackAccounts.every(
+                    (a) => !killswitchPassesPolicy(a.quota, storage, a.id),
+                  )
+
+                if (mainKilled && allFallbacksKilled) {
+                  const now = Date.now()
+                  const retryAfter = killswitchRetryAfterSeconds(
+                    mainQuotaCache.quota,
+                    fallbackAccounts,
+                    now,
+                  )
+                  const minutes = Math.floor(retryAfter / 60)
+                  const seconds = retryAfter % 60
+                  const timeStr =
+                    minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
+
+                  log('[killswitch] all accounts below threshold', {
+                    retryAfter,
+                    requestId: trace.requestId,
+                  })
+                  trace.done('killswitch_blocked', { retryAfter })
+
+                  // biome-ignore lint/suspicious/noExplicitAny: SDK client.tui type not exposed
+                  void (client.tui as any)
+                    ?.showToast?.({
+                      body: {
+                        title: 'Killswitch Active',
+                        message: `All accounts below threshold\nEarliest reset: ${timeStr}\nRetry-After: ${retryAfter}s`,
+                        variant: 'error',
+                        duration: 10000,
+                      },
+                    })
+                    ?.catch?.(() => {})
+
+                  return new Response(
+                    JSON.stringify({
+                      type: 'error',
+                      error: {
+                        type: 'rate_limit_error',
+                        message: `Killswitch: all accounts below quota threshold. Retry in ${timeStr}.`,
+                      },
+                    }),
+                    {
+                      status: 429,
+                      headers: {
+                        'content-type': 'application/json',
+                        'retry-after': String(retryAfter),
+                      },
+                    },
+                  )
+                }
+              }
+
               let preselectedFallbackAccounts:
                 | Awaited<
                     ReturnType<
