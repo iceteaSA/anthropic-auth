@@ -1214,8 +1214,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 if (needsRefresh) {
                   try {
                     const ksQuotaStart = nowMs()
-                    await refreshMainQuotaCache(auth.access, storage)
-                    await refreshFallbackQuotaCache(storage)
+                    await Promise.all([
+                      refreshMainQuotaCache(auth.access, storage),
+                      refreshFallbackQuotaCache(storage),
+                    ])
                     trace.mark('killswitch_quota_refresh', {
                       ms: roundMs(nowMs() - ksQuotaStart),
                       reason: !mainQuotaCache?.quota
