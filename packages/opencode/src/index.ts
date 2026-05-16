@@ -1151,6 +1151,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   mainQuotaCache.quota,
                   storage,
                 )
+                // Main is also unroutable if it's below the routing threshold
+                const mainBelowRoutingThreshold =
+                  mainQuotaRoutingEnabled(storage) &&
+                  !quotaSnapshotPassesPolicy(mainQuotaCache.quota, storage)
+                const mainUnroutable = mainKilled || mainBelowRoutingThreshold
                 const fallbackAccounts = (storage?.accounts ?? []).filter(
                   (a) => a.enabled !== false,
                 )
@@ -1162,11 +1167,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
                 log('[killswitch] check', {
                   mainKilled,
+                  mainBelowRoutingThreshold,
                   allFallbacksKilled,
                   fallbackCount: fallbackAccounts.length,
                 })
 
-                if (mainKilled && allFallbacksKilled) {
+                if (mainUnroutable && allFallbacksKilled) {
                   const now = Date.now()
                   const retryAfter = killswitchRetryAfterSeconds(
                     mainQuotaCache.quota,
@@ -1178,7 +1184,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   const timeStr =
                     minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
 
-                  log('[killswitch] all accounts below threshold', {
+                  log('[killswitch] no routable accounts', {
+                    mainKilled,
+                    mainBelowRoutingThreshold,
                     retryAfter,
                     requestId: trace.requestId,
                   })
@@ -1189,7 +1197,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     ?.showToast?.({
                       body: {
                         title: 'Killswitch Active',
-                        message: `All accounts below threshold\nEarliest reset: ${timeStr}\nRetry-After: ${retryAfter}s`,
+                        message: `No routable accounts${mainKilled ? ' (main killed)' : ' (main below routing threshold)'}\nAll fallbacks killed\nEarliest reset: ${timeStr}\nRetry-After: ${retryAfter}s`,
                         variant: 'error',
                         duration: 10000,
                       },
@@ -1201,7 +1209,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       type: 'error',
                       error: {
                         type: 'rate_limit_error',
-                        message: `Killswitch: all accounts below quota threshold. Retry in ${timeStr}.`,
+                        message: `Killswitch: no routable accounts (fallbacks killed${mainKilled ? ', main killed' : ', main below routing threshold'}). Retry in ${timeStr}.`,
                       },
                     }),
                     {
