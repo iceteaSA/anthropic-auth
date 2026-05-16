@@ -13,13 +13,9 @@ import {
   executeFastModeCommand,
   executeKillswitchCommand,
   FallbackAccountManager,
-  fetchOAuthQuotaSnapshot,
   getCache1hMode,
   getCache1hPersistentMode,
   getKillswitchConfig,
-  getQuotaCheckIntervalMs,
-  getQuotaNextRefreshAt,
-  getQuotaRefreshEveryNRequests,
   getRelayConfig,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -38,7 +34,7 @@ import {
   parseDumpCommandAction,
   parseFastModeCommandAction,
   type QuotaAccountSummary,
-  type QuotaFileData,
+  QuotaManager,
   quotaSnapshotPassesPolicy,
   type RelayConfig,
   refreshClaudeOAuthToken,
@@ -54,7 +50,6 @@ import {
   setKillswitchPersistent,
   shouldFallbackStatus,
   TOKEN_URL,
-  writeQuotaFile,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
@@ -71,17 +66,6 @@ import {
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 30
-
-type MainQuotaCache = {
-  accessToken: string
-  refreshAfter: number
-  quota: OAuthQuotaSnapshot
-}
-
-type FallbackQuotaCacheEntry = {
-  refreshAfter: number
-  quota: OAuthQuotaSnapshot
-}
 
 type NotificationRequest = {
   path: { id: string }
@@ -215,47 +199,20 @@ function throwHandledSentinel(): never {
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
-  const fallbackManager = new FallbackAccountManager()
-  fallbackManager.startBackgroundRefresh()
-  const initialCache1hStorage = await loadAccounts()
-  const relayConfig: RelayConfig | null = getRelayConfig(initialCache1hStorage)
-  setCache1hState({
-    enabled: isCache1hPersistentlyEnabled(initialCache1hStorage),
-    mode: getCache1hPersistentMode(initialCache1hStorage),
+  const initialStorage = await loadAccounts()
+  const quotaManager = new QuotaManager({ storage: initialStorage })
+  const fallbackManager = new FallbackAccountManager({
+    quotaManager,
   })
-  setDumpEnabled(isDumpPersistentlyEnabled(initialCache1hStorage))
-  setFastModeEnabled(isFastModePersistentlyEnabled(initialCache1hStorage))
+  fallbackManager.startBackgroundRefresh()
+  const relayConfig: RelayConfig | null = getRelayConfig(initialStorage)
+  setCache1hState({
+    enabled: isCache1hPersistentlyEnabled(initialStorage),
+    mode: getCache1hPersistentMode(initialStorage),
+  })
+  setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
+  setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
   let sessionRequestCount = 0
-  let mainQuotaCache: MainQuotaCache | null = null
-  let mainQuotaRefreshPromise: Promise<OAuthQuotaSnapshot> | null = null
-  let mainQuotaRetryAfter = 0
-  const fallbackQuotaCache = new Map<string, FallbackQuotaCacheEntry>()
-
-  function writeQuotaFileInBackground(
-    mainQuota: OAuthQuotaSnapshot | null,
-    fallbackAccounts?: Array<{
-      id: string
-      label?: string
-      enabled?: boolean
-      quota?: OAuthQuotaSnapshot
-    }>,
-  ) {
-    const data: QuotaFileData = {
-      updatedAt: Date.now(),
-      requestCount: sessionRequestCount,
-      main: mainQuota,
-    }
-    if (fallbackAccounts?.length) {
-      data.fallbacks = fallbackAccounts.map((a) => ({
-        id: a.id,
-        label: a.label,
-        enabled: a.enabled,
-        quota: a.quota,
-      }))
-    }
-    // Fire-and-forget — quota display is best-effort
-    void writeQuotaFile(data).catch(() => {})
-  }
 
   function quotaBar(pct: number, width = 16): string {
     const filled = Math.round((pct / 100) * width)
@@ -377,10 +334,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       try {
         const auth = await latestGetAuth()
         if (auth.type === 'oauth' && auth.access) {
-          // Prefer cached quota to avoid hitting the usage API unnecessarily
+          // Use QuotaManager cache; eager fetch on first request means
+          // this is always populated after the first API call.
+          const cached = quotaManager.getMain()
           const quota =
-            mainQuotaCache?.quota ??
-            (await fetchOAuthQuotaSnapshot({ accessToken: auth.access }))
+            cached?.quota ?? (await quotaManager.refreshMain(auth.access))
           accounts.push({
             name: 'OpenCode anthropic',
             role: 'main',
@@ -408,13 +366,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
     // Prefer in-memory fallback quota cache; only live-fetch if no cache exists
     const storage = await loadAccounts()
+    const fallbackEntries = quotaManager.getAllFallbacks()
     const hasCachedFallbacks = (storage?.accounts ?? []).some(
-      (a) => a.enabled !== false && fallbackQuotaCache.has(a.id),
+      (a) => a.enabled !== false && fallbackEntries.has(a.id),
     )
     if (hasCachedFallbacks) {
       // Overlay cached quota onto storage accounts for display
       for (const account of storage?.accounts ?? []) {
-        const cached = fallbackQuotaCache.get(account.id)
+        const cached = fallbackEntries.get(account.id)
         if (cached) account.quota = cached.quota
       }
       accounts.push(...buildFallbackQuotaSummaries(storage, new Map()))
@@ -953,117 +912,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             return response
           }
 
-          async function refreshMainQuotaCache(
-            accessToken: string,
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const now = Date.now()
-            const quota = await fetchOAuthQuotaSnapshot({ accessToken })
-            mainQuotaCache = {
-              accessToken,
-              refreshAfter: getQuotaNextRefreshAt(quota, storage, now),
-              quota,
-            }
-            const fallbacks =
-              storage?.accounts?.filter((a) => a.enabled !== false) ?? []
-            writeQuotaFileInBackground(quota, fallbacks)
-            showQuotaToast(quota, fallbacks, storage)
-            return quota
-          }
-
-          function refreshMainQuotaCacheInBackground(
-            accessToken: string,
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const now = Date.now()
-            if (mainQuotaRefreshPromise || now < mainQuotaRetryAfter) return
-            mainQuotaRefreshPromise = refreshMainQuotaCache(
-              accessToken,
-              storage,
-            )
-              .catch((error) => {
-                mainQuotaRetryAfter = now + getQuotaCheckIntervalMs(storage)
-                throw error
-              })
-              .finally(() => {
-                mainQuotaRefreshPromise = null
-              })
-            void mainQuotaRefreshPromise.catch(() => {})
-          }
-
-          async function getMainQuotaForRouting(
-            accessToken: string,
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const now = Date.now()
-            if (mainQuotaCache?.accessToken !== accessToken) {
-              return await refreshMainQuotaCache(accessToken, storage)
-            }
-            const everyN = getQuotaRefreshEveryNRequests(storage)
-            const staleByTime = now >= mainQuotaCache.refreshAfter
-            const staleByCount =
-              everyN > 0 && sessionRequestCount % everyN === 0
-            if (staleByTime || staleByCount) {
-              refreshMainQuotaCacheInBackground(accessToken, storage)
-            }
-            return mainQuotaCache.quota
-          }
-
           /**
-           * Refresh in-memory fallback quota cache.
-           * Only hits the Anthropic API for accounts whose cache entry is
-           * stale or missing — prevents spamming the usage endpoint.
-           */
-          async function refreshFallbackQuotaCache(
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const now = Date.now()
-            const accounts = (storage?.accounts ?? []).filter(
-              (a) => a.enabled !== false,
-            )
-            const checkInterval = getQuotaCheckIntervalMs(storage)
-            for (const account of accounts) {
-              const cached = fallbackQuotaCache.get(account.id)
-              if (cached && now < cached.refreshAfter) continue
-              // If no cache entry yet, check if the persisted quota is still
-              // fresh — avoids unnecessary API calls on first evaluation.
-              if (!cached && account.quota) {
-                const checkedAt = Math.max(
-                  account.quota.five_hour?.checkedAt ?? 0,
-                  account.quota.seven_day?.checkedAt ?? 0,
-                )
-                if (checkedAt > 0 && now - checkedAt < checkInterval) {
-                  fallbackQuotaCache.set(account.id, {
-                    refreshAfter: checkedAt + checkInterval,
-                    quota: account.quota,
-                  })
-                  continue
-                }
-              }
-              if (!account.access) continue
-              try {
-                const quota = await fetchOAuthQuotaSnapshot({
-                  accessToken: account.access,
-                })
-                fallbackQuotaCache.set(account.id, {
-                  refreshAfter: now + checkInterval,
-                  quota,
-                })
-              } catch {
-                // Best-effort — keep stale cache entry if fetch fails
-              }
-            }
-          }
-
-          /**
-           * Get the freshest quota for a fallback account: prefer in-memory
-           * cache, fall back to the persisted snapshot on the account object.
+           * Get the freshest quota for a fallback account from the shared
+           * QuotaManager cache, falling back to the persisted snapshot.
            */
           function getFallbackQuota(account: {
             id: string
             quota?: OAuthQuotaSnapshot
           }): OAuthQuotaSnapshot | undefined {
-            return fallbackQuotaCache.get(account.id)?.quota ?? account.quota
+            return quotaManager.getFallback(account.id)?.quota ?? account.quota
           }
 
           async function tryUsableFallbackAccounts(
@@ -1219,6 +1076,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
               const loadStart = nowMs()
               const storage = await loadAccounts()
+              quotaManager.updateStorage(storage)
+              quotaManager.seedFallbacksFromAccounts(storage?.accounts ?? [])
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
 
               // Killswitch — hard-block before any API call if all accounts
@@ -1227,40 +1086,49 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               // AND re-fetch when the cache is stale so killswitch can un-kill
               // accounts after their quota windows reset.
               if (isKillswitchEnabled(storage)) {
-                const ksEveryN = getQuotaRefreshEveryNRequests(storage)
                 const needsRefresh =
-                  !mainQuotaCache?.quota ||
-                  Date.now() >= mainQuotaCache.refreshAfter ||
-                  (ksEveryN > 0 && sessionRequestCount % ksEveryN === 0)
+                  quotaManager.needsRefresh(sessionRequestCount)
                 if (needsRefresh) {
                   try {
                     const ksQuotaStart = nowMs()
+                    const fallbackAccts = (storage?.accounts ?? []).filter(
+                      (a) => a.enabled !== false && a.access,
+                    )
+                    const reason = !quotaManager.getMain()
+                      ? 'first_request'
+                      : quotaManager.shouldRefreshOnRequestCount(
+                            sessionRequestCount,
+                          )
+                        ? 'request_count'
+                        : 'stale'
                     await Promise.all([
-                      refreshMainQuotaCache(auth.access, storage),
-                      refreshFallbackQuotaCache(storage),
+                      quotaManager.refreshMain(auth.access),
+                      quotaManager.refreshAllFallbacks(fallbackAccts),
                     ])
                     trace.mark('killswitch_quota_refresh', {
                       ms: roundMs(nowMs() - ksQuotaStart),
-                      reason: !mainQuotaCache?.quota
-                        ? 'first_request'
-                        : ksEveryN > 0 && sessionRequestCount % ksEveryN === 0
-                          ? 'request_count'
-                          : 'stale',
+                      reason,
                     })
+                    // Show toast after successful refresh
+                    const mainEntry = quotaManager.getMain()
+                    if (mainEntry) {
+                      const fallbacks = (storage?.accounts ?? []).filter(
+                        (a) => a.enabled !== false,
+                      )
+                      showQuotaToast(mainEntry.quota, fallbacks, storage)
+                    }
                   } catch {
                     // Best-effort — if quota fetch fails, use stale cache
                   }
                 }
               }
-              if (isKillswitchEnabled(storage) && mainQuotaCache?.quota) {
-                const mainKilled = !killswitchPassesPolicy(
-                  mainQuotaCache.quota,
-                  storage,
-                )
+              const mainQuota = quotaManager.getMain()?.quota
+              if (isKillswitchEnabled(storage) && mainQuota) {
+                const mainKilled = !killswitchPassesPolicy(mainQuota, storage)
                 // Main is also unroutable if it's below the routing threshold
                 const mainBelowRoutingThreshold =
                   mainQuotaRoutingEnabled(storage) &&
-                  !quotaSnapshotPassesPolicy(mainQuotaCache.quota, storage)
+                  !quotaSnapshotPassesPolicy(mainQuota, storage)
                 const mainUnroutable = mainKilled || mainBelowRoutingThreshold
                 const fallbackAccounts = (storage?.accounts ?? []).filter(
                   (a) => a.enabled !== false,
@@ -1286,7 +1154,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 if (mainUnroutable && allFallbacksKilled) {
                   const now = Date.now()
                   const retryAfter = killswitchRetryAfterSeconds(
-                    mainQuotaCache.quota,
+                    mainQuota,
                     fallbackAccounts,
                     now,
                   )
@@ -1338,8 +1206,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               // in normal routing and reactive fallback paths below.
               const mainKillswitched =
                 isKillswitchEnabled(storage) &&
-                mainQuotaCache?.quota != null &&
-                !killswitchPassesPolicy(mainQuotaCache.quota, storage)
+                mainQuota != null &&
+                !killswitchPassesPolicy(mainQuota, storage)
 
               // Helper: filter killswitch-killed accounts from a fallback list
               const filterKillswitchedFallbacks = <
@@ -1410,15 +1278,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               ) {
                 try {
                   const quotaStart = nowMs()
-                  const mainQuota = await getMainQuotaForRouting(
-                    auth.access,
-                    storage,
-                  )
+                  // Use QuotaManager: get cached or eagerly refresh if first time
+                  let routingQuota = quotaManager.getMain()?.quota
+                  if (!routingQuota) {
+                    routingQuota = await quotaManager.refreshMain(auth.access)
+                  } else if (quotaManager.needsRefresh(sessionRequestCount)) {
+                    // Background refresh — return stale to avoid blocking
+                    quotaManager.refreshMainInBackground(auth.access)
+                  }
                   trace.mark('main_quota_for_routing', {
                     ms: roundMs(nowMs() - quotaStart),
-                    passes: quotaSnapshotPassesPolicy(mainQuota, storage),
+                    passes: quotaSnapshotPassesPolicy(routingQuota, storage),
                   })
-                  if (!quotaSnapshotPassesPolicy(mainQuota, storage)) {
+                  if (!quotaSnapshotPassesPolicy(routingQuota, storage)) {
                     const fallbackStart = nowMs()
                     const allFallbacks =
                       await fallbackManager.getUsableFallbackAccounts()
@@ -1470,22 +1342,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               )
 
               trace.done('return_response', { status: response.status })
-
-              // Persist quota for TUI sidebar display.
-              // When quota routing is enabled, refreshMainQuotaCache already writes.
-              // When disabled, write the cached snapshot (if any) every 5 requests
-              // so the TUI file stays reasonably fresh.
-              if (
-                !mainQuotaRoutingEnabled(storage) &&
-                sessionRequestCount % 5 === 0
-              ) {
-                const fallbacks =
-                  storage?.accounts?.filter((a) => a.enabled !== false) ?? []
-                writeQuotaFileInBackground(
-                  mainQuotaCache?.quota ?? null,
-                  fallbacks,
-                )
-              }
 
               return createStrippedStream(response)
             },

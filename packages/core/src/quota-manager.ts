@@ -1,0 +1,292 @@
+/**
+ * Unified quota cache and API gateway.
+ *
+ * Single source of truth for main + fallback quota state. All consumers
+ * share one QuotaManager instance so they see the same in-memory cache.
+ * Handles deduplication, rate-limiting (429 backoff), and staleness.
+ */
+
+import type {
+  AccountStorage,
+  OAuthAccount,
+  OAuthQuotaSnapshot,
+} from './accounts.ts'
+import {
+  fetchOAuthQuotaSnapshot,
+  getQuotaCheckIntervalMs,
+  getQuotaNextRefreshAt,
+  getQuotaRefreshEveryNRequests,
+} from './accounts.ts'
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type QuotaEntry = {
+  quota: OAuthQuotaSnapshot
+  refreshAfter: number // Unix ms — earliest next refresh
+  checkedAt: number // when snapshot was fetched
+}
+
+export type QuotaManagerOptions = {
+  storage: AccountStorage | null
+  fetchImpl?: typeof fetch
+  now?: () => number
+}
+
+// ---------------------------------------------------------------------------
+// Class
+// ---------------------------------------------------------------------------
+
+export class QuotaManager {
+  // --- State ---
+  private main: QuotaEntry | null = null
+  private mainAccessToken: string | null = null
+  private fallbacks = new Map<string, QuotaEntry>()
+
+  // --- Inflight deduplication ---
+  private inflightMain: Promise<OAuthQuotaSnapshot> | null = null
+  private inflightFallbacks = new Map<string, Promise<OAuthQuotaSnapshot>>()
+
+  // --- Rate-limiting ---
+  private apiBackoffUntil = 0
+  private static readonly BACKOFF_MS = 60_000
+
+  // --- Config ---
+  private storage: AccountStorage | null
+  private readonly fetchImpl: typeof fetch
+  private readonly now: () => number
+
+  constructor(opts: QuotaManagerOptions) {
+    this.storage = opts.storage
+    this.fetchImpl = opts.fetchImpl ?? fetch
+    this.now = opts.now ?? Date.now
+  }
+
+  // =========================================================================
+  // Get (synchronous, from cache)
+  // =========================================================================
+
+  getMain(): QuotaEntry | null {
+    return this.main
+  }
+
+  getFallback(accountId: string): QuotaEntry | null {
+    return this.fallbacks.get(accountId) ?? null
+  }
+
+  getAllFallbacks(): Map<string, QuotaEntry> {
+    return this.fallbacks
+  }
+
+  // =========================================================================
+  // Set (manual inject — seeding from persisted account.quota on boot)
+  // =========================================================================
+
+  setMain(accessToken: string, entry: QuotaEntry): void {
+    this.mainAccessToken = accessToken
+    this.main = entry
+  }
+
+  setFallback(accountId: string, entry: QuotaEntry): void {
+    this.fallbacks.set(accountId, entry)
+  }
+
+  // =========================================================================
+  // Refresh (async, deduplicated, rate-limited)
+  // =========================================================================
+
+  async refreshMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
+    // If token changed, invalidate cache
+    if (this.mainAccessToken && this.mainAccessToken !== accessToken) {
+      this.main = null
+      this.mainAccessToken = null
+    }
+
+    // Deduplicate — return in-flight promise if already fetching
+    if (this.inflightMain) return this.inflightMain
+
+    // Rate-limit — if API recently 429'd, return stale or throw
+    if (this.now() < this.apiBackoffUntil) {
+      if (this.main) return this.main.quota
+      throw new Error('Quota API rate-limited — try again later')
+    }
+
+    this.inflightMain = this._fetchMain(accessToken)
+    return this.inflightMain
+  }
+
+  async refreshFallback(
+    accountId: string,
+    accessToken: string,
+  ): Promise<OAuthQuotaSnapshot> {
+    // Deduplicate
+    const inflight = this.inflightFallbacks.get(accountId)
+    if (inflight) return inflight
+
+    // Rate-limit
+    if (this.now() < this.apiBackoffUntil) {
+      const cached = this.fallbacks.get(accountId)
+      if (cached) return cached.quota
+      throw new Error('Quota API rate-limited — try again later')
+    }
+
+    const promise = this._fetchFallback(accountId, accessToken)
+    this.inflightFallbacks.set(accountId, promise)
+    return promise
+  }
+
+  async refreshAllFallbacks(accounts: OAuthAccount[]): Promise<void> {
+    const now = this.now()
+
+    for (const account of accounts) {
+      if (account.enabled === false) continue
+      if (!account.access) continue
+
+      const cached = this.fallbacks.get(account.id)
+      if (cached && now < cached.refreshAfter) continue
+
+      try {
+        await this.refreshFallback(account.id, account.access)
+      } catch {
+        // Best-effort — keep stale cache entry if fetch fails
+      }
+    }
+  }
+
+  /**
+   * Fire-and-forget refresh. Does not await, swallows errors.
+   */
+  refreshMainInBackground(accessToken: string): void {
+    if (this.inflightMain) return
+    if (this.now() < this.apiBackoffUntil) return
+    void this.refreshMain(accessToken).catch(() => {})
+  }
+
+  // =========================================================================
+  // Staleness queries
+  // =========================================================================
+
+  isMainStale(): boolean {
+    if (!this.main) return true
+    return this.now() >= this.main.refreshAfter
+  }
+
+  isFallbackStale(accountId: string): boolean {
+    const entry = this.fallbacks.get(accountId)
+    if (!entry) return true
+    return this.now() >= entry.refreshAfter
+  }
+
+  shouldRefreshOnRequestCount(requestCount: number): boolean {
+    const everyN = getQuotaRefreshEveryNRequests(this.storage)
+    if (everyN <= 0) return false
+    return requestCount > 0 && requestCount % everyN === 0
+  }
+
+  /**
+   * Combined check: should a refresh happen right now?
+   * True if main is stale by time OR triggered by request count.
+   */
+  needsRefresh(requestCount: number): boolean {
+    return this.isMainStale() || this.shouldRefreshOnRequestCount(requestCount)
+  }
+
+  // =========================================================================
+  // Config
+  // =========================================================================
+
+  updateStorage(storage: AccountStorage | null): void {
+    this.storage = storage
+  }
+
+  /**
+   * Seed fallback cache entries from persisted account.quota data.
+   * Only seeds accounts that don't already have a cache entry.
+   * Prevents unnecessary API calls when persisted quota is still fresh.
+   */
+  seedFallbacksFromAccounts(accounts: OAuthAccount[]): void {
+    const checkInterval = getQuotaCheckIntervalMs(this.storage)
+    for (const account of accounts) {
+      if (account.enabled === false) continue
+      if (this.fallbacks.has(account.id)) continue
+      if (!account.quota) continue
+      const checkedAt = Math.max(
+        account.quota.five_hour?.checkedAt ?? 0,
+        account.quota.seven_day?.checkedAt ?? 0,
+      )
+      if (checkedAt <= 0) continue
+      this.fallbacks.set(account.id, {
+        quota: account.quota,
+        refreshAfter: checkedAt + checkInterval,
+        checkedAt,
+      })
+    }
+  }
+
+  /**
+   * Whether the API is currently in backoff due to a recent 429.
+   */
+  isBackedOff(): boolean {
+    return this.now() < this.apiBackoffUntil
+  }
+
+  // =========================================================================
+  // Private
+  // =========================================================================
+
+  private async _fetchMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
+    try {
+      const quota = await fetchOAuthQuotaSnapshot({
+        accessToken,
+        fetchImpl: this.fetchImpl,
+        now: this.now,
+      })
+      const now = this.now()
+      this.mainAccessToken = accessToken
+      this.main = {
+        quota,
+        refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
+        checkedAt: now,
+      }
+      return quota
+    } catch (error) {
+      this._handleFetchError(error)
+      throw error
+    } finally {
+      this.inflightMain = null
+    }
+  }
+
+  private async _fetchFallback(
+    accountId: string,
+    accessToken: string,
+  ): Promise<OAuthQuotaSnapshot> {
+    try {
+      const quota = await fetchOAuthQuotaSnapshot({
+        accessToken,
+        fetchImpl: this.fetchImpl,
+        now: this.now,
+      })
+      const now = this.now()
+      this.fallbacks.set(accountId, {
+        quota,
+        refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
+        checkedAt: now,
+      })
+      return quota
+    } catch (error) {
+      this._handleFetchError(error)
+      throw error
+    } finally {
+      this.inflightFallbacks.delete(accountId)
+    }
+  }
+
+  private _handleFetchError(error: unknown): void {
+    const msg = error instanceof Error ? error.message : String(error)
+    if (msg.includes('429')) {
+      this.apiBackoffUntil = this.now() + QuotaManager.BACKOFF_MS
+    }
+  }
+}
