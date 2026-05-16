@@ -254,17 +254,26 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   function showQuotaToast(
     quota: OAuthQuotaSnapshot | null,
-    fallbacks?: Array<{ label?: string; quota?: OAuthQuotaSnapshot }>,
+    fallbacks?: Array<{
+      id: string
+      label?: string
+      quota?: OAuthQuotaSnapshot
+    }>,
+    storage?: Awaited<ReturnType<typeof loadAccounts>>,
   ) {
     const sections: string[] = []
     let globalMaxUsed = 0
+    const ksEnabled = isKillswitchEnabled(storage ?? null)
 
     // Main account
     if (quota) {
       const fh = quota.five_hour
       const sd = quota.seven_day
       if (fh || sd) {
+        const mainKilled =
+          ksEnabled && !killswitchPassesPolicy(quota, storage ?? null)
         const lines: string[] = []
+        if (mainKilled) lines.push('⛔ KILLED')
         if (fh) {
           lines.push(
             `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
@@ -290,7 +299,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         const sd = q.seven_day
         if (!fh && !sd) continue
         const name = fb.label || 'alt'
-        const lines: string[] = [`── ${name} ──`]
+        const fbKilled =
+          ksEnabled && !killswitchPassesPolicy(q, storage ?? null, fb.id)
+        const status = fbKilled ? ' ⛔ KILLED' : ''
+        const lines: string[] = [`── ${name}${status} ──`]
         if (fh) {
           lines.push(
             `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
@@ -308,7 +320,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
 
     if (!sections.length) return
-    const message = sections.join('\n')
+    const message = sections.join('\n\n')
     const variant =
       globalMaxUsed >= 90 ? 'error' : globalMaxUsed >= 70 ? 'warning' : 'info'
 
@@ -927,7 +939,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             const fallbacks =
               storage?.accounts?.filter((a) => a.enabled !== false) ?? []
             writeQuotaFileInBackground(quota, fallbacks)
-            showQuotaToast(quota, fallbacks)
+            showQuotaToast(quota, fallbacks, storage)
             return quota
           }
 
