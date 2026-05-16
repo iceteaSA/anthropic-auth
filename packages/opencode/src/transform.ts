@@ -488,7 +488,6 @@ function setMessageCacheAnchor(message: unknown) {
 
 function applyHybridCache1h(parsed: Record<string, unknown>) {
   removeAllCacheControls(parsed)
-  parsed.cache_control = { ...CACHE_1H_CONTROL }
 
   if (Array.isArray(parsed.system)) {
     const identityIndex = parsed.system.findIndex(
@@ -505,23 +504,14 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   }
 
   if (!Array.isArray(parsed.messages)) return
-  const firstMessageIndex = parsed.messages.findIndex((message) =>
-    isRecord(message),
-  )
-  const firstMessage = parsed.messages[firstMessageIndex]
-  if (!isRecord(firstMessage)) return
 
-  setMessageCacheAnchor(firstMessage)
+  setMessageCacheAnchor(parsed.messages[0])
+  setMessageCacheAnchor(parsed.messages[1])
 
-  if (parsed.messages.length < 20) return
-  const movingMessageIndex = parsed.messages
-    .slice(0, -1)
-    .findLastIndex(
-      (message, index) => index > firstMessageIndex && isRecord(message),
-    )
-  if (movingMessageIndex < 0) return
-
-  setMessageCacheAnchor(parsed.messages[movingMessageIndex])
+  const movingMessageIndex = parsed.messages.length - 2
+  if (movingMessageIndex > 1) {
+    setMessageCacheAnchor(parsed.messages[movingMessageIndex])
+  }
 }
 
 function applyCache1hStrategy(

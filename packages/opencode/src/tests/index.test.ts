@@ -960,7 +960,7 @@ describe('auth.loader', () => {
     })
 
     const parsedBody = JSON.parse(capturedBody!)
-    expect(parsedBody.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+    expect(parsedBody.cache_control).toBeUndefined()
     expect(parsedBody.system[2].cache_control).toEqual({
       type: 'ephemeral',
       ttl: '1h',
@@ -969,7 +969,10 @@ describe('auth.loader', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
-    expect(parsedBody.messages[1].content[0].cache_control).toBeUndefined()
+    expect(parsedBody.messages[1].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
   })
 
   test('fetch wrapper refreshes expired token', async () => {

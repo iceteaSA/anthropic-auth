@@ -1011,7 +1011,7 @@ describe('rewriteRequestBody', () => {
     expect(result.messages[1].content[0].cache_control).toBeUndefined()
   })
 
-  test('hybrid mode keeps system and messages[0] breakpoints plus top-level automatic cache', async () => {
+  test('hybrid mode keeps system, messages[0], and messages[1] explicit breakpoints', async () => {
     const body = JSON.stringify({
       system: [
         {
@@ -1023,14 +1023,14 @@ describe('rewriteRequestBody', () => {
       messages: [
         {
           role: 'user',
-          content: 'Magic Context history carrier',
+          content: 'Permanent Magic Context history',
         },
         {
-          role: 'assistant',
+          role: 'user',
           content: [
             {
               type: 'text',
-              text: 'Recent assistant response',
+              text: 'Volatile Magic Context history',
               cache_control: { type: 'ephemeral' },
             },
           ],
@@ -1045,7 +1045,7 @@ describe('rewriteRequestBody', () => {
       }),
     )
 
-    expect(result.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+    expect(result.cache_control).toBeUndefined()
     expect(result.system[2].cache_control).toEqual({
       type: 'ephemeral',
       ttl: '1h',
@@ -1053,15 +1053,18 @@ describe('rewriteRequestBody', () => {
     expect(result.messages[0].content).toEqual([
       {
         type: 'text',
-        text: 'Magic Context history carrier',
+        text: 'Permanent Magic Context history',
         cache_control: { type: 'ephemeral', ttl: '1h' },
       },
     ])
-    expect(result.messages[1].content[0].cache_control).toBeUndefined()
+    expect(result.messages[1].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
   })
 
-  test('hybrid mode adds no moving message anchor before the automatic lookback window is exceeded', async () => {
-    const messages = Array.from({ length: 19 }, (_, index) => ({
+  test('hybrid mode does not duplicate the moving marker when n-2 is messages[1]', async () => {
+    const messages = Array.from({ length: 3 }, (_, index) => ({
       role: index % 2 === 0 ? 'user' : 'assistant',
       content: `message ${index}`,
     }))
@@ -1081,12 +1084,15 @@ describe('rewriteRequestBody', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
-    expect(result.messages[17].content).toBe('message 17')
-    expect(result.messages[18].content).toBe('message 18')
+    expect(result.messages[1].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[2].content).toBe('message 2')
   })
 
-  test('hybrid mode adds a moving message anchor after the automatic lookback window is exceeded', async () => {
-    const messages = Array.from({ length: 20 }, (_, index) => ({
+  test('hybrid mode adds a moving marker at messages[n-2] once distinct from messages[1]', async () => {
+    const messages = Array.from({ length: 4 }, (_, index) => ({
       role: index % 2 === 0 ? 'user' : 'assistant',
       content: `message ${index}`,
     }))
@@ -1106,14 +1112,18 @@ describe('rewriteRequestBody', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
-    expect(result.messages[18].content).toEqual([
+    expect(result.messages[1].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[2].content).toEqual([
       {
         type: 'text',
-        text: 'message 18',
+        text: 'message 2',
         cache_control: { type: 'ephemeral', ttl: '1h' },
       },
     ])
-    expect(result.messages[19].content).toBe('message 19')
+    expect(result.messages[3].content).toBe('message 3')
   })
 
   test('hybrid mode preserves only the last original system cache anchor after billing and identity blocks', async () => {
@@ -1163,7 +1173,10 @@ describe('rewriteRequestBody', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
-    expect(result.messages[1].content[0].cache_control).toBeUndefined()
+    expect(result.messages[1].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
   })
 })
 
