@@ -96,6 +96,7 @@ export type AccountStorage = {
   accounts: OAuthAccount[]
 }
 
+
 type OAuthUsageWindow = {
   utilization?: number
   resets_at?: string
@@ -693,6 +694,71 @@ function recordQuotaRefreshError(
     message: formatErrorMessage(error),
     checkedAt: now,
   }
+}
+
+/**
+ * Shared OAuth token refresh with retry logic.
+ * Retries on 5xx server errors and transient network errors
+ * with exponential backoff: 0ms, 500ms, 1000ms.
+ */
+export async function refreshOAuthToken(opts: {
+  refreshToken: string
+  fetchImpl?: typeof fetch
+  maxRetries?: number
+  baseDelayMs?: number
+}): Promise<OAuthRefreshResponse> {
+  const fetchFn = opts.fetchImpl ?? fetch
+  const maxRetries = opts.maxRetries ?? 2
+  const baseDelayMs = opts.baseDelayMs ?? 500
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = baseDelayMs * 2 ** (attempt - 1)
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+
+      const response = await fetchFn(TOKEN_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+          'User-Agent': 'axios/1.13.6',
+        },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: opts.refreshToken,
+          client_id: CLIENT_ID,
+        }),
+      })
+
+      if (!response.ok) {
+        if (response.status >= 500 && attempt < maxRetries) {
+          await response.body?.cancel()
+          continue
+        }
+        const body = await response.text().catch(() => '')
+        throw new Error(`Token refresh failed: ${response.status} — ${body}`)
+      }
+
+      return (await response.json()) as OAuthRefreshResponse
+    } catch (error) {
+      const isNetworkError =
+        error instanceof Error &&
+        (error.message.includes('fetch failed') ||
+          ('code' in error &&
+            ((error as any).code === 'ECONNRESET' ||
+              (error as any).code === 'ECONNREFUSED' ||
+              (error as any).code === 'ETIMEDOUT' ||
+              (error as any).code === 'UND_ERR_CONNECT_TIMEOUT')))
+
+      if (attempt < maxRetries && isNetworkError) {
+        continue
+      }
+      throw error
+    }
+  }
+  throw new Error('Token refresh exhausted all retries')
 }
 
 export class FallbackAccountManager {
