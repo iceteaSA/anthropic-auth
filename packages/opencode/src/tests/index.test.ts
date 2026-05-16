@@ -178,10 +178,14 @@ describe('auth.methods', () => {
 describe('auth.loader', () => {
   const originalFetch = globalThis.fetch
   const originalSetTimeout = globalThis.setTimeout
+  const originalSetInterval = globalThis.setInterval
+  const originalClearInterval = globalThis.clearInterval
 
   beforeEach(async () => {
     globalThis.fetch = originalFetch
     globalThis.setTimeout = originalSetTimeout
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearInterval = originalClearInterval
     resetCache1hState()
     resetDumpState()
     resetFastModeState()
@@ -191,6 +195,8 @@ describe('auth.loader', () => {
   afterEach(async () => {
     globalThis.fetch = originalFetch
     globalThis.setTimeout = originalSetTimeout
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearInterval = originalClearInterval
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
     if (tempConfigDir) {
       await rm(tempConfigDir, { recursive: true, force: true })
@@ -977,6 +983,66 @@ describe('auth.loader', () => {
     expect(parsedBody.messages[1].content[0].cache_control).toEqual({
       type: 'ephemeral',
       ttl: '1h',
+    })
+  })
+
+  test('background refresh proactively rotates main oauth before expiry', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+      }),
+    )
+    const intervalHandlers: Array<() => void> = []
+    globalThis.setInterval = mock((handler: () => void) => {
+      intervalHandlers.push(handler)
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'background-refresh-new',
+              access_token: 'background-access-new',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: Date.now() + 5 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    expect(intervalHandlers.length).toBeGreaterThanOrEqual(3)
+    intervalHandlers[intervalHandlers.length - 1]!()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect(mockClient.auth.set).toHaveBeenCalledWith({
+      path: { id: 'anthropic' },
+      body: {
+        type: 'oauth',
+        refresh: 'background-refresh-new',
+        access: 'background-access-new',
+        expires: expect.any(Number),
+      },
     })
   })
 

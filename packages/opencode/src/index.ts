@@ -58,6 +58,8 @@ import {
 } from './transform.ts'
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
+const MAIN_AUTH_REFRESH_TICK_MS = 60_000
+const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 30
 
 type MainQuotaCache = {
   accessToken: string
@@ -215,6 +217,22 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         expires?: number
       }>)
     | null = null
+  let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
+
+  function mainRefreshBeforeExpiryMs(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+  ) {
+    const minutes =
+      storage?.refresh?.refreshBeforeExpiryMinutes ??
+      DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
+    return Math.max(0, minutes) * 60_000
+  }
+
+  function mainRefreshEnabled(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+  ) {
+    return storage?.refresh?.enabled !== false
+  }
 
   async function buildQuotaCommandSummary() {
     const accounts: QuotaAccountSummary[] = []
@@ -505,6 +523,48 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
             return refreshPromise
           }
+
+          function startMainBackgroundRefresh() {
+            if (mainBackgroundRefreshTimer) {
+              clearInterval(mainBackgroundRefreshTimer)
+              mainBackgroundRefreshTimer = null
+            }
+
+            const run = async () => {
+              try {
+                const storage = await loadAccounts()
+                if (!mainRefreshEnabled(storage)) return
+                const latestAuth = await getAuth()
+                if (latestAuth.type !== 'oauth') return
+                if (!latestAuth.expires) return
+                if (
+                  latestAuth.expires - Date.now() >
+                  mainRefreshBeforeExpiryMs(storage)
+                ) {
+                  return
+                }
+
+                await refreshMainAccessToken()
+                log('[refresh] opencode main oauth refreshed in background', {
+                  expires: latestAuth.expires,
+                })
+              } catch (error) {
+                log('[refresh] opencode main oauth refresh failed', {
+                  message:
+                    error instanceof Error ? error.message : String(error),
+                })
+              }
+            }
+
+            mainBackgroundRefreshTimer = setInterval(() => {
+              void run()
+            }, MAIN_AUTH_REFRESH_TICK_MS)
+            if ('unref' in mainBackgroundRefreshTimer) {
+              mainBackgroundRefreshTimer.unref()
+            }
+          }
+
+          startMainBackgroundRefresh()
 
           function isReplayableRequest(
             input: string | URL | Request,
