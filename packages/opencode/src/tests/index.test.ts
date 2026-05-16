@@ -279,12 +279,15 @@ describe('auth.loader', () => {
 
     await result.fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
+      headers: { 'x-session-affinity': 'session-abc' },
       body,
     })
 
     expect(capturedHeaders).toBeDefined()
     expect(capturedHeaders!.get('authorization')).toBe('Bearer my-access-token')
     expect(capturedHeaders!.get('x-api-key')).toBeNull()
+    expect(capturedHeaders!.get('x-session-affinity')).toBeNull()
+    expect(capturedHeaders!.get('x-opencode-session')).toBeNull()
     expect(capturedHeaders!.get('anthropic-beta')).toContain('oauth-2025-04-20')
 
     const parsedBody = JSON.parse(capturedBody!)
@@ -358,6 +361,8 @@ describe('auth.loader', () => {
         url: 'https://api.anthropic.com/v1/messages?beta=true',
       },
     })
+    expect(payload.upstream.headers['x-session-affinity']).toBeUndefined()
+    expect(payload.upstream.headers['x-opencode-session']).toBeUndefined()
     expect(payload.body.length).toBeGreaterThan(0)
   })
 

@@ -239,7 +239,10 @@ function isRelayableAnthropicRequest(
 
 function jsonHeaders(headers: Headers) {
   const result: Record<string, string> = {}
-  for (const [key, value] of headers.entries()) result[key] = value
+  for (const [key, value] of headers.entries()) {
+    if (key === 'x-session-affinity' || key === 'x-opencode-session') continue
+    result[key] = value
+  }
   return result
 }
 
@@ -867,14 +870,25 @@ export async function sendViaRelay(options: {
   headers: Headers
   body: RequestInit['body'] | null | undefined
   fallback: () => Promise<Response>
+  affinity?: string | null
   optimisticResponse?: boolean
 }): Promise<Response> {
-  const { config, input, init, headers, body, fallback, optimisticResponse } =
-    options
+  const {
+    config,
+    input,
+    init,
+    headers,
+    body,
+    fallback,
+    affinity: explicitAffinity,
+    optimisticResponse,
+  } = options
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
 
   const affinity =
-    headers.get('x-session-affinity') || headers.get('x-opencode-session')
+    explicitAffinity ||
+    headers.get('x-session-affinity') ||
+    headers.get('x-opencode-session')
   if (!affinity) {
     relayLog('skipping relay: missing x-session-affinity header')
     return fallback()

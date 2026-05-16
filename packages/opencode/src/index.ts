@@ -616,8 +616,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ) {
             const start = nowMs()
             const requestHeaders = mergeHeaders(input, init)
+            const relayAffinity =
+              requestHeaders.get('x-session-affinity') ||
+              requestHeaders.get('x-opencode-session')
             const subagentRequest = isSubagentRequest(requestHeaders)
             requestHeaders.delete('x-parent-session-id')
+            requestHeaders.delete('x-session-affinity')
+            requestHeaders.delete('x-opencode-session')
             let body = init?.body
             let modelForIdentity: string | undefined
             if (body && typeof body === 'string') {
@@ -690,6 +695,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               headers: requestHeaders,
               body,
               fallback: directFetch,
+              affinity: relayAffinity,
               optimisticResponse: relayConfig?.transport === 'websocket',
             })
             trace?.mark('send_headers_received', {

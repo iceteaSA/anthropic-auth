@@ -87,6 +87,10 @@ describe('relay client', () => {
 
     expect(calls).toHaveLength(2)
     expect(calls[0]).toMatchObject({ mode: 'full_sync', revision: 1 })
+    expect(
+      (calls[0] as { upstream: { headers: Record<string, string> } }).upstream
+        .headers['x-session-affinity'],
+    ).toBeUndefined()
     expect(calls[1]).toMatchObject({ mode: 'patch', revision: 2 })
     expect((calls[1] as { base_hash: string }).base_hash).toBe(
       hashBody(JSON.stringify({ messages: ['one'] })),

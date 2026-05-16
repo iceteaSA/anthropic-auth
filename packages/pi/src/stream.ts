@@ -160,9 +160,7 @@ async function sendAnthropicRequest(options: {
       mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
     )
   }
-  if (options.streamOptions?.sessionId) {
-    headers.set('x-session-affinity', options.streamOptions.sessionId)
-  }
+  const relayAffinity = options.streamOptions?.sessionId ?? null
 
   const input = new URL('/v1/messages?beta=true', options.model.baseUrl)
   const init: RequestInit = {
@@ -179,6 +177,7 @@ async function sendAnthropicRequest(options: {
     headers,
     body: bodyText,
     fallback: () => fetch(input, init),
+    affinity: relayAffinity,
   })
 }
 
