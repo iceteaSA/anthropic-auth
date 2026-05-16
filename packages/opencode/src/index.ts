@@ -49,7 +49,6 @@ import {
   setFastModePersistentEnabled,
   setKillswitchPersistent,
   shouldFallbackStatus,
-  TOKEN_URL,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
