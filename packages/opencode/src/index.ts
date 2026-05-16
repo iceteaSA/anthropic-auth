@@ -812,6 +812,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             trace?: PerfTrace,
             route = 'unknown',
           ) {
+            log(`[route] sending via ${route}`)
             const start = nowMs()
             const requestHeaders = mergeHeaders(input, init)
             const relayAffinity =
@@ -1049,6 +1050,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 accounts: accounts.length,
               })
             }
+            // Filter out killswitch-killed fallbacks
+            if (isKillswitchEnabled(storage)) {
+              const before = accounts.length
+              accounts = accounts.filter((a) =>
+                killswitchPassesPolicy(a.quota, storage, a.id),
+              )
+              if (accounts.length < before) {
+                log('[killswitch] filtered fallbacks', {
+                  before,
+                  after: accounts.length,
+                })
+              }
+            }
             return (
               (await tryUsableFallbackAccounts(
                 input,
@@ -1117,6 +1131,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     (a) => !killswitchPassesPolicy(a.quota, storage, a.id),
                   )
 
+                log('[killswitch] check', {
+                  mainKilled,
+                  allFallbacksKilled,
+                  fallbackCount: fallbackAccounts.length,
+                })
+
                 if (mainKilled && allFallbacksKilled) {
                   const now = Date.now()
                   const retryAfter = killswitchRetryAfterSeconds(
@@ -1166,6 +1186,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 }
               }
 
+              // Track whether killswitch has killed main — used to skip main
+              // in normal routing and reactive fallback paths below.
+              const mainKillswitched =
+                isKillswitchEnabled(storage) &&
+                mainQuotaCache?.quota != null &&
+                !killswitchPassesPolicy(mainQuotaCache.quota, storage)
+
+              // Helper: filter killswitch-killed accounts from a fallback list
+              const filterKillswitchedFallbacks = <
+                T extends { id: string; quota?: unknown },
+              >(
+                accounts: T[],
+              ): T[] => {
+                if (!isKillswitchEnabled(storage)) return accounts
+                return accounts.filter((a) =>
+                  killswitchPassesPolicy(
+                    a.quota as Parameters<typeof killswitchPassesPolicy>[0],
+                    storage,
+                    a.id,
+                  ),
+                )
+              }
+
               let preselectedFallbackAccounts:
                 | Awaited<
                     ReturnType<
@@ -1173,6 +1216,46 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     >
                   >
                 | undefined
+
+              // Killswitch: main is killed — route directly to surviving fallbacks
+              if (mainKillswitched && isReplayableRequest(input, init?.body)) {
+                log('[route] skipping main (killswitch), trying fallbacks')
+                const fallbackStart = nowMs()
+                const allFallbacks =
+                  await fallbackManager.getUsableFallbackAccounts()
+                preselectedFallbackAccounts =
+                  filterKillswitchedFallbacks(allFallbacks)
+                trace.mark('preselect_fallback_accounts', {
+                  ms: roundMs(nowMs() - fallbackStart),
+                  accounts: preselectedFallbackAccounts.length,
+                  filtered:
+                    allFallbacks.length - preselectedFallbackAccounts.length,
+                  reason: 'killswitch',
+                })
+                if (preselectedFallbackAccounts.length > 0) {
+                  const fallbackResponse = await tryUsableFallbackAccounts(
+                    input,
+                    init,
+                    preselectedFallbackAccounts,
+                    storage,
+                    undefined,
+                    trace,
+                  )
+                  if (fallbackResponse) {
+                    trace.done('return_preselected_fallback', {
+                      status: fallbackResponse.status,
+                      reason: 'killswitch',
+                    })
+                    return createStrippedStream(fallbackResponse)
+                  }
+                }
+                // All surviving fallbacks failed — fall through to main as last resort
+                log(
+                  '[killswitch] surviving fallbacks exhausted, falling through to main',
+                )
+              }
+
+              // Normal quota routing (independent of killswitch)
               if (
                 isReplayableRequest(input, init?.body) &&
                 mainQuotaRoutingEnabled(storage)
@@ -1189,11 +1272,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   })
                   if (!quotaSnapshotPassesPolicy(mainQuota, storage)) {
                     const fallbackStart = nowMs()
-                    preselectedFallbackAccounts =
+                    const allFallbacks =
                       await fallbackManager.getUsableFallbackAccounts()
+                    preselectedFallbackAccounts =
+                      filterKillswitchedFallbacks(allFallbacks)
                     trace.mark('preselect_fallback_accounts', {
                       ms: roundMs(nowMs() - fallbackStart),
                       accounts: preselectedFallbackAccounts.length,
+                      filtered:
+                        allFallbacks.length -
+                        preselectedFallbackAccounts.length,
                     })
                     const fallbackResponse = await tryUsableFallbackAccounts(
                       input,
