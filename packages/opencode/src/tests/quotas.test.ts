@@ -97,6 +97,7 @@ describe('quota summaries', () => {
 
     expect(buildFallbackQuotaSummaries(storage)).toEqual([
       {
+        id: 'fallback-1',
         name: 'personal',
         role: 'fallback',
         enabled: false,
@@ -127,6 +128,7 @@ describe('quota summaries', () => {
       ),
     ).toEqual([
       {
+        id: 'fallback-1',
         name: 'personal',
         role: 'fallback',
         enabled: true,

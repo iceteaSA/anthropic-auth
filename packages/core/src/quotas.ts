@@ -1,9 +1,11 @@
-import type {
-  AccountQuotaWindow,
-  AccountStorage,
-  OAuthAccount,
-  OAuthQuotaSnapshot,
-  QuotaWindowName,
+import {
+  type AccountQuotaWindow,
+  type AccountStorage,
+  type KillswitchConfig,
+  killswitchPassesPolicy,
+  type OAuthAccount,
+  type OAuthQuotaSnapshot,
+  type QuotaWindowName,
 } from './accounts.ts'
 
 export const CLAUDE_QUOTAS_COMMAND_NAME = 'claude-quota'
@@ -14,6 +16,7 @@ const WINDOW_LABELS: Record<QuotaWindowName, string> = {
 }
 
 export type QuotaAccountSummary = {
+  id?: string
   name: string
   role: 'main' | 'fallback'
   enabled?: boolean
@@ -90,6 +93,7 @@ export function buildFallbackQuotaSummaries(
   return storage.accounts.map((account) => {
     const error = errors.get(account.id) ?? accountStoredError(account)
     return {
+      id: account.id,
       name: accountName(account),
       role: 'fallback' as const,
       enabled: account.enabled !== false,
@@ -103,6 +107,9 @@ export function buildFallbackQuotaSummaries(
 export function buildClaudeQuotaSummary(input: {
   accounts: QuotaAccountSummary[]
   refreshedAt?: number
+  killswitch?: KillswitchConfig
+  /** Full storage needed for killswitchPassesPolicy evaluation */
+  storage?: AccountStorage | null
   now?: number
 }) {
   const now = input.now ?? Date.now()
@@ -131,6 +138,44 @@ export function buildClaudeQuotaSummary(input: {
     }
     lines.push(formatWindow('five_hour', account.quota?.five_hour, now))
     lines.push(formatWindow('seven_day', account.quota?.seven_day, now))
+    lines.push('')
+  }
+
+  // Killswitch status
+  const ks = input.killswitch
+  if (ks) {
+    lines.push(`### Killswitch: ${ks.enabled ? 'ON' : 'OFF'}`)
+    if (ks.enabled) {
+      const mainT = ks.main ?? {}
+      const mfh = mainT.five_hour ?? mainT['5h'] ?? 5
+      const msd = mainT.seven_day ?? mainT['1w'] ?? 10
+      const mainAccount = input.accounts.find((a) => a.role === 'main')
+      const mainStatus =
+        ks.enabled && input.storage && mainAccount?.quota
+          ? killswitchPassesPolicy(mainAccount.quota, input.storage)
+            ? 'active'
+            : 'KILLED'
+          : ''
+      const mainSuffix = mainStatus ? ` \u2014 ${mainStatus}` : ''
+      lines.push(`  - main: 5h \u2265 ${mfh}%, 1w \u2265 ${msd}%${mainSuffix}`)
+      if (ks.accounts) {
+        for (const [id, t] of Object.entries(ks.accounts)) {
+          const fh = t.five_hour ?? t['5h'] ?? mfh
+          const sd = t.seven_day ?? t['1w'] ?? msd
+          const fb = input.accounts.find(
+            (a) => a.role === 'fallback' && (a.id === id || a.name === id),
+          )
+          const fbStatus =
+            input.storage && fb?.quota
+              ? killswitchPassesPolicy(fb.quota, input.storage, id)
+                ? 'active'
+                : 'KILLED'
+              : ''
+          const fbSuffix = fbStatus ? ` \u2014 ${fbStatus}` : ''
+          lines.push(`  - ${id}: 5h \u2265 ${fh}%, 1w \u2265 ${sd}%${fbSuffix}`)
+        }
+      }
+    }
     lines.push('')
   }
 

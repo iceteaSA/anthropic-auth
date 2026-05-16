@@ -394,7 +394,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       })
     }
 
-    return buildClaudeQuotaSummary({ accounts, refreshedAt: Date.now() })
+    return buildClaudeQuotaSummary({
+      accounts,
+      refreshedAt: Date.now(),
+      killswitch: storage?.killswitch ?? undefined,
+      storage,
+    })
   }
 
   async function executePersistentCache1hCommand(argumentsText: string) {
