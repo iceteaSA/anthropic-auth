@@ -1060,6 +1060,62 @@ describe('rewriteRequestBody', () => {
     expect(result.messages[1].content[0].cache_control).toBeUndefined()
   })
 
+  test('hybrid mode adds no moving message anchor before the automatic lookback window is exceeded', async () => {
+    const messages = Array.from({ length: 19 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `message ${index}`,
+    }))
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages,
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    expect(result.messages[0].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[17].content).toBe('message 17')
+    expect(result.messages[18].content).toBe('message 18')
+  })
+
+  test('hybrid mode adds a moving message anchor after the automatic lookback window is exceeded', async () => {
+    const messages = Array.from({ length: 20 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `message ${index}`,
+    }))
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages,
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    expect(result.messages[0].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[18].content).toEqual([
+      {
+        type: 'text',
+        text: 'message 18',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ])
+    expect(result.messages[19].content).toBe('message 19')
+  })
+
   test('hybrid mode preserves only the last original system cache anchor after billing and identity blocks', async () => {
     const body = JSON.stringify({
       system: [

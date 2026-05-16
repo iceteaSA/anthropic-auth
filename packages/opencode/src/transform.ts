@@ -473,6 +473,19 @@ function applyAutomaticCache1h(parsed: Record<string, unknown>) {
   parsed.cache_control = { ...CACHE_1H_CONTROL }
 }
 
+function setMessageCacheAnchor(message: unknown) {
+  if (!isRecord(message)) return false
+
+  const content = normalizeContentToArray(message.content)
+  if (!content?.length) return setWireCacheControl(message, true)
+
+  message.content = content
+  const lastCacheableBlock = [...content]
+    .reverse()
+    .find((block) => isRecord(block) && block.type !== 'thinking')
+  return setWireCacheControl(lastCacheableBlock ?? message, true)
+}
+
 function applyHybridCache1h(parsed: Record<string, unknown>) {
   removeAllCacheControls(parsed)
   parsed.cache_control = { ...CACHE_1H_CONTROL }
@@ -492,20 +505,23 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   }
 
   if (!Array.isArray(parsed.messages)) return
-  const firstMessage = parsed.messages.find((message) => isRecord(message))
+  const firstMessageIndex = parsed.messages.findIndex((message) =>
+    isRecord(message),
+  )
+  const firstMessage = parsed.messages[firstMessageIndex]
   if (!isRecord(firstMessage)) return
 
-  const content = normalizeContentToArray(firstMessage.content)
-  if (!content?.length) {
-    setWireCacheControl(firstMessage, true)
-    return
-  }
+  setMessageCacheAnchor(firstMessage)
 
-  firstMessage.content = content
-  const lastCacheableBlock = [...content]
-    .reverse()
-    .find((block) => isRecord(block) && block.type !== 'thinking')
-  setWireCacheControl(lastCacheableBlock ?? firstMessage, true)
+  if (parsed.messages.length < 20) return
+  const movingMessageIndex = parsed.messages
+    .slice(0, -1)
+    .findLastIndex(
+      (message, index) => index > firstMessageIndex && isRecord(message),
+    )
+  if (movingMessageIndex < 0) return
+
+  setMessageCacheAnchor(parsed.messages[movingMessageIndex])
 }
 
 function applyCache1hStrategy(
