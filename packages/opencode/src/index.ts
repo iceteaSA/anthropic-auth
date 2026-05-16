@@ -979,13 +979,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               ReturnType<FallbackAccountManager['getUsableFallbackAccounts']>
             >,
             trace?: PerfTrace,
+            existingStorage?: Awaited<ReturnType<typeof loadAccounts>>,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
             const loadStart = nowMs()
-            const storage = await loadAccounts()
+            const storage = existingStorage ?? (await loadAccounts())
             trace?.mark('fallback_load_storage', {
               ms: roundMs(nowMs() - loadStart),
+              cached: !!existingStorage,
             })
             let currentResponse = mainResponse
             let shouldFallback = shouldFallbackStatus(
@@ -1007,7 +1009,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             let accounts = preselectedAccounts
             if (!accounts) {
               const accountsStart = nowMs()
-              accounts = await fallbackManager.getUsableFallbackAccounts()
+              accounts =
+                await fallbackManager.getUsableFallbackAccounts(storage)
               trace?.mark('fallback_get_accounts', {
                 ms: roundMs(nowMs() - accountsStart),
                 accounts: accounts.length,
@@ -1238,7 +1241,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 log('[route] skipping main (killswitch), trying fallbacks')
                 const fallbackStart = nowMs()
                 const allFallbacks =
-                  await fallbackManager.getUsableFallbackAccounts()
+                  await fallbackManager.getUsableFallbackAccounts(storage)
                 preselectedFallbackAccounts =
                   filterKillswitchedFallbacks(allFallbacks)
                 trace.mark('preselect_fallback_accounts', {
@@ -1293,7 +1296,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   if (!quotaSnapshotPassesPolicy(routingQuota, storage)) {
                     const fallbackStart = nowMs()
                     const allFallbacks =
-                      await fallbackManager.getUsableFallbackAccounts()
+                      await fallbackManager.getUsableFallbackAccounts(storage)
                     preselectedFallbackAccounts =
                       filterKillswitchedFallbacks(allFallbacks)
                     trace.mark('preselect_fallback_accounts', {
@@ -1339,6 +1342,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 mainResponse,
                 preselectedFallbackAccounts,
                 trace,
+                storage,
               )
 
               trace.done('return_response', { status: response.status })
