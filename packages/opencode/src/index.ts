@@ -1134,6 +1134,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
               // Killswitch — hard-block before any API call if all accounts
               // are below their configured thresholds.
+              // Eagerly fetch main quota on first request so killswitch can evaluate.
+              if (isKillswitchEnabled(storage) && !mainQuotaCache?.quota) {
+                try {
+                  const ksQuotaStart = nowMs()
+                  await refreshMainQuotaCache(auth.access, storage)
+                  trace.mark('killswitch_eager_quota', {
+                    ms: roundMs(nowMs() - ksQuotaStart),
+                  })
+                } catch {
+                  // Best-effort — if quota fetch fails, skip killswitch
+                }
+              }
               if (isKillswitchEnabled(storage) && mainQuotaCache?.quota) {
                 const mainKilled = !killswitchPassesPolicy(
                   mainQuotaCache.quota,
