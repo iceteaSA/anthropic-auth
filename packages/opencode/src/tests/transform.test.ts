@@ -1060,7 +1060,7 @@ describe('rewriteRequestBody', () => {
     expect(result.messages[1].content[0].cache_control).toBeUndefined()
   })
 
-  test('hybrid mode preserves both original system cache anchors after billing and identity blocks', async () => {
+  test('hybrid mode preserves only the last original system cache anchor after billing and identity blocks', async () => {
     const body = JSON.stringify({
       system: [
         {
@@ -1098,10 +1098,7 @@ describe('rewriteRequestBody', () => {
 
     expect(result.system[0].cache_control).toBeUndefined()
     expect(result.system[1].cache_control).toBeUndefined()
-    expect(result.system[2].cache_control).toEqual({
-      type: 'ephemeral',
-      ttl: '1h',
-    })
+    expect(result.system[2].cache_control).toBeUndefined()
     expect(result.system[3].cache_control).toEqual({
       type: 'ephemeral',
       ttl: '1h',

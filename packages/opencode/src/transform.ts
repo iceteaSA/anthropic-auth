@@ -478,9 +478,15 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   parsed.cache_control = { ...CACHE_1H_CONTROL }
 
   if (Array.isArray(parsed.system)) {
-    for (const block of parsed.system.slice(2).filter(isRecord).slice(0, 2)) {
-      setWireCacheControl(block, true)
-    }
+    const identityIndex = parsed.system.findIndex(
+      (block) => isRecord(block) && block.text === CLAUDE_CODE_IDENTITY,
+    )
+    const cacheableSystemBlocks = parsed.system
+      .slice(identityIndex >= 0 ? identityIndex + 1 : 0)
+      .filter(isRecord)
+    const lastSystemBlock =
+      cacheableSystemBlocks[cacheableSystemBlocks.length - 1]
+    setWireCacheControl(lastSystemBlock, true)
   } else {
     setWireCacheControl(parsed.system, true)
   }
