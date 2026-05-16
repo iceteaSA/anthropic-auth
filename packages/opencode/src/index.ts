@@ -19,6 +19,7 @@ import {
   getKillswitchConfig,
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
+  getQuotaRefreshEveryNRequests,
   getRelayConfig,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -971,7 +972,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             if (mainQuotaCache?.accessToken !== accessToken) {
               return await refreshMainQuotaCache(accessToken, storage)
             }
-            if (now >= mainQuotaCache.refreshAfter) {
+            const everyN = getQuotaRefreshEveryNRequests(storage)
+            const staleByTime = now >= mainQuotaCache.refreshAfter
+            const staleByCount =
+              everyN > 0 && sessionRequestCount % everyN === 0
+            if (staleByTime || staleByCount) {
               refreshMainQuotaCacheInBackground(accessToken, storage)
             }
             return mainQuotaCache.quota
@@ -1138,16 +1143,22 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               // AND re-fetch when the cache is stale so killswitch can un-kill
               // accounts after their quota windows reset.
               if (isKillswitchEnabled(storage)) {
+                const ksEveryN = getQuotaRefreshEveryNRequests(storage)
                 const needsRefresh =
                   !mainQuotaCache?.quota ||
-                  Date.now() >= mainQuotaCache.refreshAfter
+                  Date.now() >= mainQuotaCache.refreshAfter ||
+                  (ksEveryN > 0 && sessionRequestCount % ksEveryN === 0)
                 if (needsRefresh) {
                   try {
                     const ksQuotaStart = nowMs()
                     await refreshMainQuotaCache(auth.access, storage)
                     trace.mark('killswitch_quota_refresh', {
                       ms: roundMs(nowMs() - ksQuotaStart),
-                      reason: mainQuotaCache?.quota ? 'stale' : 'first_request',
+                      reason: !mainQuotaCache?.quota
+                        ? 'first_request'
+                        : ksEveryN > 0 && sessionRequestCount % ksEveryN === 0
+                          ? 'request_count'
+                          : 'stale',
                     })
                   } catch {
                     // Best-effort — if quota fetch fails, use stale cache

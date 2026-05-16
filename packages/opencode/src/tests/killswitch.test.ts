@@ -7,6 +7,7 @@ import {
   type AccountStorage,
   executeKillswitchCommand,
   getKillswitchConfig,
+  getQuotaRefreshEveryNRequests,
   isKillswitchEnabled,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
@@ -451,5 +452,49 @@ describe('executeKillswitchCommand', () => {
     })
     expect(result.text).toContain('/killswitch')
     expect(result.updatedConfig).toBeUndefined()
+  })
+})
+
+describe('getQuotaRefreshEveryNRequests', () => {
+  test('returns 0 when quota config is missing', () => {
+    expect(getQuotaRefreshEveryNRequests(null)).toBe(0)
+    expect(
+      getQuotaRefreshEveryNRequests({ ...baseStorage(), quota: undefined }),
+    ).toBe(0)
+  })
+
+  test('returns 0 when refreshEveryNRequests is not set', () => {
+    const storage = baseStorage()
+    expect(getQuotaRefreshEveryNRequests(storage)).toBe(0)
+  })
+
+  test('returns the configured value', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota!, refreshEveryNRequests: 3 }
+    expect(getQuotaRefreshEveryNRequests(storage)).toBe(3)
+  })
+
+  test('returns 0 for zero or negative values', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota!, refreshEveryNRequests: 0 }
+    expect(getQuotaRefreshEveryNRequests(storage)).toBe(0)
+
+    storage.quota = { ...storage.quota!, refreshEveryNRequests: -1 }
+    expect(getQuotaRefreshEveryNRequests(storage)).toBe(0)
+  })
+
+  test('floors fractional values', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota!, refreshEveryNRequests: 3.7 }
+    expect(getQuotaRefreshEveryNRequests(storage)).toBe(3)
+  })
+
+  test('returns 0 for NaN/Infinity', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota!, refreshEveryNRequests: NaN }
+    expect(getQuotaRefreshEveryNRequests(storage)).toBe(0)
+
+    storage.quota = { ...storage.quota!, refreshEveryNRequests: Infinity }
+    expect(getQuotaRefreshEveryNRequests(storage)).toBe(0)
   })
 })

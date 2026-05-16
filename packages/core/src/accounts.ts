@@ -71,6 +71,7 @@ export type AccountStorage = {
   quota?: {
     enabled?: boolean
     checkIntervalMinutes?: number
+    refreshEveryNRequests?: number
     minimumRemaining?: Partial<Record<QuotaWindowName | '5h' | '1w', number>>
     failClosedOnUnknownQuota?: boolean
   }
@@ -418,6 +419,19 @@ export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
   const minutes =
     storage?.quota?.checkIntervalMinutes ?? DEFAULT_QUOTA_CHECK_INTERVAL_MINUTES
   return Math.max(1, minutes) * 60_000
+}
+
+/**
+ * How often (in requests) to force a quota refresh, independent of the timer.
+ * Returns 0 when disabled (default).
+ */
+export function getQuotaRefreshEveryNRequests(
+  storage: AccountStorage | null,
+): number {
+  const n = storage?.quota?.refreshEveryNRequests
+  return typeof n === 'number' && Number.isFinite(n) && n > 0
+    ? Math.floor(n)
+    : 0
 }
 
 function failClosedOnUnknownQuota(storage: AccountStorage | null) {
