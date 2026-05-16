@@ -226,6 +226,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   setDumpEnabled(isDumpPersistentlyEnabled(initialCache1hStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialCache1hStorage))
   let sessionRequestCount = 0
+  let mainQuotaCache: MainQuotaCache | null = null
+  let mainQuotaRefreshPromise: Promise<OAuthQuotaSnapshot> | null = null
+  let mainQuotaRetryAfter = 0
+  const fallbackQuotaCache = new Map<string, FallbackQuotaCacheEntry>()
 
   function writeQuotaFileInBackground(
     mainQuota: OAuthQuotaSnapshot | null,
@@ -373,10 +377,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       try {
         const auth = await latestGetAuth()
         if (auth.type === 'oauth' && auth.access) {
+          // Prefer cached quota to avoid hitting the usage API unnecessarily
+          const quota =
+            mainQuotaCache?.quota ??
+            (await fetchOAuthQuotaSnapshot({ accessToken: auth.access }))
           accounts.push({
             name: 'OpenCode anthropic',
             role: 'main',
-            quota: await fetchOAuthQuotaSnapshot({ accessToken: auth.access }),
+            quota,
           })
         } else if (auth.type === 'oauth') {
           accounts.push({
@@ -387,22 +395,39 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           })
         }
       } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
         accounts.push({
           name: 'OpenCode anthropic',
           role: 'main',
-          error: error instanceof Error ? error.message : String(error),
+          error: msg.includes('429')
+            ? 'Usage API rate limited — try again in a moment'
+            : msg,
         })
       }
     }
 
-    const { storage, errors } =
-      await fallbackManager.refreshQuotaForAllAccounts()
-    accounts.push(
-      ...buildFallbackQuotaSummaries(
-        storage,
-        new Map(errors.map((error) => [error.accountId, error.message])),
-      ),
+    // Prefer in-memory fallback quota cache; only live-fetch if no cache exists
+    const storage = await loadAccounts()
+    const hasCachedFallbacks = (storage?.accounts ?? []).some(
+      (a) => a.enabled !== false && fallbackQuotaCache.has(a.id),
     )
+    if (hasCachedFallbacks) {
+      // Overlay cached quota onto storage accounts for display
+      for (const account of storage?.accounts ?? []) {
+        const cached = fallbackQuotaCache.get(account.id)
+        if (cached) account.quota = cached.quota
+      }
+      accounts.push(...buildFallbackQuotaSummaries(storage, new Map()))
+    } else {
+      const { storage: refreshed, errors } =
+        await fallbackManager.refreshQuotaForAllAccounts()
+      accounts.push(
+        ...buildFallbackQuotaSummaries(
+          refreshed,
+          new Map(errors.map((error) => [error.accountId, error.message])),
+        ),
+      )
+    }
 
     if (!latestGetAuth) {
       accounts.unshift({
@@ -597,10 +622,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           // Shared inflight refresh promise — prevents concurrent token refreshes
           // from racing against each other (and causing 401 cascades with token rotation)
           let refreshPromise: Promise<string> | null = null
-          let mainQuotaCache: MainQuotaCache | null = null
-          let mainQuotaRefreshPromise: Promise<OAuthQuotaSnapshot> | null = null
-          let mainQuotaRetryAfter = 0
-          const fallbackQuotaCache = new Map<string, FallbackQuotaCacheEntry>()
 
           async function refreshMainAccessToken() {
             if (!refreshPromise) {
