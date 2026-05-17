@@ -1106,6 +1106,39 @@ function headersToObject(headers) {
   return result
 }
 
+const SKIP_ERROR_LOG_STATUSES = new Set([429, 403])
+
+async function logUpstreamError(env, ctx, upstream, meta) {
+  if (!upstream.status || upstream.status < 400 || SKIP_ERROR_LOG_STATUSES.has(upstream.status)) return
+  try {
+    const body = await upstream.clone().text()
+    const key = 'error:' + Date.now() + ':' + (meta.id || meta.affinity || 'unknown')
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      status: upstream.status,
+      statusText: upstream.statusText,
+      transport: meta.transport,
+      mode: meta.mode,
+      affinity: meta.affinity,
+      id: meta.id,
+      bodyBytes: meta.bodyBytes,
+      responseBody: body.slice(0, 50000),
+      responseHeaders: headersToObject(upstream.headers),
+    })
+    const kvWrite = env.RELAY_STATE.put(key, entry, { expirationTtl: 604800 }).catch(() => {})
+    if (ctx?.waitUntil) ctx.waitUntil(kvWrite)
+    else void kvWrite
+    console.error(JSON.stringify({
+      relay: 'opencode-anthropic-auth',
+      event: 'upstream_error',
+      status: upstream.status,
+      transport: meta.transport,
+      affinity: String(meta.affinity || '').slice(0, 12),
+      responsePreview: body.slice(0, 500),
+    }))
+  } catch {}
+}
+
 async function handleRelayPayload(env, payload) {
   const prepared = await prepareUpstream(env, payload)
   if (prepared.error) return prepared
@@ -1143,6 +1176,20 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
     })
     ctx?.waitUntil?.(result.checkpoint)
     const upstream = await upstreamPromise
+
+    // Log non-429/403 errors to KV for debugging
+    if (upstream.status >= 400 && !SKIP_ERROR_LOG_STATUSES.has(upstream.status)) {
+      const errorLog = logUpstreamError(env, ctx, upstream.clone(), {
+        transport: 'websocket',
+        mode: payload.mode,
+        affinity: payload.affinity,
+        id: payload.id,
+        bodyBytes: result.body.length,
+      })
+      if (ctx?.waitUntil) ctx.waitUntil(errorLog)
+      else void errorLog
+    }
+
     socket.send(JSON.stringify({
       protocol: 2,
       type: 'response_start',
@@ -1234,6 +1281,12 @@ export default {
     if (result.error) return Response.json({ error: result.error }, { status: result.status })
 
     const upstream = result.upstream
+    await logUpstreamError(env, ctx, upstream, {
+      transport: 'http',
+      mode: payload.mode,
+      affinity: payload.affinity,
+      bodyBytes: payload.body?.length ?? 0,
+    })
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
