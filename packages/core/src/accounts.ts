@@ -100,6 +100,7 @@ export type AccountManagerOptions = {
   now?: () => number
   fetchImpl?: typeof fetch
   configPath?: string
+  quotaManager?: import('./quota-manager.ts').QuotaManager
 }
 
 export type AccountRefreshError = {
@@ -567,11 +568,37 @@ export class FallbackAccountManager {
   private readonly refreshPromises = new Map<string, Promise<OAuthAccount>>()
   private refreshTimer: ReturnType<typeof setInterval> | null = null
   private quotaTimer: ReturnType<typeof setInterval> | null = null
+  readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
 
   constructor(options: AccountManagerOptions = {}) {
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl ?? fetch
     this.configPath = options.configPath ?? getAccountStoragePath()
+    this.quotaManager = options.quotaManager ?? null
+  }
+
+  /**
+   * Seed QuotaManager from persisted account.quota if no cache entry exists
+   * yet. Prevents unnecessary API calls when the on-disk snapshot is fresh.
+   */
+  private seedFallbackQuota(
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ): void {
+    if (!this.quotaManager) return
+    if (this.quotaManager.getFallback(account.id)) return
+    if (!account.quota) return
+    const checkedAt = Math.max(
+      account.quota.five_hour?.checkedAt ?? 0,
+      account.quota.seven_day?.checkedAt ?? 0,
+    )
+    if (checkedAt <= 0) return
+    const checkInterval = getQuotaCheckIntervalMs(storage)
+    this.quotaManager.setFallback(account.id, {
+      quota: account.quota,
+      refreshAfter: checkedAt + checkInterval,
+      checkedAt,
+    })
   }
 
   async load() {
@@ -620,7 +647,11 @@ export class FallbackAccountManager {
           next = await this.refreshAccount(next, storage)
           changed = true
         }
-        if (quotaIsStale(next, storage, this.now())) {
+        this.seedFallbackQuota(next, storage)
+        const stale = this.quotaManager
+          ? this.quotaManager.isFallbackStale(next.id)
+          : quotaIsStale(next, storage, this.now())
+        if (stale) {
           next = await this.refreshAccountQuota(next, storage)
           changed = true
         }
@@ -684,7 +715,13 @@ export class FallbackAccountManager {
           next = await this.refreshAccount(next, storage)
           changed = true
         }
-        if (!quotaIsStale(next, storage, this.now())) continue
+        this.seedFallbackQuota(next, storage)
+        // Use QuotaManager staleness when available (shared cache);
+        // fall back to per-account on-disk staleness otherwise.
+        const stale = this.quotaManager
+          ? this.quotaManager.isFallbackStale(next.id)
+          : quotaIsStale(next, storage, this.now())
+        if (!stale) continue
         await this.refreshAccountQuota(next, storage)
         changed = true
       } catch (error) {
@@ -810,6 +847,15 @@ export class FallbackAccountManager {
     }
     target.lastQuotaRefreshError = undefined
     updateStoredAccount(storage, target)
+    // Sync to shared QuotaManager so all consumers see the same cache
+    if (this.quotaManager && target.quota) {
+      const now = this.now()
+      this.quotaManager.setFallback(target.id, {
+        quota: target.quota,
+        refreshAfter: now + getQuotaCheckIntervalMs(storage),
+        checkedAt: now,
+      })
+    }
     return target
   }
 }
