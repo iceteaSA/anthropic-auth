@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import {
   authorize,
   CLIENT_ID,
+  ClaudeOAuthRefreshError,
   CODE_CALLBACK_URL,
   exchange,
   OAUTH_SCOPES,
@@ -150,6 +151,91 @@ describe('exchange', () => {
   })
 })
 
+describe('ClaudeOAuthRefreshError', () => {
+  test('exposes status and body', () => {
+    const error = new ClaudeOAuthRefreshError(429, 'rate limited')
+    expect(error.status).toBe(429)
+    expect(error.body).toBe('rate limited')
+    expect(error.message).toContain('429')
+    expect(error.name).toBe('ClaudeOAuthRefreshError')
+  })
+
+  test('accepts optional retryAfter seconds', () => {
+    const error = new ClaudeOAuthRefreshError(429, 'rate limited', 120)
+    expect(error.status).toBe(429)
+    expect(error.body).toBe('rate limited')
+    expect(error.retryAfter).toBe(120)
+  })
+
+  test('retryAfter is undefined when not provided', () => {
+    const error = new ClaudeOAuthRefreshError(429, 'rate limited')
+    expect(error.retryAfter).toBeUndefined()
+  })
+
+  test('parses Retry-After header in seconds format', async () => {
+    let thrownError: ClaudeOAuthRefreshError | null = null
+    spyOn(globalThis, 'fetch').mockImplementation((() =>
+      Promise.resolve(
+        new Response('rate limited', {
+          status: 429,
+          headers: { 'retry-after': '300' },
+        }),
+      )) as unknown as typeof fetch)
+
+    try {
+      await refreshClaudeOAuthToken({ refreshToken: 'test' })
+    } catch (e) {
+      if (e instanceof ClaudeOAuthRefreshError) thrownError = e
+    }
+
+    expect(thrownError?.status).toBe(429)
+    expect(thrownError?.body).toBe('rate limited')
+    expect(thrownError?.retryAfter).toBe(300)
+  })
+
+  test('parses Retry-After header in HTTP-date format', async () => {
+    const now = Date.parse('2026-05-17T14:25:00.000Z')
+    const futureDate = new Date(now + 600_000).toUTCString()
+    spyOn(globalThis, 'fetch').mockImplementation((() =>
+      Promise.resolve(
+        new Response('rate limited', {
+          status: 429,
+          headers: { 'retry-after': futureDate },
+        }),
+      )) as unknown as typeof fetch)
+
+    let thrownError: ClaudeOAuthRefreshError | null = null
+    try {
+      await refreshClaudeOAuthToken({ refreshToken: 'test', now: () => now })
+    } catch (e) {
+      if (e instanceof ClaudeOAuthRefreshError) thrownError = e
+    }
+
+    expect(thrownError?.status).toBe(429)
+    expect(thrownError?.retryAfter).toBe(600)
+  })
+
+  test('retryAfter is undefined for invalid Retry-After header', async () => {
+    spyOn(globalThis, 'fetch').mockImplementation((() =>
+      Promise.resolve(
+        new Response('rate limited', {
+          status: 429,
+          headers: { 'retry-after': 'not-a-number' },
+        }),
+      )) as unknown as typeof fetch)
+
+    let thrownError: ClaudeOAuthRefreshError | null = null
+    try {
+      await refreshClaudeOAuthToken({ refreshToken: 'test' })
+    } catch (e) {
+      if (e instanceof ClaudeOAuthRefreshError) thrownError = e
+    }
+
+    expect(thrownError?.status).toBe(429)
+    expect(thrownError?.retryAfter).toBeUndefined()
+  })
+})
+
 describe('refreshClaudeOAuthToken', () => {
   test('uses Anthropic platform JSON refresh path and preserves omitted refresh rotations', async () => {
     let capturedUrl: string | undefined
@@ -184,5 +270,24 @@ describe('refreshClaudeOAuthToken', () => {
       expires: 3_601_000,
       expiresIn: 3600,
     })
+  })
+
+  test('does not retry 429 — throws immediately with retryAfter', async () => {
+    let callCount = 0
+    spyOn(globalThis, 'fetch').mockImplementation((() => {
+      callCount++
+      return Promise.resolve(
+        new Response('rate limited', {
+          status: 429,
+          headers: { 'retry-after': '120' },
+        }),
+      )
+    }) as unknown as typeof fetch)
+
+    await expect(
+      refreshClaudeOAuthToken({ refreshToken: 'test' }),
+    ).rejects.toThrow('Claude OAuth refresh failed: 429')
+
+    expect(callCount).toBe(1)
   })
 })

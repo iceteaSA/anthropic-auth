@@ -2082,4 +2082,460 @@ describe('auth.loader', () => {
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
     expect(response.status).toBe(200)
   })
+
+  test('oauth 429 retry-after sets request-time cooldown', async () => {
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenCalls++
+        return Promise.resolve(
+          new Response('rate limited', {
+            status: 429,
+            headers: { 'retry-after': '180' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired-token',
+          refresh: 'old-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    // Retry-After: 180 < backoff floor 300 — cooldown floored to 300
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+    })
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+      retryAfter: 300,
+    })
+
+    expect(tokenCalls).toBe(1)
+  })
+
+  test('oauth 429 without retry-after uses five minute cooldown', async () => {
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenCalls++
+        return Promise.resolve(new Response('rate limited', { status: 429 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired-token',
+          refresh: 'old-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+    })
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+      retryAfter: 300,
+    })
+
+    expect(tokenCalls).toBe(1)
+  })
+
+  test('short retry-after does not bypass backoff floor and escalates', async () => {
+    const originalDateNow = Date.now
+    let now = 1_000_000
+    let tokenCalls = 0
+    Date.now = mock(() => now) as unknown as typeof Date.now
+
+    try {
+      globalThis.fetch = mock((input: any) => {
+        const url = extractUrl(input)
+        if (url.includes('/v1/oauth/token')) {
+          tokenCalls++
+          return Promise.resolve(
+            new Response('rate limited', {
+              status: 429,
+              headers: { 'retry-after': '30' },
+            }),
+          )
+        }
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'expired-token',
+            refresh: 'old-refresh',
+            expires: Date.now() - 1000,
+          }),
+        { models: {} },
+      )
+
+      // First 429 with Retry-After: 30 — should be floored to 300s (5min backoff)
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({ status: 429 })
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({ status: 429, retryAfter: 300 })
+
+      // Advance past 300s cooldown
+      now += 301_000
+      expect(tokenCalls).toBe(1)
+
+      // Second 429 with Retry-After: 30 — backoff should escalate to 600s
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({ status: 429 })
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({ status: 429, retryAfter: 600 })
+      expect(tokenCalls).toBe(2)
+    } finally {
+      Date.now = originalDateNow
+    }
+  })
+
+  test('large retry-after overrides backoff when larger', async () => {
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenCalls++
+        return Promise.resolve(
+          new Response('rate limited', {
+            status: 429,
+            headers: { 'retry-after': '900' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired-token',
+          refresh: 'old-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    // Retry-After: 900 > backoff 300 — should use 900
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+    })
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+      retryAfter: 900,
+    })
+    expect(tokenCalls).toBe(1)
+  })
+
+  test('retry-after zero uses backoff (Anthropic sends 0 while still limited)', async () => {
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenCalls++
+        return Promise.resolve(
+          new Response('rate limited', {
+            status: 429,
+            headers: { 'retry-after': '0' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired-token',
+          refresh: 'old-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    // Retry-After: 0 must NOT mean "retry immediately" — use 300s backoff
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+    })
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+      retryAfter: 300,
+    })
+    expect(tokenCalls).toBe(1)
+  })
+
+  test('background refresh skips during cooldown', async () => {
+    const intervalHandlers: Array<() => void> = []
+    globalThis.setInterval = mock((handler: () => void) => {
+      intervalHandlers.push(handler)
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
+
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenCalls++
+        return Promise.resolve(
+          new Response('rate limited', {
+            status: 429,
+            headers: { 'retry-after': '300' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: Date.now() + 5 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const runBackgroundRefresh = intervalHandlers[intervalHandlers.length - 1]
+    expect(runBackgroundRefresh).toBeFunction()
+
+    runBackgroundRefresh!()
+    await new Promise((resolve) => originalSetTimeout(resolve, 0))
+    expect(tokenCalls).toBe(1)
+
+    runBackgroundRefresh!()
+    await new Promise((resolve) => originalSetTimeout(resolve, 0))
+    expect(tokenCalls).toBe(1)
+  })
+
+  test('background refresh 429 sets cooldown', async () => {
+    const intervalHandlers: Array<() => void> = []
+    globalThis.setInterval = mock((handler: () => void) => {
+      intervalHandlers.push(handler)
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
+
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenCalls++
+        return Promise.resolve(
+          new Response('rate limited', {
+            status: 429,
+            headers: { 'retry-after': '300' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: Date.now() + 5 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const runBackgroundRefresh = intervalHandlers[intervalHandlers.length - 1]
+    expect(runBackgroundRefresh).toBeFunction()
+
+    runBackgroundRefresh!()
+    await new Promise((resolve) => originalSetTimeout(resolve, 0))
+    expect(tokenCalls).toBe(1)
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired-token',
+          refresh: 'old-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toMatchObject({
+      status: 429,
+      retryAfter: 300,
+    })
+    expect(tokenCalls).toBe(1)
+  })
+
+  test('successful refresh clears cooldown', async () => {
+    const originalDateNow = Date.now
+    let now = 1_000_000
+    let tokenCalls = 0
+    Date.now = mock(() => now) as unknown as typeof Date.now
+
+    try {
+      globalThis.fetch = mock((input: any) => {
+        const url = extractUrl(input)
+        if (url.includes('/v1/oauth/token')) {
+          tokenCalls++
+          if (tokenCalls === 2) {
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  refresh_token: 'new-refresh',
+                  access_token: 'new-access',
+                  expires_in: 3600,
+                }),
+                { status: 200 },
+              ),
+            )
+          }
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'expired-token',
+            refresh: 'old-refresh',
+            expires: Date.now() - 1000,
+          }),
+        { models: {} },
+      )
+
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({
+        status: 429,
+      })
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({
+        retryAfter: 300,
+      })
+
+      now += 301_000
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({
+        status: 429,
+      })
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({
+        retryAfter: 300,
+      })
+      expect(tokenCalls).toBe(3)
+    } finally {
+      Date.now = originalDateNow
+    }
+  })
+
+  test('request-time refresh fails fast during cooldown', async () => {
+    let tokenCalls = 0
+    let firstCall = true
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenCalls++
+        if (firstCall) {
+          firstCall = false
+          // First token call returns 429, setting cooldown
+          return Promise.resolve(
+            new Response('rate limited', {
+              status: 429,
+              headers: { 'retry-after': '600' },
+            }),
+          )
+        }
+        // Subsequent calls should not happen during cooldown
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired-token',
+          refresh: 'old-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    // First request triggers cooldown
+    try {
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+    } catch {
+      // Expected to fail on 429
+    }
+
+    expect(tokenCalls).toBe(1)
+
+    // Second request during cooldown should fail fast without calling token endpoint
+    let secondRequestFailedWith429 = false
+    try {
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('429')) {
+        secondRequestFailedWith429 = true
+      }
+    }
+
+    // Token endpoint should NOT have been called again (still only 1 call)
+    expect(tokenCalls).toBe(1)
+    expect(secondRequestFailedWith429).toBe(true)
+  })
 })

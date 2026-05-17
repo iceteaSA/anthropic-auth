@@ -65,6 +65,8 @@ import {
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 30
+const MAIN_AUTH_REFRESH_429_INITIAL_BACKOFF_MS = 5 * 60_000
+const MAIN_AUTH_REFRESH_429_MAX_BACKOFF_MS = 30 * 60_000
 
 type NotificationRequest = {
   path: { id: string }
@@ -221,9 +223,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   /**
    * Show a toast notification with quota usage bars.
    *
+   * `activeAccountId` marks which account is currently routable:
+   *   - `'main'` → main account is active
+   *   - a fallback ID → that fallback is active
+   *   - omitted → no active indicator shown
+   *
    * The optional `isKilled` callback allows killswitch integration
    * without coupling the toast to killswitch logic. When omitted,
-   * quota bars are shown without killed/active annotations.
+   * no killed annotations are shown.
    */
   function showQuotaToast(
     quota: OAuthQuotaSnapshot | null,
@@ -232,6 +239,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       label?: string
       quota?: OAuthQuotaSnapshot
     }>,
+    activeAccountId?: string,
     isKilled?: (
       quota: OAuthQuotaSnapshot | undefined,
       accountId?: string,
@@ -246,8 +254,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const sd = quota.seven_day
       if (fh || sd) {
         const mainKilled = isKilled?.(quota) ?? false
-        const lines: string[] = []
-        if (mainKilled) lines.push('⛔ KILLED')
+        const mainActive = activeAccountId === 'main'
+        const indicator = mainKilled ? '🔴' : mainActive ? '🟢' : '  '
+        const lines: string[] = [`${indicator} main`]
         if (fh) {
           lines.push(
             `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
@@ -274,8 +283,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         if (!fh && !sd) continue
         const name = fb.label || 'alt'
         const fbKilled = isKilled?.(q, fb.id) ?? false
-        const status = fbKilled ? ' ⛔ KILLED' : ''
-        const lines: string[] = [`── ${name}${status} ──`]
+        const fbActive = activeAccountId === fb.id
+        const indicator = fbKilled ? '🔴' : fbActive ? '🟢' : '  '
+        const lines: string[] = [`${indicator} ${name}`]
         if (fh) {
           lines.push(
             `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
@@ -318,6 +328,42 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }>)
     | null = null
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
+  let mainRefreshBlockedUntil = 0
+  let mainRefresh429BackoffMs = 0
+
+  function mainRefreshCooldownRemainingMs(now = Date.now()) {
+    return Math.max(0, mainRefreshBlockedUntil - now)
+  }
+
+  function noteMainRefreshRateLimited(
+    error: ClaudeOAuthRefreshError,
+    now = Date.now(),
+  ) {
+    // Always escalate backoff counter, even when Retry-After is present.
+    // Prevents a server sending repeated short Retry-After values from
+    // bypassing our exponential backoff (e.g. Retry-After: 30 every time).
+    mainRefresh429BackoffMs =
+      mainRefresh429BackoffMs === 0
+        ? MAIN_AUTH_REFRESH_429_INITIAL_BACKOFF_MS
+        : Math.min(
+            mainRefresh429BackoffMs * 2,
+            MAIN_AUTH_REFRESH_429_MAX_BACKOFF_MS,
+          )
+
+    const retryAfterMs =
+      typeof error.retryAfter === 'number' && error.retryAfter > 0
+        ? error.retryAfter * 1000
+        : undefined
+
+    // Use the larger of server's Retry-After and our backoff
+    mainRefreshBlockedUntil =
+      now + Math.max(retryAfterMs ?? 0, mainRefresh429BackoffMs)
+  }
+
+  function clearMainRefreshRateLimit() {
+    mainRefresh429BackoffMs = 0
+    mainRefreshBlockedUntil = 0
+  }
 
   function mainRefreshBeforeExpiryMs(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -589,6 +635,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           let refreshPromise: Promise<string> | null = null
 
           async function refreshMainAccessToken() {
+            const cooldownMs = mainRefreshCooldownRemainingMs()
+            if (cooldownMs > 0) {
+              throw new ClaudeOAuthRefreshError(
+                429,
+                `OAuth refresh temporarily rate-limited; retry in ${Math.ceil(
+                  cooldownMs / 1000,
+                )}s`,
+                Math.ceil(cooldownMs / 1000),
+              )
+            }
+
             if (!refreshPromise) {
               refreshPromise = (async () => {
                 const maxRetries = 2
@@ -622,6 +679,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     } catch (error) {
                       if (
                         error instanceof ClaudeOAuthRefreshError &&
+                        error.status === 429
+                      ) {
+                        noteMainRefreshRateLimited(error)
+                        throw error
+                      }
+                      if (
+                        error instanceof ClaudeOAuthRefreshError &&
                         error.status >= 500 &&
                         attempt < maxRetries
                       ) {
@@ -643,6 +707,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       },
                     })
 
+                    clearMainRefreshRateLimit()
                     return refreshed.access
                   } catch (error) {
                     const isNetworkError =
@@ -692,11 +757,30 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   return
                 }
 
+                const cooldownMs = mainRefreshCooldownRemainingMs()
+                if (cooldownMs > 0) {
+                  log('[refresh] opencode main oauth skipped during cooldown', {
+                    retryInSeconds: Math.ceil(cooldownMs / 1000),
+                  })
+                  return
+                }
+
                 await refreshMainAccessToken()
                 log('[refresh] opencode main oauth refreshed in background', {
                   expires: latestAuth.expires,
                 })
               } catch (error) {
+                if (
+                  error instanceof ClaudeOAuthRefreshError &&
+                  error.status === 429
+                ) {
+                  log('[refresh] opencode main oauth refresh rate limited', {
+                    retryInSeconds: Math.ceil(
+                      mainRefreshCooldownRemainingMs() / 1000,
+                    ),
+                  })
+                  return
+                }
                 log('[refresh] opencode main oauth refresh failed', {
                   message:
                     error instanceof Error ? error.message : String(error),
@@ -1089,6 +1173,34 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               quotaManager.seedFallbacksFromAccounts(storage?.accounts ?? [])
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
 
+              /** Show quota toast from current QuotaManager state */
+              function showQuotaToastFromCache() {
+                const mainEntry = quotaManager.getMain()
+                if (!mainEntry) return
+                const fallbacks = (storage?.accounts ?? []).filter(
+                  (a) => a.enabled !== false,
+                )
+                const ksEnabled = isKillswitchEnabled(storage)
+                const ksIsKilled = ksEnabled
+                  ? (q: OAuthQuotaSnapshot | undefined, id?: string) =>
+                      !killswitchPassesPolicy(q, storage, id)
+                  : undefined
+                const mainPassesPolicy = quotaSnapshotPassesPolicy(
+                  mainEntry.quota,
+                  storage,
+                )
+                const mainIsKilled = ksIsKilled?.(mainEntry.quota) ?? false
+                let activeId: string | undefined
+                if (!mainIsKilled && mainPassesPolicy) {
+                  activeId = 'main'
+                } else {
+                  activeId = fallbacks.find(
+                    (fb) => !(ksIsKilled?.(fb.quota, fb.id) ?? false),
+                  )?.id
+                }
+                showQuotaToast(mainEntry.quota, fallbacks, activeId, ksIsKilled)
+              }
+
               // Killswitch — hard-block before any API call if all accounts
               // are below their configured thresholds.
               // Eagerly fetch main quota on first request so killswitch can evaluate,
@@ -1118,20 +1230,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       ms: roundMs(nowMs() - ksQuotaStart),
                       reason,
                     })
-                    // Show toast after successful refresh
-                    const mainEntry = quotaManager.getMain()
-                    if (mainEntry) {
-                      const fallbacks = (storage?.accounts ?? []).filter(
-                        (a) => a.enabled !== false,
-                      )
-                      showQuotaToast(
-                        mainEntry.quota,
-                        fallbacks,
-                        isKillswitchEnabled(storage)
-                          ? (q, id) => !killswitchPassesPolicy(q, storage, id)
-                          : undefined,
-                      )
-                    }
+                    showQuotaToastFromCache()
                   } catch {
                     // Best-effort — if quota fetch fails, use stale cache
                   }
@@ -1297,6 +1396,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   let routingQuota = quotaManager.getMain()?.quota
                   if (!routingQuota) {
                     routingQuota = await quotaManager.refreshMain(auth.access)
+                    showQuotaToastFromCache()
                   } else if (quotaManager.needsRefresh(sessionRequestCount)) {
                     // Background refresh — return stale to avoid blocking
                     quotaManager.refreshMainInBackground(auth.access)
