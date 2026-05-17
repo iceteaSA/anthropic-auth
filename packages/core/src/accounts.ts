@@ -606,8 +606,9 @@ export class FallbackAccountManager {
     this.quotaTimer = null
   }
 
-  async getUsableFallbackAccounts() {
-    const storage = await this.load()
+  async getUsableFallbackAccounts(existingStorage?: AccountStorage | null) {
+    const storage =
+      existingStorage !== undefined ? existingStorage : await this.load()
     if (!storage) return []
     const usable: OAuthAccount[] = []
     let changed = false
