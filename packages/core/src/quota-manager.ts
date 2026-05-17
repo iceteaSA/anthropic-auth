@@ -18,6 +18,9 @@ import {
   getQuotaRefreshEveryNRequests,
 } from './accounts.ts'
 
+// Capture real setTimeout before tests can mock globalThis.setTimeout
+const nativeSetTimeout = globalThis.setTimeout
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -51,6 +54,10 @@ export class QuotaManager {
   // --- Rate-limiting ---
   private apiBackoffUntil = 0
   private static readonly BACKOFF_MS = 60_000
+
+  // --- Serial API gate (prevents concurrent quota API calls) ---
+  private apiGate: Promise<unknown> = Promise.resolve()
+  private lastApiCallAt = 0
 
   // --- Config ---
   private storage: AccountStorage | null
@@ -235,52 +242,95 @@ export class QuotaManager {
   // Private
   // =========================================================================
 
-  private async _fetchMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
-    try {
-      const quota = await fetchOAuthQuotaSnapshot({
-        accessToken,
-        fetchImpl: this.fetchImpl,
-        now: this.now,
-      })
-      const now = this.now()
-      this.mainAccessToken = accessToken
-      this.main = {
-        quota,
-        refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
-        checkedAt: now,
+  /** Minimum gap between consecutive quota API calls (ms). */
+  private static readonly API_CALL_GAP_MS = 1_000
+
+  /**
+   * Serialize API calls through a shared gate so only one
+   * quota API request runs at a time, with a minimum gap
+   * between calls. Prevents concurrent and rapid-fire calls
+   * from triggering Anthropic's rate limits.
+   */
+  private _enqueueApiFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const gatedFn = async (): Promise<T> => {
+      // Wait until minimum gap since last API call
+      const elapsed = this.now() - this.lastApiCallAt
+      if (elapsed < QuotaManager.API_CALL_GAP_MS) {
+        await new Promise<void>((r) => {
+          const id = nativeSetTimeout(r, QuotaManager.API_CALL_GAP_MS - elapsed)
+          if (typeof id === 'object' && 'unref' in id) id.unref()
+        })
       }
-      return quota
-    } catch (error) {
-      this._handleFetchError(error)
-      throw error
-    } finally {
-      this.inflightMain = null
+      this.lastApiCallAt = this.now()
+      return fn()
     }
+    const queued = this.apiGate.then(gatedFn, gatedFn)
+    this.apiGate = queued.catch(() => {})
+    return queued
+  }
+
+  private async _fetchMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
+    return this._enqueueApiFetch(async () => {
+      try {
+        // Re-check backoff inside gate — may have been set by
+        // a preceding queued call while we waited
+        if (this.now() < this.apiBackoffUntil) {
+          if (this.main) return this.main.quota
+          throw new Error('Quota API rate-limited — try again later')
+        }
+        const quota = await fetchOAuthQuotaSnapshot({
+          accessToken,
+          fetchImpl: this.fetchImpl,
+          now: this.now,
+        })
+        const now = this.now()
+        this.mainAccessToken = accessToken
+        this.main = {
+          quota,
+          refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
+          checkedAt: now,
+        }
+        return quota
+      } catch (error) {
+        this._handleFetchError(error)
+        throw error
+      } finally {
+        this.inflightMain = null
+      }
+    })
   }
 
   private async _fetchFallback(
     accountId: string,
     accessToken: string,
   ): Promise<OAuthQuotaSnapshot> {
-    try {
-      const quota = await fetchOAuthQuotaSnapshot({
-        accessToken,
-        fetchImpl: this.fetchImpl,
-        now: this.now,
-      })
-      const now = this.now()
-      this.fallbacks.set(accountId, {
-        quota,
-        refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
-        checkedAt: now,
-      })
-      return quota
-    } catch (error) {
-      this._handleFetchError(error)
-      throw error
-    } finally {
-      this.inflightFallbacks.delete(accountId)
-    }
+    return this._enqueueApiFetch(async () => {
+      try {
+        // Re-check backoff inside gate
+        if (this.now() < this.apiBackoffUntil) {
+          const cached = this.fallbacks.get(accountId)
+          if (cached) return cached.quota
+          throw new Error('Quota API rate-limited — try again later')
+        }
+        const quota = await fetchOAuthQuotaSnapshot({
+          accessToken,
+          fetchImpl: this.fetchImpl,
+          now: this.now,
+        })
+        const now = this.now()
+        this.fallbacks.set(accountId, {
+          quota,
+          refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
+          checkedAt: now,
+        })
+        return quota
+      } catch (error) {
+        this._handleFetchError(error)
+        throw error
+      } finally {
+        this.inflightFallbacks.delete(accountId)
+      }
+    })
   }
 
   private _handleFetchError(error: unknown): void {

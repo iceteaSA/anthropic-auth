@@ -52,6 +52,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
+import { type SidebarState, setSidebarState } from './sidebar-state.ts'
 import {
   addFastModeBetaHeader,
   createStrippedStream,
@@ -232,6 +233,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
    * without coupling the toast to killswitch logic. When omitted,
    * no killed annotations are shown.
    */
+  function formatResetIn(resetsAt: string | undefined): string {
+    if (!resetsAt) return ''
+    const ms = new Date(resetsAt).getTime() - Date.now()
+    if (ms <= 0) return 'resets now'
+    const mins = Math.floor(ms / 60_000)
+    if (mins < 60) return `resets ${mins}m`
+    const hrs = Math.floor(mins / 60)
+    const rm = mins % 60
+    return rm > 0 ? `resets ${hrs}h${rm}m` : `resets ${hrs}h`
+  }
+
   function showQuotaToast(
     quota: OAuthQuotaSnapshot | null,
     fallbacks?: Array<{
@@ -256,7 +268,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         const mainKilled = isKilled?.(quota) ?? false
         const mainActive = activeAccountId === 'main'
         const indicator = mainKilled ? '🔴' : mainActive ? '🟢' : '  '
-        const lines: string[] = [`${indicator} main`]
+        const reset = formatResetIn(fh?.resetsAt)
+        const lines: string[] = [
+          `${indicator} main${reset ? ` (${reset})` : ''}`,
+        ]
         if (fh) {
           lines.push(
             `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
@@ -285,7 +300,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         const fbKilled = isKilled?.(q, fb.id) ?? false
         const fbActive = activeAccountId === fb.id
         const indicator = fbKilled ? '🔴' : fbActive ? '🟢' : '  '
-        const lines: string[] = [`${indicator} ${name}`]
+        const fbReset = formatResetIn(fh?.resetsAt)
+        const lines: string[] = [
+          `${indicator} ${name}${fbReset ? ` (${fbReset})` : ''}`,
+        ]
         if (fh) {
           lines.push(
             `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
@@ -318,6 +336,53 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         },
       })
       ?.catch?.(() => {})
+  }
+
+  function writeSidebarState(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    activeId: string | undefined,
+    route: string,
+  ) {
+    const mainEntry = quotaManager.getMain()
+    const ksEnabled = isKillswitchEnabled(storage)
+    const state: SidebarState = {
+      main: {
+        quota: mainEntry?.quota ?? null,
+        killed:
+          ksEnabled && mainEntry?.quota != null
+            ? !killswitchPassesPolicy(mainEntry.quota, storage)
+            : false,
+      },
+      fallbacks: (storage?.accounts ?? [])
+        .filter((a) => a.enabled !== false)
+        .map((a) => ({
+          id: a.id,
+          label: a.label,
+          quota: a.quota ?? null,
+          killed:
+            ksEnabled && a.quota != null
+              ? !killswitchPassesPolicy(a.quota, storage, a.id)
+              : false,
+          enabled: a.enabled !== false,
+        })),
+      activeId,
+      route,
+      relay: relayConfig
+        ? { enabled: true, transport: relayConfig.transport ?? 'http' }
+        : null,
+      fastMode: isFastModeEnabled(),
+      lastUpdated: Date.now(),
+    }
+    setSidebarState(state).catch((error) =>
+      log('[sidebar] state write failed', {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    )
+    log('[sidebar] state updated', {
+      activeId,
+      route,
+      accountCount: state.fallbacks.length + 1,
+    })
   }
   let latestGetAuth:
     | (() => Promise<{
@@ -416,29 +481,23 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     }
 
-    // Prefer in-memory fallback quota cache; only live-fetch if no cache exists
+    // Use QuotaManager for fallbacks — goes through serial API gate
     const storage = await loadAccounts()
-    const fallbackEntries = quotaManager.getAllFallbacks()
-    const hasCachedFallbacks = (storage?.accounts ?? []).some(
-      (a) => a.enabled !== false && fallbackEntries.has(a.id),
+    const fallbackAccts = (storage?.accounts ?? []).filter(
+      (a) => a.enabled !== false && a.access,
     )
-    if (hasCachedFallbacks) {
-      // Overlay cached quota onto storage accounts for display
-      for (const account of storage?.accounts ?? []) {
-        const cached = fallbackEntries.get(account.id)
-        if (cached) account.quota = cached.quota
-      }
-      accounts.push(...buildFallbackQuotaSummaries(storage, new Map()))
-    } else {
-      const { storage: refreshed, errors } =
-        await fallbackManager.refreshQuotaForAllAccounts()
-      accounts.push(
-        ...buildFallbackQuotaSummaries(
-          refreshed,
-          new Map(errors.map((error) => [error.accountId, error.message])),
-        ),
-      )
+    try {
+      await quotaManager.refreshAllFallbacks(fallbackAccts)
+    } catch {
+      // Best-effort — stale cache is fine for display
     }
+    // Overlay QuotaManager cache onto storage accounts for display
+    const fallbackEntries = quotaManager.getAllFallbacks()
+    for (const account of storage?.accounts ?? []) {
+      const cached = fallbackEntries.get(account.id)
+      if (cached) account.quota = cached.quota
+    }
+    accounts.push(...buildFallbackQuotaSummaries(storage, new Map()))
 
     if (!latestGetAuth) {
       accounts.unshift({
@@ -565,6 +624,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           input.sessionID,
           await buildQuotaCommandSummary(),
         )
+        const cmdStorage = await loadAccounts()
+        writeSidebarState(cmdStorage, 'main', 'main')
         throwHandledSentinel()
       }
 
@@ -601,6 +662,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           await setKillswitchPersistent(result.updatedConfig)
         }
         await sendIgnoredMessage(ctx, input.sessionID, result.text)
+        const ksStorage = await loadAccounts()
+        writeSidebarState(ksStorage, 'main', 'main')
         throwHandledSentinel()
       }
     },
@@ -797,6 +860,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           }
 
           startMainBackgroundRefresh()
+
+          // Seed sidebar with initial state from persisted storage
+          writeSidebarState(initialStorage, 'main', 'main')
 
           function isReplayableRequest(
             input: string | URL | Request,
@@ -1199,6 +1265,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   )?.id
                 }
                 showQuotaToast(mainEntry.quota, fallbacks, activeId, ksIsKilled)
+                writeSidebarState(
+                  storage,
+                  activeId,
+                  activeId === 'main' ? 'main' : (activeId ?? 'main'),
+                )
               }
 
               // Killswitch — hard-block before any API call if all accounts
@@ -1231,8 +1302,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       reason,
                     })
                     showQuotaToastFromCache()
-                  } catch {
+                  } catch (error) {
                     // Best-effort — if quota fetch fails, use stale cache
+                    log('[quota] killswitch refresh failed', {
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                      backedOff: quotaManager.isBackedOff(),
+                    })
                   }
                 }
               }
@@ -1399,7 +1475,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     showQuotaToastFromCache()
                   } else if (quotaManager.needsRefresh(sessionRequestCount)) {
                     // Background refresh — return stale to avoid blocking
-                    quotaManager.refreshMainInBackground(auth.access)
+                    // Update sidebar when it completes
+                    void quotaManager
+                      .refreshMain(auth.access)
+                      .then(() => {
+                        writeSidebarState(storage, 'main', 'main')
+                      })
+                      .catch(() => {})
                   }
                   trace.mark('main_quota_for_routing', {
                     ms: roundMs(nowMs() - quotaStart),
@@ -1434,11 +1516,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     }
                   }
                 } catch (error) {
+                  const errorMsg =
+                    error instanceof Error ? error.message : String(error)
                   trace.mark('main_quota_for_routing_error', {
-                    error:
-                      error instanceof Error ? error.message : String(error),
+                    error: errorMsg,
+                  })
+                  log('[quota] routing refresh failed', {
+                    error: errorMsg,
+                    backedOff: quotaManager.isBackedOff(),
                   })
                   // Main quota checks should optimize routing, not break requests.
+                  // Still update sidebar with stale/cached data
+                  writeSidebarState(storage, 'main', 'main')
                 }
               }
               const mainResponse = await sendWithAccessToken(
