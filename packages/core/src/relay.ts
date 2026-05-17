@@ -1027,7 +1027,7 @@ async function prepareUpstream(env, payload) {
     return { error: 'hash mismatch', status: 409 }
   }
 
-  await writeState(env, payload.affinity, { body, hash: payload.next_hash, revision: payload.revision })
+  const stateWrite = writeState(env, payload.affinity, { body, hash: payload.next_hash, revision: payload.revision }).catch(() => {})
   console.log(JSON.stringify({
     relay: 'opencode-anthropic-auth',
     transport: 'relay',
@@ -1037,7 +1037,7 @@ async function prepareUpstream(env, payload) {
     bodyBytes: body.length,
   }))
 
-  return { body }
+  return { body, stateWrite }
 }
 
 function resolveBodyFromState(state, payload) {
@@ -1114,7 +1114,7 @@ async function handleRelayPayload(env, payload) {
     headers: payload.upstream.headers,
     body: prepared.body,
   })
-  return { upstream }
+  return { upstream, stateWrite: prepared.stateWrite }
 }
 
 async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
@@ -1124,7 +1124,7 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
     } catch {
       clearInterval(heartbeat)
     }
-  }, 5000)
+  }, 15000)
   try {
     const result = await prepareWebSocketUpstream(env, getState(), payload)
     if (result.error) {
@@ -1223,22 +1223,33 @@ export default {
       return new Response(null, { status: 101, webSocket: client })
     }
 
-    if (request.method === 'GET') return new Response('ok')
+    if (request.method === 'GET') {
+      return Response.json({ status: 'ok', transports: ['http', 'websocket'] })
+    }
     if (request.method !== 'POST') return new Response('method not allowed', { status: 405 })
     if (request.headers.get('x-relay-token') !== env.RELAY_TOKEN) {
       return new Response('unauthorized', { status: 401 })
     }
 
-    const payload = await request.json()
-    const result = await handleRelayPayload(env, payload)
-    if (result.error) return Response.json({ error: result.error }, { status: result.status })
+    try {
+      const payload = await request.json()
+      const result = await handleRelayPayload(env, payload)
+      if (result.error) return Response.json({ error: result.error }, { status: result.status })
 
-    const upstream = result.upstream
-    return new Response(upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers: upstream.headers,
-    })
+      if (result.stateWrite) ctx.waitUntil(result.stateWrite)
+
+      const upstream = result.upstream
+      return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: upstream.headers,
+      })
+    } catch (error) {
+      return Response.json(
+        { error: error instanceof Error ? error.message : 'internal relay error' },
+        { status: 502 },
+      )
+    }
   },
 }
 `
