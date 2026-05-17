@@ -808,6 +808,23 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'error') {
+      // If an optimistic response is already streaming (responseStartedAt is
+      // set), the pending promise was already resolved — calling failPending
+      // would reject a settled promise and leave the stream hanging. Instead,
+      // inject an SSE error event and close cleanly.
+      if (pending.optimisticResponse && pending.responseStartedAt != null) {
+        relayLog(
+          `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${message.status} message=${message.message || 'unknown'}`,
+        )
+        pending.streamController?.enqueue(
+          new TextEncoder().encode(
+            `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_error', message: message.message || 'relay error' } })}\n\n`,
+          ),
+        )
+        this.finishPending()
+        this.socket?.close()
+        return
+      }
       if (
         message.status === 409 &&
         this.retryPendingBeforeResponse(
