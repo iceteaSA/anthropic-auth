@@ -81,19 +81,22 @@ function convertTextAndImages(
       .join('\n')
   }
 
-  const blocks = content.map((item) => {
-    if (item.type === 'text') {
-      return { type: 'text', text: sanitize(item.text) }
-    }
-    return {
-      type: 'image',
-      source: {
-        type: 'base64',
-        media_type: item.mimeType,
-        data: item.data,
-      },
-    }
-  })
+  const blocks = content
+    .map((item) => {
+      if (item.type === 'text') {
+        return { type: 'text', text: sanitize(item.text) }
+      }
+      if (!item.data) return null
+      return {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: item.mimeType,
+          data: item.data,
+        },
+      }
+    })
+    .filter((block): block is NonNullable<typeof block> => block !== null)
 
   if (!blocks.some((block) => block.type === 'text')) {
     blocks.unshift({ type: 'text', text: '(see attached image)' })
@@ -158,10 +161,20 @@ function convertMessages(
     if (message.role === 'toolResult') {
       const toolResult = message as ToolResultMessage
       const toolResults: Array<Record<string, unknown>> = []
+      let content = convertTextAndImages(toolResult.content)
+      // Anthropic rejects tool_result with is_error=true but empty content
+      if (
+        toolResult.isError &&
+        (!content ||
+          (Array.isArray(content) && content.length === 0) ||
+          content === '')
+      ) {
+        content = [{ type: 'text', text: 'Error' }]
+      }
       toolResults.push({
         type: 'tool_result',
         tool_use_id: sanitizeToolId(toolResult.toolCallId),
-        content: convertTextAndImages(toolResult.content),
+        content,
         is_error: toolResult.isError,
       })
 
@@ -171,10 +184,19 @@ function convertMessages(
         messages[nextIndex]?.role === 'toolResult'
       ) {
         const next = messages[nextIndex] as ToolResultMessage
+        let nextContent = convertTextAndImages(next.content)
+        if (
+          next.isError &&
+          (!nextContent ||
+            (Array.isArray(nextContent) && nextContent.length === 0) ||
+            nextContent === '')
+        ) {
+          nextContent = [{ type: 'text', text: 'Error' }]
+        }
         toolResults.push({
           type: 'tool_result',
           tool_use_id: sanitizeToolId(next.toolCallId),
-          content: convertTextAndImages(next.content),
+          content: nextContent,
           is_error: next.isError,
         })
         nextIndex += 1
