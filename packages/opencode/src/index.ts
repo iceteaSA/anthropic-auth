@@ -218,6 +218,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return '█'.repeat(filled) + '░'.repeat(width - filled)
   }
 
+  /**
+   * Show a toast notification with quota usage bars.
+   *
+   * The optional `isKilled` callback allows killswitch integration
+   * without coupling the toast to killswitch logic. When omitted,
+   * quota bars are shown without killed/active annotations.
+   */
   function showQuotaToast(
     quota: OAuthQuotaSnapshot | null,
     fallbacks?: Array<{
@@ -225,19 +232,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       label?: string
       quota?: OAuthQuotaSnapshot
     }>,
-    storage?: Awaited<ReturnType<typeof loadAccounts>>,
+    isKilled?: (
+      quota: OAuthQuotaSnapshot | undefined,
+      accountId?: string,
+    ) => boolean,
   ) {
     const sections: string[] = []
     let globalMaxUsed = 0
-    const ksEnabled = isKillswitchEnabled(storage ?? null)
 
     // Main account
     if (quota) {
       const fh = quota.five_hour
       const sd = quota.seven_day
       if (fh || sd) {
-        const mainKilled =
-          ksEnabled && !killswitchPassesPolicy(quota, storage ?? null)
+        const mainKilled = isKilled?.(quota) ?? false
         const lines: string[] = []
         if (mainKilled) lines.push('⛔ KILLED')
         if (fh) {
@@ -265,8 +273,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         const sd = q.seven_day
         if (!fh && !sd) continue
         const name = fb.label || 'alt'
-        const fbKilled =
-          ksEnabled && !killswitchPassesPolicy(q, storage ?? null, fb.id)
+        const fbKilled = isKilled?.(q, fb.id) ?? false
         const status = fbKilled ? ' ⛔ KILLED' : ''
         const lines: string[] = [`── ${name}${status} ──`]
         if (fh) {
@@ -1117,7 +1124,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       const fallbacks = (storage?.accounts ?? []).filter(
                         (a) => a.enabled !== false,
                       )
-                      showQuotaToast(mainEntry.quota, fallbacks, storage)
+                      showQuotaToast(
+                        mainEntry.quota,
+                        fallbacks,
+                        isKillswitchEnabled(storage)
+                          ? (q, id) => !killswitchPassesPolicy(q, storage, id)
+                          : undefined,
+                      )
                     }
                   } catch {
                     // Best-effort — if quota fetch fails, use stale cache
