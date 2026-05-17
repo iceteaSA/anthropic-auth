@@ -7,7 +7,7 @@ set -euo pipefail
 
 TAG=""
 MAX_WAIT="${MAX_WAIT_SECONDS:-900}"
-REPO="cortexkit/opencode-anthropic-auth"
+REPO="cortexkit/anthropic-auth"
 INTERVAL=5
 
 while [[ $# -gt 0 ]]; do
