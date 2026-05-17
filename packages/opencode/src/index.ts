@@ -1,7 +1,11 @@
+import { randomUUID } from 'node:crypto'
+
 import {
+  type AccountStorage,
   authorize,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  buildRefreshOperationError,
   CACHE_1H_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
   CLAUDE_FAST_COMMAND_NAME,
@@ -13,11 +17,13 @@ import {
   executeFastModeCommand,
   FallbackAccountManager,
   fetchOAuthQuotaSnapshot,
+  formatRefreshBackoffMessage,
   getCache1hMode,
   getCache1hPersistentMode,
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
   getRelayConfig,
+  hashRefreshToken,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
   isDumpPersistentlyEnabled,
@@ -33,8 +39,10 @@ import {
   type QuotaAccountSummary,
   quotaSnapshotPassesPolicy,
   type RelayConfig,
+  refreshBackoffActive,
   refreshClaudeOAuthToken,
   resolveClaudeCodeIdentity,
+  saveAccounts,
   sendViaRelay,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -445,8 +453,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               refreshPromise = (async () => {
                 const maxRetries = 2
                 const baseDelayMs = 500
+                let leaseId: string | null = null
+                let leaseTokenHash: string | null = null
+
+                async function updateMainRefreshState(
+                  update: (storage: AccountStorage) => void,
+                ) {
+                  const storage: AccountStorage = (await loadAccounts()) ?? {
+                    version: 1,
+                    main: { type: 'opencode', provider: 'anthropic' },
+                    accounts: [],
+                  }
+                  storage.refresh = storage.refresh ?? {}
+                  update(storage)
+                  await saveAccounts(storage)
+                }
 
                 for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                  let freshAuth: Awaited<ReturnType<typeof getAuth>> | null =
+                    null
                   try {
                     if (attempt > 0) {
                       const delay = baseDelayMs * 2 ** (attempt - 1)
@@ -456,7 +481,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     // Re-read auth to get the latest refresh token.
                     // The outer `auth` snapshot may be stale if tokens
                     // were rotated since the fetch() call was made.
-                    const freshAuth = await getAuth()
+                    freshAuth = await getAuth()
 
                     if (!freshAuth.refresh) {
                       throw new Error(
@@ -464,23 +489,57 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       )
                     }
 
-                    let refreshed: Awaited<
-                      ReturnType<typeof refreshClaudeOAuthToken>
-                    >
-                    try {
-                      refreshed = await refreshClaudeOAuthToken({
-                        refreshToken: freshAuth.refresh,
-                      })
-                    } catch (error) {
-                      if (
-                        error instanceof ClaudeOAuthRefreshError &&
-                        error.status >= 500 &&
-                        attempt < maxRetries
-                      ) {
-                        continue
-                      }
-                      throw error
+                    const storage = await loadAccounts()
+                    const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
+                    const mainError = storage?.refresh?.mainLastRefreshError
+                    if (
+                      mainError &&
+                      refreshBackoffActive(
+                        mainError,
+                        freshAuth.refresh,
+                        Date.now(),
+                      )
+                    ) {
+                      throw new Error(
+                        formatRefreshBackoffMessage(mainError, Date.now()),
+                      )
                     }
+                    if (
+                      storage?.refresh?.mainRefreshLeaseUntil &&
+                      storage.refresh.mainRefreshLeaseUntil > Date.now() &&
+                      storage.refresh.mainRefreshLeaseTokenHash ===
+                        refreshTokenHash
+                    ) {
+                      throw new Error(
+                        'Claude OAuth refresh is already in progress',
+                      )
+                    }
+
+                    leaseId = randomUUID()
+                    leaseTokenHash = refreshTokenHash
+                    await updateMainRefreshState((nextStorage) => {
+                      nextStorage.refresh = nextStorage.refresh ?? {}
+                      nextStorage.refresh.mainRefreshLeaseId =
+                        leaseId ?? undefined
+                      nextStorage.refresh.mainRefreshLeaseUntil =
+                        Date.now() + 2 * 60_000
+                      nextStorage.refresh.mainRefreshLeaseTokenHash =
+                        refreshTokenHash
+                    })
+                    const latestLease = await loadAccounts()
+                    if (
+                      latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
+                      latestLease.refresh.mainRefreshLeaseTokenHash !==
+                        refreshTokenHash
+                    ) {
+                      throw new Error(
+                        'Claude OAuth refresh is already in progress',
+                      )
+                    }
+
+                    const refreshed = await refreshClaudeOAuthToken({
+                      refreshToken: freshAuth.refresh,
+                    })
 
                     // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
                     await (client as any).auth.set({
@@ -495,6 +554,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       },
                     })
 
+                    await updateMainRefreshState((storage) => {
+                      if (!storage?.refresh) return
+                      storage.refresh.mainLastRefreshError = undefined
+                      if (storage.refresh.mainRefreshLeaseId === leaseId) {
+                        storage.refresh.mainRefreshLeaseId = undefined
+                        storage.refresh.mainRefreshLeaseUntil = undefined
+                        storage.refresh.mainRefreshLeaseTokenHash = undefined
+                      }
+                    })
+
                     return refreshed.access
                   } catch (error) {
                     const isNetworkError =
@@ -506,11 +575,48 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             error.code === 'ETIMEDOUT' ||
                             error.code === 'UND_ERR_CONNECT_TIMEOUT')))
 
-                    if (attempt < maxRetries && isNetworkError) {
+                    if (
+                      attempt < maxRetries &&
+                      (isNetworkError ||
+                        (error instanceof ClaudeOAuthRefreshError &&
+                          error.status >= 500))
+                    ) {
                       continue
                     }
 
+                    const failedRefreshToken = freshAuth?.refresh
+                    if (
+                      failedRefreshToken &&
+                      error instanceof ClaudeOAuthRefreshError
+                    ) {
+                      await updateMainRefreshState((storage) => {
+                        storage.refresh = storage.refresh ?? {}
+                        storage.refresh.mainLastRefreshError =
+                          buildRefreshOperationError({
+                            error,
+                            now: Date.now(),
+                            refreshToken: failedRefreshToken,
+                            previous: storage.refresh.mainLastRefreshError,
+                          })
+                      })
+                    }
+
                     throw error
+                  } finally {
+                    if (leaseId) {
+                      await updateMainRefreshState((storage) => {
+                        if (!storage?.refresh) return
+                        if (
+                          storage.refresh.mainRefreshLeaseId === leaseId &&
+                          storage.refresh.mainRefreshLeaseTokenHash ===
+                            leaseTokenHash
+                        ) {
+                          storage.refresh.mainRefreshLeaseId = undefined
+                          storage.refresh.mainRefreshLeaseUntil = undefined
+                          storage.refresh.mainRefreshLeaseTokenHash = undefined
+                        }
+                      }).catch(() => {})
+                    }
                   }
                 }
                 // Unreachable — each iteration either returns or throws.
@@ -540,6 +646,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 if (
                   latestAuth.expires - Date.now() >
                   mainRefreshBeforeExpiryMs(storage)
+                ) {
+                  return
+                }
+                if (
+                  latestAuth.refresh &&
+                  refreshBackoffActive(
+                    storage?.refresh?.mainLastRefreshError,
+                    latestAuth.refresh,
+                    Date.now(),
+                  )
+                ) {
+                  return
+                }
+                if (
+                  latestAuth.refresh &&
+                  storage?.refresh?.mainRefreshLeaseUntil &&
+                  storage.refresh.mainRefreshLeaseUntil > Date.now() &&
+                  storage.refresh.mainRefreshLeaseTokenHash ===
+                    hashRefreshToken(latestAuth.refresh)
                 ) {
                   return
                 }

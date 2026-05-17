@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { refreshClaudeOAuthToken } from './auth.ts'
+import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from './auth.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
@@ -35,6 +35,9 @@ export type OAuthAccount = {
 export type AccountOperationError = {
   message: string
   checkedAt: number
+  nextRetryAt?: number
+  retryCount?: number
+  tokenHash?: string
 }
 
 export type AccountQuotaWindow = {
@@ -55,6 +58,10 @@ export type AccountStorage = {
     enabled?: boolean
     intervalMinutes?: number
     refreshBeforeExpiryMinutes?: number
+    mainLastRefreshError?: AccountOperationError
+    mainRefreshLeaseId?: string
+    mainRefreshLeaseUntil?: number
+    mainRefreshLeaseTokenHash?: string
   }
   quota?: {
     enabled?: boolean
@@ -109,6 +116,10 @@ export type AccountRefreshError = {
 
 const DEFAULT_FALLBACK_ON = [401, 403, 429]
 const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = 30
+const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
+const MIN_REFRESH_RETRY_DELAY_MS = 5 * 60_000
+const MAX_REFRESH_RETRY_DELAY_MS = 60 * 60_000
+const NON_TRANSIENT_REFRESH_RETRY_DELAY_MS = 24 * 60 * 60_000
 const DEFAULT_QUOTA_CHECK_INTERVAL_MINUTES = 5
 const DEFAULT_MINIMUM_REMAINING: Record<QuotaWindowName, number> = {
   five_hour: 0,
@@ -173,7 +184,16 @@ function normalizeOperationError(
   if (typeof value.message !== 'string') return undefined
   const checkedAt = Number(value.checkedAt)
   if (!Number.isFinite(checkedAt)) return undefined
-  return { message: value.message, checkedAt }
+  const nextRetryAt = Number(value.nextRetryAt)
+  const retryCount = Number(value.retryCount)
+  return {
+    message: value.message,
+    checkedAt,
+    nextRetryAt: Number.isFinite(nextRetryAt) ? nextRetryAt : undefined,
+    retryCount: Number.isFinite(retryCount) ? retryCount : undefined,
+    tokenHash:
+      typeof value.tokenHash === 'string' ? value.tokenHash : undefined,
+  }
 }
 
 function normalizeQuota(value: unknown): OAuthAccount['quota'] {
@@ -400,6 +420,74 @@ function refreshBeforeExpiryMs(storage: AccountStorage | null) {
   return Math.max(0, minutes) * 60_000
 }
 
+export function getRefreshIntervalMs(storage: AccountStorage | null) {
+  const minutes =
+    storage?.refresh?.intervalMinutes ?? DEFAULT_REFRESH_INTERVAL_MINUTES
+  return Math.max(1, minutes) * 60_000
+}
+
+export function hashRefreshToken(refreshToken: string) {
+  return createHash('sha256').update(refreshToken).digest('hex')
+}
+
+function isTransientRefreshError(error: unknown) {
+  if (error instanceof ClaudeOAuthRefreshError) {
+    return error.status === 429 || error.status >= 500
+  }
+  if (!(error instanceof Error)) return false
+  return (
+    error.message.includes('fetch failed') ||
+    ('code' in error &&
+      (error.code === 'ECONNRESET' ||
+        error.code === 'ECONNREFUSED' ||
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'UND_ERR_CONNECT_TIMEOUT'))
+  )
+}
+
+export function buildRefreshOperationError(input: {
+  error: unknown
+  now: number
+  refreshToken: string
+  previous?: AccountOperationError
+}): AccountOperationError {
+  const retryCount = (input.previous?.retryCount ?? 0) + 1
+  const delay = isTransientRefreshError(input.error)
+    ? Math.min(
+        MAX_REFRESH_RETRY_DELAY_MS,
+        MIN_REFRESH_RETRY_DELAY_MS * 2 ** Math.min(retryCount - 1, 6),
+      )
+    : NON_TRANSIENT_REFRESH_RETRY_DELAY_MS
+  return {
+    message: formatErrorMessage(input.error),
+    checkedAt: input.now,
+    nextRetryAt: input.now + delay,
+    retryCount,
+    tokenHash: hashRefreshToken(input.refreshToken),
+  }
+}
+
+export function refreshBackoffActive(
+  error: AccountOperationError | undefined,
+  refreshToken: string | undefined,
+  now: number,
+) {
+  if (!error?.nextRetryAt || error.nextRetryAt <= now) return false
+  if (!refreshToken) return true
+  return error.tokenHash === hashRefreshToken(refreshToken)
+}
+
+export function formatRefreshBackoffMessage(
+  error: AccountOperationError,
+  now: number,
+) {
+  const seconds = Math.max(
+    1,
+    Math.ceil(((error.nextRetryAt ?? now) - now) / 1000),
+  )
+  return `Claude OAuth refresh is backed off for ${seconds}s after: ${error.message}`
+}
+
 export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
   const minutes =
     storage?.quota?.checkIntervalMinutes ?? DEFAULT_QUOTA_CHECK_INTERVAL_MINUTES
@@ -543,10 +631,12 @@ function recordRefreshError(
   error: unknown,
   now: number,
 ) {
-  account.lastRefreshError = {
-    message: formatErrorMessage(error),
-    checkedAt: now,
-  }
+  account.lastRefreshError = buildRefreshOperationError({
+    error,
+    now,
+    refreshToken: account.refresh,
+    previous: account.lastRefreshError,
+  })
 }
 
 function recordQuotaRefreshError(
@@ -557,6 +647,9 @@ function recordQuotaRefreshError(
   account.lastQuotaRefreshError = {
     message: formatErrorMessage(error),
     checkedAt: now,
+  }
+  if (error instanceof ClaudeOAuthRefreshError) {
+    recordRefreshError(account, error, now)
   }
 }
 
@@ -583,19 +676,16 @@ export class FallbackAccountManager {
   }
 
   startBackgroundRefresh() {
-    void this.refreshDueAccounts().catch(() => {})
-    void this.refreshQuotaForDueAccounts().catch(() => {})
+    const run = async () => {
+      await this.refreshDueAccounts()
+      await this.refreshQuotaForDueAccounts()
+    }
+    void run().catch(() => {})
     if (!this.refreshTimer) {
       this.refreshTimer = setInterval(() => {
-        void this.refreshDueAccounts().catch(() => {})
+        void run().catch(() => {})
       }, BACKGROUND_TICK_MS)
       if ('unref' in this.refreshTimer) this.refreshTimer.unref()
-    }
-    if (!this.quotaTimer) {
-      this.quotaTimer = setInterval(() => {
-        void this.refreshQuotaForDueAccounts().catch(() => {})
-      }, BACKGROUND_TICK_MS)
-      if ('unref' in this.quotaTimer) this.quotaTimer.unref()
     }
   }
 
@@ -617,6 +707,15 @@ export class FallbackAccountManager {
       try {
         let next = account
         if (tokenNeedsRefresh(next, storage, this.now())) {
+          const refreshError = next.lastRefreshError
+          if (
+            refreshError &&
+            refreshBackoffActive(refreshError, next.refresh, this.now())
+          ) {
+            throw new Error(
+              formatRefreshBackoffMessage(refreshError, this.now()),
+            )
+          }
           next = await this.refreshAccount(next, storage)
           changed = true
         }
@@ -659,6 +758,15 @@ export class FallbackAccountManager {
     for (const account of storage.accounts) {
       if (account.enabled === false) continue
       if (!tokenNeedsRefresh(account, storage, this.now())) continue
+      if (
+        refreshBackoffActive(
+          account.lastRefreshError,
+          account.refresh,
+          this.now(),
+        )
+      ) {
+        continue
+      }
       try {
         await this.refreshAccount(account, storage)
         changed = true
@@ -681,6 +789,15 @@ export class FallbackAccountManager {
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
+          if (
+            refreshBackoffActive(
+              next.lastRefreshError,
+              next.refresh,
+              this.now(),
+            )
+          ) {
+            continue
+          }
           next = await this.refreshAccount(next, storage)
           changed = true
         }
@@ -707,6 +824,15 @@ export class FallbackAccountManager {
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
+          const refreshError = next.lastRefreshError
+          if (
+            refreshError &&
+            refreshBackoffActive(refreshError, next.refresh, this.now())
+          ) {
+            throw new Error(
+              formatRefreshBackoffMessage(refreshError, this.now()),
+            )
+          }
           next = await this.refreshAccount(next, storage)
           changed = true
         }

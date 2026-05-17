@@ -1031,7 +1031,7 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
-    expect(intervalHandlers.length).toBeGreaterThanOrEqual(3)
+    expect(intervalHandlers.length).toBeGreaterThanOrEqual(2)
     intervalHandlers[intervalHandlers.length - 1]!()
     await new Promise((resolve) => setTimeout(resolve, 10))
 
@@ -1044,6 +1044,65 @@ describe('auth.loader', () => {
         expires: expect.any(Number),
       },
     })
+  })
+
+  test('fetch wrapper backs off main oauth refresh after rate limits', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+      }),
+    )
+    let tokenRefreshCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error: { type: 'rate_limit_error', message: 'Rate limited' },
+            }),
+            { status: 429 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired',
+          refresh: 'refresh-token',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      result.fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: '{}',
+      }),
+    ).rejects.toThrow('Claude OAuth refresh failed: 429')
+    await expect(
+      result.fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: '{}',
+      }),
+    ).rejects.toThrow('Claude OAuth refresh is backed off')
+
+    expect(tokenRefreshCalls).toBe(1)
+    const saved = JSON.parse(
+      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    )
+    expect(saved.refresh.mainLastRefreshError.nextRetryAt).toBeGreaterThan(
+      Date.now(),
+    )
   })
 
   test('fetch wrapper refreshes expired token', async () => {

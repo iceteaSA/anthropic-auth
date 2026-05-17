@@ -203,6 +203,45 @@ describe('FallbackAccountManager', () => {
     expect(saved?.accounts[0]?.lastRefreshedAt).toBe(1_000)
   })
 
+  test('backs off failed fallback refreshes instead of retrying every pass', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'rate-limited',
+      type: 'oauth',
+      access: 'expired-access',
+      refresh: 'old-refresh',
+      expires: 1,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: { type: 'rate_limit_error', message: 'Rate limited' },
+          }),
+          { status: 429 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 2_000,
+    })
+
+    await manager.refreshDueAccounts()
+    await manager.refreshDueAccounts()
+    await manager.refreshQuotaForDueAccounts()
+
+    const saved = await loadAccounts()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(saved?.accounts[0]?.lastRefreshError?.nextRetryAt).toBeGreaterThan(
+      2_000,
+    )
+    expect(saved?.accounts[0]?.lastRefreshError?.retryCount).toBe(1)
+  })
+
   test('preserves existing refresh token when refresh response omits rotation', async () => {
     const storage = baseStorage()
     storage.accounts.push({
