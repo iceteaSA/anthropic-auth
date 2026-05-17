@@ -27,7 +27,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "dev": "bun ../../scripts/dev.ts",
     "dev:clean": "bun ../../scripts/dev-clean.ts",
     "extract": "bun ../../scripts/extract-system-prompt.ts",
