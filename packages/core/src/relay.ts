@@ -808,7 +808,7 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'error') {
-      if (pending.optimisticResponse && pending.responseStarted) {
+      if (pending.optimisticResponse && pending.responseStartedAt != null) {
         relayLog(
           `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${message.status} message=${message.message || 'unknown'}`,
         )
@@ -1126,7 +1126,7 @@ async function logUpstreamError(env, ctx, upstream, meta) {
   } catch {}
 }
 
-function prepareWebSocketUpstream(state, payload) {
+async function prepareWebSocketUpstream(env, state, payload) {
   if (payload.protocol !== 2 || payload.type !== 'request' || !payload.id || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
     return { error: 'invalid payload', status: 400 }
   }
@@ -1134,8 +1134,26 @@ function prepareWebSocketUpstream(state, payload) {
   const body = resolveBodyFromState(state, payload)
   if (body && typeof body === 'object' && 'error' in body) return body
   if (typeof body !== 'string') return { error: 'invalid body', status: 400 }
+  if ((await hashBody(body)) !== payload.next_hash) {
+    return { error: 'hash mismatch', status: 409 }
+  }
 
-  return { body, state: { body, hash: payload.next_hash, revision: payload.revision } }
+  const nextState = { body, hash: payload.next_hash, revision: payload.revision }
+  const checkpoint = (async () => {
+    try {
+      await writeState(env, payload.affinity, nextState)
+    } catch (error) {
+      console.log(JSON.stringify({
+        relay: 'opencode-anthropic-auth',
+        transport: 'websocket',
+        event: 'checkpoint_failed',
+        affinity: String(payload.affinity).slice(0, 12),
+        message: error instanceof Error ? error.message : String(error),
+      }))
+    }
+  })()
+
+  return { body, state: nextState, checkpoint }
 }
 
 async function handleWebSocket(socket, env, ctx, payload, getState, setState, config) {
@@ -1144,7 +1162,7 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState, co
     catch { clearInterval(heartbeat) }
   }, 15000)
   try {
-    const result = prepareWebSocketUpstream(getState(), payload)
+    const result = await prepareWebSocketUpstream(env, getState(), payload)
     if (result.error) {
       socket.send(JSON.stringify({ protocol: 2, type: 'error', id: payload.id, status: result.status, message: result.error }))
       return
@@ -1164,23 +1182,7 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState, co
       }))
     }
 
-    const checkpoint = (async () => {
-      try {
-        if ((await hashBody(result.body)) !== payload.next_hash) throw new Error('hash mismatch')
-        await writeState(env, payload.affinity, result.state)
-      } catch (error) {
-        if (config.logRequests) {
-          console.log(JSON.stringify({
-            relay: 'opencode-anthropic-auth',
-            transport: 'websocket',
-            event: 'checkpoint_failed',
-            affinity: String(payload.affinity).slice(0, 12),
-            message: error instanceof Error ? error.message : String(error),
-          }))
-        }
-      }
-    })()
-    ctx?.waitUntil?.(checkpoint)
+    if (result.checkpoint) ctx?.waitUntil?.(result.checkpoint)
 
     const upstream = await fetch(payload.upstream.url, {
       method: payload.upstream.method || 'POST',

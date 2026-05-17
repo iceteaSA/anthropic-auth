@@ -48,7 +48,7 @@ async function startWorker() {
     modules: true,
     compatibilityDate: '2026-04-28',
     kvNamespaces: ['RELAY_STATE'],
-    bindings: { RELAY_TOKEN },
+    bindings: { RELAY_TOKEN, RELAY_PLAN: 'paid' },
     port: 0,
     log: new NoOpLog(),
   })
