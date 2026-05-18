@@ -7,12 +7,16 @@ import {
   buildFallbackQuotaSummaries,
   buildRefreshOperationError,
   CACHE_1H_COMMAND_NAME,
+  CACHE_KEEP_EXTENDED_TTL_BETA,
+  CacheKeepManager,
+  CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   ClaudeOAuthRefreshError,
   exchange,
   executeCache1hCommand,
+  executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
   FallbackAccountManager,
@@ -20,20 +24,25 @@ import {
   formatRefreshBackoffMessage,
   getCache1hMode,
   getCache1hPersistentMode,
+  getCacheKeepWindow,
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
   getRelayConfig,
   hashRefreshToken,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
+  isCacheKeepHybridActive,
+  isCacheKeepPersistentlyEnabled,
   isDumpPersistentlyEnabled,
   isFastModeEnabled,
   isFastModePersistentlyEnabled,
   isFastModeSupportedModel,
   loadAccounts,
   log,
+  mergeAnthropicBetas,
   type OAuthQuotaSnapshot,
   parseCache1hCommandAction,
+  parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
   type QuotaAccountSummary,
@@ -47,6 +56,8 @@ import {
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCache1hState,
+  setCacheKeepPersistentEnabled,
+  setCacheKeepPersistentWindow,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModeEnabled,
@@ -108,6 +119,10 @@ type PerfTrace = {
 let nextPerfRequestId = 1
 let eventLoopLagMonitorStarted = false
 
+function perfLoggingEnabled() {
+  return process.env.OPENCODE_ANTHROPIC_AUTH_PERF === '1'
+}
+
 function nowMs() {
   return performance.now()
 }
@@ -117,7 +132,13 @@ function roundMs(value: number) {
 }
 
 function startEventLoopLagMonitor() {
-  if (eventLoopLagMonitorStarted || process.env.NODE_ENV === 'test') return
+  if (
+    eventLoopLagMonitorStarted ||
+    process.env.NODE_ENV === 'test' ||
+    !perfLoggingEnabled()
+  ) {
+    return
+  }
   eventLoopLagMonitorStarted = true
   const intervalMs = 100
   const thresholdMs = 250
@@ -142,28 +163,37 @@ function createPerfTrace(data?: Record<string, unknown>): PerfTrace {
     last: start,
     mark(stage, stageData) {
       const current = nowMs()
-      log('[perf] opencode request stage', {
-        requestId: trace.requestId,
-        stage,
-        deltaMs: roundMs(current - trace.last),
-        totalMs: roundMs(current - trace.start),
-        ...stageData,
-      })
+      if (perfLoggingEnabled()) {
+        log('[perf] opencode request stage', {
+          requestId: trace.requestId,
+          stage,
+          deltaMs: roundMs(current - trace.last),
+          totalMs: roundMs(current - trace.start),
+          ...stageData,
+        })
+      }
       trace.last = current
     },
     done(stage, stageData) {
       const current = nowMs()
-      log('[perf] opencode request done', {
-        requestId: trace.requestId,
-        stage,
-        deltaMs: roundMs(current - trace.last),
-        totalMs: roundMs(current - trace.start),
-        ...stageData,
-      })
+      if (perfLoggingEnabled()) {
+        log('[perf] opencode request done', {
+          requestId: trace.requestId,
+          stage,
+          deltaMs: roundMs(current - trace.last),
+          totalMs: roundMs(current - trace.start),
+          ...stageData,
+        })
+      }
       trace.last = current
     },
   }
-  log('[perf] opencode request start', { requestId: trace.requestId, ...data })
+  if (perfLoggingEnabled()) {
+    log('[perf] opencode request start', {
+      requestId: trace.requestId,
+      ...data,
+    })
+  }
   return trace
 }
 
@@ -209,6 +239,46 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const { client } = ctx
   const fallbackManager = new FallbackAccountManager()
   fallbackManager.startBackgroundRefresh()
+  let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
+  const cacheKeepManager = new CacheKeepManager({
+    loadStorage: () => loadAccounts(),
+    prepareHeaders: async (headers, target) => {
+      if (!latestGetAuth) return headers
+      const auth = await latestGetAuth()
+      if (auth.type !== 'oauth') return headers
+      if (!auth.access || (auth.expires && auth.expires < Date.now())) {
+        if (!latestRefreshMainAccessToken) return headers
+        auth.access = await latestRefreshMainAccessToken()
+      }
+      if (!auth.access) return headers
+      try {
+        const parsedBody = JSON.parse(target.bodyText) as Record<
+          string,
+          unknown
+        >
+        const identity = await resolveClaudeCodeIdentity(
+          auth.access,
+          typeof parsedBody.model === 'string' ? parsedBody.model : undefined,
+        )
+        headers.delete('anthropic-beta')
+        setOAuthHeaders(headers, auth.access, {
+          body: parsedBody,
+          identity,
+        })
+        headers.set(
+          'anthropic-beta',
+          mergeAnthropicBetas(headers.get('anthropic-beta'), [
+            CACHE_KEEP_EXTENDED_TTL_BETA,
+          ]),
+        )
+        if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+      } catch {
+        setOAuthHeaders(headers, auth.access)
+      }
+      return headers
+    },
+    log,
+  })
   const initialCache1hStorage = await loadAccounts()
   const relayConfig: RelayConfig | null = getRelayConfig(initialCache1hStorage)
   setCache1hState({
@@ -240,6 +310,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     storage: Awaited<ReturnType<typeof loadAccounts>>,
   ) {
     return storage?.refresh?.enabled !== false
+  }
+
+  async function clearStaleMainRefreshError(refreshToken?: string) {
+    if (!refreshToken) return
+    const storage = await loadAccounts()
+    const error = storage?.refresh?.mainLastRefreshError
+    if (!storage?.refresh || !error?.tokenHash) return
+    const tokenHash = hashRefreshToken(refreshToken)
+    if (error.tokenHash === tokenHash) return
+    storage.refresh.mainLastRefreshError = undefined
+    await saveAccounts(storage)
+    log(
+      '[refresh] opencode main oauth cleared stale backoff after token rotation',
+      {
+        previousCheckedAt: error.checkedAt,
+        previousNextRetryAt: error.nextRetryAt,
+        previousRetryCount: error.retryCount,
+      },
+    )
   }
 
   async function buildQuotaCommandSummary() {
@@ -318,6 +407,30 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return executeCache1hCommand({ argumentsText, enabled, mode })
   }
 
+  async function executePersistentCacheKeepCommand(argumentsText: string) {
+    const action = parseCacheKeepCommandAction(argumentsText)
+    let storage = await loadAccounts()
+    if (action.type === 'window') {
+      storage = await setCacheKeepPersistentWindow(
+        action.startHour,
+        action.endHour,
+      )
+    } else if (action.type === 'disable') {
+      storage = await setCacheKeepPersistentEnabled(false)
+    }
+
+    const window = getCacheKeepWindow(storage)
+    const stats = cacheKeepManager.stats(window)
+    return executeCacheKeepCommand({
+      argumentsText,
+      enabled: isCacheKeepPersistentlyEnabled(storage),
+      window,
+      hybridActive: isCacheKeepHybridActive(storage),
+      trackedSessions: stats.trackedSessions,
+      nextPrewarmAt: stats.nextPrewarmAt,
+    })
+  }
+
   async function executePersistentDumpCommand(argumentsText: string) {
     const action = parseDumpCommandAction(argumentsText)
     if (action.type === 'enable' || action.type === 'disable') {
@@ -357,6 +470,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           description:
             'Show or toggle 1-hour Anthropic ephemeral prompt cache TTL.',
         },
+        [CLAUDE_CACHE_KEEP_COMMAND_NAME]: {
+          template: CLAUDE_CACHE_KEEP_COMMAND_NAME,
+          description:
+            'Keep hybrid Claude cache warm for recently used sessions during a local time window.',
+        },
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
           template: CLAUDE_QUOTAS_COMMAND_NAME,
           description:
@@ -384,6 +502,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ctx,
           input.sessionID,
           await executePersistentCache1hCommand(input.arguments),
+        )
+        throwHandledSentinel()
+      }
+
+      if (input.command === CLAUDE_CACHE_KEEP_COMMAND_NAME) {
+        await sendIgnoredMessage(
+          ctx,
+          input.sessionID,
+          await executePersistentCacheKeepCommand(input.arguments),
         )
         throwHandledSentinel()
       }
@@ -492,6 +619,22 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     const storage = await loadAccounts()
                     const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
                     const mainError = storage?.refresh?.mainLastRefreshError
+                    log('[refresh] opencode main oauth refresh check', {
+                      attempt,
+                      expiresInMs: freshAuth.expires
+                        ? freshAuth.expires - Date.now()
+                        : undefined,
+                      hasBackoff: Boolean(mainError),
+                      backoffActive: mainError
+                        ? refreshBackoffActive(
+                            mainError,
+                            freshAuth.refresh,
+                            Date.now(),
+                          )
+                        : false,
+                      retryCount: mainError?.retryCount,
+                      nextRetryAt: mainError?.nextRetryAt,
+                    })
                     if (
                       mainError &&
                       refreshBackoffActive(
@@ -500,6 +643,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         Date.now(),
                       )
                     ) {
+                      log(
+                        '[refresh] opencode main oauth refresh skipped backoff',
+                        {
+                          nextRetryAt: mainError.nextRetryAt,
+                          retryCount: mainError.retryCount,
+                        },
+                      )
                       throw new Error(
                         formatRefreshBackoffMessage(mainError, Date.now()),
                       )
@@ -510,6 +660,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       storage.refresh.mainRefreshLeaseTokenHash ===
                         refreshTokenHash
                     ) {
+                      log(
+                        '[refresh] opencode main oauth refresh skipped lease',
+                        {
+                          leaseUntil: storage.refresh.mainRefreshLeaseUntil,
+                        },
+                      )
                       throw new Error(
                         'Claude OAuth refresh is already in progress',
                       )
@@ -527,6 +683,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         refreshTokenHash
                     })
                     const latestLease = await loadAccounts()
+                    log(
+                      '[refresh] opencode main oauth refresh lease acquired',
+                      {
+                        attempt,
+                        leaseUntil: Date.now() + 2 * 60_000,
+                      },
+                    )
                     if (
                       latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
                       latestLease.refresh.mainRefreshLeaseTokenHash !==
@@ -537,6 +700,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       )
                     }
 
+                    log('[refresh] opencode main oauth refresh request start', {
+                      attempt,
+                    })
                     const refreshed = await refreshClaudeOAuthToken({
                       refreshToken: freshAuth.refresh,
                     })
@@ -564,6 +730,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       }
                     })
 
+                    log('[refresh] opencode main oauth refresh succeeded', {
+                      attempt,
+                      expiresInMs: refreshed.expires - Date.now(),
+                    })
                     return refreshed.access
                   } catch (error) {
                     const isNetworkError =
@@ -583,6 +753,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     ) {
                       continue
                     }
+
+                    log(
+                      '[refresh] opencode main oauth refresh attempt failed',
+                      {
+                        attempt,
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : String(error),
+                        transient: isNetworkError,
+                      },
+                    )
 
                     const failedRefreshToken = freshAuth?.refresh
                     if (
@@ -630,6 +812,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             return refreshPromise
           }
 
+          latestRefreshMainAccessToken = refreshMainAccessToken
+
           function startMainBackgroundRefresh() {
             if (mainBackgroundRefreshTimer) {
               clearInterval(mainBackgroundRefreshTimer)
@@ -642,13 +826,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 if (!mainRefreshEnabled(storage)) return
                 const latestAuth = await getAuth()
                 if (latestAuth.type !== 'oauth') return
+                await clearStaleMainRefreshError(latestAuth.refresh)
                 if (!latestAuth.expires) return
-                if (
-                  latestAuth.expires - Date.now() >
-                  mainRefreshBeforeExpiryMs(storage)
-                ) {
+                const expiresInMs = latestAuth.expires - Date.now()
+                const refreshBeforeMs = mainRefreshBeforeExpiryMs(storage)
+                if (expiresInMs > refreshBeforeMs) {
                   return
                 }
+                log('[refresh] opencode main oauth background due', {
+                  expiresInMs,
+                  refreshBeforeMs,
+                })
                 if (
                   latestAuth.refresh &&
                   refreshBackoffActive(
@@ -657,6 +845,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     Date.now(),
                   )
                 ) {
+                  log(
+                    '[refresh] opencode main oauth background skipped backoff',
+                    {
+                      nextRetryAt:
+                        storage?.refresh?.mainLastRefreshError?.nextRetryAt,
+                      retryCount:
+                        storage?.refresh?.mainLastRefreshError?.retryCount,
+                    },
+                  )
                   return
                 }
                 if (
@@ -863,6 +1060,26 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             }
 
             const rewritten = rewriteUrl(input)
+            if (
+              route === 'main' &&
+              typeof body === 'string' &&
+              !subagentRequest &&
+              isCache1hEnabled() &&
+              getCache1hMode() === 'hybrid'
+            ) {
+              const storage = await loadAccounts()
+              const tracked = await cacheKeepManager.track({
+                sessionId: relayAffinity,
+                url: rewritten.url?.toString() ?? rewritten.input.toString(),
+                headers: requestHeaders,
+                bodyText: body,
+                storage,
+                cacheMode: 'hybrid',
+              })
+              if (tracked.tracked) {
+                trace?.mark('cachekeep_track', { session: relayAffinity })
+              }
+            }
 
             const directFetch = () =>
               fetch(rewritten.input, {
@@ -1067,7 +1284,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace.done('non_oauth_passthrough', { status: response.status })
                 return response
               }
+              await clearStaleMainRefreshError(auth.refresh)
               if (!auth.access || !auth.expires || auth.expires < Date.now()) {
+                log(
+                  '[refresh] opencode main oauth refresh required for request',
+                  {
+                    hasAccess: Boolean(auth.access),
+                    expiresInMs: auth.expires
+                      ? auth.expires - Date.now()
+                      : undefined,
+                  },
+                )
                 const refreshStart = nowMs()
                 auth.access = await refreshMainAccessToken()
                 trace.mark('refresh_main_access', {

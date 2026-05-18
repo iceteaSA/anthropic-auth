@@ -40,7 +40,7 @@ Pi state is stored separately from OpenCode at:
 
 Override the path with `PI_ANTHROPIC_AUTH_FILE`. The package also respects `PI_AGENT_DIR` when deriving the default sidecar path.
 
-The sidecar uses the same JSON shape as the OpenCode package, including `claudeCache`, `claudeFast`, `dump`, `relay`, and fallback `accounts` blocks.
+The sidecar uses the same JSON shape as the OpenCode package, including `claudeCache`, `cacheKeep`, `claudeFast`, `dump`, `relay`, and fallback `accounts` blocks.
 
 ## Commands
 
@@ -51,6 +51,10 @@ The sidecar uses the same JSON shape as the OpenCode package, including `claudeC
 /claude-cache mode explicit
 /claude-cache mode automatic
 /claude-cache mode hybrid
+
+/claude-cachekeep
+/claude-cachekeep 09-23
+/claude-cachekeep off
 
 /claude-dump
 /claude-dump on
@@ -63,7 +67,7 @@ The sidecar uses the same JSON shape as the OpenCode package, including `claudeC
 /claude-quota
 ```
 
-`/claude-quota` reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`. `/claude-fast on` adds Anthropic `speed: "fast"` plus the `fast-mode-2026-02-01` beta header for supported Opus models (`claude-opus-4-6` and `claude-opus-4-7`).
+`/claude-quota` reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`. `/claude-cachekeep HH-HH` keeps recently used hybrid-mode session caches warm during the configured local time window by sending `max_tokens: 0` pre-warm requests about five minutes before the 1-hour TTL expires. `/claude-fast on` adds Anthropic `speed: "fast"` plus the `fast-mode-2026-02-01` beta header for supported Opus models (`claude-opus-4-6` and `claude-opus-4-7`).
 
 ## Relay
 

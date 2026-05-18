@@ -19,7 +19,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Primary Claude Pro/Max OAuth | OpenCode `/connect anthropic` | Pi `/login anthropic` |
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
-| Commands | `/claude-cache`, `/claude-fast`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-fast`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-cachekeep`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
 | Fallback accounts, quota routing, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
 ## What CortexKit adds over the original plugin
@@ -27,6 +27,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Fallback Claude accounts**: keep each agent's normal Anthropic login as the primary account, then route to ordered fallback OAuth accounts on auth/quota/rate-limit failures.
 - **Quota-aware routing**: skip main or fallback accounts when their 5-hour or 7-day Claude quota falls below your configured minimum.
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
+- **Cache keepalive**: use `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
@@ -41,7 +42,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
-- Add `/claude-cache`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
+- Add `/claude-cache`, `/claude-cachekeep`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
 
 ## Install
@@ -172,6 +173,11 @@ Example:
     "enabled": false,
     "mode": "explicit"
   },
+  "cacheKeep": {
+    "enabled": false,
+    "startHour": 9,
+    "endHour": 23
+  },
   "dump": {
     "enabled": false
   },
@@ -189,7 +195,7 @@ Example:
 }
 ```
 
-The `claudeCache` block controls the `/claude-cache` command's persisted mode, and `claudeFast` controls `/claude-fast`. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
+The `claudeCache` block controls the `/claude-cache` command's persisted mode, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
 
 ## Fallback accounts
 
@@ -274,6 +280,22 @@ Modes:
 - `hybrid` (recommended) removes top-level automatic caching and uses explicit anchors on the last stable system block, the first two messages, and `messages[n-2]` when that anchor is distinct.
 
 In OpenCode, subagent requests do not receive 1-hour TTL caching. The plugin detects child sessions through OpenCode's `x-parent-session-id` header, strips that internal header before forwarding to Anthropic, and leaves default ephemeral caching in place for those requests.
+
+### Cache keepalive
+
+`/claude-cachekeep` keeps recently used hybrid-mode session caches warm while the agent process is running:
+
+```text
+/claude-cachekeep
+/claude-cachekeep 09-23
+/claude-cachekeep off
+```
+
+The hour range uses local 24-hour time and is start-inclusive/end-exclusive. `09-23` means cache keepalive may run from 09:00 until 22:59. Overnight windows such as `23-09` are accepted.
+
+Cache keepalive only tracks requests when `/claude-cache` is enabled in `hybrid` mode. For each active session seen that day, the package keeps an in-memory clone of the latest rewritten Anthropic request and sends a non-streaming `max_tokens: 0` pre-warm request about five minutes before the 1-hour cache entry would expire. Nothing is written to disk except the schedule configuration.
+
+Pre-warm requests preserve explicit cache anchors but remove response-only fields that Anthropic rejects with `max_tokens: 0`, such as streaming, enabled thinking, structured output format, and forced/any tool choice. The feature works only while OpenCode or Pi is running and the machine is awake, and cache writes are still billed when the cache entry is no longer warm.
 
 ## Claude fast mode
 

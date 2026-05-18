@@ -1,6 +1,7 @@
 export * from './accounts.ts'
 export * from './auth.ts'
 export * from './cache1h.ts'
+export * from './cachekeep.ts'
 export * from './cch.ts'
 export * from './claude-code.ts'
 export * from './constants.ts'

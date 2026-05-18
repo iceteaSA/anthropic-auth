@@ -10,6 +10,7 @@ import {
   CLAUDE_CODE_VERSION,
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
+import { log } from './logger.ts'
 
 export const ACCOUNT_FILE_NAME = 'anthropic-auth.json'
 export const QUOTA_URL = 'https://api.anthropic.com/api/oauth/usage'
@@ -78,6 +79,11 @@ export type AccountStorage = {
   }
   claudeFast?: {
     enabled?: boolean
+  }
+  cacheKeep?: {
+    enabled?: boolean
+    startHour?: number
+    endHour?: number
   }
   relay?: {
     enabled?: boolean
@@ -236,6 +242,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     claudeCache: isRecord(value.claudeCache) ? value.claudeCache : undefined,
     dump: isRecord(value.dump) ? value.dump : undefined,
     claudeFast: isRecord(value.claudeFast) ? value.claudeFast : undefined,
+    cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
     accounts: value.accounts
       .map(normalizeAccount)
@@ -374,6 +381,42 @@ export async function setFastModePersistentEnabled(
   }
   storage.claudeFast = {
     ...(storage.claudeFast ?? {}),
+    enabled,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export async function setCacheKeepPersistentWindow(
+  startHour: number,
+  endHour: number,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.cacheKeep = {
+    enabled: true,
+    startHour,
+    endHour,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export async function setCacheKeepPersistentEnabled(
+  enabled: boolean,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
     enabled,
   }
   await saveAccounts(storage, path)
@@ -765,12 +808,27 @@ export class FallbackAccountManager {
           this.now(),
         )
       ) {
+        log('[refresh] fallback oauth skipped backoff', {
+          accountId: account.id,
+          nextRetryAt: account.lastRefreshError?.nextRetryAt,
+          retryCount: account.lastRefreshError?.retryCount,
+        })
         continue
       }
       try {
+        log('[refresh] fallback oauth background due', {
+          accountId: account.id,
+          expiresInMs: account.expires
+            ? account.expires - this.now()
+            : undefined,
+        })
         await this.refreshAccount(account, storage)
         changed = true
       } catch (error) {
+        log('[refresh] fallback oauth background failed', {
+          accountId: account.id,
+          error: error instanceof Error ? error.message : String(error),
+        })
         recordRefreshError(account, error, this.now())
         updateStoredAccount(storage, account)
         changed = true
@@ -895,6 +953,13 @@ export class FallbackAccountManager {
 
     const sourceAccount = latestAccount ?? account
     const refreshToken = sourceAccount.refresh
+    log('[refresh] fallback oauth refresh request start', {
+      accountId: sourceAccount.id,
+      force: options.force === true,
+      expiresInMs: sourceAccount.expires
+        ? sourceAccount.expires - this.now()
+        : undefined,
+    })
     const refreshed = await refreshClaudeOAuthToken({
       refreshToken,
       fetchImpl: this.fetchImpl,
@@ -907,6 +972,12 @@ export class FallbackAccountManager {
       refreshed.expires - refreshed.expiresIn * 1000
     sourceAccount.lastRefreshError = undefined
     updateStoredAccount(storage, sourceAccount)
+    log('[refresh] fallback oauth refresh succeeded', {
+      accountId: sourceAccount.id,
+      expiresInMs: sourceAccount.expires
+        ? sourceAccount.expires - this.now()
+        : undefined,
+    })
     return sourceAccount
   }
 

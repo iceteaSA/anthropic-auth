@@ -1,19 +1,27 @@
 import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  CLAUDE_CACHE_KEEP_COMMAND_NAME,
   executeCache1hCommand,
+  executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
   getCache1hPersistentMode,
+  getCacheKeepWindow,
   isCache1hPersistentlyEnabled,
+  isCacheKeepHybridActive,
+  isCacheKeepPersistentlyEnabled,
   isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
   loadAccounts,
   parseCache1hCommandAction,
+  parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
+  setCacheKeepPersistentEnabled,
+  setCacheKeepPersistentWindow,
   setDumpPersistentEnabled,
   setFastModePersistentEnabled,
 } from '@cortexkit/anthropic-auth-core'
@@ -66,6 +74,36 @@ export function registerCommands(pi: ExtensionAPI) {
           argumentsText: args ?? '',
           enabled: nextEnabled,
           mode: nextMode,
+        }),
+        action.type === 'usage' ? 'warning' : 'info',
+      )
+    },
+  })
+
+  pi.registerCommand(CLAUDE_CACHE_KEEP_COMMAND_NAME, {
+    description: 'Keep hybrid Claude cache warm during a local time window',
+    handler: async (args, ctx) => {
+      const path = getPiAccountStoragePath()
+      let storage = await loadAccounts(path)
+      const action = parseCacheKeepCommandAction(args ?? '')
+
+      if (action.type === 'window') {
+        storage = await setCacheKeepPersistentWindow(
+          action.startHour,
+          action.endHour,
+          path,
+        )
+      } else if (action.type === 'disable') {
+        storage = await setCacheKeepPersistentEnabled(false, path)
+      }
+
+      notify(
+        ctx,
+        executeCacheKeepCommand({
+          argumentsText: args ?? '',
+          enabled: isCacheKeepPersistentlyEnabled(storage),
+          window: getCacheKeepWindow(storage),
+          hybridActive: isCacheKeepHybridActive(storage),
         }),
         action.type === 'usage' ? 'warning' : 'info',
       )

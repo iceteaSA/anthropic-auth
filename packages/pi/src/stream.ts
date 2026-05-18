@@ -1,10 +1,13 @@
 import {
   applyClaudeCodeHeaders,
+  CACHE_KEEP_EXTENDED_TTL_BETA,
+  CacheKeepManager,
   FAST_MODE_BETA,
   FallbackAccountManager,
   getCache1hPersistentMode,
   getRelayConfig,
   isCache1hPersistentlyEnabled,
+  isCacheKeepHybridActive,
   isFastModePersistentlyEnabled,
   loadAccounts,
   mergeAnthropicBetas,
@@ -29,6 +32,40 @@ import {
 
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import { getPiAccountStoragePath } from './paths.ts'
+
+const cacheKeepManager = new CacheKeepManager({
+  loadStorage: () => loadAccounts(getPiAccountStoragePath()),
+  prepareHeaders: async (headers, target) => {
+    const authorization = headers.get('authorization') ?? ''
+    const match = /^Bearer\s+(.+)$/i.exec(authorization)
+    const accessToken = match?.[1]
+    if (!accessToken) return headers
+    try {
+      const body = JSON.parse(target.bodyText) as Record<string, unknown>
+      const identity = await resolveClaudeCodeIdentity(
+        accessToken,
+        typeof body.model === 'string' ? body.model : undefined,
+      )
+      headers.delete('anthropic-beta')
+      applyClaudeCodeHeaders(headers, accessToken, { body, identity })
+      headers.set(
+        'anthropic-beta',
+        mergeAnthropicBetas(headers.get('anthropic-beta'), [
+          CACHE_KEEP_EXTENDED_TTL_BETA,
+        ]),
+      )
+      if (body.speed === 'fast') {
+        headers.set(
+          'anthropic-beta',
+          mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
+        )
+      }
+    } catch {
+      applyClaudeCodeHeaders(headers, accessToken)
+    }
+    return headers
+  },
+})
 
 function mapStopReason(reason: string | null | undefined): StopReason {
   switch (reason) {
@@ -169,6 +206,15 @@ async function sendAnthropicRequest(options: {
     body: bodyText,
     signal: options.streamOptions?.signal,
   }
+
+  await cacheKeepManager.track({
+    sessionId: relayAffinity,
+    url: input.toString(),
+    headers,
+    bodyText,
+    storage,
+    cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
+  })
 
   return sendViaRelay({
     config: getRelayConfig(storage),

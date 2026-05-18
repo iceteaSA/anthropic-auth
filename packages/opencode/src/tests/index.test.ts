@@ -396,6 +396,10 @@ describe('auth.loader', () => {
       template: 'claude-fast',
       description: expect.stringContaining('fast mode'),
     })
+    expect(config.command?.['claude-cachekeep']).toMatchObject({
+      template: 'claude-cachekeep',
+      description: expect.stringContaining('cache warm'),
+    })
 
     await expect(
       plugin['command.execute.before']({
@@ -439,6 +443,46 @@ describe('auth.loader', () => {
       await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
     )
     expect(saved.claudeCache).toEqual({ enabled: true, mode: 'explicit' })
+  })
+
+  test('handles /claude-cachekeep command and persists window', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+      }),
+    )
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-cachekeep',
+        arguments: '09-23',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls
+    const latestCall = promptCalls.at(-1)?.[0]
+    expect(latestCall?.body.parts[0]?.text).toContain(
+      '## Claude Cache Keep Enabled',
+    )
+    expect(latestCall?.body.parts[0]?.text).toContain('Window: 09-23')
+    expect(latestCall?.body.parts[0]?.text).toContain('Hybrid active: yes')
+
+    const saved = JSON.parse(
+      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    )
+    expect(saved.cacheKeep).toEqual({
+      enabled: true,
+      startHour: 9,
+      endHour: 23,
+    })
   })
 
   test('registers and handles /claude-fast slash command with ignored status replies', async () => {

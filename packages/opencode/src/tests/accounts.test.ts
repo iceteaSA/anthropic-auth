@@ -12,6 +12,8 @@ import {
   saveAccounts,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
+  setCacheKeepPersistentEnabled,
+  setCacheKeepPersistentWindow,
   setFastModePersistentEnabled,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
@@ -136,6 +138,21 @@ describe('account storage', () => {
     saved = await loadAccounts()
 
     expect(saved?.claudeCache).toEqual({ enabled: false, mode: 'hybrid' })
+  })
+
+  test('persists cacheKeep window', async () => {
+    const storage = await setCacheKeepPersistentWindow(9, 23)
+    expect(storage.cacheKeep).toEqual({
+      enabled: true,
+      startHour: 9,
+      endHour: 23,
+    })
+    const disabled = await setCacheKeepPersistentEnabled(false)
+    expect(disabled.cacheKeep).toEqual({
+      enabled: false,
+      startHour: 9,
+      endHour: 23,
+    })
   })
 
   test('persists claudeFast enabled state', async () => {
