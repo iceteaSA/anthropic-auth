@@ -284,6 +284,13 @@ export async function buildAnthropicRequest(
   identity?: ClaudeCodeIdentity,
 ): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
   const messages = convertMessages(context.messages)
+  // Strip trailing assistant messages — Anthropic rejects prefill on some models
+  while (
+    messages.length &&
+    messages[messages.length - 1]?.role === 'assistant'
+  ) {
+    messages.pop()
+  }
   const system = [
     {
       type: 'text',
