@@ -494,7 +494,12 @@ export function buildRefreshOperationError(input: {
   refreshToken: string
   previous?: AccountOperationError
 }): AccountOperationError {
-  const retryCount = (input.previous?.retryCount ?? 0) + 1
+  const tokenHash = hashRefreshToken(input.refreshToken)
+  const previousRetryCount =
+    input.previous?.tokenHash === tokenHash
+      ? (input.previous.retryCount ?? 0)
+      : 0
+  const retryCount = previousRetryCount + 1
   const delay = isTransientRefreshError(input.error)
     ? Math.min(
         MAX_REFRESH_RETRY_DELAY_MS,
@@ -506,7 +511,7 @@ export function buildRefreshOperationError(input: {
     checkedAt: input.now,
     nextRetryAt: input.now + delay,
     retryCount,
-    tokenHash: hashRefreshToken(input.refreshToken),
+    tokenHash,
   }
 }
 

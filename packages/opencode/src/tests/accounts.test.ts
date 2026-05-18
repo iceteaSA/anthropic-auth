@@ -5,6 +5,8 @@ import { join } from 'node:path'
 
 import {
   type AccountStorage,
+  buildRefreshOperationError,
+  ClaudeOAuthRefreshError,
   FallbackAccountManager,
   getCache1hPersistentMode,
   isFastModePersistentlyEnabled,
@@ -218,6 +220,29 @@ describe('FallbackAccountManager', () => {
     expect(saved?.accounts[0]?.refresh).toBe('new-refresh')
     expect(saved?.accounts[0]?.expires).toBe(3_601_000)
     expect(saved?.accounts[0]?.lastRefreshedAt).toBe(1_000)
+  })
+
+  test('refresh backoff retry count resets after token rotation', () => {
+    const first = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1_000,
+      refreshToken: 'old-refresh',
+    })
+    const second = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: first.nextRetryAt ?? 2_000,
+      refreshToken: 'old-refresh',
+      previous: first,
+    })
+    const afterRelogin = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: second.nextRetryAt ?? 3_000,
+      refreshToken: 'new-refresh',
+      previous: second,
+    })
+
+    expect(second.retryCount).toBe(2)
+    expect(afterRelogin.retryCount).toBe(1)
   })
 
   test('backs off failed fallback refreshes instead of retrying every pass', async () => {
