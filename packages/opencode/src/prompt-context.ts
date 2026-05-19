@@ -94,6 +94,7 @@ export async function resolvePromptContext(
     session?: {
       messages?: (input: {
         path: { id: string }
+        query?: { limit?: number }
       }) =>
         | Promise<{ data?: unknown[] } | unknown[]>
         | { data?: unknown[] }
@@ -106,7 +107,10 @@ export async function resolvePromptContext(
   try {
     messages = extractMessages(
       await Promise.resolve(
-        typedClient.session.messages({ path: { id: sessionId } }),
+        typedClient.session.messages({
+          path: { id: sessionId },
+          query: { limit: 100 },
+        }),
       ),
     )
   } catch {

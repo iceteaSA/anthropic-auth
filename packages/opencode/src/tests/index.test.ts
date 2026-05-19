@@ -570,6 +570,7 @@ describe('auth.loader', () => {
 
     expect(mockClient.session.messages).toHaveBeenCalledWith({
       path: { id: 'session-1' },
+      query: { limit: 100 },
     })
     expect(mockClient.session.promptAsync).toHaveBeenCalledWith({
       path: { id: 'session-1' },
