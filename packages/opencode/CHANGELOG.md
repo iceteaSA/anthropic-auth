@@ -2,6 +2,13 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.1.3
+
+### Patch Changes
+
+- Refresh Claude OAuth tokens earlier by treating `refresh.refreshBeforeExpiryMinutes` as a minimum 4-hour window, preventing transient OAuth `429` backoff from pushing retries past token expiry.
+- Serialize main OpenCode OAuth refresh across concurrently running OpenCode processes with an atomic filesystem lock, avoiding multi-session refresh races against Anthropic's OAuth endpoint.
+
 ## 1.1.2
 
 ### Patch Changes
