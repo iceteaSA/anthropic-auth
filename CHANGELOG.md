@@ -2,6 +2,14 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.1.2
+
+### Patch Changes
+
+- Added `/claude-cachekeep` for hybrid Claude cache mode. It keeps in-memory clones of recently used rewritten requests and sends prewarm-safe `max_tokens: 0` calls during the configured local time window.
+- Fixed OAuth refresh backoff after re-login by resetting retry severity when the refresh token rotates.
+- Reduced hidden slash-command reply overhead by bounding OpenCode prompt-context lookup to the most recent 100 messages instead of hydrating the full session.
+
 ## 1.0.0
 
 ### Major Changes
