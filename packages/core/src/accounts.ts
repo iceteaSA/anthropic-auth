@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -290,6 +290,57 @@ export async function saveAccounts(
     mode: 0o600,
   })
   await rename(tempPath, path)
+}
+
+export async function acquireRefreshFileLock(options: {
+  name: string
+  ttlMs: number
+  path?: string
+  now?: () => number
+}): Promise<{ release: () => Promise<void> } | null> {
+  const accountPath = options.path ?? getAccountStoragePath()
+  const lockDir = `${accountPath}.${options.name}.lock`
+  const ownerPath = join(lockDir, 'owner.json')
+  const ownerId = randomUUID()
+  const now = options.now ?? Date.now
+
+  async function tryAcquire() {
+    try {
+      await mkdir(lockDir, { mode: 0o700 })
+      await writeFile(
+        ownerPath,
+        `${JSON.stringify({ ownerId, expiresAt: now() + options.ttlMs })}\n`,
+        { encoding: 'utf8', mode: 0o600 },
+      )
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      return false
+    }
+  }
+
+  if (!(await tryAcquire())) {
+    try {
+      const owner = JSON.parse(await readFile(ownerPath, 'utf8'))
+      if (Number(owner?.expiresAt) > now()) return null
+    } catch {
+      // Broken owner metadata is treated as stale.
+    }
+    await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+    if (!(await tryAcquire())) return null
+  }
+
+  return {
+    release: async () => {
+      try {
+        const owner = JSON.parse(await readFile(ownerPath, 'utf8'))
+        if (owner?.ownerId !== ownerId) return
+      } catch {
+        return
+      }
+      await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+    },
+  }
 }
 
 export function isCache1hPersistentlyEnabled(storage: AccountStorage | null) {

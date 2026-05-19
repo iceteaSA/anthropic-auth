@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import {
   type AccountStorage,
+  acquireRefreshFileLock,
   authorize,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
@@ -584,6 +585,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 const baseDelayMs = 500
                 let leaseId: string | null = null
                 let leaseTokenHash: string | null = null
+                let releaseFileLock: (() => Promise<void>) | null = null
 
                 async function updateMainRefreshState(
                   update: (storage: AccountStorage) => void,
@@ -672,6 +674,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         'Claude OAuth refresh is already in progress',
                       )
                     }
+
+                    const fileLock = await acquireRefreshFileLock({
+                      name: 'opencode-main-oauth-refresh',
+                      ttlMs: 2 * 60_000,
+                    })
+                    if (!fileLock) {
+                      log(
+                        '[refresh] opencode main oauth refresh skipped file lock',
+                      )
+                      throw new Error(
+                        'Claude OAuth refresh is already in progress',
+                      )
+                    }
+                    releaseFileLock = fileLock.release
 
                     leaseId = randomUUID()
                     leaseTokenHash = refreshTokenHash
@@ -801,6 +817,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         }
                       }).catch(() => {})
                     }
+                    await releaseFileLock?.().catch(() => {})
                   }
                 }
                 // Unreachable — each iteration either returns or throws.

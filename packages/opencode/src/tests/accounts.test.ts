@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import {
   type AccountStorage,
+  acquireRefreshFileLock,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
@@ -74,6 +75,53 @@ describe('account storage', () => {
   test('malformed sidecar file is ignored', async () => {
     await writeFile(accountPath, '{nope', 'utf8')
     await expect(loadAccounts()).resolves.toBeNull()
+  })
+
+  test('refresh file lock allows only one holder', async () => {
+    let now = 1_000
+    const first = await acquireRefreshFileLock({
+      name: 'test-refresh',
+      ttlMs: 60_000,
+      path: accountPath,
+      now: () => now,
+    })
+    expect(first).not.toBeNull()
+
+    await expect(
+      acquireRefreshFileLock({
+        name: 'test-refresh',
+        ttlMs: 60_000,
+        path: accountPath,
+        now: () => now,
+      }),
+    ).resolves.toBeNull()
+
+    await first?.release()
+    const second = await acquireRefreshFileLock({
+      name: 'test-refresh',
+      ttlMs: 60_000,
+      path: accountPath,
+      now: () => now,
+    })
+    expect(second).not.toBeNull()
+    await second?.release()
+
+    const stale = await acquireRefreshFileLock({
+      name: 'test-refresh',
+      ttlMs: 60_000,
+      path: accountPath,
+      now: () => now,
+    })
+    expect(stale).not.toBeNull()
+    now += 60_001
+    const afterStale = await acquireRefreshFileLock({
+      name: 'test-refresh',
+      ttlMs: 60_000,
+      path: accountPath,
+      now: () => now,
+    })
+    expect(afterStale).not.toBeNull()
+    await afterStale?.release()
   })
 
   test('preserves relay config when saving storage loaded by older code', async () => {
