@@ -222,6 +222,52 @@ describe('FallbackAccountManager', () => {
     expect(saved?.accounts[0]?.lastRefreshedAt).toBe(1_000)
   })
 
+  test('refreshes fallback tokens within the four-hour minimum window', async () => {
+    const storage = baseStorage()
+    storage.refresh = {
+      enabled: true,
+      intervalMinutes: 10,
+      refreshBeforeExpiryMinutes: 30,
+    }
+    const now = Date.now()
+    storage.accounts.push({
+      id: 'fallback-early',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: now + 3 * 60 * 60_000,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: any) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshDueAccounts()
+
+    const saved = await loadAccounts()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(saved?.accounts[0]?.refresh).toBe('new-refresh')
+  })
+
   test('refresh backoff retry count resets after token rotation', () => {
     const first = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
@@ -347,7 +393,7 @@ describe('FallbackAccountManager', () => {
       type: 'oauth',
       access: 'fresh-access',
       refresh: 'fresh-refresh',
-      expires: 3_602_000,
+      expires: 20_000_000,
     })
     await saveAccounts(newer)
 
@@ -404,7 +450,7 @@ describe('FallbackAccountManager', () => {
       type: 'oauth',
       access: 'access',
       refresh: 'refresh',
-      expires: 3_601_000,
+      expires: 20_000_000,
       quota: {
         five_hour: { usedPercent: 95, remainingPercent: 5, checkedAt: 1_000 },
         seven_day: { usedPercent: 50, remainingPercent: 50, checkedAt: 1_000 },
@@ -423,7 +469,7 @@ describe('FallbackAccountManager', () => {
       type: 'oauth',
       access: 'access',
       refresh: 'refresh',
-      expires: 3_601_000,
+      expires: 20_000_000,
     })
     await saveAccounts(storage)
 
@@ -507,7 +553,7 @@ describe('FallbackAccountManager', () => {
       type: 'oauth',
       access: 'old-access',
       refresh: 'refresh-token',
-      expires: 3_601_000,
+      expires: 20_000_000,
     })
     await saveAccounts(storage)
 

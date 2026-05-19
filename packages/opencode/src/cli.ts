@@ -22,7 +22,7 @@ function defaultStorage(): AccountStorage {
     refresh: {
       enabled: true,
       intervalMinutes: 10,
-      refreshBeforeExpiryMinutes: 30,
+      refreshBeforeExpiryMinutes: 240,
     },
     quota: {
       enabled: true,

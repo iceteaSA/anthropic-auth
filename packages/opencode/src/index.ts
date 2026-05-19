@@ -78,7 +78,9 @@ import {
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
-const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 30
+const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
+const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
+  MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 
 type MainQuotaCache = {
   accessToken: string
@@ -303,7 +305,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const minutes =
       storage?.refresh?.refreshBeforeExpiryMinutes ??
       DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
-    return Math.max(0, minutes) * 60_000
+    return Math.max(MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES, minutes) * 60_000
   }
 
   function mainRefreshEnabled(

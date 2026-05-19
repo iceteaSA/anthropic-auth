@@ -61,7 +61,7 @@ function createFallbackStorage(
         type: 'oauth',
         access: 'fallback-access',
         refresh: 'fallback-refresh',
-        expires: Date.now() + 60 * 60 * 1000,
+        expires: Date.now() + 5 * 60 * 60 * 1000,
         quota: {
           five_hour: {
             usedPercent: 25,
@@ -698,7 +698,7 @@ describe('auth.loader', () => {
             type: 'oauth',
             access: 'fallback-access',
             refresh: 'fallback-refresh',
-            expires: Date.now() + 60 * 60 * 1000,
+            expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
                 usedPercent: 99,
@@ -1086,6 +1086,65 @@ describe('auth.loader', () => {
         type: 'oauth',
         refresh: 'background-refresh-new',
         access: 'background-access-new',
+        expires: expect.any(Number),
+      },
+    })
+  })
+
+  test('background refresh uses a four-hour minimum window for main oauth', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+      }),
+    )
+    const intervalHandlers: Array<() => void> = []
+    globalThis.setInterval = mock((handler: () => void) => {
+      intervalHandlers.push(handler)
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'early-refresh-new',
+              access_token: 'early-access-new',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: Date.now() + 3 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    intervalHandlers[intervalHandlers.length - 1]!()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect(mockClient.auth.set).toHaveBeenCalledWith({
+      path: { id: 'anthropic' },
+      body: {
+        type: 'oauth',
+        refresh: 'early-refresh-new',
+        access: 'early-access-new',
         expires: expect.any(Number),
       },
     })
@@ -1807,7 +1866,7 @@ describe('auth.loader', () => {
             type: 'oauth',
             access: 'fallback-access',
             refresh: 'fallback-refresh',
-            expires: Date.now() + 60 * 60 * 1000,
+            expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
                 usedPercent: 95,

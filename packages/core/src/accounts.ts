@@ -121,7 +121,8 @@ export type AccountRefreshError = {
 }
 
 const DEFAULT_FALLBACK_ON = [401, 403, 429]
-const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = 30
+const MIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
+const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = MIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
 const MIN_REFRESH_RETRY_DELAY_MS = 5 * 60_000
 const MAX_REFRESH_RETRY_DELAY_MS = 60 * 60_000
@@ -460,7 +461,7 @@ function refreshBeforeExpiryMs(storage: AccountStorage | null) {
   const minutes =
     storage?.refresh?.refreshBeforeExpiryMinutes ??
     DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES
-  return Math.max(0, minutes) * 60_000
+  return Math.max(MIN_REFRESH_BEFORE_EXPIRY_MINUTES, minutes) * 60_000
 }
 
 export function getRefreshIntervalMs(storage: AccountStorage | null) {
