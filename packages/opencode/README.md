@@ -481,6 +481,25 @@ bun run lint
 bun run format:check
 ```
 
+### Build modes
+
+Two build modes are available:
+
+```bash
+bun run build      # Deploy: bun build → bundled dist/ with all deps inlined (core + xxhash-wasm)
+bun run build:dev  # Dev: tsc → individual dist/*.js files (requires workspace node_modules)
+```
+
+The default `build` uses `bun build` to bundle `@cortexkit/anthropic-auth-core` and all transitive dependencies into self-contained output files. No `node_modules/` needed at runtime — the plugin works via `file://` path in OpenCode config:
+
+```json
+{
+  "plugin": ["file:///path/to/anthropic-auth/packages/opencode"]
+}
+```
+
+`@opencode-ai/plugin` remains external (peer dep provided by OpenCode).
+
 Inspect package contents:
 
 ```bash
