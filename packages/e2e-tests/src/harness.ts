@@ -78,10 +78,14 @@ export class E2EHarness {
     this.anthropic.script(responses)
   }
 
-  async createSession() {
-    const response = await this.client.session.create({
-      query: { directory: this.opencode.env.workdir },
-    })
+  async createSession(timeoutMs = 45_000) {
+    const response = await this.withTimeout(
+      this.client.session.create({
+        query: { directory: this.opencode.env.workdir },
+      }),
+      timeoutMs,
+      'session.create',
+    )
     if (!response.data) {
       throw new Error(
         `session.create failed\n--- stdout ---\n${this.opencode.stdout()}\n--- stderr ---\n${this.opencode.stderr()}`,
@@ -91,23 +95,42 @@ export class E2EHarness {
   }
 
   async sendPrompt(sessionId: string, text: string, timeoutMs = 45_000) {
-    const request = this.client.session.prompt({
-      path: { id: sessionId },
-      body: {
-        model: { providerID: 'anthropic', modelID: 'claude-sonnet-4-5' },
-        parts: [{ type: 'text', text }],
-      },
-    })
-    const timeout = new Promise<null>((resolve) =>
-      setTimeout(() => resolve(null), timeoutMs),
+    const result = await this.withTimeout(
+      this.client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: 'anthropic', modelID: 'claude-sonnet-4-5' },
+          parts: [{ type: 'text', text }],
+        },
+      }),
+      timeoutMs,
+      'session.prompt',
     )
-    const result = await Promise.race([request, timeout])
-    if (result === null) {
-      throw new Error(
-        `prompt timed out\n--- stdout ---\n${this.opencode.stdout()}\n--- stderr ---\n${this.opencode.stderr()}`,
-      )
-    }
     return result
+  }
+
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    label: string,
+  ) {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeout = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `${label} timed out\n--- stdout ---\n${this.opencode.stdout()}\n--- stderr ---\n${this.opencode.stderr()}`,
+            ),
+          ),
+        timeoutMs,
+      )
+    })
+    try {
+      return await Promise.race([promise, timeoutPromise])
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
   }
 
   async waitFor<T>(

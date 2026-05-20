@@ -120,9 +120,10 @@ async function waitForReady(
       combinedLogs.includes('sqlite-migration:done')
 
     try {
-      const response = await fetch(`${url}/doc`)
-      const serverAcceptsRequests =
-        response.ok || response.status === 404 || response.status === 401
+      const response = await fetch(`${url}/global/health`, {
+        signal: AbortSignal.timeout(2_000),
+      })
+      const serverAcceptsRequests = response.ok || response.status === 401
       if (serverAcceptsRequests && (!migrationStarted || migrationDone)) {
         readySince ||= Date.now()
         if (Date.now() - readySince >= 1_000) return
