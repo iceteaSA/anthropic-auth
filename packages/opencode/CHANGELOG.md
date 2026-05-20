@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.2.1
+
+### Patch Changes
+
+- Refresh Claude OAuth tokens through `https://api.anthropic.com/v1/oauth/token`, matching the live-smoke-tested CLIProxyAPI JSON refresh path, after `platform.claude.com` repeatedly returned OAuth `429` during proactive refresh.
+
 ## 1.2.0
 
 ### Minor Changes
