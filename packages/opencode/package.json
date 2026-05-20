@@ -19,7 +19,7 @@
     "opencode-anthropic-auth": "dist/cli.js"
   },
   "engines": {
-    "bun": "1.3.11"
+    "bun": "1.3.14"
   },
   "files": [
     "dist",

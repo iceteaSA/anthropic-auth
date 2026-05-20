@@ -2,6 +2,23 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.2.0
+
+### Minor Changes
+
+- Bundle the OpenCode plugin runtime with Bun so published installs no longer depend on workspace-local source layout.
+- Move Pi integration dependencies and imports from the old `@mariozechner/*` namespace to `@earendil-works/*`, including `@earendil-works/pi-tui`.
+
+### Patch Changes
+
+- Retry transient Claude OAuth refresh failures in the shared helper while keeping the OpenCode main-account refresh path single-sourced through its existing retry, backoff, and cross-process lock.
+- Harden Pi message conversion for empty base64 images, error `tool_result` parts, and tool IDs.
+- Reduce redundant account-storage reads in fallback routing and quota selection paths.
+- Harden relay optimistic-stream error handling and Worker request handling, including deferred KV state writes and a health response.
+- Update development dependencies and release workflow actions; release CI now also runs the OpenCode e2e harness before publishing.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the batch of Pi, fallback, relay, and packaging improvements that went into this release.
+
 ## 1.1.3
 
 ### Patch Changes
