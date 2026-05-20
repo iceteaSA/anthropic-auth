@@ -53,6 +53,9 @@ jobs:
       - name: Test
         run: bun run test
 
+      - name: Install OpenCode CLI for e2e
+        run: npm install -g opencode-ai@1.15.5
+
       - name: E2E tests
         run: bun run test:e2e
 
