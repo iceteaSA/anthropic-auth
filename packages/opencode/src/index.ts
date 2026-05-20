@@ -723,6 +723,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     })
                     const refreshed = await refreshClaudeOAuthToken({
                       refreshToken: freshAuth.refresh,
+                      // Main OpenCode OAuth already has request-path retry,
+                      // persisted backoff, and cross-process serialization here.
+                      // Keep the shared helper single-shot in this path so the
+                      // two retry layers cannot multiply endpoint pressure.
+                      maxRetries: 0,
                     })
 
                     // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set

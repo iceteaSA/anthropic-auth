@@ -1324,6 +1324,49 @@ describe('auth.loader', () => {
     expect(mockClient.auth.set).toHaveBeenCalledTimes(1)
   })
 
+  test('fetch wrapper keeps main oauth retry count bounded when helper also supports retries', async () => {
+    let tokenRefreshCalls = 0
+    const setTimeoutMock = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = setTimeoutMock
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+        return Promise.resolve(
+          new Response('Temporary failure', { status: 500 }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired',
+          refresh: 'refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      result.fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: '{}',
+      }),
+    ).rejects.toThrow('Claude OAuth refresh failed: 500')
+
+    expect(tokenRefreshCalls).toBe(3)
+  })
+
   test('fetch wrapper does not retry non-transient token refresh failures', async () => {
     let tokenRefreshCalls = 0
 

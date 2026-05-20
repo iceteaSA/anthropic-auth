@@ -8,7 +8,10 @@ import {
   refreshClaudeOAuthToken,
 } from '@cortexkit/anthropic-auth-core'
 
+const originalSetTimeout = globalThis.setTimeout
+
 afterEach(() => {
+  globalThis.setTimeout = originalSetTimeout
   mock.restore()
 })
 
@@ -184,5 +187,68 @@ describe('refreshClaudeOAuthToken', () => {
       expires: 3_601_000,
       expiresIn: 3600,
     })
+  })
+
+  test('retries transient OAuth refresh failures in the shared helper', async () => {
+    let calls = 0
+    const setTimeoutMock = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = setTimeoutMock
+
+    const result = await refreshClaudeOAuthToken({
+      refreshToken: 'old-refresh',
+      baseDelayMs: 25,
+      fetchImpl: mock(() => {
+        calls += 1
+        if (calls === 1) {
+          return Promise.resolve(new Response('temporary', { status: 500 }))
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch,
+    })
+
+    expect(calls).toBe(2)
+    expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 25)
+    expect(result.refresh).toBe('new-refresh')
+  })
+
+  test('does not retry OAuth refresh rate limits or invalid grants', async () => {
+    for (const status of [400, 429]) {
+      let calls = 0
+      await expect(
+        refreshClaudeOAuthToken({
+          refreshToken: 'old-refresh',
+          fetchImpl: mock(() => {
+            calls += 1
+            return Promise.resolve(
+              new Response(
+                status === 400
+                  ? JSON.stringify({ error: 'invalid_grant' })
+                  : JSON.stringify({
+                      error: {
+                        type: 'rate_limit_error',
+                        message: 'Rate limited',
+                      },
+                    }),
+                { status },
+              ),
+            )
+          }) as unknown as typeof fetch,
+        }),
+      ).rejects.toThrow(`Claude OAuth refresh failed: ${status}`)
+      expect(calls).toBe(1)
+    }
   })
 })

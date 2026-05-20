@@ -29,43 +29,79 @@ export type ClaudeOAuthRefreshResult = {
   expiresIn: number
 }
 
+function isTransientNetworkError(error: unknown) {
+  if (!(error instanceof Error)) return false
+  const code = (error as Error & { code?: unknown }).code
+  return (
+    error.message.includes('fetch failed') ||
+    code === 'ECONNRESET' ||
+    code === 'ECONNREFUSED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT'
+  )
+}
+
 export async function refreshClaudeOAuthToken(input: {
   refreshToken: string
   fetchImpl?: typeof fetch
   now?: () => number
+  maxRetries?: number
+  baseDelayMs?: number
 }): Promise<ClaudeOAuthRefreshResult> {
   const fetchImpl = input.fetchImpl ?? fetch
-  const response = await fetchImpl(TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: input.refreshToken,
-      client_id: CLIENT_ID,
-    }),
-  })
+  const maxRetries = input.maxRetries ?? 2
+  const baseDelayMs = input.baseDelayMs ?? 500
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '')
-    throw new ClaudeOAuthRefreshError(response.status, body)
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = baseDelayMs * 2 ** (attempt - 1)
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+
+      const response = await fetchImpl(TOKEN_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: input.refreshToken,
+          client_id: CLIENT_ID,
+        }),
+      })
+
+      if (!response.ok) {
+        if (response.status >= 500 && attempt < maxRetries) {
+          await response.body?.cancel().catch(() => {})
+          continue
+        }
+        const body = await response.text().catch(() => '')
+        throw new ClaudeOAuthRefreshError(response.status, body)
+      }
+
+      const json = (await response.json()) as {
+        access_token: string
+        refresh_token?: string
+        expires_in: number
+      }
+      const refreshedAt = input.now?.() ?? Date.now()
+
+      return {
+        access: json.access_token,
+        refresh: json.refresh_token ?? input.refreshToken,
+        expires: refreshedAt + json.expires_in * 1000,
+        expiresIn: json.expires_in,
+      }
+    } catch (error) {
+      if (error instanceof ClaudeOAuthRefreshError) throw error
+      if (attempt < maxRetries && isTransientNetworkError(error)) continue
+      throw error
+    }
   }
 
-  const json = (await response.json()) as {
-    access_token: string
-    refresh_token?: string
-    expires_in: number
-  }
-  const refreshedAt = input.now?.() ?? Date.now()
-
-  return {
-    access: json.access_token,
-    refresh: json.refresh_token ?? input.refreshToken,
-    expires: refreshedAt + json.expires_in * 1000,
-    expiresIn: json.expires_in,
-  }
+  throw new Error('Token refresh exhausted all retries')
 }
 
 export type AuthorizationResult = {
