@@ -51,6 +51,13 @@ function sanitize(text: string): string {
   return text.replace(/[\uD800-\uDFFF]/g, '\uFFFD')
 }
 
+function sanitizeToolId(id: string): string {
+  if (!id) return 'tool_call_unknown'
+  const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, '_')
+  if (!sanitized) return 'tool_call_unknown'
+  return sanitized.slice(0, 256)
+}
+
 function toClaudeCodeToolName(name: string): string {
   return CLAUDE_CODE_TOOLS.get(name.toLowerCase()) ?? name
 }
@@ -70,19 +77,22 @@ function convertTextAndImages(
       .join('\n')
   }
 
-  const blocks = content.map((item) => {
-    if (item.type === 'text') {
-      return { type: 'text', text: sanitize(item.text) }
-    }
-    return {
-      type: 'image',
-      source: {
-        type: 'base64',
-        media_type: item.mimeType,
-        data: item.data,
-      },
-    }
-  })
+  const blocks = content
+    .map((item) => {
+      if (item.type === 'text') {
+        return { type: 'text', text: sanitize(item.text) }
+      }
+      if (!item.data) return null
+      return {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: item.mimeType,
+          data: item.data,
+        },
+      }
+    })
+    .filter((block): block is NonNullable<typeof block> => block !== null)
 
   if (!blocks.some((block) => block.type === 'text')) {
     blocks.unshift({ type: 'text', text: '(see attached image)' })
@@ -134,7 +144,7 @@ function convertMessages(
         } else if (block.type === 'toolCall') {
           blocks.push({
             type: 'tool_use',
-            id: block.id,
+            id: sanitizeToolId(block.id),
             name: toClaudeCodeToolName(block.name),
             input: block.arguments,
           })
@@ -147,10 +157,17 @@ function convertMessages(
     if (message.role === 'toolResult') {
       const toolResult = message as ToolResultMessage
       const toolResults: Array<Record<string, unknown>> = []
+      const firstContent = convertTextAndImages(toolResult.content)
+      const firstContentArr = Array.isArray(firstContent)
+        ? firstContent
+        : [{ type: 'text', text: firstContent }]
+      if (toolResult.isError && firstContentArr.length === 0) {
+        firstContentArr.push({ type: 'text', text: 'Error' })
+      }
       toolResults.push({
         type: 'tool_result',
-        tool_use_id: toolResult.toolCallId,
-        content: convertTextAndImages(toolResult.content),
+        tool_use_id: sanitizeToolId(toolResult.toolCallId),
+        content: firstContentArr,
         is_error: toolResult.isError,
       })
 
@@ -160,10 +177,17 @@ function convertMessages(
         messages[nextIndex]?.role === 'toolResult'
       ) {
         const next = messages[nextIndex] as ToolResultMessage
+        const nextContent = convertTextAndImages(next.content)
+        const nextContentArr = Array.isArray(nextContent)
+          ? nextContent
+          : [{ type: 'text', text: nextContent }]
+        if (next.isError && nextContentArr.length === 0) {
+          nextContentArr.push({ type: 'text', text: 'Error' })
+        }
         toolResults.push({
           type: 'tool_result',
-          tool_use_id: next.toolCallId,
-          content: convertTextAndImages(next.content),
+          tool_use_id: sanitizeToolId(next.toolCallId),
+          content: nextContentArr,
           is_error: next.isError,
         })
         nextIndex += 1
