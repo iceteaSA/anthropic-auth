@@ -18,7 +18,7 @@ import type {
   ThinkingContent,
   Tool,
   ToolResultMessage,
-} from '@mariozechner/pi-ai'
+} from '@earendil-works/pi-ai'
 
 const CLAUDE_CODE_TOOLS = new Map(
   [
