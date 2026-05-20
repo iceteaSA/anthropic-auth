@@ -102,15 +102,35 @@ function writeConfigs(env: IsolatedEnv, options: SpawnOptions) {
   )
 }
 
-async function waitForReady(url: string, timeoutMs = 30_000) {
+async function waitForReady(
+  url: string,
+  getLogs: () => { stdout: string; stderr: string },
+  timeoutMs = 60_000,
+) {
   const deadline = Date.now() + timeoutMs
   let lastError: unknown
+  let readySince = 0
+
   while (Date.now() < deadline) {
+    const logs = getLogs()
+    const combinedLogs = `${logs.stdout}\n${logs.stderr}`
+    const migrationStarted = combinedLogs.includes('database migration')
+    const migrationDone =
+      combinedLogs.includes('Database migration complete') ||
+      combinedLogs.includes('sqlite-migration:done')
+
     try {
       const response = await fetch(`${url}/doc`)
-      if (response.ok || response.status === 404 || response.status === 401)
-        return
+      const serverAcceptsRequests =
+        response.ok || response.status === 404 || response.status === 401
+      if (serverAcceptsRequests && (!migrationStarted || migrationDone)) {
+        readySince ||= Date.now()
+        if (Date.now() - readySince >= 1_000) return
+      } else {
+        readySince = 0
+      }
     } catch (error) {
+      readySince = 0
       lastError = error
     }
     await Bun.sleep(200)
@@ -169,7 +189,7 @@ export async function spawnOpencode(
 
   const url = `http://127.0.0.1:${port}`
   try {
-    await waitForReady(url)
+    await waitForReady(url, () => ({ stdout, stderr }))
   } catch (error) {
     child.kill('SIGTERM')
     throw new Error(
