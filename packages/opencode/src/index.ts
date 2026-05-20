@@ -1234,13 +1234,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               ReturnType<FallbackAccountManager['getUsableFallbackAccounts']>
             >,
             trace?: PerfTrace,
+            existingStorage?: Awaited<ReturnType<typeof loadAccounts>>,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
             const loadStart = nowMs()
-            const storage = await loadAccounts()
+            const storage = existingStorage ?? (await loadAccounts())
             trace?.mark('fallback_load_storage', {
               ms: roundMs(nowMs() - loadStart),
+              cached: !!existingStorage,
             })
             let currentResponse = mainResponse
             let shouldFallback = shouldFallbackStatus(
@@ -1393,6 +1395,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 mainResponse,
                 preselectedFallbackAccounts,
                 trace,
+                storage,
               )
 
               trace.done('return_response', { status: response.status })
