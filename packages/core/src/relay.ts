@@ -1191,6 +1191,11 @@ export async function sendViaRelay(options: {
 }
 
 export const WORKER_SCRIPT = `
+function getPlanConfig(env) {
+  const paid = (env.RELAY_PLAN || '').toLowerCase() === 'paid'
+  return { paid, allowWebSocket: paid, logRequests: paid }
+}
+
 async function hashBody(body) {
   const bytes = new TextEncoder().encode(body)
   const digest = await crypto.subtle.digest('SHA-256', bytes)
@@ -1238,7 +1243,7 @@ async function resolveBody(env, payload) {
   return { error: 'unknown mode', status: 400 }
 }
 
-async function prepareUpstream(env, payload) {
+async function prepareUpstream(env, payload, config) {
   if ((payload.protocol !== 1 && payload.protocol !== 2) || payload.type !== 'request' || !payload.affinity || !payload.upstream?.url || !payload.next_hash) {
     return { error: 'invalid payload', status: 400 }
   }
@@ -1251,14 +1256,16 @@ async function prepareUpstream(env, payload) {
   }
 
   const stateWrite = writeState(env, payload.affinity, { body, hash: payload.next_hash, revision: payload.revision }).catch(() => {})
-  console.log(JSON.stringify({
-    relay: 'opencode-anthropic-auth',
-    transport: 'relay',
-    mode: payload.mode,
-    revision: payload.revision,
-    affinity: String(payload.affinity).slice(0, 12),
-    bodyBytes: body.length,
-  }))
+  if (config.logRequests) {
+    console.log(JSON.stringify({
+      relay: 'opencode-anthropic-auth',
+      transport: 'http',
+      mode: payload.mode,
+      revision: payload.revision,
+      affinity: String(payload.affinity).slice(0, 12),
+      bodyBytes: body.length,
+    }))
+  }
 
   return { body, stateWrite }
 }
@@ -1378,16 +1385,8 @@ async function prepareWebSocketUpstream(env, state, payload) {
 
   const nextState = { body, hash: payload.next_hash, revision: payload.revision }
   const checkpoint = checkpointWebSocketState(env, payload, body, nextState)
-  const logAccepted = () => console.log(JSON.stringify({
-    relay: 'opencode-anthropic-auth',
-    transport: 'websocket',
-    mode: payload.mode,
-    revision: payload.revision,
-    affinity: String(payload.affinity).slice(0, 12),
-    bodyBytes: body.length,
-  }))
 
-  return { body, state: nextState, checkpoint, logAccepted }
+  return { body, state: nextState, checkpoint }
 }
 
 function headersToObject(headers) {
@@ -1396,18 +1395,55 @@ function headersToObject(headers) {
   return result
 }
 
-async function handleRelayPayload(env, payload) {
-  const prepared = await prepareUpstream(env, payload)
+const SKIP_ERROR_LOG_STATUSES = new Set([429, 403])
+
+async function logUpstreamError(env, ctx, upstream, meta) {
+  if (!upstream.status || upstream.status < 400 || SKIP_ERROR_LOG_STATUSES.has(upstream.status)) return
+  try {
+    // Callers pass a dedicated clone, so consume it directly — cloning again
+    // here would leave the intermediate response body unread (stream leak).
+    const body = await upstream.text()
+    // Random suffix so two concurrent error logs for the same id/affinity that
+    // land in the same millisecond do not overwrite each other.
+    const key = 'error:' + Date.now() + ':' + (meta.id || meta.affinity || 'unknown') + ':' + crypto.randomUUID().slice(0, 8)
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      status: upstream.status,
+      statusText: upstream.statusText,
+      transport: meta.transport,
+      mode: meta.mode,
+      affinity: meta.affinity,
+      id: meta.id,
+      bodyBytes: meta.bodyBytes,
+      responseBody: body.slice(0, 50000),
+      responseHeaders: headersToObject(upstream.headers),
+    })
+    const kvWrite = env.RELAY_STATE.put(key, entry, { expirationTtl: 604800 }).catch(() => {})
+    if (ctx?.waitUntil) ctx.waitUntil(kvWrite)
+    else void kvWrite
+    console.error(JSON.stringify({
+      relay: 'opencode-anthropic-auth',
+      event: 'upstream_error',
+      status: upstream.status,
+      transport: meta.transport,
+      affinity: String(meta.affinity || '').slice(0, 12),
+      responsePreview: body.slice(0, 500),
+    }))
+  } catch {}
+}
+
+async function handleRelayPayload(env, payload, config) {
+  const prepared = await prepareUpstream(env, payload, config)
   if (prepared.error) return prepared
   const upstream = await fetch(payload.upstream.url, {
     method: payload.upstream.method || 'POST',
     headers: payload.upstream.headers,
     body: prepared.body,
   })
-  return { upstream, stateWrite: prepared.stateWrite }
+  return { upstream, stateWrite: prepared.stateWrite, bodyBytes: prepared.body.length }
 }
 
-async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
+async function handleWebSocket(socket, env, ctx, payload, getState, setState, config) {
   const heartbeat = setInterval(() => {
     try {
       socket.send(JSON.stringify({ protocol: 2, type: 'keepalive' }))
@@ -1425,7 +1461,16 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
 
     setState(result.state)
     socket.send(JSON.stringify({ protocol: 2, type: 'accepted', id: payload.id, hash: result.state.hash, revision: result.state.revision }))
-    ctx?.waitUntil?.(deferWorkerTask(result.logAccepted))
+    if (config.logRequests) {
+      console.log(JSON.stringify({
+        relay: 'opencode-anthropic-auth',
+        transport: 'websocket',
+        mode: payload.mode,
+        revision: payload.revision,
+        affinity: String(payload.affinity).slice(0, 12),
+        bodyBytes: result.body.length,
+      }))
+    }
 
     const upstreamPromise = fetch(payload.upstream.url, {
       method: payload.upstream.method || 'POST',
@@ -1434,6 +1479,19 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
     })
     ctx?.waitUntil?.(result.checkpoint)
     const upstream = await upstreamPromise
+    // Log non-429/403 errors to KV for debugging
+    if (upstream.status >= 400 && !SKIP_ERROR_LOG_STATUSES.has(upstream.status)) {
+      const errorClone = upstream.clone()
+      const errorLog = logUpstreamError(env, ctx, errorClone, {
+        transport: 'websocket',
+        mode: payload.mode,
+        affinity: payload.affinity,
+        id: payload.id,
+        bodyBytes: result.body.length,
+      })
+      if (ctx?.waitUntil) ctx.waitUntil(errorLog)
+      else void errorLog
+    }
     socket.send(JSON.stringify({
       protocol: 2,
       type: 'response_start',
@@ -1467,7 +1525,12 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
 
 export default {
   async fetch(request, env, ctx) {
+    const config = getPlanConfig(env)
+
     if (request.headers.get('Upgrade') === 'websocket') {
+      if (!config.allowWebSocket) {
+        return new Response('WebSocket transport requires Workers Paid plan. Use HTTP transport or upgrade your plan.', { status: 403 })
+      }
       const url = new URL(request.url)
       const token = url.searchParams.get('token')
       const affinity = url.searchParams.get('affinity')
@@ -1513,7 +1576,7 @@ export default {
         }
         payload.affinity = affinity
         busy = true
-        const run = handleWebSocket(server, env, ctx, payload, () => state, (nextState) => { state = nextState }).finally(() => { busy = false })
+        const run = handleWebSocket(server, env, ctx, payload, () => state, (nextState) => { state = nextState }, config).finally(() => { busy = false })
         ctx?.waitUntil?.(run)
         if (!ctx?.waitUntil) void run
       })
@@ -1521,7 +1584,11 @@ export default {
     }
 
     if (request.method === 'GET') {
-      return Response.json({ status: 'ok', transports: ['http', 'websocket'] })
+      return Response.json({
+        status: 'ok',
+        plan: config.paid ? 'paid' : 'free',
+        transports: config.allowWebSocket ? ['http', 'websocket'] : ['http'],
+      })
     }
     if (request.method !== 'POST') return new Response('method not allowed', { status: 405 })
     if (request.headers.get('x-relay-token') !== env.RELAY_TOKEN) {
@@ -1530,12 +1597,23 @@ export default {
 
     try {
       const payload = await request.json()
-      const result = await handleRelayPayload(env, payload)
+      const result = await handleRelayPayload(env, payload, config)
       if (result.error) return Response.json({ error: result.error }, { status: result.status })
 
       if (result.stateWrite) ctx.waitUntil(result.stateWrite)
 
       const upstream = result.upstream
+      // Defer error logging so reading the upstream error body never adds
+      // latency to forwarding the response (mirrors the WebSocket path).
+      const errorClone = upstream.clone()
+      const errorLog = logUpstreamError(env, ctx, errorClone, {
+        transport: 'http',
+        mode: payload.mode,
+        affinity: payload.affinity,
+        bodyBytes: result.bodyBytes,
+      })
+      if (ctx?.waitUntil) ctx.waitUntil(errorLog)
+      else void errorLog
       return new Response(upstream.body, {
         status: upstream.status,
         statusText: upstream.statusText,
