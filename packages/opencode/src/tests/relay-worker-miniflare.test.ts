@@ -42,13 +42,13 @@ function startUpstream() {
   return { server, bodies, url: `http://127.0.0.1:${server.port}/messages` }
 }
 
-async function startWorker() {
+async function startWorker(plan: 'paid' | 'free' = 'paid') {
   const mf = new Miniflare({
     script: WORKER_SCRIPT,
     modules: true,
     compatibilityDate: '2026-04-28',
     kvNamespaces: ['RELAY_STATE'],
-    bindings: { RELAY_TOKEN },
+    bindings: { RELAY_TOKEN, RELAY_PLAN: plan },
     port: 0,
     log: new NoOpLog(),
   })
@@ -298,6 +298,46 @@ describe('relay Worker under Miniflare', () => {
       workerSocket.socket.close()
       await mf.dispose()
       upstream.server.stop(true)
+    }
+  }, 30_000)
+
+  test('free plan rejects websocket upgrade and advertises http-only transport', async () => {
+    const mf = await startWorker('free')
+    try {
+      const base = (await mf.ready).toString()
+
+      // Plain fetch with an Upgrade header: the worker returns a normal 403
+      // Response before any handshake, so no WebSocket client is involved.
+      const upgrade = await fetch(
+        `${base}ws?token=${RELAY_TOKEN}&affinity=free-plan-session`,
+        { headers: { Upgrade: 'websocket' } },
+      )
+      expect(upgrade.status).toBe(403)
+      expect(await upgrade.text()).toContain('Workers Paid plan')
+
+      const health = await (await fetch(base, { method: 'GET' })).json()
+      expect(health).toMatchObject({
+        status: 'ok',
+        plan: 'free',
+        transports: ['http'],
+      })
+    } finally {
+      await mf.dispose()
+    }
+  }, 30_000)
+
+  test('paid plan health endpoint advertises websocket transport', async () => {
+    const mf = await startWorker('paid')
+    try {
+      const base = (await mf.ready).toString()
+      const health = await (await fetch(base, { method: 'GET' })).json()
+      expect(health).toMatchObject({
+        status: 'ok',
+        plan: 'paid',
+        transports: ['http', 'websocket'],
+      })
+    } finally {
+      await mf.dispose()
     }
   }, 30_000)
 })
