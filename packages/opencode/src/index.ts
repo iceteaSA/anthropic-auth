@@ -79,6 +79,9 @@ import {
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
+const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
+const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
+const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
 const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
@@ -132,6 +135,10 @@ function nowMs() {
 
 function roundMs(value: number) {
   return Math.round(value * 10) / 10
+}
+
+function jitterMs(maxMs: number) {
+  return Math.floor(Math.random() * Math.max(0, maxMs))
 }
 
 function startEventLoopLagMonitor() {
@@ -600,6 +607,44 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   await saveAccounts(storage)
                 }
 
+                async function waitForConcurrentMainRefresh(previous: {
+                  access?: string
+                  refresh?: string
+                  expires?: number
+                }) {
+                  const deadline = Date.now() + CONCURRENT_MAIN_REFRESH_WAIT_MS
+                  while (Date.now() < deadline) {
+                    await new Promise((resolve) =>
+                      setTimeout(
+                        resolve,
+                        CONCURRENT_MAIN_REFRESH_POLL_BASE_MS +
+                          jitterMs(CONCURRENT_MAIN_REFRESH_POLL_BASE_MS),
+                      ),
+                    )
+                    const latest = await getAuth()
+                    if (latest.type !== 'oauth' || !latest.access) continue
+                    const changed =
+                      latest.access !== previous.access ||
+                      latest.refresh !== previous.refresh ||
+                      (latest.expires ?? 0) > (previous.expires ?? 0) + 60_000
+                    if (
+                      changed &&
+                      (!latest.expires || latest.expires > Date.now())
+                    ) {
+                      log(
+                        '[refresh] opencode main oauth joined concurrent refresh',
+                        {
+                          expiresInMs: latest.expires
+                            ? latest.expires - Date.now()
+                            : undefined,
+                        },
+                      )
+                      return latest.access
+                    }
+                  }
+                  return null
+                }
+
                 for (let attempt = 0; attempt <= maxRetries; attempt++) {
                   let freshAuth: Awaited<ReturnType<typeof getAuth>> | null =
                     null
@@ -670,6 +715,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                           leaseUntil: storage.refresh.mainRefreshLeaseUntil,
                         },
                       )
+                      const concurrentAccess =
+                        await waitForConcurrentMainRefresh(freshAuth)
+                      if (concurrentAccess) return concurrentAccess
                       throw new Error(
                         'Claude OAuth refresh is already in progress',
                       )
@@ -683,6 +731,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       log(
                         '[refresh] opencode main oauth refresh skipped file lock',
                       )
+                      const concurrentAccess =
+                        await waitForConcurrentMainRefresh(freshAuth)
+                      if (concurrentAccess) return concurrentAccess
                       throw new Error(
                         'Claude OAuth refresh is already in progress',
                       )
@@ -904,7 +955,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
             mainBackgroundRefreshTimer = setInterval(() => {
               void run()
-            }, MAIN_AUTH_REFRESH_TICK_MS)
+            }, MAIN_AUTH_REFRESH_TICK_MS +
+              jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
             if ('unref' in mainBackgroundRefreshTimer) {
               mainBackgroundRefreshTimer.unref()
             }

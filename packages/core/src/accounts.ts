@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -134,6 +134,7 @@ const DEFAULT_MINIMUM_REMAINING: Record<QuotaWindowName, number> = {
 }
 const DEFAULT_FAIL_CLOSED_ON_UNKNOWN_QUOTA = true
 const BACKGROUND_TICK_MS = 60_000
+const BACKGROUND_TICK_JITTER_MS = 60_000
 
 function getConfigDir() {
   if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
@@ -299,46 +300,61 @@ export async function acquireRefreshFileLock(options: {
   now?: () => number
 }): Promise<{ release: () => Promise<void> } | null> {
   const accountPath = options.path ?? getAccountStoragePath()
-  const lockDir = `${accountPath}.${options.name}.lock`
-  const ownerPath = join(lockDir, 'owner.json')
+  const lockPath = `${accountPath}.${options.name}.lock`
+  const legacyOwnerPath = join(lockPath, 'owner.json')
   const ownerId = randomUUID()
   const now = options.now ?? Date.now
 
+  async function readOwner() {
+    try {
+      return JSON.parse(await readFile(lockPath, 'utf8'))
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EISDIR') throw error
+      return JSON.parse(await readFile(legacyOwnerPath, 'utf8'))
+    }
+  }
+
   async function tryAcquire() {
     try {
-      await mkdir(lockDir, { mode: 0o700 })
       await writeFile(
-        ownerPath,
+        lockPath,
         `${JSON.stringify({ ownerId, expiresAt: now() + options.ttlMs })}\n`,
-        { encoding: 'utf8', mode: 0o600 },
+        { encoding: 'utf8', mode: 0o600, flag: 'wx' },
       )
       return true
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      return false
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST' || code === 'EISDIR') return false
+      throw error
     }
   }
 
   if (!(await tryAcquire())) {
     try {
-      const owner = JSON.parse(await readFile(ownerPath, 'utf8'))
+      const owner = await readOwner()
       if (Number(owner?.expiresAt) > now()) return null
     } catch {
-      // Broken owner metadata is treated as stale.
+      try {
+        const current = await stat(lockPath)
+        if (current.mtimeMs + options.ttlMs > Date.now()) return null
+      } catch {
+        return null
+      }
     }
-    await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+    await rm(lockPath, { recursive: true, force: true }).catch(() => {})
     if (!(await tryAcquire())) return null
   }
 
   return {
     release: async () => {
       try {
-        const owner = JSON.parse(await readFile(ownerPath, 'utf8'))
+        const owner = await readOwner()
         if (owner?.ownerId !== ownerId) return
       } catch {
         return
       }
-      await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+      await rm(lockPath, { recursive: true, force: true }).catch(() => {})
     },
   }
 }
@@ -506,6 +522,10 @@ function quotaEnabled(storage: AccountStorage | null) {
 
 function refreshEnabled(storage: AccountStorage | null) {
   return storage?.refresh?.enabled !== false
+}
+
+function jitterMs(maxMs: number) {
+  return Math.floor(Math.random() * Math.max(0, maxMs))
 }
 
 function refreshBeforeExpiryMs(storage: AccountStorage | null) {
@@ -784,7 +804,7 @@ export class FallbackAccountManager {
     if (!this.refreshTimer) {
       this.refreshTimer = setInterval(() => {
         void run().catch(() => {})
-      }, BACKGROUND_TICK_MS)
+      }, BACKGROUND_TICK_MS + jitterMs(BACKGROUND_TICK_JITTER_MS))
       if ('unref' in this.refreshTimer) this.refreshTimer.unref()
     }
   }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -122,6 +122,22 @@ describe('account storage', () => {
     })
     expect(afterStale).not.toBeNull()
     await afterStale?.release()
+  })
+
+  test('refresh file lock does not steal an initializing lock', async () => {
+    const lockDir = `${accountPath}.test-refresh.lock`
+    await mkdir(lockDir, { recursive: true })
+
+    const contender = await acquireRefreshFileLock({
+      name: 'test-refresh',
+      ttlMs: 60_000,
+      path: accountPath,
+    })
+
+    expect(contender).toBeNull()
+    await expect(
+      readFile(join(lockDir, 'owner.json'), 'utf8'),
+    ).rejects.toThrow()
   })
 
   test('preserves relay config when saving storage loaded by older code', async () => {

@@ -180,12 +180,14 @@ describe('auth.loader', () => {
   const originalSetTimeout = globalThis.setTimeout
   const originalSetInterval = globalThis.setInterval
   const originalClearInterval = globalThis.clearInterval
+  const originalRandom = Math.random
 
   beforeEach(async () => {
     globalThis.fetch = originalFetch
     globalThis.setTimeout = originalSetTimeout
     globalThis.setInterval = originalSetInterval
     globalThis.clearInterval = originalClearInterval
+    Math.random = originalRandom
     resetCache1hState()
     resetDumpState()
     resetFastModeState()
@@ -197,6 +199,7 @@ describe('auth.loader', () => {
     globalThis.setTimeout = originalSetTimeout
     globalThis.setInterval = originalSetInterval
     globalThis.clearInterval = originalClearInterval
+    Math.random = originalRandom
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
     if (tempConfigDir) {
       await rm(tempConfigDir, { recursive: true, force: true })
@@ -1029,6 +1032,38 @@ describe('auth.loader', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
+  })
+
+  test('background refresh timers include per-process jitter', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+      }),
+    )
+    Math.random = () => 0.5
+    const intervalDelays: number[] = []
+    globalThis.setInterval = mock((handler: () => void, delay?: number) => {
+      void handler
+      intervalDelays.push(Number(delay))
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+    globalThis.clearInterval = mock(() => {}) as unknown as typeof clearInterval
+
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'access',
+          refresh: 'refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    expect(intervalDelays).toContain(90_000)
   })
 
   test('background refresh proactively rotates main oauth before expiry', async () => {
