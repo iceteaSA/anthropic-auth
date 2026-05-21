@@ -2,6 +2,14 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.2.2
+
+### Patch Changes
+
+- Add jitter to OpenCode and fallback-account background OAuth refresh timers so concurrent OpenCode processes do not all refresh at the same due timestamp.
+- Harden the cross-process main OAuth refresh lock so a process cannot steal a lock while another process is still initializing it, preventing duplicate refresh requests that can consume a rotated refresh token and leave the loser with `invalid_grant`.
+- When a main OAuth refresh is already in progress, wait briefly and re-read OpenCode auth so followers can join the successful token rotation instead of failing immediately.
+
 ## 1.2.1
 
 ### Patch Changes
