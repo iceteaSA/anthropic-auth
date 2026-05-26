@@ -2,6 +2,15 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.2.3
+
+### Patch Changes
+
+- Align Claude OAuth token refresh with the live-tested PR #40 request shape: `https://platform.claude.com/v1/oauth/token`, JSON payloads, and an `axios/1.13.6` User-Agent.
+- Honor OAuth `Retry-After` responses and skip request-path refresh attempts while main-account backoff is active, reducing repeated refresh failures during Anthropic rate limits.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the OAuth refresh fixes in this release.
+
 ## 1.2.1
 
 ### Patch Changes

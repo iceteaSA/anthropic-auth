@@ -2,6 +2,15 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.2.3
+
+### Patch Changes
+
+- Align Claude OAuth token refresh with the live-tested PR #40 request shape: `https://platform.claude.com/v1/oauth/token`, JSON payloads, and an `axios/1.13.6` User-Agent.
+- Honor OAuth `Retry-After` responses and skip request-path refresh attempts while main-account backoff is active, reducing repeated refresh failures during Anthropic rate limits.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the OAuth refresh fixes in this release.
+
 ## 1.2.2
 
 ### Patch Changes
