@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.2.4
+
+### Patch Changes
+
+- Serialize fallback-account OAuth refreshes across OpenCode processes so concurrent refresh attempts cannot reuse and invalidate a rotating refresh token.
+
 ## 1.2.3
 
 ### Patch Changes
