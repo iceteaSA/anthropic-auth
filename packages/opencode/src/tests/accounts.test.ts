@@ -742,6 +742,137 @@ describe('FallbackAccountManager', () => {
     expect(saved?.accounts[0]?.refresh).toBe('fresh-refresh')
   })
 
+  test('uses cached passing quota when a stale quota refresh is rate limited', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'stale-good-quota',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: 20_000_000,
+      quota: {
+        five_hour: {
+          usedPercent: 30,
+          remainingPercent: 70,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+        seven_day: {
+          usedPercent: 62,
+          remainingPercent: 38,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: { type: 'rate_limit_error', message: 'Rate limited' },
+          }),
+          { status: 429 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 10 * 60_000,
+    })
+
+    const accounts = await manager.getUsableFallbackAccounts()
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(accounts.map((account) => account.id)).toEqual(['stale-good-quota'])
+  })
+
+  test('does not use cached failing quota when a stale quota refresh is rate limited', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'stale-low-quota',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: 20_000_000,
+      quota: {
+        five_hour: {
+          usedPercent: 95,
+          remainingPercent: 5,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+        seven_day: {
+          usedPercent: 62,
+          remainingPercent: 38,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: { type: 'rate_limit_error', message: 'Rate limited' },
+          }),
+          { status: 429 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 10 * 60_000,
+    })
+
+    const accounts = await manager.getUsableFallbackAccounts()
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(accounts).toEqual([])
+  })
+
+  test('skips fresh quota refresh and clears stale quota errors', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fresh-quota-with-old-error',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: 20_000_000,
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1_900 },
+        seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: 1_900 },
+      },
+      lastQuotaRefreshError: {
+        message: 'Claude quota check failed: 429 — rate limited',
+        checkedAt: 1_800,
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() => {
+      throw new Error('fresh quota should not be refetched')
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 2_000,
+    })
+
+    const result = await manager.refreshQuotaForAllAccounts()
+
+    expect(result.errors).toEqual([])
+    expect(fetchImpl).not.toHaveBeenCalled()
+    const saved = await loadAccounts()
+    expect(saved?.accounts[0]?.quota?.five_hour?.remainingPercent).toBe(90)
+    expect(saved?.accounts[0]?.lastQuotaRefreshError).toBeUndefined()
+  })
+
   test('returns refresh errors from explicit quota refresh', async () => {
     const storage = baseStorage()
     storage.accounts.push({

@@ -695,6 +695,52 @@ function quotaIsStale(
   })
 }
 
+function cachedQuotaWindowStillRelevant(
+  window: AccountQuotaWindow | undefined,
+  now: number,
+) {
+  if (!window) return false
+  if (!window.resetsAt) return true
+  const resetTime = Date.parse(window.resetsAt)
+  return !Number.isFinite(resetTime) || resetTime > now
+}
+
+function cachedQuotaSnapshotStillRelevant(
+  quota: OAuthQuotaSnapshot | undefined,
+  now: number,
+) {
+  return (['five_hour', 'seven_day'] as const).every((key) =>
+    cachedQuotaWindowStillRelevant(quota?.[key], now),
+  )
+}
+
+function isTransientQuotaError(error: unknown) {
+  const message = formatErrorMessage(error)
+  if (/Claude quota check failed: (429|5\d\d)\b/.test(message)) return true
+  if (!(error instanceof Error)) return false
+  const code = (error as Error & { code?: unknown }).code
+  return (
+    message.includes('fetch failed') ||
+    code === 'ECONNRESET' ||
+    code === 'ECONNREFUSED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT'
+  )
+}
+
+function canUseCachedQuotaAfterRefreshError(
+  account: OAuthAccount,
+  storage: AccountStorage | null,
+  error: unknown,
+  now: number,
+) {
+  return (
+    isTransientQuotaError(error) &&
+    quotaSnapshotPassesPolicy(account.quota, storage) &&
+    cachedQuotaSnapshotStillRelevant(account.quota, now)
+  )
+}
+
 function clampPercent(value: number) {
   if (!Number.isFinite(value)) return 0
   if (value < 0) return 0
@@ -863,8 +909,26 @@ export class FallbackAccountManager {
           changed = true
         }
         if (this.accountPassesQuotaPolicy(next, storage)) usable.push(next)
-      } catch {
-        if (!failClosedOnUnknownQuota(storage)) usable.push(account)
+      } catch (error) {
+        if (
+          canUseCachedQuotaAfterRefreshError(
+            account,
+            storage,
+            error,
+            this.now(),
+          )
+        ) {
+          log(
+            '[refresh] fallback quota using cached quota after refresh error',
+            {
+              accountId: account.id,
+              error: formatErrorMessage(error),
+            },
+          )
+          usable.push(account)
+        } else if (!failClosedOnUnknownQuota(storage)) {
+          usable.push(account)
+        }
       }
     }
 
@@ -989,6 +1053,14 @@ export class FallbackAccountManager {
           }
           next = await this.refreshAccount(next, storage)
           changed = true
+        }
+        if (!quotaIsStale(next, storage, this.now())) {
+          if (next.lastQuotaRefreshError) {
+            next.lastQuotaRefreshError = undefined
+            updateStoredAccount(storage, next)
+            changed = true
+          }
+          continue
         }
         await this.refreshAccountQuota(next, storage)
         changed = true

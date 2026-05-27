@@ -2,6 +2,13 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.2.5
+
+### Patch Changes
+
+- Reuse cached fallback-account quota snapshots when transient quota probes are rate limited, so an account with known remaining quota can still be tried instead of falling back to an exhausted main account.
+- Reuse fresh fallback-account quota snapshots during explicit quota checks and clear stale quota errors so transient quota-probe `429`s do not hide otherwise usable fallback account state.
+
 ## 1.2.4
 
 ### Patch Changes
