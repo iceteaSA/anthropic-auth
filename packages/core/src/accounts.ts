@@ -48,11 +48,16 @@ export type AccountQuotaWindow = {
   checkedAt: number
 }
 
+export type RoutingMode = 'main-first' | 'fallback-first'
+
 export type AccountStorage = {
   version: 1
   main?: {
     type: 'opencode'
     provider: 'anthropic'
+  }
+  routing?: {
+    mode?: RoutingMode
   }
   fallbackOn?: number[]
   refresh?: {
@@ -239,6 +244,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
   return {
     version: 1,
     main: { type: 'opencode', provider: 'anthropic' },
+    routing: isRecord(value.routing) ? value.routing : undefined,
     fallbackOn: Array.isArray(value.fallbackOn)
       ? value.fallbackOn.filter((status) => Number.isInteger(status))
       : undefined,

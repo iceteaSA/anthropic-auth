@@ -2,12 +2,15 @@ import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
+  CLAUDE_ROUTING_COMMAND_NAME,
   executeCache1hCommand,
   executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
+  executeRoutingCommand,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getRoutingMode,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
@@ -18,12 +21,14 @@ import {
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseRoutingCommandAction,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setDumpPersistentEnabled,
   setFastModePersistentEnabled,
+  setRoutingMode,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   ExtensionAPI,
@@ -166,6 +171,28 @@ export function registerCommands(pi: ExtensionAPI) {
         executeFastModeCommand({
           argumentsText: args ?? '',
           enabled: nextEnabled,
+        }),
+        action.type === 'usage' ? 'warning' : 'info',
+      )
+    },
+  })
+
+  pi.registerCommand(CLAUDE_ROUTING_COMMAND_NAME, {
+    description: 'Show or change Claude account routing mode',
+    handler: async (args, ctx) => {
+      const path = getPiAccountStoragePath()
+      let storage = await loadAccounts(path)
+      const action = parseRoutingCommandAction(args ?? '')
+
+      if (action.type === 'mode') {
+        storage = await setRoutingMode(action.mode, path)
+      }
+
+      notify(
+        ctx,
+        executeRoutingCommand({
+          argumentsText: args ?? '',
+          mode: getRoutingMode(storage),
         }),
         action.type === 'usage' ? 'warning' : 'info',
       )

@@ -6,6 +6,7 @@ import {
   FallbackAccountManager,
   getCache1hPersistentMode,
   getRelayConfig,
+  getRoutingMode,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isFastModePersistentlyEnabled,
@@ -260,6 +261,35 @@ async function executeWithFallback(options: {
     configPath: options.storagePath,
   })
   const storage = await loadAccounts(options.storagePath)
+
+  async function tryFallbackAccounts() {
+    for (const account of await manager.getUsableFallbackAccounts(storage)) {
+      if (!account.access) continue
+      const response = await sendAnthropicRequest({
+        ...options,
+        accessToken: account.access,
+      })
+      const preflight = await firstStreamingError(response)
+      if (preflight instanceof Response && preflight.ok) {
+        await manager.markUsed(account)
+        return preflight
+      }
+      if (
+        preflight instanceof Response &&
+        !shouldFallbackStatus(preflight.status, storage)
+      ) {
+        return preflight
+      }
+    }
+    return null
+  }
+
+  const fallbackFirst = getRoutingMode(storage) === 'fallback-first'
+  if (fallbackFirst) {
+    const fallback = await tryFallbackAccounts()
+    if (fallback) return fallback
+  }
+
   const primary = await sendAnthropicRequest({
     ...options,
     accessToken: options.primaryAccessToken,
@@ -270,23 +300,9 @@ async function executeWithFallback(options: {
       return primaryPreflight
   }
 
-  for (const account of await manager.getUsableFallbackAccounts()) {
-    if (!account.access) continue
-    const response = await sendAnthropicRequest({
-      ...options,
-      accessToken: account.access,
-    })
-    const preflight = await firstStreamingError(response)
-    if (preflight instanceof Response && preflight.ok) {
-      await manager.markUsed(account)
-      return preflight
-    }
-    if (
-      preflight instanceof Response &&
-      !shouldFallbackStatus(preflight.status, storage)
-    ) {
-      return preflight
-    }
+  if (!fallbackFirst) {
+    const fallback = await tryFallbackAccounts()
+    if (fallback) return fallback
   }
 
   return primaryPreflight instanceof Response ? primaryPreflight : primary

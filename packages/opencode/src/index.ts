@@ -14,12 +14,14 @@ import {
   CLAUDE_DUMP_COMMAND_NAME,
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
+  CLAUDE_ROUTING_COMMAND_NAME,
   ClaudeOAuthRefreshError,
   exchange,
   executeCache1hCommand,
   executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
+  executeRoutingCommand,
   FallbackAccountManager,
   fetchOAuthQuotaSnapshot,
   formatRefreshBackoffMessage,
@@ -29,6 +31,7 @@ import {
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
   getRelayConfig,
+  getRoutingMode,
   hashRefreshToken,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -46,6 +49,7 @@ import {
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseRoutingCommandAction,
   type QuotaAccountSummary,
   quotaSnapshotPassesPolicy,
   type RelayConfig,
@@ -63,6 +67,7 @@ import {
   setDumpPersistentEnabled,
   setFastModeEnabled,
   setFastModePersistentEnabled,
+  setRoutingMode,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
@@ -484,6 +489,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return executeFastModeCommand({ argumentsText, enabled })
   }
 
+  async function executePersistentRoutingCommand(argumentsText: string) {
+    const action = parseRoutingCommandAction(argumentsText)
+    if (action.type === 'mode') {
+      await setRoutingMode(action.mode)
+      return executeRoutingCommand({ argumentsText, mode: action.mode })
+    }
+
+    const storage = await loadAccounts()
+    return executeRoutingCommand({
+      argumentsText,
+      mode: getRoutingMode(storage),
+    })
+  }
+
   return {
     config: async (config: { command?: Record<string, unknown> }) => {
       config.command = {
@@ -512,6 +531,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           template: CLAUDE_FAST_COMMAND_NAME,
           description:
             'Show or toggle Anthropic fast mode for supported Opus models.',
+        },
+        [CLAUDE_ROUTING_COMMAND_NAME]: {
+          template: CLAUDE_ROUTING_COMMAND_NAME,
+          description:
+            'Show or change Claude account routing between main-first and fallback-first.',
         },
       }
     },
@@ -561,6 +585,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ctx,
           input.sessionID,
           await executePersistentFastModeCommand(input.arguments),
+        )
+        throwHandledSentinel()
+      }
+
+      if (input.command === CLAUDE_ROUTING_COMMAND_NAME) {
+        await sendIgnoredMessage(
+          ctx,
+          input.sessionID,
+          await executePersistentRoutingCommand(input.arguments),
         )
         throwHandledSentinel()
       }
@@ -1261,9 +1294,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             storage: Awaited<ReturnType<typeof loadAccounts>>,
             currentResponse?: Response,
             trace?: PerfTrace,
+            options?: { returnLastOnExhausted?: boolean },
           ) {
             if (!accounts.length) return currentResponse ?? null
 
+            const returnLastOnExhausted = options?.returnLastOnExhausted ?? true
             await currentResponse?.body?.cancel().catch(() => {})
             let lastResponse: Response | null = currentResponse ?? null
 
@@ -1292,12 +1327,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 await fallbackManager.markUsed(account)
                 return response
               }
-              if (index < accounts.length - 1) {
+              if (index < accounts.length - 1 || !returnLastOnExhausted) {
                 await response.body?.cancel().catch(() => {})
               }
             }
 
-            return lastResponse
+            return returnLastOnExhausted ? lastResponse : null
           }
 
           async function tryFallbackAccounts(
@@ -1380,6 +1415,54 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 return response
               }
               await clearStaleMainRefreshError(auth.refresh)
+              const loadStart = nowMs()
+              const storage = await loadAccounts()
+              trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
+              const replayableRequest = isReplayableRequest(input, init?.body)
+              let preselectedFallbackAccounts:
+                | Awaited<
+                    ReturnType<
+                      FallbackAccountManager['getUsableFallbackAccounts']
+                    >
+                  >
+                | undefined
+
+              if (
+                replayableRequest &&
+                getRoutingMode(storage) === 'fallback-first'
+              ) {
+                try {
+                  const fallbackStart = nowMs()
+                  preselectedFallbackAccounts =
+                    await fallbackManager.getUsableFallbackAccounts(storage)
+                  trace.mark('fallback_first_get_accounts', {
+                    ms: roundMs(nowMs() - fallbackStart),
+                    accounts: preselectedFallbackAccounts.length,
+                  })
+                  const fallbackResponse = await tryUsableFallbackAccounts(
+                    input,
+                    init,
+                    preselectedFallbackAccounts,
+                    storage,
+                    undefined,
+                    trace,
+                    { returnLastOnExhausted: false },
+                  )
+                  if (fallbackResponse) {
+                    trace.done('return_fallback_first', {
+                      status: fallbackResponse.status,
+                    })
+                    return createStrippedStream(fallbackResponse)
+                  }
+                  preselectedFallbackAccounts = []
+                } catch (error) {
+                  trace.mark('fallback_first_error', {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  })
+                }
+              }
+
               if (!auth.access || !auth.expires || auth.expires < Date.now()) {
                 // Check backoff before attempting refresh — avoids noisy
                 // per-request retries during prolonged rate limits
@@ -1430,20 +1513,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace.done('missing_access_error')
                 throw new Error('OAuth access token is missing after refresh')
               }
-              const loadStart = nowMs()
-              const storage = await loadAccounts()
-              trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
-              let preselectedFallbackAccounts:
-                | Awaited<
-                    ReturnType<
-                      FallbackAccountManager['getUsableFallbackAccounts']
-                    >
-                  >
-                | undefined
-              if (
-                isReplayableRequest(input, init?.body) &&
-                mainQuotaRoutingEnabled(storage)
-              ) {
+              if (replayableRequest && mainQuotaRoutingEnabled(storage)) {
                 try {
                   const quotaStart = nowMs()
                   const mainQuota = await getMainQuotaForRouting(

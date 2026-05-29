@@ -403,6 +403,10 @@ describe('auth.loader', () => {
       template: 'claude-cachekeep',
       description: expect.stringContaining('cache warm'),
     })
+    expect(config.command?.['claude-routing']).toMatchObject({
+      template: 'claude-routing',
+      description: expect.stringContaining('account routing'),
+    })
 
     await expect(
       plugin['command.execute.before']({
@@ -535,6 +539,57 @@ describe('auth.loader', () => {
       await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
     )
     expect(saved.claudeFast).toEqual({ enabled: true })
+  })
+
+  test('handles /claude-routing slash command and persists routing mode', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-routing',
+        arguments: 'fallback-first',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(mockClient.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: 'session-1' },
+      body: {
+        noReply: true,
+        parts: [
+          {
+            type: 'text',
+            ignored: true,
+            text: expect.stringContaining('Mode updated to `fallback-first`.'),
+          },
+        ],
+      },
+    })
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-routing',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls
+    const latestCall = promptCalls.at(-1)?.[0]
+    expect(latestCall?.body.parts[0]?.text).toContain(
+      '- Mode: `fallback-first`',
+    )
+
+    const saved = JSON.parse(
+      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    )
+    expect(saved.routing).toEqual({ mode: 'fallback-first' })
   })
 
   test('hidden slash-command replies preserve previous assistant model and variant', async () => {
@@ -1721,6 +1776,148 @@ describe('auth.loader', () => {
       'Bearer main-access',
       'Bearer fallback-access',
     ])
+  })
+
+  test('fetch wrapper uses fallback first when routing mode is fallback-first', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    const authorizations: string[] = []
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        throw new Error('fallback-first should use cached quota in this test')
+      }
+      authorizations.push(init?.headers?.get('authorization'))
+      return Promise.resolve(new Response('fallback ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('fallback ok')
+    expect(authorizations).toEqual(['Bearer fallback-access'])
+  })
+
+  test('fallback-first routing does not refresh expired main oauth when fallback succeeds', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        refresh: { enabled: false },
+      }),
+    )
+    let tokenRefreshCalls = 0
+    const authorizations: string[] = []
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+        return Promise.resolve(
+          new Response('should not refresh', { status: 500 }),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        throw new Error('fallback-first should use cached quota in this test')
+      }
+      authorizations.push(init?.headers?.get('authorization'))
+      return Promise.resolve(new Response('fallback ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired-main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('fallback ok')
+    expect(tokenRefreshCalls).toBe(0)
+    expect(authorizations).toEqual(['Bearer fallback-access'])
+  })
+
+  test('fallback-first routing tries main when no fallback account is usable', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'fallback-low',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 95,
+                remainingPercent: 5,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 10,
+                remainingPercent: 90,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      authorizations.push(init?.headers?.get('authorization'))
+      return Promise.resolve(new Response('main ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('main ok')
+    expect(authorizations).toEqual(['Bearer main-access'])
   })
 
   test('fetch wrapper skips main account when quota policy is already exhausted', async () => {

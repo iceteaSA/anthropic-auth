@@ -19,12 +19,13 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Primary Claude Pro/Max OAuth | OpenCode `/connect anthropic` | Pi `/login anthropic` |
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
-| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-fast`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-cachekeep`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
 | Fallback accounts, quota routing, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
 ## What CortexKit adds over the original plugin
 
 - **Fallback Claude accounts**: keep each agent's normal Anthropic login as the primary account, then route to ordered fallback OAuth accounts on auth/quota/rate-limit failures.
+- **Routing mode toggle**: use `/claude-routing fallback-first` to prefer sidecar fallback accounts before the main account.
 - **Quota-aware routing**: skip main or fallback accounts when their 5-hour or 7-day Claude quota falls below your configured minimum.
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
 - **Cache keepalive**: use `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
@@ -155,6 +156,9 @@ Example:
   "version": 1,
   "main": { "type": "opencode", "provider": "anthropic" },
   "fallbackOn": [401, 403, 429],
+  "routing": {
+    "mode": "main-first"
+  },
   "refresh": {
     "enabled": true,
     "intervalMinutes": 10,
@@ -195,11 +199,13 @@ Example:
 }
 ```
 
-The `claudeCache` block controls the `/claude-cache` command's persisted mode, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
+The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
 
 ## Fallback accounts
 
-Fallback accounts are separate Claude OAuth accounts managed by this plugin. The main account is tried first unless quota policy says it is currently unusable. Fallbacks are then tried in sidecar order when the primary request returns a configured fallback status.
+Fallback accounts are separate Claude OAuth accounts managed by this plugin. By default, the main account is tried first unless quota policy says it is currently unusable. Fallbacks are then tried in sidecar order when the primary request returns a configured fallback status.
+
+Use `/claude-routing fallback-first` to prefer usable fallback accounts before the main account. Use `/claude-routing main-first` to restore the default. The command persists `routing.mode` and takes effect on the next request without restarting.
 
 Default fallback statuses:
 
