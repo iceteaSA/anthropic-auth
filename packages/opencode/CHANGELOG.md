@@ -2,6 +2,13 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.3.0
+
+### Minor Changes
+
+- Add `/claude-routing` with persisted `routing.mode` so OpenCode can switch between the default `main-first` routing and `fallback-first` routing without restarting.
+- In `fallback-first` mode, usable sidecar fallback accounts are tried before the main account; if no fallback succeeds, the request falls back to the main account.
+
 ## 1.2.5
 
 ### Patch Changes

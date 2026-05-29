@@ -2,6 +2,13 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.3.0
+
+### Minor Changes
+
+- Add `/claude-routing` with persisted `routing.mode` so OpenCode and Pi can switch between the default `main-first` routing and `fallback-first` routing without restarting.
+- In `fallback-first` mode, usable sidecar fallback accounts are tried before the main account; if no fallback succeeds, the request falls back to the main account.
+
 ## 1.2.5
 
 ### Patch Changes
