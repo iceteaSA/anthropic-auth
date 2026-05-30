@@ -411,7 +411,7 @@ function normalizeContentToArray(content: unknown) {
 function updateCacheControlTtl(value: unknown, cache1hEnabled: boolean) {
   if (!isRecord(value)) return
   const cacheControl = getCacheControl(value) as CacheControl | null
-  if (!cacheControl || cacheControl.type !== 'ephemeral') return
+  if (cacheControl?.type !== 'ephemeral') return
 
   if (cache1hEnabled) {
     cacheControl.ttl = '1h'
