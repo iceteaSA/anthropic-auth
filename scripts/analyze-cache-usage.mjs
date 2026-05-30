@@ -10,8 +10,8 @@ const MILLION = 1_000_000
 
 const MODEL_PRICES = [
   {
-    match: /opus-4-[765]/i,
-    label: 'Claude Opus 4.5/4.6/4.7',
+    match: /opus-4-[8765]/i,
+    label: 'Claude Opus 4.5/4.6/4.7/4.8',
     input: 5,
     cacheWrite5m: 6.25,
     cacheWrite1h: 10,

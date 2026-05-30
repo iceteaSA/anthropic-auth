@@ -313,7 +313,7 @@ Both OpenCode and Pi packages can persistently request Anthropic fast mode for s
 /claude-fast off
 ```
 
-When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6` and `claude-opus-4-7`.
+When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6`, `claude-opus-4-7`, and `claude-opus-4-8`.
 
 Fast and standard speeds do not share prompt-cache prefixes, so switching this setting can cause cache misses.
 
@@ -340,7 +340,7 @@ bun run analyze:cache -- --days 7 --json
 bun run analyze:cache -- --db ~/.local/share/opencode/opencode.db --days 30
 ```
 
-The script reads OpenCode usage data from `~/.local/share/opencode/opencode.db` by default. It uses recorded prompt, cache-read, cache-write, and output tokens, then estimates counterfactual 5-minute and no-cache costs from the same turns. The default 5-minute expiry threshold is 5 minutes; override it with `--idle-threshold-min <minutes>` if needed.
+The script reads OpenCode usage data from `~/.local/share/opencode/opencode.db` by default. It uses recorded prompt, cache-read, cache-write, and output tokens, then estimates counterfactual 5-minute and no-cache costs from the same turns. Its pricing table includes Claude Opus 4.5 through 4.8. The default 5-minute expiry threshold is 5 minutes; override it with `--idle-threshold-min <minutes>` if needed.
 
 This analyzer is OpenCode-specific because it reads OpenCode's local message database.
 

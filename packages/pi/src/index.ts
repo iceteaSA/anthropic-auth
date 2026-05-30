@@ -59,6 +59,15 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
     api: 'cortexkit-anthropic-messages',
     models: [
       {
+        id: 'claude-opus-4-8',
+        name: 'Claude Opus 4.8',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
+      },
+      {
         id: 'claude-opus-4-5',
         name: 'Claude Opus 4.5',
         reasoning: true,

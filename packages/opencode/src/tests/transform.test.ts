@@ -684,7 +684,7 @@ describe('rewriteRequestBody', () => {
 
   test('sets fast speed for supported Opus models when fast mode is enabled', async () => {
     const body = JSON.stringify({
-      model: 'claude-opus-4-7-20260201',
+      model: 'claude-opus-4-8',
       messages: [{ role: 'user', content: 'hi' }],
     })
 

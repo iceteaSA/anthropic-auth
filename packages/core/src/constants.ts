@@ -41,7 +41,9 @@ export function mergeAnthropicBetas(
 export function isFastModeSupportedModel(model: unknown) {
   return (
     typeof model === 'string' &&
-    (model.startsWith('claude-opus-4-6') || model.startsWith('claude-opus-4-7'))
+    (model.startsWith('claude-opus-4-6') ||
+      model.startsWith('claude-opus-4-7') ||
+      model.startsWith('claude-opus-4-8'))
   )
 }
 

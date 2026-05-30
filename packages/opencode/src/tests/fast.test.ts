@@ -25,7 +25,9 @@ describe('claude-fast command state', () => {
 
     expect(summary).toContain('## Claude Fast Mode Status')
     expect(parseEnabled(summary)).toBe(false)
-    expect(summary).toContain('claude-opus-4-6 and claude-opus-4-7')
+    expect(summary).toContain(
+      'claude-opus-4-6, claude-opus-4-7, and claude-opus-4-8',
+    )
   })
 
   test('on and off render requested state without mutating module state directly', () => {
