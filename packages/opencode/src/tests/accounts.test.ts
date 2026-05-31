@@ -124,6 +124,35 @@ describe('account storage', () => {
     await afterStale?.release()
   })
 
+  test('refresh file lock renews while the holder is alive', async () => {
+    const first = await acquireRefreshFileLock({
+      name: 'test-refresh-renew',
+      ttlMs: 500,
+      path: accountPath,
+      renew: true,
+      renewIntervalMs: 100,
+    })
+    expect(first).not.toBeNull()
+
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    await expect(
+      acquireRefreshFileLock({
+        name: 'test-refresh-renew',
+        ttlMs: 500,
+        path: accountPath,
+      }),
+    ).resolves.toBeNull()
+
+    await first?.release()
+    const second = await acquireRefreshFileLock({
+      name: 'test-refresh-renew',
+      ttlMs: 500,
+      path: accountPath,
+    })
+    expect(second).not.toBeNull()
+    await second?.release()
+  })
+
   test('refresh file lock does not steal an initializing lock', async () => {
     const lockDir = `${accountPath}.test-refresh.lock`
     await mkdir(lockDir, { recursive: true })

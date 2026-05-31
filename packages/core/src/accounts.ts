@@ -12,6 +12,9 @@ import {
 } from './constants.ts'
 import { log } from './logger.ts'
 
+const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
+const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
+
 export const ACCOUNT_FILE_NAME = 'anthropic-auth.json'
 export const QUOTA_URL = 'https://api.anthropic.com/api/oauth/usage'
 
@@ -140,7 +143,7 @@ const DEFAULT_MINIMUM_REMAINING: Record<QuotaWindowName, number> = {
 const DEFAULT_FAIL_CLOSED_ON_UNKNOWN_QUOTA = true
 const BACKGROUND_TICK_MS = 60_000
 const BACKGROUND_TICK_JITTER_MS = 60_000
-const FALLBACK_REFRESH_LOCK_TTL_MS = 2 * 60_000
+const FALLBACK_REFRESH_LOCK_TTL_MS = 10 * 60_000
 const FALLBACK_REFRESH_JOIN_WAIT_MS = 10_000
 const FALLBACK_REFRESH_JOIN_POLL_MS = 100
 
@@ -307,12 +310,16 @@ export async function acquireRefreshFileLock(options: {
   ttlMs: number
   path?: string
   now?: () => number
+  renew?: boolean
+  renewIntervalMs?: number
 }): Promise<{ release: () => Promise<void> } | null> {
   const accountPath = options.path ?? getAccountStoragePath()
   const lockPath = `${accountPath}.${options.name}.lock`
   const legacyOwnerPath = join(lockPath, 'owner.json')
   const ownerId = randomUUID()
   const now = options.now ?? Date.now
+  let renewTimer: ReturnType<typeof setTimeout> | null = null
+  let released = false
 
   async function readOwner() {
     try {
@@ -322,6 +329,14 @@ export async function acquireRefreshFileLock(options: {
       if (code !== 'EISDIR') throw error
       return JSON.parse(await readFile(legacyOwnerPath, 'utf8'))
     }
+  }
+
+  async function writeOwner() {
+    await writeFile(
+      lockPath,
+      `${JSON.stringify({ ownerId, expiresAt: now() + options.ttlMs })}\n`,
+      { encoding: 'utf8', mode: 0o600 },
+    )
   }
 
   async function tryAcquire() {
@@ -337,6 +352,32 @@ export async function acquireRefreshFileLock(options: {
       if (code === 'EEXIST' || code === 'EISDIR') return false
       throw error
     }
+  }
+
+  function scheduleRenewal() {
+    if (!options.renew || released) return
+    const intervalMs =
+      options.renewIntervalMs ?? Math.max(1_000, Math.floor(options.ttlMs / 3))
+    renewTimer = setRefreshLockRenewalTimeout(() => {
+      void (async () => {
+        try {
+          const owner = await readOwner()
+          const currentNow = now()
+          if (
+            released ||
+            owner?.ownerId !== ownerId ||
+            Number(owner?.expiresAt) <= currentNow
+          ) {
+            return
+          }
+          await writeOwner()
+          scheduleRenewal()
+        } catch {
+          // If renewal fails, contenders will wait until the last written expiry.
+        }
+      })()
+    }, intervalMs)
+    if ('unref' in renewTimer) renewTimer.unref()
   }
 
   if (!(await tryAcquire())) {
@@ -355,8 +396,15 @@ export async function acquireRefreshFileLock(options: {
     if (!(await tryAcquire())) return null
   }
 
+  scheduleRenewal()
+
   return {
     release: async () => {
+      released = true
+      if (renewTimer) {
+        clearRefreshLockRenewalTimeout(renewTimer)
+        renewTimer = null
+      }
       try {
         const owner = await readOwner()
         if (owner?.ownerId !== ownerId) return
@@ -1179,6 +1227,7 @@ export class FallbackAccountManager {
       ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
       path: this.configPath,
       now: this.now,
+      renew: true,
     })
     if (!fileLock) {
       log('[refresh] fallback oauth refresh skipped file lock', {

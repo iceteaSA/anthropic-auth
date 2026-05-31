@@ -772,6 +772,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     const fileLock = await acquireRefreshFileLock({
                       name: 'opencode-main-oauth-refresh',
                       ttlMs: 2 * 60_000,
+                      renew: true,
                     })
                     if (!fileLock) {
                       log(
