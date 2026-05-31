@@ -1,5 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   createStringPatch,
   getDumpDirectory,
@@ -99,7 +101,10 @@ describe('relay client', () => {
 
   test('dumps final body and redacted relay payload when enabled', async () => {
     const originalFetch = globalThis.fetch
-    await rm(getDumpDirectory(), { recursive: true, force: true })
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = await mkdtemp(
+      join(tmpdir(), 'anthropic-auth-dump-test-'),
+    )
     setDumpEnabled(true)
     globalThis.fetch = mock(
       async () => new Response('ok', { status: 200 }),
@@ -114,7 +119,13 @@ describe('relay client', () => {
         body: JSON.stringify({
           model: 'claude-sonnet-4-6',
           stream: true,
-          system: [{ type: 'text', text: 'system cch=abcde;' }],
+          system: [
+            {
+              type: 'text',
+              text: 'x-anthropic-billing-header: cc_version=2.1.87.623; cc_entrypoint=sdk-cli; cch=abcde;',
+            },
+            { type: 'text', text: 'system cch=fffff;' },
+          ],
           messages: [
             { role: 'user', content: [{ type: 'text', text: 'first' }] },
             { role: 'assistant', content: [{ type: 'text', text: 'second' }] },
@@ -138,7 +149,7 @@ describe('relay client', () => {
       expect(meta.body).toMatchObject({
         parseable: true,
         messagesCount: 2,
-        systemCount: 1,
+        systemCount: 2,
         cch: 'abcde',
       })
       expect(
@@ -150,9 +161,15 @@ describe('relay client', () => {
       )
       expect(relay.upstream.headers.authorization).toBe('[redacted]')
     } finally {
+      const dumpDir = getDumpDirectory()
       resetDumpState()
       globalThis.fetch = originalFetch
-      await rm(getDumpDirectory(), { recursive: true, force: true })
+      if (originalDumpDir === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
+      }
+      await rm(dumpDir, { recursive: true, force: true })
     }
   })
 

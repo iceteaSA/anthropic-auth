@@ -1,5 +1,5 @@
 import type { AccountStorage } from './accounts.ts'
-import { CCH_PATTERN, signRequestBody } from './cch.ts'
+import { signRequestBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
@@ -237,11 +237,9 @@ export async function buildCacheKeepPrewarmBody(
     delete warm.tool_choice
   }
 
-  const unsignedBodyText = JSON.stringify(orderClaudeCodeBody(warm)).replace(
-    CCH_PATTERN,
-    'cch=00000;',
+  const signedBodyText = await signRequestBody(
+    JSON.stringify(orderClaudeCodeBody(warm)),
   )
-  const signedBodyText = await signRequestBody(unsignedBodyText)
   return { ok: true, bodyText: signedBodyText }
 }
 

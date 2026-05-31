@@ -8,7 +8,12 @@ type Message = {
 }
 
 const CCH_SEED = 0x6e52736ac806831en
+const CCH_PLACEHOLDER = 'cch=00000;'
 export const CCH_PATTERN = /\bcch=([0-9a-f]{5});/
+const BILLING_HEADER_CCH_PATTERN =
+  /("system":\[\{"type":"text","text":"x-anthropic-billing-header: cc_version=[^;"]+; cc_entrypoint=[^;"]+; )cch=([0-9a-f]{5});/
+const BILLING_HEADER_CCH_PLACEHOLDER_PATTERN =
+  /("system":\[\{"type":"text","text":"x-anthropic-billing-header: cc_version=[^;"]+; cc_entrypoint=[^;"]+; )cch=00000;/
 
 let xxhashPromise: Promise<void> | null = null
 let xxhash64Raw: ((input: Uint8Array, seed: bigint) => bigint) | null = null
@@ -53,11 +58,23 @@ export async function computeCCH(bodyBytes: Uint8Array): Promise<string> {
   return (hash & 0xfffffn).toString(16).padStart(5, '0')
 }
 
-export async function signRequestBody(bodyString: string): Promise<string> {
-  if (!CCH_PATTERN.test(bodyString)) return bodyString
+export function resetBillingHeaderCCH(bodyString: string): string {
+  return bodyString.replace(BILLING_HEADER_CCH_PATTERN, `$1${CCH_PLACEHOLDER}`)
+}
 
-  const token = await computeCCH(new TextEncoder().encode(bodyString))
-  return bodyString.replace(CCH_PATTERN, `cch=${token};`)
+export function extractBillingHeaderCCH(bodyString: string): string | null {
+  return BILLING_HEADER_CCH_PATTERN.exec(bodyString)?.[2] ?? null
+}
+
+export async function signRequestBody(bodyString: string): Promise<string> {
+  if (!BILLING_HEADER_CCH_PATTERN.test(bodyString)) return bodyString
+
+  const unsignedBodyString = resetBillingHeaderCCH(bodyString)
+  const token = await computeCCH(new TextEncoder().encode(unsignedBodyString))
+  return unsignedBodyString.replace(
+    BILLING_HEADER_CCH_PLACEHOLDER_PATTERN,
+    `$1cch=${token};`,
+  )
 }
 
 /**

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { extractBillingHeaderCCH } from './cch.ts'
 import { relayLog } from './logger.ts'
 
 export const CLAUDE_DUMP_COMMAND_NAME = 'claude-dump'
@@ -12,7 +13,8 @@ const DUMP_DISABLED_TITLE = '## Claude Dump Disabled'
 const DUMP_USAGE_TITLE = '## Claude Dump Usage'
 const DUMP_USAGE =
   'Usage: `/claude-dump`, `/claude-dump on`, or `/claude-dump off`.'
-const DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
+const DUMP_DIR_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_DIR'
+const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
 
 let dumpEnabled = false
 let nextDumpId = 0
@@ -36,7 +38,7 @@ export function resetDumpState() {
 }
 
 export function getDumpDirectory() {
-  return DUMP_DIR
+  return process.env[DUMP_DIR_ENV] || DEFAULT_DUMP_DIR
 }
 
 export function parseDumpCommandAction(
@@ -57,7 +59,7 @@ export function buildDumpStatusSummary(input?: { enabled?: boolean }) {
     DUMP_STATUS_TITLE,
     '',
     `- Enabled: ${enabled ? 'enabled' : 'disabled'}`,
-    `- Directory: ${DUMP_DIR}`,
+    `- Directory: ${getDumpDirectory()}`,
     '- Persisted: ~/.config/opencode/anthropic-auth.json',
     '- Captures: final rewritten Anthropic body plus redacted relay payload metadata',
     '- Warning: body dumps may contain prompt/session content; turn this off after debugging',
@@ -107,7 +109,7 @@ function hashText(value: string) {
 }
 
 function cchToken(bodyText: string) {
-  return bodyText.match(/\bcch=([0-9a-f]{5});/)?.[1] ?? null
+  return extractBillingHeaderCCH(bodyText)
 }
 
 function diffSummary(previousBodyText: string | undefined, bodyText: string) {
@@ -233,10 +235,11 @@ export async function dumpRelayRequest(input: {
   if (!dumpEnabled) return
   nextDumpId += 1
   const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${input.transport}-p${input.protocol}-${input.mode}`
-  const prefix = join(DUMP_DIR, id)
+  const dumpDir = getDumpDirectory()
+  const prefix = join(dumpDir, id)
 
   try {
-    await mkdir(DUMP_DIR, { recursive: true })
+    await mkdir(dumpDir, { recursive: true })
     const metadata = {
       id,
       createdAt: new Date().toISOString(),

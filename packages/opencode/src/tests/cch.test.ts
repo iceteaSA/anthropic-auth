@@ -46,6 +46,31 @@ describe('billing header helpers', () => {
     expect(await signRequestBody(body)).toContain('cch=59353;')
   })
 
+  test('signs only the billing header cch and leaves message history unchanged', async () => {
+    const historyText = 'historical debug content: cch=abcde; cch=00000;'
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: historyText }],
+        },
+      ],
+      system: [
+        {
+          type: 'text',
+          text: 'x-anthropic-billing-header: cc_version=2.1.87.623; cc_entrypoint=sdk-cli; cch=00000;',
+        },
+      ],
+    })
+
+    const signed = await signRequestBody(body)
+    const parsed = JSON.parse(signed)
+
+    expect(parsed.messages[0].content[0].text).toBe(historyText)
+    expect(parsed.system[0].text).toMatch(/cch=[0-9a-f]{5};$/)
+    expect(parsed.system[0].text).not.toContain('cch=00000;')
+  })
+
   test('builds the full billing header value', () => {
     expect(
       buildBillingHeaderValue(
