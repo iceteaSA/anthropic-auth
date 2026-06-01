@@ -39,10 +39,15 @@ export interface SidebarState {
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
-const STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
-const STATE_FILE = join(STATE_DIR, 'sidebar-state.json')
+const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
+const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
+const DEFAULT_STATE_FILE = join(DEFAULT_STATE_DIR, 'sidebar-state.json')
+
+export function getSidebarStateFile(): string {
+  return process.env[STATE_FILE_ENV] || DEFAULT_STATE_FILE
+}
 
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   main: { quota: null },
@@ -56,7 +61,7 @@ export const DEFAULT_SIDEBAR_STATE: SidebarState = {
 
 export async function getSidebarState(): Promise<SidebarState> {
   try {
-    const raw = await readFile(STATE_FILE, 'utf8')
+    const raw = await readFile(getSidebarStateFile(), 'utf8')
     return JSON.parse(raw) as SidebarState
   } catch {
     return DEFAULT_SIDEBAR_STATE
@@ -65,8 +70,9 @@ export async function getSidebarState(): Promise<SidebarState> {
 
 export async function setSidebarState(state: SidebarState): Promise<void> {
   try {
-    await mkdir(STATE_DIR, { recursive: true })
-    await writeFile(STATE_FILE, JSON.stringify(state), 'utf8')
+    const stateFile = getSidebarStateFile()
+    await mkdir(dirname(stateFile), { recursive: true })
+    await writeFile(stateFile, JSON.stringify(state), 'utf8')
   } catch {
     // Best-effort — sidebar is non-critical
   }

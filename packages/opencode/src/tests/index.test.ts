@@ -11,6 +11,7 @@ import {
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
+import { getSidebarState } from '../sidebar-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -90,7 +91,23 @@ async function useTempAccountFile(storage: AccountStorage) {
     tempConfigDir,
     'anthropic-auth.json',
   )
+  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+    tempConfigDir,
+    'sidebar-state.json',
+  )
   await saveAccounts(storage)
+}
+
+async function waitForSidebarState(
+  predicate: (state: Awaited<ReturnType<typeof getSidebarState>>) => boolean,
+) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const state = await getSidebarState()
+    if (predicate(state)) return state
+    await Bun.sleep(10)
+  }
+  const state = await getSidebarState()
+  throw new Error(`Sidebar state did not match: ${JSON.stringify(state)}`)
 }
 
 /**
@@ -134,6 +151,26 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
     client: client ?? createMockClient(),
   })) as Promise<any>
 }
+
+describe('package metadata', () => {
+  test('exports a built and typed TUI entrypoint', async () => {
+    const packageJson = JSON.parse(
+      await readFile(new URL('../../package.json', import.meta.url), 'utf8'),
+    ) as {
+      exports?: Record<string, { import?: string; types?: string }>
+      'oc-plugin'?: string[]
+      scripts?: Record<string, string>
+    }
+
+    expect(packageJson.exports?.['./tui']).toEqual({
+      types: './dist/tui.d.ts',
+      import: './dist/tui.js',
+    })
+    expect(packageJson['oc-plugin']).toEqual(['server', 'tui'])
+    expect(packageJson.scripts?.build).toContain('src/tui.tsx')
+    expect(packageJson.scripts?.build).toContain('--outfile dist/tui.js')
+  })
+})
 
 describe('AnthropicAuthPlugin', () => {
   test('returns an object with auth properties', async () => {
@@ -272,6 +309,7 @@ describe('auth.loader', () => {
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
     if (tempConfigDir) {
       await rm(tempConfigDir, { recursive: true, force: true })
       tempConfigDir = undefined
@@ -325,6 +363,58 @@ describe('auth.loader', () => {
     )
     expect(result.apiKey).toBe('')
     expect(result.fetch).toBeFunction()
+  })
+
+  test('sidebar state records the actual fallback-first route', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    const state = await waitForSidebarState(
+      (candidate) => candidate.activeId === 'fallback-1',
+    )
+    expect(state.route).toBe('fallback-first')
+    expect(state.fallbacks[0]?.quota?.five_hour?.usedPercent).toBe(25)
+    expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
   test('fetch wrapper sets OAuth headers and prefixes tools', async () => {

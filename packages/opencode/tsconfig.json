@@ -2,7 +2,9 @@
   "extends": "@tsconfig/bun/tsconfig.json",
   "compilerOptions": {
     "types": ["bun-types"],
-    "noEmit": true
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid"
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
 }

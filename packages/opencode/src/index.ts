@@ -359,10 +359,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
-    activeId: string | undefined,
-    route: string,
+    options: {
+      activeId?: string
+      route: string
+      mainAccessToken?: string
+      mainRefreshToken?: string
+    },
   ) {
-    const mainEntry = quotaManager.getMain()
+    const mainEntry = quotaManager.getMain(options.mainAccessToken)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
     const state: SidebarState = {
@@ -371,23 +375,30 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         quotaBackedOff: quotaManager.isBackedOff(),
         quotaBackoffUntil: lastApiError?.nextRetryAt,
         refreshBackedOff: mainRefreshError
-          ? refreshBackoffActive(mainRefreshError, undefined, Date.now())
+          ? refreshBackoffActive(
+              mainRefreshError,
+              options.mainRefreshToken,
+              Date.now(),
+            )
           : false,
         refreshBackoffUntil: mainRefreshError?.nextRetryAt,
       },
       fallbacks: (storage?.accounts ?? [])
-        .filter((a) => a.enabled !== false)
-        .map((a) => ({
-          id: a.id,
-          label: a.label,
-          // Prefer the shared QuotaManager cache (kept fresh by the background
-          // refresh timer and active-route refresh) over the request-start
-          // storage snapshot so fallback quota is not stale in the sidebar.
-          quota: quotaManager.getFallback(a.id)?.quota ?? a.quota ?? null,
-          enabled: a.enabled !== false,
+        .filter((account) => account.enabled !== false)
+        .map((account) => ({
+          id: account.id,
+          label: account.label,
+          // Token-aware read: if a fallback account was re-logged with the same
+          // id/label, an old in-memory quota snapshot must not be shown as the
+          // new account's quota.
+          quota: account.access
+            ? (quotaManager.getFallback(account.id, account.access)?.quota ??
+              null)
+            : null,
+          enabled: account.enabled !== false,
         })),
-      activeId,
-      route,
+      activeId: options.activeId,
+      route: options.route,
       relay: relayConfig
         ? { enabled: true, transport: relayConfig.transport ?? 'http' }
         : null,
@@ -697,7 +708,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           await buildQuotaCommandSummary(),
         )
         const cmdStorage = await loadAccounts()
-        writeSidebarState(cmdStorage, 'main', 'main')
+        const cmdAuth = latestGetAuth
+          ? await latestGetAuth().catch(() => undefined)
+          : undefined
+        writeSidebarState(cmdStorage, {
+          activeId: 'main',
+          route: 'main',
+          mainAccessToken: cmdAuth?.access,
+          mainRefreshToken: cmdAuth?.refresh,
+        })
         throwHandledSentinel()
       }
 
@@ -1143,7 +1162,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           }
 
           startMainBackgroundRefresh()
-          writeSidebarState(initialStorage, 'main', 'main')
+          quotaManager.seedFallbacksFromAccounts(initialStorage?.accounts ?? [])
+          writeSidebarState(initialStorage, {
+            activeId: 'main',
+            route: 'main',
+            mainAccessToken: auth.access,
+            mainRefreshToken: auth.refresh,
+          })
 
           function isReplayableRequest(
             input: string | URL | Request,
@@ -1377,7 +1402,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             storage: Awaited<ReturnType<typeof loadAccounts>>,
             currentResponse?: Response,
             trace?: PerfTrace,
-            options?: { returnLastOnExhausted?: boolean },
+            options?: {
+              returnLastOnExhausted?: boolean
+              onSuccess?: (account: { id: string; access?: string }) => void
+            },
           ) {
             if (!accounts.length) return currentResponse ?? null
 
@@ -1408,6 +1436,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
               if (!fallbackAgain) {
                 await fallbackManager.markUsed(account)
+                options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
                 // request, so keep its quota fresh on the same cadence as main.
                 // Non-blocking; only the served account, never idle fallbacks.
@@ -1417,6 +1446,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 ) {
                   void quotaManager
                     .refreshFallback(account.id, access)
+                    .then(() => options?.onSuccess?.(account))
                     .catch(() => {})
                 }
                 return response
@@ -1438,6 +1468,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             >,
             trace?: PerfTrace,
             existingStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+            onFallbackSuccess?: (account: {
+              id: string
+              access?: string
+            }) => void,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
@@ -1482,6 +1516,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 storage,
                 currentResponse,
                 trace,
+                { onSuccess: onFallbackSuccess },
               )) ?? currentResponse
             )
           }
@@ -1521,6 +1556,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               // (quota.refreshEveryNRequests) advances for main and the active
               // fallback route on all paths, including successful fallback-first.
               if (replayableRequest) sessionRequestCount++
+              const writeCurrentSidebarState = (
+                activeId: string | undefined,
+                route: string,
+              ) =>
+                writeSidebarState(storage, {
+                  activeId,
+                  route,
+                  mainAccessToken: auth.access,
+                  mainRefreshToken: auth.refresh,
+                })
               let preselectedFallbackAccounts:
                 | Awaited<
                     ReturnType<
@@ -1548,7 +1593,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     storage,
                     undefined,
                     trace,
-                    { returnLastOnExhausted: false },
+                    {
+                      returnLastOnExhausted: false,
+                      onSuccess: (account) =>
+                        writeCurrentSidebarState(account.id, 'fallback-first'),
+                    },
                   )
                   if (fallbackResponse) {
                     trace.done('return_fallback_first', {
@@ -1630,12 +1679,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     // sidebar again once the new main quota lands.
                     void quotaManager
                       .refreshMain(auth.access)
-                      .then(() => writeSidebarState(storage, 'main', 'main'))
+                      .then(() =>
+                        writeSidebarState(storage, {
+                          activeId: 'main',
+                          route: 'main',
+                          mainAccessToken: auth.access,
+                          mainRefreshToken: auth.refresh,
+                        }),
+                      )
                       .catch(() => {})
                   }
                   // Update the sidebar every replayable request so fallback
                   // quota refreshed by the background timer is reflected too.
-                  writeSidebarState(storage, 'main', 'main')
+                  writeSidebarState(storage, {
+                    activeId: 'main',
+                    route: 'main',
+                    mainAccessToken: auth.access,
+                    mainRefreshToken: auth.refresh,
+                  })
                   trace.mark('main_quota_for_routing', {
                     ms: roundMs(nowMs() - quotaStart),
                     passes: quotaSnapshotPassesPolicy(routingQuota, storage),
@@ -1655,6 +1716,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       storage,
                       undefined,
                       trace,
+                      {
+                        onSuccess: (account) =>
+                          writeCurrentSidebarState(account.id, 'fallback'),
+                      },
                     )
                     if (fallbackResponse) {
                       trace.done('return_preselected_fallback', {
@@ -1679,6 +1744,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace,
                 'main',
               )
+              let fallbackServed = false
               const response = await tryFallbackAccounts(
                 input,
                 init,
@@ -1686,7 +1752,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 preselectedFallbackAccounts,
                 trace,
                 storage,
+                (account) => {
+                  fallbackServed = true
+                  writeCurrentSidebarState(account.id, 'fallback')
+                },
               )
+              if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 
               trace.done('return_response', { status: response.status })
               return createStrippedStream(response)

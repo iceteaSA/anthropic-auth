@@ -1,33 +1,21 @@
 /** @jsxImportSource @opentui/solid */
 
-import { readFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
-import { createSignal, For, onCleanup, Show } from 'solid-js'
-import type { AccountQuota, SidebarState } from './sidebar-state.js'
+import { For, Show, createSignal, onCleanup } from 'solid-js'
 
-const STATE_FILE = join(
-  tmpdir(),
-  'opencode-anthropic-auth',
-  'sidebar-state.json',
-)
+import {
+  type AccountQuota,
+  DEFAULT_SIDEBAR_STATE,
+  type SidebarState,
+  getSidebarState,
+} from './sidebar-state.js'
+
 const POLL_MS = 1500
 const REFRESH_DEBOUNCE_MS = 200
-
-const DEFAULT_STATE: SidebarState = {
-  main: { quota: null },
-  fallbacks: [],
-  activeId: undefined,
-  route: 'main',
-  relay: null,
-  fastMode: false,
-  lastUpdated: 0,
-}
 
 const ID = 'cortexkit.anthropic-auth'
 const BAR_WIDTH = 10
@@ -210,16 +198,11 @@ function AccountBlock(props: {
 // --- State plumbing ---------------------------------------------------------
 
 async function readStateFromFile(): Promise<SidebarState> {
-  try {
-    const raw = await readFile(STATE_FILE, 'utf8')
-    return JSON.parse(raw) as SidebarState
-  } catch {
-    return DEFAULT_STATE
-  }
+  return getSidebarState()
 }
 
 function QuotaSidebar(props: { api: TuiPluginApi }) {
-  const [state, setState] = createSignal<SidebarState>(DEFAULT_STATE)
+  const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
   let lastUpdated = 0
   let debounce: ReturnType<typeof setTimeout> | null = null
 
