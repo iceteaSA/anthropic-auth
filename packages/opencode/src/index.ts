@@ -42,7 +42,6 @@ import {
   loadAccounts,
   log,
   mergeAnthropicBetas,
-  type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,

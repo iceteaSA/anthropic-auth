@@ -1002,14 +1002,26 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
     const qm = new QuotaManager({ storage, fetchImpl, now: () => 1_000 })
     // Active-route refresh left a FRESH but EXHAUSTED entry in the QM cache.
-    qm.setFallback('fallback-1', {
-      quota: {
-        five_hour: { usedPercent: 100, remainingPercent: 0, checkedAt: 1_000 },
-        seven_day: { usedPercent: 100, remainingPercent: 0, checkedAt: 1_000 },
+    qm.setFallback(
+      'fallback-1',
+      {
+        quota: {
+          five_hour: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: 1_000,
+          },
+          seven_day: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: 1_000,
+          },
+        },
+        refreshAfter: 1_000 + 10 * 60_000,
+        checkedAt: 1_000,
       },
-      refreshAfter: 1_000 + 10 * 60_000,
-      checkedAt: 1_000,
-    })
+      'fallback-access',
+    )
 
     const manager = new FallbackAccountManager({
       fetchImpl,
@@ -1046,6 +1058,73 @@ describe('FallbackAccountManager', () => {
     // Same account id, NEW token (re-login): entry is invalidated → stale.
     expect(qm.isFallbackStale('fallback-1', 'new-access')).toBe(true)
     expect(qm.getFallback('fallback-1', 'new-access')).toBeNull()
+  })
+
+  test('re-login invalidates fallback cache seeded from persisted quota', async () => {
+    // Regression: seedFallbackQuota used to write a tokenless QuotaManager entry.
+    // A still-running plugin process could then reuse old same-label quota after
+    // CLI re-login cleared account.quota on disk.
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'same-label',
+      label: 'same-label',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 30_000_000,
+      quota: {
+        five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: 1_900 },
+        seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: 1_900 },
+      },
+    })
+
+    const quotaProbeTokens: string[] = []
+    const fetchImpl = mock((_: string | URL | Request, init?: RequestInit) => {
+      quotaProbeTokens.push(
+        new Headers(init?.headers).get('authorization') ?? '',
+      )
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            five_hour: { utilization: 10 },
+            seven_day: { utilization: 10 },
+          }),
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+    const qm = new QuotaManager({ storage, fetchImpl, now: () => 2_000 })
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 2_000,
+      quotaManager: qm,
+    })
+
+    // First selection seeds the old persisted quota into QuotaManager.
+    expect(
+      (await manager.getUsableFallbackAccounts(storage)).map((a) => a.id),
+    ).toContain('same-label')
+    expect(quotaProbeTokens).toEqual([])
+
+    // Simulate same-label re-login in a still-running process. CLI upsert clears
+    // quota/error metadata for the stored account.
+    storage.accounts[0] = {
+      id: 'same-label',
+      label: 'same-label',
+      type: 'oauth',
+      access: 'new-access',
+      refresh: 'new-refresh',
+      expires: 30_000_000,
+      enabled: true,
+      addedAt: 2_000,
+      lastUsed: 2_000,
+    }
+
+    expect(
+      (await manager.getUsableFallbackAccounts(storage)).map((a) => a.id),
+    ).toContain('same-label')
+    expect(quotaProbeTokens).toEqual(['Bearer new-access'])
+    expect(storage.accounts[0]?.quota?.five_hour?.remainingPercent).toBe(90)
   })
 })
 

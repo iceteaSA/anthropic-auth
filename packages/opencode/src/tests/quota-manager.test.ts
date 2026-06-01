@@ -86,12 +86,44 @@ describe('QuotaManager', () => {
 
       // Fallback account is backed off; main is not.
       expect(qm.isFallbackBackedOff('fallback-1')).toBe(true)
+      expect(qm.isFallbackBackedOff('fallback-1', 'fallback-token')).toBe(true)
       expect(qm.isBackedOff()).toBe(false)
       // onApiError (persists mainLastQuotaApiError) must NOT have fired.
       expect(apiErrorCount).toBe(0)
       expect(qm.getLastApiError()).toBeUndefined()
       // A different fallback is unaffected.
       expect(qm.isFallbackBackedOff('fallback-2')).toBe(false)
+    })
+
+    test('fallback quota backoff is token-bound after re-login', async () => {
+      // Same-label re-login changes the access token. A quota backoff recorded
+      // for the old token must not block a fresh quota probe for the new token.
+      const seenTokens: string[] = []
+      const fetchMock = mock(
+        (_: string | URL | Request, init?: RequestInit) => {
+          const token = new Headers(init?.headers).get('authorization') ?? ''
+          seenTokens.push(token)
+          if (token === 'Bearer old-token') {
+            return Promise.resolve(
+              new Response('rate limited', { status: 429 }),
+            )
+          }
+          return Promise.resolve(makeQuotaResponse(now))
+        },
+      ) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+
+      await expect(
+        qm.refreshFallback('fallback-1', 'old-token'),
+      ).rejects.toThrow('429')
+      expect(qm.isFallbackBackedOff('fallback-1', 'old-token')).toBe(true)
+      expect(qm.isFallbackBackedOff('fallback-1', 'new-token')).toBe(false)
+
+      now += 1_100
+      await expect(
+        qm.refreshFallback('fallback-1', 'new-token'),
+      ).resolves.toBeDefined()
+      expect(seenTokens).toEqual(['Bearer old-token', 'Bearer new-token'])
     })
 
     test('main 429 does NOT back off a fallback account', async () => {
@@ -310,6 +342,45 @@ describe('QuotaManager', () => {
       // Different token (account switch) drops the entry and returns null.
       expect(qm.getMain('new-main-token')).toBeNull()
       expect(qm.getMain()).toBeNull()
+    })
+
+    test('seedFallbacksFromAccounts token-binds persisted fallback quota', () => {
+      // Regression: persisted fallback quota seeds must be tied to the access
+      // token that produced them. Otherwise same-label re-login can reuse a
+      // still-running plugin's old in-memory quota cache.
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: { checkIntervalMinutes: 5 },
+        },
+        now: () => 1_000_000,
+      })
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'old-fallback-token',
+          refresh: 'refresh-token',
+          expires: 2_000_000,
+          quota: {
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: 900_000,
+            },
+            seven_day: {
+              usedPercent: 20,
+              remainingPercent: 80,
+              checkedAt: 900_000,
+            },
+          },
+        },
+      ])
+
+      expect(qm.getFallback('fallback-1', 'old-fallback-token')).not.toBeNull()
+      expect(qm.getFallback('fallback-1', 'new-fallback-token')).toBeNull()
     })
 
     test('drops persisted main seed during backoff when the token changed', async () => {

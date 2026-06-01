@@ -995,7 +995,7 @@ export class FallbackAccountManager {
     storage: AccountStorage,
   ): void {
     if (!this.quotaManager) return
-    if (this.quotaManager.getFallback(account.id)) return
+    if (this.quotaManager.getFallback(account.id, account.access)) return
     if (!account.quota) return
     const checkedAt = Math.max(
       account.quota.five_hour?.checkedAt ?? 0,
@@ -1003,11 +1003,15 @@ export class FallbackAccountManager {
     )
     if (checkedAt <= 0) return
     const checkInterval = getQuotaCheckIntervalMs(storage)
-    this.quotaManager.setFallback(account.id, {
-      quota: account.quota,
-      refreshAfter: checkedAt + checkInterval,
-      checkedAt,
-    })
+    this.quotaManager.setFallback(
+      account.id,
+      {
+        quota: account.quota,
+        refreshAfter: checkedAt + checkInterval,
+        checkedAt,
+      },
+      account.access,
+    )
   }
 
   async load() {
@@ -1217,7 +1221,7 @@ export class FallbackAccountManager {
         // Use QuotaManager staleness when available (shared cache);
         // fall back to per-account on-disk staleness otherwise.
         const stale = this.quotaManager
-          ? this.quotaManager.isFallbackStale(next.id)
+          ? this.quotaManager.isFallbackStale(next.id, next.access)
           : quotaIsStale(next, storage, this.now())
         if (!stale) continue
         await this.refreshAccountQuota(next, storage)
@@ -1476,11 +1480,15 @@ export class FallbackAccountManager {
     // refreshAfter reflects this storage's check interval consistently.
     if (this.quotaManager && target.quota) {
       const now = this.now()
-      this.quotaManager.setFallback(target.id, {
-        quota: target.quota,
-        refreshAfter: now + getQuotaCheckIntervalMs(storage),
-        checkedAt: now,
-      })
+      this.quotaManager.setFallback(
+        target.id,
+        {
+          quota: target.quota,
+          refreshAfter: now + getQuotaCheckIntervalMs(storage),
+          checkedAt: now,
+        },
+        target.access,
+      )
     }
     return target
   }
