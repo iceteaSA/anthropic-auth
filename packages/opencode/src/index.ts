@@ -45,6 +45,7 @@ import {
   log,
   mergeAnthropicBetas,
   type OAuthQuotaSnapshot,
+  PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
@@ -247,6 +248,27 @@ async function sendIgnoredMessage(
 
 function throwHandledSentinel(): never {
   throw new Error(HANDLED_SENTINEL)
+}
+
+function shouldInjectParallelToolPrompt(input: {
+  sessionID?: string
+  model?: { providerID?: string; api?: { npm?: string } }
+}) {
+  if (input.sessionID == null) return false
+  const model = input.model
+  return (
+    model?.providerID === 'anthropic' ||
+    model?.api?.npm === '@ai-sdk/anthropic' ||
+    model?.api?.npm === '@ai-sdk/google-vertex/anthropic'
+  )
+}
+
+function appendParallelToolPrompt(system: string[]) {
+  if (system.some((entry) => entry.includes('<use_parallel_tool_calls>'))) {
+    return false
+  }
+  system.push(PARALLEL_TOOL_CALLS_SYSTEM_PROMPT)
+  return true
 }
 
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
@@ -538,6 +560,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             'Show or change Claude account routing between main-first and fallback-first.',
         },
       }
+    },
+    'experimental.chat.system.transform': async (
+      input: {
+        sessionID?: string
+        model?: { providerID?: string; api?: { npm?: string } }
+      },
+      output: { system: string[] },
+    ) => {
+      if (!shouldInjectParallelToolPrompt(input)) return
+      appendParallelToolPrompt(output.system)
     },
     'command.execute.before': async (input: {
       command: string

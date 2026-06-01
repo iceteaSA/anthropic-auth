@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
+  PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   resetCache1hState,
   resetDumpState,
   resetFastModeState,
@@ -141,6 +142,67 @@ describe('AnthropicAuthPlugin', () => {
     expect(plugin.auth.provider).toBe('anthropic')
     expect(plugin.auth.loader).toBeFunction()
     expect(plugin.auth.methods).toBeArray()
+  })
+})
+
+describe('experimental.chat.system.transform', () => {
+  test('injects parallel tool-call prompt only for Anthropic chat sessions', async () => {
+    const plugin = await getPlugin()
+    const system = ['base system']
+
+    await plugin['experimental.chat.system.transform'](
+      {
+        sessionID: 'ses_test',
+        model: { providerID: 'anthropic', id: 'claude-opus-4-8' },
+      },
+      { system },
+    )
+
+    expect(system).toEqual(['base system', PARALLEL_TOOL_CALLS_SYSTEM_PROMPT])
+  })
+
+  test('does not inject parallel tool-call prompt for non-Anthropic models', async () => {
+    const plugin = await getPlugin()
+    const system = ['base system']
+
+    await plugin['experimental.chat.system.transform'](
+      {
+        sessionID: 'ses_test',
+        model: { providerID: 'openai', id: 'gpt-5.5-fast' },
+      },
+      { system },
+    )
+
+    expect(system).toEqual(['base system'])
+  })
+
+  test('does not inject parallel tool-call prompt outside chat sessions', async () => {
+    const plugin = await getPlugin()
+    const system = ['base system']
+
+    await plugin['experimental.chat.system.transform'](
+      {
+        model: { providerID: 'anthropic', id: 'claude-opus-4-8' },
+      },
+      { system },
+    )
+
+    expect(system).toEqual(['base system'])
+  })
+
+  test('does not duplicate an existing parallel tool-call prompt', async () => {
+    const plugin = await getPlugin()
+    const system = ['base system', PARALLEL_TOOL_CALLS_SYSTEM_PROMPT]
+
+    await plugin['experimental.chat.system.transform'](
+      {
+        sessionID: 'ses_test',
+        model: { providerID: 'anthropic', id: 'claude-opus-4-8' },
+      },
+      { system },
+    )
+
+    expect(system).toEqual(['base system', PARALLEL_TOOL_CALLS_SYSTEM_PROMPT])
   })
 })
 

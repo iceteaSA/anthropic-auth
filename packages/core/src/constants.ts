@@ -51,6 +51,12 @@ export const OPENCODE_IDENTITY_PREFIX = 'You are OpenCode'
 export const CLAUDE_CODE_IDENTITY =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
+export const PARALLEL_TOOL_CALLS_SYSTEM_PROMPT = [
+  '<use_parallel_tool_calls>',
+  'For maximum efficiency, whenever you perform multiple independent operations, invoke all relevant tools simultaneously rather than sequentially. Prioritize calling tools in parallel whenever possible. For example, when reading 3 files, run 3 tool calls in parallel to read all 3 files into context at the same time. When running multiple read-only commands like `ls` or `list_dir`, always run all of the commands in parallel. Err on the side of maximizing parallel tool calls rather than running too many tools sequentially.',
+  '</use_parallel_tool_calls>',
+].join('\n')
+
 export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
 export const CLAUDE_CODE_VERSION = '2.1.141'

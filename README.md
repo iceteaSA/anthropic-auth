@@ -283,7 +283,7 @@ Modes:
 
 - `explicit` keeps OpenCode's explicit cache breakpoints and adds `ttl: "1h"` to them.
 - `automatic` removes block-level cache controls and sends a top-level `cache_control` object.
-- `hybrid` (recommended) removes top-level automatic caching and uses explicit anchors on the last stable system block, the first two messages, and `messages[n-2]` when that anchor is distinct.
+- `hybrid` (recommended) removes top-level automatic caching and uses explicit anchors on the first two messages plus a moving latest-user boundary. It keeps the last stable system block in normal turns, and uses that slot for the previous user boundary when a tool-heavy step would exceed Anthropic's 20-block lookback.
 
 In OpenCode, subagent requests do not receive 1-hour TTL caching. The plugin detects child sessions through OpenCode's `x-parent-session-id` header, strips that internal header before forwarding to Anthropic, and leaves default ephemeral caching in place for those requests.
 

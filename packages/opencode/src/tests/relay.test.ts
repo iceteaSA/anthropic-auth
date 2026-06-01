@@ -1255,8 +1255,10 @@ describe('relay client', () => {
 
   test('dumps the exact websocket protocol 2 frame payload', async () => {
     const originalWebSocket = globalThis.WebSocket
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-dump-test-'))
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
     const sentPayloads: unknown[] = []
-    await rm(getDumpDirectory(), { recursive: true, force: true })
     setDumpEnabled(true)
 
     class DumpingWebSocket extends EventTarget {
@@ -1348,7 +1350,12 @@ describe('relay client', () => {
     } finally {
       resetDumpState()
       globalThis.WebSocket = originalWebSocket
-      await rm(getDumpDirectory(), { recursive: true, force: true })
+      if (originalDumpDir === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
+      }
+      await rm(dumpDir, { recursive: true, force: true })
     }
   })
 })

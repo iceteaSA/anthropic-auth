@@ -1063,14 +1063,13 @@ describe('rewriteRequestBody', () => {
     })
   })
 
-  test('hybrid mode does not duplicate the moving marker when n-2 is messages[1]', async () => {
-    const messages = Array.from({ length: 3 }, (_, index) => ({
-      role: index % 2 === 0 ? 'user' : 'assistant',
-      content: `message ${index}`,
-    }))
+  test('hybrid mode does not duplicate the moving marker when the latest user boundary is messages[1]', async () => {
     const body = JSON.stringify({
       system: 'Stable system block',
-      messages,
+      messages: [
+        { role: 'user', content: 'message 0' },
+        { role: 'user', content: 'message 1' },
+      ],
     })
 
     const result = JSON.parse(
@@ -1088,17 +1087,17 @@ describe('rewriteRequestBody', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
-    expect(result.messages[2].content).toBe('message 2')
   })
 
-  test('hybrid mode adds a moving marker at messages[n-2] once distinct from messages[1]', async () => {
-    const messages = Array.from({ length: 4 }, (_, index) => ({
-      role: index % 2 === 0 ? 'user' : 'assistant',
-      content: `message ${index}`,
-    }))
+  test('hybrid mode adds a moving marker at the latest user boundary', async () => {
     const body = JSON.stringify({
       system: 'Stable system block',
-      messages,
+      messages: [
+        { role: 'user', content: 'message 0' },
+        { role: 'assistant', content: 'message 1' },
+        { role: 'user', content: 'message 2' },
+        { role: 'assistant', content: 'message 3' },
+      ],
     })
 
     const result = JSON.parse(
@@ -1124,6 +1123,102 @@ describe('rewriteRequestBody', () => {
       },
     ])
     expect(result.messages[3].content).toBe('message 3')
+  })
+
+  test('hybrid mode keeps the system anchor when the latest user boundary is within lookback', async () => {
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages: [
+        { role: 'user', content: 'message 0' },
+        { role: 'user', content: 'message 1' },
+        { role: 'user', content: 'previous user boundary' },
+        {
+          role: 'assistant',
+          content: Array.from({ length: 17 }, (_, index) => ({
+            type: 'text',
+            text: `assistant block ${index}`,
+          })),
+        },
+        { role: 'user', content: 'latest user boundary' },
+      ],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    expect(result.system[2].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[2].content).toBe('previous user boundary')
+    expect(result.messages[4].content).toEqual([
+      {
+        type: 'text',
+        text: 'latest user boundary',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ])
+  })
+
+  test('hybrid mode bridges tool-heavy steps that exceed Anthropic lookback', async () => {
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages: [
+        { role: 'user', content: 'message 0' },
+        { role: 'user', content: 'message 1' },
+        { role: 'user', content: 'previous user boundary' },
+        {
+          role: 'assistant',
+          content: Array.from({ length: 19 }, (_, index) => ({
+            type: 'tool_use',
+            id: `tool_${index}`,
+            name: 'Read',
+            input: { filePath: `file-${index}.ts` },
+          })),
+        },
+        { role: 'user', content: 'latest user boundary' },
+      ],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    expect(result.system[2].cache_control).toBeUndefined()
+    expect(result.messages[0].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[1].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[2].content).toEqual([
+      {
+        type: 'text',
+        text: 'previous user boundary',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ])
+    expect(
+      result.messages[3].content.some(
+        (block: { cache_control?: unknown }) => block.cache_control,
+      ),
+    ).toBe(false)
+    expect(result.messages[4].content).toEqual([
+      {
+        type: 'text',
+        text: 'latest user boundary',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ])
   })
 
   test('hybrid mode preserves only the last original system cache anchor after billing and identity blocks', async () => {

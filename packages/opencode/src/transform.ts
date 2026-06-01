@@ -380,6 +380,7 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
 
 type CacheControl = { type: string; ttl?: string; [k: string]: unknown }
 const CACHE_1H_CONTROL = { type: 'ephemeral', ttl: '1h' } as const
+const ANTHROPIC_CACHE_LOOKBACK_BLOCKS = 20
 
 function getCacheControl(value: Record<string, unknown>) {
   if (isRecord(value.cache_control)) return value.cache_control
@@ -486,9 +487,51 @@ function setMessageCacheAnchor(message: unknown) {
   return setWireCacheControl(lastCacheableBlock ?? message, true)
 }
 
-function applyHybridCache1h(parsed: Record<string, unknown>) {
-  removeAllCacheControls(parsed)
+function messageContentBlockCount(message: unknown) {
+  if (!isRecord(message)) return 0
+  const content = message.content
+  if (Array.isArray(content)) return content.length
+  if (content == null) return 0
+  return 1
+}
 
+function findUserCacheAnchors(messages: unknown[]) {
+  const anchors: Array<{ index: number; blockPosition: number }> = []
+  let blockPosition = 0
+
+  messages.forEach((message, index) => {
+    const blockCount = messageContentBlockCount(message)
+    if (isRecord(message) && message.role === 'user' && blockCount > 0) {
+      anchors.push({ index, blockPosition: blockPosition + blockCount - 1 })
+    }
+    blockPosition += blockCount
+  })
+
+  return anchors
+}
+
+function selectHybridMessageAnchors(messages: unknown[]) {
+  const userAnchors = findUserCacheAnchors(messages)
+  const latest = [...userAnchors].reverse().find((anchor) => anchor.index > 1)
+  if (!latest) return { latest: undefined, bridge: undefined }
+
+  const previous = [...userAnchors]
+    .reverse()
+    .find((anchor) => anchor.index < latest.index)
+  const distanceFromPrevious = previous
+    ? latest.blockPosition - previous.blockPosition + 1
+    : 0
+  const bridge =
+    previous &&
+    previous.index > 1 &&
+    distanceFromPrevious > ANTHROPIC_CACHE_LOOKBACK_BLOCKS
+      ? previous
+      : undefined
+
+  return { latest, bridge }
+}
+
+function setHybridSystemAnchor(parsed: Record<string, unknown>) {
   if (Array.isArray(parsed.system)) {
     const identityIndex = parsed.system.findIndex(
       (block) => isRecord(block) && block.text === CLAUDE_CODE_IDENTITY,
@@ -502,16 +545,28 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   } else {
     setWireCacheControl(parsed.system, true)
   }
+}
 
-  if (!Array.isArray(parsed.messages)) return
+function applyHybridCache1h(parsed: Record<string, unknown>) {
+  removeAllCacheControls(parsed)
+
+  if (!Array.isArray(parsed.messages)) {
+    setHybridSystemAnchor(parsed)
+    return
+  }
+
+  const { latest, bridge } = selectHybridMessageAnchors(parsed.messages)
+
+  // Hybrid has only four Anthropic cache slots. Keep the system fallback in
+  // normal turns, but spend that slot on the previous user/tool-result boundary
+  // when a tool-heavy step pushes the latest user boundary outside Anthropic's
+  // 20-block lookback window.
+  if (!bridge) setHybridSystemAnchor(parsed)
 
   setMessageCacheAnchor(parsed.messages[0])
   setMessageCacheAnchor(parsed.messages[1])
-
-  const movingMessageIndex = parsed.messages.length - 2
-  if (movingMessageIndex > 1) {
-    setMessageCacheAnchor(parsed.messages[movingMessageIndex])
-  }
+  if (bridge) setMessageCacheAnchor(parsed.messages[bridge.index])
+  if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
 }
 
 function applyCache1hStrategy(
