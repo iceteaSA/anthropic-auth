@@ -1140,6 +1140,7 @@ describe('auth.loader', () => {
               },
             ],
           },
+          { role: 'user', content: 'follow up' },
         ],
       }),
     })
