@@ -7,6 +7,7 @@ import {
   getCollapsedQuotaSummary,
   resolveActiveAccount,
   SEVEN_DAY_MS,
+  type SidebarAccountState,
   type SidebarState,
 } from '../sidebar-state'
 
@@ -15,25 +16,39 @@ const quota = (used: number): AccountQuota => ({
   seven_day: { usedPercent: used, remainingPercent: 100 - used },
 })
 
+const main = (
+  q: AccountQuota | null,
+  killed = false,
+): SidebarState['main'] => ({ quota: q, killed })
+
+const fb = (
+  overrides: Partial<SidebarAccountState> & { id: string },
+): SidebarAccountState => ({
+  label: undefined,
+  quota: null,
+  killed: false,
+  enabled: true,
+  ...overrides,
+})
+
 function make(overrides: Partial<SidebarState>): SidebarState {
   return { ...DEFAULT_SIDEBAR_STATE, ...overrides }
 }
 
 describe('resolveActiveAccount', () => {
   test('activeId "main" resolves to the main account', () => {
-    const state = make({ activeId: 'main', main: { quota: quota(20) } })
+    const state = make({ activeId: 'main', main: main(quota(20)) })
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('main')
     expect(active.name).toBe('main')
     expect(active.quota?.five_hour?.usedPercent).toBe(20)
+    expect(active.killed).toBe(false)
   })
 
   test('activeId matching an enabled fallback resolves to that fallback (label name)', () => {
     const state = make({
       activeId: 'fb1',
-      fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: true },
-      ],
+      fallbacks: [fb({ id: 'fb1', label: 'work', quota: quota(40) })],
     })
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('fb1')
@@ -44,9 +59,7 @@ describe('resolveActiveAccount', () => {
   test('fallback without a label uses its id as the name', () => {
     const state = make({
       activeId: 'fb1',
-      fallbacks: [
-        { id: 'fb1', label: undefined, quota: quota(5), enabled: true },
-      ],
+      fallbacks: [fb({ id: 'fb1', label: undefined, quota: quota(5) })],
     })
     expect(resolveActiveAccount(state).name).toBe('fb1')
   })
@@ -54,9 +67,9 @@ describe('resolveActiveAccount', () => {
   test('activeId matching a DISABLED fallback falls back to main', () => {
     const state = make({
       activeId: 'fb1',
-      main: { quota: quota(12) },
+      main: main(quota(12)),
       fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: false },
+        fb({ id: 'fb1', label: 'work', quota: quota(40), enabled: false }),
       ],
     })
     const active = resolveActiveAccount(state)
@@ -65,21 +78,36 @@ describe('resolveActiveAccount', () => {
   })
 
   test('undefined activeId resolves to main', () => {
-    const state = make({ activeId: undefined, main: { quota: quota(7) } })
+    const state = make({ activeId: undefined, main: main(quota(7)) })
     expect(resolveActiveAccount(state).id).toBe('main')
   })
 
   test('unmatched activeId resolves to main', () => {
     const state = make({
       activeId: 'ghost',
-      main: { quota: null },
-      fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: true },
-      ],
+      main: main(null),
+      fallbacks: [fb({ id: 'fb1', label: 'work', quota: quota(40) })],
     })
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('main')
     expect(active.quota).toBeNull()
+  })
+
+  test('carries through the killed flag for the active main account', () => {
+    const state = make({ activeId: 'main', main: main(quota(95), true) })
+    expect(resolveActiveAccount(state).killed).toBe(true)
+  })
+
+  test('carries through the killed flag for the active fallback account', () => {
+    const state = make({
+      activeId: 'fb1',
+      fallbacks: [
+        fb({ id: 'fb1', label: 'work', quota: quota(99), killed: true }),
+      ],
+    })
+    const active = resolveActiveAccount(state)
+    expect(active.id).toBe('fb1')
+    expect(active.killed).toBe(true)
   })
 })
 

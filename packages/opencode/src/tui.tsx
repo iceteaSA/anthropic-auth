@@ -302,12 +302,15 @@ function AccountBlock(props: {
   appearance: AppearancePrefs
   name: string
   quota: AccountQuota | null
+  killed: boolean
   active: boolean
   pacingEnabled: boolean
   marginTop?: number
 }) {
-  const statusWord = () => (props.active ? 'active' : 'idle')
-  const statusTone = (): Tone => (props.active ? 'ok' : 'muted')
+  const statusWord = () =>
+    props.killed ? 'blocked' : props.active ? 'active' : 'idle'
+  const statusTone = (): Tone =>
+    props.killed ? 'err' : props.active ? 'ok' : 'muted'
   const pacingFor = (
     window:
       | { usedPercent: number; remainingPercent: number; resetsAt?: string }
@@ -388,6 +391,7 @@ function QuotaDialogContent(props: {
           appearance={prefs().appearance}
           name='main'
           quota={state().main.quota}
+          killed={state().main.killed}
           active={state().activeId === 'main'}
           pacingEnabled={prefs().sections.pacing}
         />
@@ -399,6 +403,7 @@ function QuotaDialogContent(props: {
                 appearance={prefs().appearance}
                 name={fb.label ?? fb.id}
                 quota={fb.quota}
+                killed={fb.killed}
                 active={state().activeId === fb.id}
                 pacingEnabled={prefs().sections.pacing}
                 marginTop={1}
@@ -567,10 +572,18 @@ function QuotaSidebar(props: {
     if (!activePacingDeficit()) return base
     return base === 'ok' || base === 'muted' ? 'warn' : base
   }
+  const killedNames = () =>
+    [
+      state().main.killed ? 'main' : '',
+      ...enabledFallbacks()
+        .filter((f) => f.killed)
+        .map((f) => f.label ?? f.id),
+    ].filter(Boolean)
 
   const quotaBackedOff = () => state().main.quotaBackedOff === true
   const refreshBackedOff = () => state().main.refreshBackedOff === true
-  const degraded = () => quotaBackedOff() || refreshBackedOff()
+  const degraded = () =>
+    killedNames().length > 0 || quotaBackedOff() || refreshBackedOff()
 
   const cacheKeep = () => state().cacheKeep
   const showCache = () =>
@@ -628,16 +641,27 @@ function QuotaSidebar(props: {
         </Show>
       </box>
 
-      {/* Collapsed: active account 5h + 7d quota, plus fast-mode when on */}
+      {/* Collapsed: active account 5h + 7d quota + dot (red ⊘ when killed),
+          plus fast-mode when on */}
       <Show when={collapsed() && hasData()}>
         <CollapsedRow theme={theme()} label={activeAccount().name}>
           <Show
             when={activeQuotaSummary().text != null}
             fallback={<text fg={theme().textMuted}>{'\u2014'}</text>}
           >
-            <text fg={toneColor(theme(), activeQuotaTone())}>
-              <b>{activeQuotaSummary().text}</b>
-            </text>
+            <box flexDirection='row'>
+              <text fg={toneColor(theme(), activeQuotaTone())}>
+                <b>{activeQuotaSummary().text}</b>
+              </text>
+              <text
+                fg={toneColor(
+                  theme(),
+                  activeAccount().killed ? 'err' : activeQuotaTone(),
+                )}
+              >
+                {activeAccount().killed ? ' \u2298' : ' \u25cf'}
+              </text>
+            </box>
           </Show>
         </CollapsedRow>
         <Show when={state().fastMode}>
@@ -668,6 +692,7 @@ function QuotaSidebar(props: {
               appearance={prefs().appearance}
               name='main'
               quota={state().main.quota}
+              killed={state().main.killed}
               active={state().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
             />
@@ -679,6 +704,7 @@ function QuotaSidebar(props: {
                     appearance={prefs().appearance}
                     name={fb.label ?? fb.id}
                     quota={fb.quota}
+                    killed={fb.killed}
                     active={state().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
                     marginTop={1}
@@ -750,6 +776,14 @@ function QuotaSidebar(props: {
               tone='warn'
             />
           </Show>
+        </Show>
+        <Show when={killedNames().length > 0}>
+          <StatRow
+            theme={theme()}
+            label='Killswitch'
+            value={`${killedNames().join(', ')} blocked`}
+            tone='err'
+          />
         </Show>
       </Show>
     </box>

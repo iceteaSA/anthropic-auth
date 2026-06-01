@@ -13,12 +13,14 @@ export interface SidebarAccountState {
   id: string
   label: string | undefined
   quota: AccountQuota | null
+  killed: boolean
   enabled: boolean
 }
 
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    killed: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
     refreshBackedOff?: boolean
@@ -50,7 +52,7 @@ export function getSidebarStateFile(): string {
 }
 
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
-  main: { quota: null },
+  main: { quota: null, killed: false },
   fallbacks: [],
   activeId: undefined,
   route: 'main',
@@ -85,6 +87,7 @@ export function resolveActiveAccount(state: SidebarState): {
   id: string
   name: string
   quota: AccountQuota | null
+  killed: boolean
 } {
   const activeId = state.activeId
   if (activeId && activeId !== 'main') {
@@ -100,10 +103,16 @@ export function resolveActiveAccount(state: SidebarState): {
         id: fallback.id,
         name: fallback.label ?? fallback.id,
         quota: fallback.quota,
+        killed: fallback.killed,
       }
     }
   }
-  return { id: 'main', name: 'main', quota: state.main.quota }
+  return {
+    id: 'main',
+    name: 'main',
+    quota: state.main.quota,
+    killed: state.main.killed,
+  }
 }
 
 export function getCollapsedQuotaSummary(quota: AccountQuota | null): {

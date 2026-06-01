@@ -548,11 +548,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       (storage?.accounts ?? []).filter(isOAuthAccount),
     )
     const mainEntry = quotaManager.getMain(options.mainAccessToken)
+    const ksEnabled = isKillswitchEnabled(storage)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
     const state: SidebarState = {
       main: {
         quota: mainEntry?.quota ?? null,
+        // No `quota != null` guard: under failClosedOnUnknownQuota the
+        // killswitch blocks unknown-quota accounts, so the sidebar must show
+        // them as killed too (killswitchPassesPolicy handles the null case).
+        killed: ksEnabled
+          ? !killswitchPassesPolicy(mainEntry?.quota, storage)
+          : false,
         quotaBackedOff: quotaManager.isBackedOff(),
         quotaBackoffUntil: lastApiError?.nextRetryAt,
         refreshBackedOff: mainRefreshError
@@ -569,18 +576,27 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           (account): account is OAuthAccount =>
             account.enabled !== false && isOAuthAccount(account),
         )
-        .map((account) => ({
-          id: account.id,
-          label: account.label,
+        .map((account) => {
           // Token-aware read: if a fallback account was re-logged with the same
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
-          quota: account.access
+          const quota = account.access
             ? (quotaManager.getFallback(account.id, account.access)?.quota ??
               null)
-            : null,
-          enabled: account.enabled !== false,
-        })),
+            : null
+          return {
+            id: account.id,
+            label: account.label,
+            quota,
+            // No `quota != null` guard: under failClosedOnUnknownQuota the
+            // killswitch blocks unknown-quota accounts, so the sidebar must
+            // show them as killed too.
+            killed: ksEnabled
+              ? !killswitchPassesPolicy(quota ?? undefined, storage, account.id)
+              : false,
+            enabled: account.enabled !== false,
+          }
+        }),
       activeId: options.activeId,
       route: options.route,
       relay: (() => {
