@@ -876,11 +876,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       (storage?.accounts ?? []).filter(isOAuthAccount),
     )
     const mainEntry = quotaManager.getMain(options.mainAccessToken)
+    const ksEnabled = isKillswitchEnabled(storage)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
     const state: SidebarState = {
       main: {
         quota: mainEntry?.quota ?? null,
+        // No `quota != null` guard: under failClosedOnUnknownQuota the
+        // killswitch blocks unknown-quota accounts, so the sidebar must show
+        // them as killed too (killswitchPassesPolicy handles the null case).
+        killed: ksEnabled
+          ? !killswitchPassesPolicy(mainEntry?.quota, storage)
+          : false,
         quotaBackedOff: quotaManager.isBackedOff(),
         quotaBackoffUntil: lastApiError?.nextRetryAt,
         refreshBackedOff: mainRefreshError
@@ -897,30 +904,39 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           (account): account is OAuthAccount =>
             account.enabled !== false && isOAuthAccount(account),
         )
-        .map((account) => ({
-          id: account.id,
-          label: account.label,
+        .map((account) => {
           // Token-aware read: if a fallback account was re-logged with the same
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
-          quota: account.access
+          const quota = account.access
             ? (quotaManager.getFallback(account.id, account.access)?.quota ??
               null)
-            : null,
-          // A fallback with a permanently-dead refresh token (400 invalid_grant)
-          // is dropped by getUsableFallbackAccounts and silently degrades to
-          // main — surface it as "needs re-login". Only flag truly-dead tokens
-          // whose backoff is still active, not transient (429/5xx) backoff.
-          needsReauth:
-            account.lastRefreshError != null &&
-            refreshBackoffActive(
-              account.lastRefreshError,
-              account.refresh,
-              Date.now(),
-            ) &&
-            isPermanentRefreshError(account.lastRefreshError),
-          enabled: account.enabled !== false,
-        })),
+            : null
+          return {
+            id: account.id,
+            label: account.label,
+            quota,
+            // No `quota != null` guard: under failClosedOnUnknownQuota the
+            // killswitch blocks unknown-quota accounts, so the sidebar must
+            // show them as killed too.
+            killed: ksEnabled
+              ? !killswitchPassesPolicy(quota ?? undefined, storage, account.id)
+              : false,
+            // A fallback with a permanently-dead refresh token (400 invalid_grant)
+            // is dropped by getUsableFallbackAccounts and silently degrades to
+            // main — surface it as "needs re-login". Only flag truly-dead tokens
+            // whose backoff is still active, not transient (429/5xx) backoff.
+            needsReauth:
+              account.lastRefreshError != null &&
+              refreshBackoffActive(
+                account.lastRefreshError,
+                account.refresh,
+                Date.now(),
+              ) &&
+              isPermanentRefreshError(account.lastRefreshError),
+            enabled: account.enabled !== false,
+          }
+        }),
       activeId: options.activeId,
       route: options.route,
       relay: (() => {

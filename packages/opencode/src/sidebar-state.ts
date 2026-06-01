@@ -21,6 +21,7 @@ export interface SidebarAccountState {
   id: string
   label: string | undefined
   quota: AccountQuota | null
+  killed: boolean
   enabled: boolean
   // True when the account's refresh token is permanently dead (400
   // invalid_grant) and it needs a re-login — distinct from a transient backoff.
@@ -37,6 +38,7 @@ export interface FableRecoverySidebarState {
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    killed: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
     refreshBackedOff?: boolean
@@ -69,7 +71,7 @@ export function getSidebarStateFile(): string {
 }
 
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
-  main: { quota: null },
+  main: { quota: null, killed: false },
   fallbacks: [],
   activeId: undefined,
   route: 'main',
@@ -142,10 +144,11 @@ function normalizeAccountQuota(value: unknown): AccountQuota | null {
 export function normalizeSidebarState(raw: unknown): SidebarState {
   if (!isRecord(raw)) return { ...DEFAULT_SIDEBAR_STATE }
 
-  const main: SidebarState['main'] = { quota: null }
+  const main: SidebarState['main'] = { quota: null, killed: false }
   if (isRecord(raw.main)) {
     const m = raw.main
     main.quota = normalizeAccountQuota(m.quota)
+    if (typeof m.killed === 'boolean') main.killed = m.killed
     if (typeof m.quotaBackedOff === 'boolean')
       main.quotaBackedOff = m.quotaBackedOff
     if (typeof m.quotaBackoffUntil === 'number')
@@ -164,6 +167,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           id: entry.id as string,
           label: typeof entry.label === 'string' ? entry.label : undefined,
           quota: normalizeAccountQuota(entry.quota),
+          killed: typeof entry.killed === 'boolean' ? entry.killed : false,
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
@@ -274,6 +278,7 @@ export function resolveActiveAccount(state: SidebarState): {
   id: string
   name: string
   quota: AccountQuota | null
+  killed: boolean
 } {
   const activeId = state.activeId
   if (activeId && activeId !== 'main') {
@@ -289,10 +294,16 @@ export function resolveActiveAccount(state: SidebarState): {
         id: fallback.id,
         name: fallback.label ?? fallback.id,
         quota: fallback.quota,
+        killed: fallback.killed,
       }
     }
   }
-  return { id: 'main', name: 'main', quota: state.main?.quota ?? null }
+  return {
+    id: 'main',
+    name: 'main',
+    quota: state.main?.quota ?? null,
+    killed: state.main?.killed ?? false,
+  }
 }
 
 export function formatScopedQuotaLabel(title: string) {
