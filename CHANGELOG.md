@@ -2,6 +2,20 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.4.0
+
+### Minor Changes
+
+- Add Claude Opus 4.8 support across fast mode, the Pi model catalog, documentation, and cache-usage price estimates.
+- Improve `/claude-cache hybrid` anchor placement for long tool-heavy sessions by moving the rolling anchor to the latest user/tool-result boundary and adding a bridge anchor when Anthropic's 20-block cache lookback would otherwise miss the prior tail anchor.
+- Add Anthropic's `<use_parallel_tool_calls>` system prompt guidance for OpenCode Anthropic chat sessions only, encouraging independent read-only tool calls to be issued in parallel without modifying non-Anthropic model prompts.
+
+### Patch Changes
+
+- Renew main and fallback OAuth refresh file locks while a refresh is in flight, preventing another OpenCode process from reusing a rotating refresh token if Anthropic's OAuth endpoint is slow to respond.
+- Sign only the controlled billing-header CCH placeholder so historical `cch=...;` text in prior messages cannot receive the per-request signature and break prompt-cache stability.
+- Update development and integration dependencies, including OpenCode/Pi SDK packages, Biome, Miniflare, and release workflow pins.
+
 ## 1.3.0
 
 ### Minor Changes
