@@ -967,6 +967,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       quota?: OAuthQuotaSnapshot
     }>,
     activeAccountId?: string,
+    isKilled?: (
+      quota: OAuthQuotaSnapshot | undefined,
+      accountId?: string,
+    ) => boolean,
   ) {
     const sections: string[] = []
     let globalMaxUsed = 0
@@ -977,7 +981,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const sd = quota.seven_day
       if (fh || sd) {
         const mainActive = activeAccountId === 'main'
-        const status = mainActive ? 'active' : 'idle'
+        const mainKilled = isKilled?.(quota) ?? false
+        const status = mainKilled ? 'blocked' : mainActive ? 'active' : 'idle'
         const reset = formatResetIn(fh?.resetsAt)
         const lines: string[] = [
           `main · ${status}${reset ? ` (${reset})` : ''}`,
@@ -1004,7 +1009,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         if (!fh && !sd) continue
         const name = fb.label || 'alt'
         const fbActive = activeAccountId === fb.id
-        const status = fbActive ? 'active' : 'idle'
+        const fbKilled = isKilled?.(q, fb.id) ?? false
+        const status = fbKilled ? 'blocked' : fbActive ? 'active' : 'idle'
         const fbReset = formatResetIn(fh?.resetsAt)
         const lines: string[] = [
           `${name} · ${status}${fbReset ? ` (${fbReset})` : ''}`,
@@ -2428,23 +2434,32 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       quotaManager.getFallback(a.id, a.access)?.quota ??
                       a.quota,
                   }))
+                const ksEnabled = isKillswitchEnabled(storage)
+                const ksIsKilled = ksEnabled
+                  ? (q: OAuthQuotaSnapshot | undefined, id?: string) =>
+                      !killswitchPassesPolicy(q, storage, id)
+                  : undefined
                 const mainPassesPolicy = quotaSnapshotPassesPolicy(
                   mainEntry.quota,
                   storage,
                 )
+                const mainIsKilled = ksIsKilled?.(mainEntry.quota) ?? false
                 let activeId: string | undefined
-                if (mainPassesPolicy) {
+                if (!mainIsKilled && mainPassesPolicy) {
                   activeId = 'main'
                 } else {
-                  // Mirror routing: the active account is the first fallback that
-                  // actually passes quota policy; if none do, routing falls
-                  // through to main, so label main — never a failing fallback.
+                  // Mirror routing: the active account is the first fallback
+                  // that both passes quota policy and is not killswitch-blocked;
+                  // if none do, routing falls through to main, so label main —
+                  // never a failing fallback.
                   activeId =
-                    fallbacks.find((f) =>
-                      quotaSnapshotPassesPolicy(f.quota, storage),
+                    fallbacks.find(
+                      (fb) =>
+                        quotaSnapshotPassesPolicy(fb.quota, storage) &&
+                        !(ksIsKilled?.(fb.quota, fb.id) ?? false),
                     )?.id ?? 'main'
                 }
-                showQuotaToast(mainEntry.quota, fallbacks, activeId)
+                showQuotaToast(mainEntry.quota, fallbacks, activeId, ksIsKilled)
               }
 
               if (replayableRequest && mainQuotaRoutingEnabled(storage)) {
