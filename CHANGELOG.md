@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.4.1
+
+### Patch Changes
+
+- Clarify the `<use_parallel_tool_calls>` guidance so agents parallelize only independent tool calls and never invent placeholder task IDs or other values for calls that depend on earlier tool results.
+
 ## 1.4.0
 
 ### Minor Changes

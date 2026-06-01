@@ -204,6 +204,15 @@ describe('experimental.chat.system.transform', () => {
 
     expect(system).toEqual(['base system', PARALLEL_TOOL_CALLS_SYSTEM_PROMPT])
   })
+
+  test('parallel tool-call prompt forbids parallelizing dependent calls', () => {
+    expect(PARALLEL_TOOL_CALLS_SYSTEM_PROMPT).toContain(
+      'Do not parallelize tool calls when one call depends on the output of another call.',
+    )
+    expect(PARALLEL_TOOL_CALLS_SYSTEM_PROMPT).toContain(
+      'Never invent placeholder IDs, guessed task IDs, or other guessed values',
+    )
+  })
 })
 
 describe('auth.methods', () => {

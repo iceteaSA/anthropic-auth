@@ -53,7 +53,9 @@ export const CLAUDE_CODE_IDENTITY =
 
 export const PARALLEL_TOOL_CALLS_SYSTEM_PROMPT = [
   '<use_parallel_tool_calls>',
-  'For maximum efficiency, whenever you perform multiple independent operations, invoke all relevant tools simultaneously rather than sequentially. Prioritize calling tools in parallel whenever possible. For example, when reading 3 files, run 3 tool calls in parallel to read all 3 files into context at the same time. When running multiple read-only commands like `ls` or `list_dir`, always run all of the commands in parallel. Err on the side of maximizing parallel tool calls rather than running too many tools sequentially.',
+  'For maximum efficiency, whenever you perform multiple independent operations, invoke all relevant tools simultaneously rather than sequentially. Prioritize calling independent tools in parallel whenever possible. For example, when reading 3 known files, run 3 tool calls in parallel to read all 3 files into context at the same time. When running multiple independent read-only commands like `ls` or `list_dir`, run all of those commands in parallel. Err on the side of maximizing parallel tool calls for independent work rather than running too many tools sequentially.',
+  '',
+  'Do not parallelize tool calls when one call depends on the output of another call. If a tool call needs an ID, filename, search result, or any other value returned by a previous tool call, run the first call, wait for its result, then run the dependent call using the real returned value. Never invent placeholder IDs, guessed task IDs, or other guessed values for dependent tool calls just to place them in the same parallel block.',
   '</use_parallel_tool_calls>',
 ].join('\n')
 
