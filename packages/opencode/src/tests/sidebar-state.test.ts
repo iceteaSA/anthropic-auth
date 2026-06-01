@@ -12,6 +12,7 @@ import {
   normalizeSidebarState,
   resolveActiveAccount,
   SEVEN_DAY_MS,
+  type SidebarAccountState,
   type SidebarState,
 } from '../sidebar-state'
 
@@ -20,31 +21,40 @@ const quota = (used: number): AccountQuota => ({
   seven_day: { usedPercent: used, remainingPercent: 100 - used },
 })
 
+const main = (
+  q: AccountQuota | null,
+  killed = false,
+): SidebarState['main'] => ({ quota: q, killed })
+
+const fb = (
+  overrides: Partial<SidebarAccountState> & { id: string },
+): SidebarAccountState => ({
+  label: undefined,
+  quota: null,
+  killed: false,
+  enabled: true,
+  needsReauth: false,
+  ...overrides,
+})
+
 function make(overrides: Partial<SidebarState>): SidebarState {
   return { ...DEFAULT_SIDEBAR_STATE, ...overrides }
 }
 
 describe('resolveActiveAccount', () => {
   test('activeId "main" resolves to the main account', () => {
-    const state = make({ activeId: 'main', main: { quota: quota(20) } })
+    const state = make({ activeId: 'main', main: main(quota(20)) })
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('main')
     expect(active.name).toBe('main')
     expect(active.quota?.five_hour?.usedPercent).toBe(20)
+    expect(active.killed).toBe(false)
   })
 
   test('activeId matching an enabled fallback resolves to that fallback (label name)', () => {
     const state = make({
       activeId: 'fb1',
-      fallbacks: [
-        {
-          id: 'fb1',
-          label: 'work',
-          quota: quota(40),
-          enabled: true,
-          needsReauth: false,
-        },
-      ],
+      fallbacks: [fb({ id: 'fb1', label: 'work', quota: quota(40) })],
     })
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('fb1')
@@ -55,15 +65,7 @@ describe('resolveActiveAccount', () => {
   test('fallback without a label uses its id as the name', () => {
     const state = make({
       activeId: 'fb1',
-      fallbacks: [
-        {
-          id: 'fb1',
-          label: undefined,
-          quota: quota(5),
-          enabled: true,
-          needsReauth: false,
-        },
-      ],
+      fallbacks: [fb({ id: 'fb1', label: undefined, quota: quota(5) })],
     })
     expect(resolveActiveAccount(state).name).toBe('fb1')
   })
@@ -71,15 +73,9 @@ describe('resolveActiveAccount', () => {
   test('activeId matching a DISABLED fallback falls back to main', () => {
     const state = make({
       activeId: 'fb1',
-      main: { quota: quota(12) },
+      main: main(quota(12)),
       fallbacks: [
-        {
-          id: 'fb1',
-          label: 'work',
-          quota: quota(40),
-          enabled: false,
-          needsReauth: false,
-        },
+        fb({ id: 'fb1', label: 'work', quota: quota(40), enabled: false }),
       ],
     })
     const active = resolveActiveAccount(state)
@@ -88,23 +84,15 @@ describe('resolveActiveAccount', () => {
   })
 
   test('undefined activeId resolves to main', () => {
-    const state = make({ activeId: undefined, main: { quota: quota(7) } })
+    const state = make({ activeId: undefined, main: main(quota(7)) })
     expect(resolveActiveAccount(state).id).toBe('main')
   })
 
   test('unmatched activeId resolves to main', () => {
     const state = make({
       activeId: 'ghost',
-      main: { quota: null },
-      fallbacks: [
-        {
-          id: 'fb1',
-          label: 'work',
-          quota: quota(40),
-          enabled: true,
-          needsReauth: false,
-        },
-      ],
+      main: main(null),
+      fallbacks: [fb({ id: 'fb1', label: 'work', quota: quota(40) })],
     })
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('main')
@@ -144,6 +132,23 @@ describe('resolveActiveAccount', () => {
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('main')
     expect(active.quota).toBeNull()
+  })
+
+  test('carries through the killed flag for the active main account', () => {
+    const state = make({ activeId: 'main', main: main(quota(95), true) })
+    expect(resolveActiveAccount(state).killed).toBe(true)
+  })
+
+  test('carries through the killed flag for the active fallback account', () => {
+    const state = make({
+      activeId: 'fb1',
+      fallbacks: [
+        fb({ id: 'fb1', label: 'work', quota: quota(99), killed: true }),
+      ],
+    })
+    const active = resolveActiveAccount(state)
+    expect(active.id).toBe('fb1')
+    expect(active.killed).toBe(true)
   })
 })
 
@@ -330,7 +335,7 @@ describe('normalizeSidebarState', () => {
   test('fills defaults for an empty object', () => {
     const out = normalizeSidebarState({})
     expect(isValidSidebarState(out)).toBe(true)
-    expect(out.main).toEqual({ quota: null })
+    expect(out.main).toEqual({ quota: null, killed: false })
     expect(out.fallbacks).toEqual([])
     expect(out.route).toBe(DEFAULT_SIDEBAR_STATE.route)
     expect(out.lastUpdated).toBe(0)
@@ -342,23 +347,23 @@ describe('normalizeSidebarState', () => {
   test('fills defaults for a sentinel-only object', () => {
     const out = normalizeSidebarState({ SENTINEL: true })
     expect(isValidSidebarState(out)).toBe(true)
-    expect(out.main).toEqual({ quota: null })
+    expect(out.main).toEqual({ quota: null, killed: false })
     expect(out.fallbacks).toEqual([])
   })
 
   test('empty main object gets quota:null', () => {
     const out = normalizeSidebarState({ main: {} })
-    expect(out.main).toEqual({ quota: null })
+    expect(out.main).toEqual({ quota: null, killed: false })
   })
 
   test('main: null is replaced with {quota:null}', () => {
     const out = normalizeSidebarState({ main: null })
-    expect(out.main).toEqual({ quota: null })
+    expect(out.main).toEqual({ quota: null, killed: false })
   })
 
   test('main: non-object is replaced with {quota:null}', () => {
     const out = normalizeSidebarState({ main: 42 })
-    expect(out.main).toEqual({ quota: null })
+    expect(out.main).toEqual({ quota: null, killed: false })
   })
 
   test('fallbacks: string is replaced with []', () => {
@@ -493,6 +498,7 @@ describe('normalizeSidebarState', () => {
           },
           seven_day: { usedPercent: 7, remainingPercent: 93 },
         },
+        killed: false,
         quotaBackedOff: false,
         quotaBackoffUntil: 1719000000000,
         refreshBackedOff: true,
@@ -505,6 +511,7 @@ describe('normalizeSidebarState', () => {
           quota: {
             five_hour: { usedPercent: 40, remainingPercent: 60 },
           },
+          killed: false,
           enabled: true,
           needsReauth: false,
         },
@@ -551,7 +558,7 @@ describe('getSidebarState malformed file round-trip', () => {
       JSON.stringify({ main: null, fallbacks: 'bad', lastUpdated: 'nope' }),
     )
     const state = await getSidebarState()
-    expect(state.main).toEqual({ quota: null })
+    expect(state.main).toEqual({ quota: null, killed: false })
     expect(state.fallbacks).toEqual([])
     expect(state.lastUpdated).toBe(0)
   })
@@ -573,6 +580,7 @@ describe('getSidebarState malformed file round-trip', () => {
           five_hour: { usedPercent: 13, remainingPercent: 87 },
           seven_day: { usedPercent: 7, remainingPercent: 93 },
         },
+        killed: false,
         quotaBackedOff: false,
         refreshBackedOff: true,
       },
@@ -581,6 +589,7 @@ describe('getSidebarState malformed file round-trip', () => {
           id: 'fb1',
           label: 'work',
           quota: null,
+          killed: false,
           enabled: true,
           needsReauth: false,
         },
