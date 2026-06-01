@@ -71,6 +71,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
+import { type SidebarState, setSidebarState } from './sidebar-state.ts'
 import {
   addFastModeBetaHeader,
   createStrippedStream,
@@ -355,6 +356,60 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
+
+  function writeSidebarState(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    activeId: string | undefined,
+    route: string,
+  ) {
+    const mainEntry = quotaManager.getMain()
+    const lastApiError = quotaManager.getLastApiError()
+    const mainRefreshError = storage?.refresh?.mainLastRefreshError
+    const state: SidebarState = {
+      main: {
+        quota: mainEntry?.quota ?? null,
+        quotaBackedOff: quotaManager.isBackedOff(),
+        quotaBackoffUntil: lastApiError?.nextRetryAt,
+        refreshBackedOff: mainRefreshError
+          ? refreshBackoffActive(mainRefreshError, undefined, Date.now())
+          : false,
+        refreshBackoffUntil: mainRefreshError?.nextRetryAt,
+      },
+      fallbacks: (storage?.accounts ?? [])
+        .filter((a) => a.enabled !== false)
+        .map((a) => ({
+          id: a.id,
+          label: a.label,
+          // Prefer the shared QuotaManager cache (kept fresh by the background
+          // refresh timer and active-route refresh) over the request-start
+          // storage snapshot so fallback quota is not stale in the sidebar.
+          quota: quotaManager.getFallback(a.id)?.quota ?? a.quota ?? null,
+          enabled: a.enabled !== false,
+        })),
+      activeId,
+      route,
+      relay: relayConfig
+        ? { enabled: true, transport: relayConfig.transport ?? 'http' }
+        : null,
+      fastMode: isFastModeEnabled(),
+      cacheKeep: {
+        enabled: isCacheKeepHybridActive(storage),
+        window:
+          storage?.cacheKeep?.startHour != null &&
+          storage?.cacheKeep?.endHour != null
+            ? `${storage.cacheKeep.startHour}-${storage.cacheKeep.endHour}`
+            : undefined,
+        trackedSessions: cacheKeepManager.trackedCount(),
+      },
+      lastUpdated: Date.now(),
+    }
+    setSidebarState(state).catch((error) =>
+      log('[sidebar] state write failed', {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    )
+  }
+
   let latestGetAuth:
     | (() => Promise<{
         type: string
@@ -641,6 +696,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           input.sessionID,
           await buildQuotaCommandSummary(),
         )
+        const cmdStorage = await loadAccounts()
+        writeSidebarState(cmdStorage, 'main', 'main')
         throwHandledSentinel()
       }
 
@@ -1086,6 +1143,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           }
 
           startMainBackgroundRefresh()
+          writeSidebarState(initialStorage, 'main', 'main')
 
           function isReplayableRequest(
             input: string | URL | Request,
@@ -1568,9 +1626,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     routingQuota = await quotaManager.refreshMain(auth.access)
                   } else if (quotaManager.needsRefresh(sessionRequestCount)) {
                     // Stale OR every-N request boundary — background refresh,
-                    // return current snapshot to avoid blocking.
-                    void quotaManager.refreshMain(auth.access).catch(() => {})
+                    // return current snapshot to avoid blocking. Refresh the
+                    // sidebar again once the new main quota lands.
+                    void quotaManager
+                      .refreshMain(auth.access)
+                      .then(() => writeSidebarState(storage, 'main', 'main'))
+                      .catch(() => {})
                   }
+                  // Update the sidebar every replayable request so fallback
+                  // quota refreshed by the background timer is reflected too.
+                  writeSidebarState(storage, 'main', 'main')
                   trace.mark('main_quota_for_routing', {
                     ms: roundMs(nowMs() - quotaStart),
                     passes: quotaSnapshotPassesPolicy(routingQuota, storage),
