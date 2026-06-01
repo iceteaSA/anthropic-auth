@@ -334,6 +334,18 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
 
     globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedHeaders = init?.headers
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
@@ -402,7 +414,19 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
     let capturedHeaders: Headers | undefined
     globalThis.fetch = mock((input: any, init: any) => {
-      capturedUrl = extractUrl(input)
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      capturedUrl = url
       capturedBody = init?.body
       capturedHeaders = new Headers(init?.headers)
       return Promise.resolve(
@@ -916,7 +940,19 @@ describe('auth.loader', () => {
 
     let capturedHeaders: Headers | undefined
     let capturedBody: string | undefined
-    globalThis.fetch = mock((_input: any, init: any) => {
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedHeaders = init?.headers
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
@@ -958,7 +994,19 @@ describe('auth.loader', () => {
 
     let capturedHeaders: Headers | undefined
     let capturedBody: string | undefined
-    globalThis.fetch = mock((_input: any, init: any) => {
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedHeaders = init?.headers
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
@@ -995,7 +1043,19 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
     const mockClient = createMockClient()
 
-    globalThis.fetch = mock((_input: any, init: any) => {
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
@@ -1050,7 +1110,19 @@ describe('auth.loader', () => {
     const mockClient = createMockClient()
 
     globalThis.fetch = mock(
-      (_input: string | URL | Request, init?: RequestInit) => {
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
         capturedBody = String(init?.body)
         capturedHeaders = new Headers(init?.headers)
         return Promise.resolve(new Response(null, { status: 200 }))
@@ -1100,7 +1172,19 @@ describe('auth.loader', () => {
     const mockClient = createMockClient()
 
     globalThis.fetch = mock(
-      (_input: string | URL | Request, init?: RequestInit) => {
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
         capturedBody = String(init?.body)
         return Promise.resolve(new Response(null, { status: 200 }))
       },
@@ -1780,7 +1864,19 @@ describe('auth.loader', () => {
     let capturedUrl: string | undefined
 
     globalThis.fetch = mock((input: any) => {
-      capturedUrl = extractUrl(input)
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      capturedUrl = url
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
@@ -1881,6 +1977,65 @@ describe('auth.loader', () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toBe('fallback ok')
     expect(authorizations).toEqual(['Bearer fallback-access'])
+  })
+
+  test('successful fallback-first request advances the every-N counter and refreshes the served fallback', async () => {
+    // Regression: the request counter must increment before the fallback-first
+    // early return, so a served fallback's active-route every-N refresh fires.
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          refreshEveryNRequests: 1,
+        },
+      }),
+    )
+    const usageTokens: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        usageTokens.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 20 },
+              seven_day: { utilization: 20 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('fallback ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('fallback ok')
+
+    // The active-route refresh is fire-and-forget; wait for it to land.
+    for (
+      let i = 0;
+      i < 50 && !usageTokens.includes('Bearer fallback-access');
+      i++
+    ) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(usageTokens).toContain('Bearer fallback-access')
   })
 
   test('fallback-first routing does not refresh expired main oauth when fallback succeeds', async () => {
@@ -2144,6 +2299,8 @@ describe('auth.loader', () => {
       ])
 
       expect(second).toBe('message-2')
+      // Background quota refresh involves file-lock I/O; wait for it to fire.
+      await new Promise((r) => setTimeout(r, 50))
       expect(quotaCalls).toBe(2)
       expect(messageCalls).toBe(2)
     } finally {

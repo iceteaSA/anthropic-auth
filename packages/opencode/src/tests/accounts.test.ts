@@ -12,6 +12,7 @@ import {
   getCache1hPersistentMode,
   isFastModePersistentlyEnabled,
   loadAccounts,
+  QuotaManager,
   saveAccounts,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -934,6 +935,117 @@ describe('FallbackAccountManager', () => {
     expect(saved?.accounts[0]?.lastQuotaRefreshError?.message).toBe(
       'Claude OAuth refresh failed: 400 — invalid_grant',
     )
+  })
+
+  test('force refreshes fresh accounts and persists the new quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fresh-but-forced',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: 20_000_000,
+      // Fresh quota — would normally be skipped by the staleness gate.
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1_900 },
+        seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: 1_900 },
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            five_hour: { utilization: 70 },
+            seven_day: { utilization: 30 },
+          }),
+          { status: 200 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({ fetchImpl, now: () => 2_000 })
+
+    // force: true bypasses the staleness skip and fetches anyway.
+    const result = await manager.refreshQuotaForAllAccounts({ force: true })
+
+    expect(result.errors).toEqual([])
+    expect(fetchImpl).toHaveBeenCalled()
+    // Refreshed numbers are PERSISTED to disk (regression guard for #2).
+    const saved = await loadAccounts()
+    expect(saved?.accounts[0]?.quota?.five_hour?.remainingPercent).toBe(30)
+    expect(saved?.accounts[0]?.quota?.seven_day?.remainingPercent).toBe(70)
+  })
+
+  test('fallback policy uses the QuotaManager cache, not stale storage quota', async () => {
+    // Regression: an active-route refresh updates only the QM cache. Selection
+    // must evaluate quota policy from that cache (single source of truth), not
+    // the older storage account.quota, or it routes to an exhausted account.
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'fallback-access',
+      refresh: 'fallback-refresh',
+      expires: Date.now() + 5 * 60 * 60_000,
+      // Storage says PASSING (100% remaining).
+      quota: {
+        five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: 900 },
+        seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: 900 },
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() => {
+      throw new Error('should not fetch — QM entry is fresh')
+    }) as unknown as typeof fetch
+    const qm = new QuotaManager({ storage, fetchImpl, now: () => 1_000 })
+    // Active-route refresh left a FRESH but EXHAUSTED entry in the QM cache.
+    qm.setFallback('fallback-1', {
+      quota: {
+        five_hour: { usedPercent: 100, remainingPercent: 0, checkedAt: 1_000 },
+        seven_day: { usedPercent: 100, remainingPercent: 0, checkedAt: 1_000 },
+      },
+      refreshAfter: 1_000 + 10 * 60_000,
+      checkedAt: 1_000,
+    })
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 1_000,
+      quotaManager: qm,
+    })
+    const accounts = await manager.getUsableFallbackAccounts(storage)
+    // QM cache is exhausted → account must NOT be usable (was usable when policy
+    // read the stale storage quota).
+    expect(accounts.map((a) => a.id)).not.toContain('fallback-1')
+  })
+
+  test('re-login (token change) invalidates a fresh fallback cache entry', async () => {
+    // Regression: a same-id re-login changes the access token. The token-bound
+    // fallback cache entry from the old token must be treated as stale so the
+    // new credentials trigger a refetch instead of reusing the old quota.
+    const fetchImpl = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            five_hour: { utilization: 10 },
+            seven_day: { utilization: 10 },
+          }),
+          { status: 200 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+    const qm = new QuotaManager({ storage: null, fetchImpl, now: () => 2_000 })
+
+    // Cache populated by the OLD token (binds its fingerprint), entry is fresh.
+    await qm.refreshFallback('fallback-1', 'old-access')
+    expect(qm.isFallbackStale('fallback-1', 'old-access')).toBe(false)
+
+    // Same account id, NEW token (re-login): entry is invalidated → stale.
+    expect(qm.isFallbackStale('fallback-1', 'new-access')).toBe(true)
+    expect(qm.getFallback('fallback-1', 'new-access')).toBeNull()
   })
 })
 
