@@ -38,6 +38,29 @@ function unprefixName(name: string): string {
   return `${name.charAt(0).toLowerCase()}${name.slice(1)}`
 }
 
+const AFT_SUFFIX_TOOL_NAMES = new Set([
+  'callgraph',
+  'conflicts',
+  'delete',
+  'import',
+  'inspect',
+  'move',
+  'navigate',
+  'outline',
+  'refactor',
+  'safety',
+  'search',
+  'transform',
+  'zoom',
+])
+
+function canonicalizeAftToolName(name: string): string | null {
+  const normalized = unprefixName(name)
+  if (normalized.startsWith('aft_')) return normalized
+  if (AFT_SUFFIX_TOOL_NAMES.has(normalized)) return `aft_${normalized}`
+  return null
+}
+
 export type FetchInput = string | URL | Request
 
 /**
@@ -159,8 +182,15 @@ export function prefixToolNames(parsed: Record<string, unknown>): string {
  */
 export function stripToolPrefix(text: string): string {
   return text.replace(
-    /"name"\s*:\s*"mcp_([^"]+)"/g,
-    (_match, name: string) => `"name": "${unprefixName(name)}"`,
+    /"name"\s*:\s*"(mcp_)?([^"]+)"/g,
+    (match, prefix: string | undefined, name: string) => {
+      if (prefix) {
+        return `"name": "${canonicalizeAftToolName(name) ?? unprefixName(name)}"`
+      }
+
+      const canonical = canonicalizeAftToolName(name)
+      return canonical ? `"name": "${canonical}"` : match
+    },
   )
 }
 

@@ -230,6 +230,28 @@ describe('stripToolPrefix', () => {
     expect(stripToolPrefix(text)).toBe(text)
   })
 
+  test('canonicalizes Claude-dropped AFT namespace for prefixed tool names', () => {
+    expect(stripToolPrefix('{"name": "mcp_Safety"}')).toBe(
+      '{"name": "aft_safety"}',
+    )
+    expect(stripToolPrefix('{"name": "mcp_Outline"}')).toBe(
+      '{"name": "aft_outline"}',
+    )
+  })
+
+  test('canonicalizes raw AFT suffix tool names', () => {
+    expect(stripToolPrefix('{"name": "safety"}')).toBe('{"name": "aft_safety"}')
+    expect(stripToolPrefix('{"name": "outline"}')).toBe(
+      '{"name": "aft_outline"}',
+    )
+  })
+
+  test('preserves existing AFT names after stripping mcp prefix', () => {
+    expect(stripToolPrefix('{"name": "mcp_Aft_safety"}')).toBe(
+      '{"name": "aft_safety"}',
+    )
+  })
+
   test('handles whitespace variations in JSON', () => {
     const text = '{"name"  :  "mcp_tool"}'
     expect(stripToolPrefix(text)).toBe('{"name": "tool"}')
