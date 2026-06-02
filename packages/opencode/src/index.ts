@@ -51,7 +51,6 @@ import {
   type QuotaAccountSummary,
   QuotaManager,
   quotaSnapshotPassesPolicy,
-  type RelayConfig,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
   resolveClaudeCodeIdentity,
@@ -349,7 +348,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     },
     log,
   })
-  const relayConfig: RelayConfig | null = getRelayConfig(initialStorage)
   setCache1hState({
     enabled: isCache1hPersistentlyEnabled(initialStorage),
     mode: getCache1hPersistentMode(initialStorage),
@@ -399,9 +397,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         })),
       activeId: options.activeId,
       route: options.route,
-      relay: relayConfig
-        ? { enabled: true, transport: relayConfig.transport ?? 'http' }
-        : null,
+      relay: (() => {
+        const currentRelayConfig = getRelayConfig(storage)
+        return currentRelayConfig
+          ? {
+              enabled: true,
+              transport: currentRelayConfig.transport ?? 'http',
+            }
+          : null
+      })(),
       fastMode: isFastModeEnabled(),
       cacheKeep: {
         enabled: isCacheKeepHybridActive(storage),
@@ -1277,8 +1281,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             accessToken: string,
             trace?: PerfTrace,
             route = 'unknown',
+            currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
           ) {
             const start = nowMs()
+            let requestStorage = currentStorage
+            const getRequestStorage = async () => {
+              requestStorage ??= await loadAccounts(accountStoragePath)
+              return requestStorage
+            }
             const requestHeaders = mergeHeaders(input, init)
             const relayAffinity =
               requestHeaders.get('x-session-affinity') ||
@@ -1349,8 +1359,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               isCache1hEnabled() &&
               getCache1hMode() === 'hybrid'
             ) {
-              const storage = await loadAccounts(accountStoragePath)
-              const tracked = await cacheKeepManager.track({
+              const storage = await getRequestStorage()
+              const tracked = cacheKeepManager.track({
                 sessionId: relayAffinity,
                 url: rewritten.url?.toString() ?? rewritten.input.toString(),
                 headers: requestHeaders,
@@ -1371,6 +1381,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
               })
 
+            const relayConfig = getRelayConfig(await getRequestStorage())
             const sendStart = nowMs()
             const response = await sendViaRelay({
               config: relayConfig,
@@ -1422,6 +1433,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 access,
                 trace,
                 `fallback_${index}`,
+                storage,
               )
               lastResponse = response
               let fallbackAgain = shouldFallbackStatus(response.status, storage)
@@ -1530,7 +1542,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   typeof initialBody === 'string'
                     ? initialBody.length
                     : undefined,
-                relayConfigured: relayConfig != null,
               })
               const authStart = nowMs()
               const auth = await getAuth()
@@ -1743,6 +1754,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 auth.access,
                 trace,
                 'main',
+                storage,
               )
               let fallbackServed = false
               const response = await tryFallbackAccounts(

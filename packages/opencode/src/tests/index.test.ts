@@ -584,6 +584,122 @@ describe('auth.loader', () => {
     expect(payload.body.length).toBeGreaterThan(0)
   })
 
+  test('reloads relay config from sidecar after plugin startup', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+
+    let capturedUrl: string | undefined
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      capturedUrl = url
+      return Promise.resolve(
+        new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await saveAccounts(
+      createFallbackStorage({
+        accounts: [],
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: true,
+          transport: 'http',
+        },
+      }),
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'session-abc' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'hello' }],
+        system: 'system',
+      }),
+    })
+
+    expect(capturedUrl).toBe('https://relay.example.test')
+  })
+
+  test('sidebar relay transport reflects current sidecar storage', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: true,
+          transport: 'http',
+        },
+      }),
+    )
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+      ),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await saveAccounts(
+      createFallbackStorage({
+        accounts: [],
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: true,
+          transport: 'websocket',
+        },
+      }),
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: new Uint8Array([123, 125]),
+    })
+
+    const state = await waitForSidebarState(
+      (value) => value.relay?.transport === 'websocket',
+    )
+    expect(state.relay).toEqual({ enabled: true, transport: 'websocket' })
+  })
+
   test('registers and handles /claude-cache slash command with ignored status replies', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
