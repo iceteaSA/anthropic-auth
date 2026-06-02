@@ -2,6 +2,27 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.5.0
+
+### Minor Changes
+
+- Add an OpenCode TUI sidebar for Claude quota, active route, relay transport, and cache status.
+- Add persisted quota caching, quota API backoff, token-bound fallback quota state, and request-count-based quota refreshes.
+
+### Patch Changes
+
+- Strip trailing assistant messages from Anthropic request bodies to avoid Claude OAuth prefill `400` errors when a conversation does not end with a user message.
+- Avoid placing `cache_control` on message objects in hybrid cache mode when the selected message has no cacheable content block.
+- Invalidate fallback quota cache and quota backoff when a same-label fallback account is re-logged with a new token.
+- Fix TUI package loading by exporting the source TUI entrypoint and including required sidebar state files in the package.
+- Fix TUI sidebar state so it uses token-bound quota reads and reflects the actual active route.
+- Canonicalize dropped AFT tool namespaces in Anthropic responses, so `safety`/`mcp_Safety` and other known AFT suffixes are mapped back to `aft_*` tool names.
+- Reload relay config from the sidecar on each request so long-running OpenCode processes stop using stale HTTP/WebSocket settings.
+- Reduce fallback OAuth refresh backoff log noise and improve WebSocket relay fallback diagnostics.
+- Fix root `bun test` and CI workflow test commands.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the quota manager and TUI sidebar contributions.
+
 ## 1.3.0
 
 ### Minor Changes
