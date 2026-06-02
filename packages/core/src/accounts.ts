@@ -1163,11 +1163,11 @@ export class FallbackAccountManager {
           this.now(),
         )
       ) {
-        log('[refresh] fallback oauth skipped backoff', {
-          accountId: account.id,
-          nextRetryAt: account.lastRefreshError?.nextRetryAt,
-          retryCount: account.lastRefreshError?.retryCount,
-        })
+        // Backoff skips are steady-state while a fallback account is waiting for
+        // its next retry. Logging every background tick from every OpenCode
+        // process creates noise without adding new diagnostic signal; the
+        // failure/backoff itself is recorded when the refresh attempt fails and
+        // shown by /claude-quota.
         continue
       }
       try {

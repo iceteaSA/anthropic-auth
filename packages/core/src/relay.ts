@@ -406,6 +406,15 @@ function parseRelayControlMessage(data: string): RelayControlMessage {
   return JSON.parse(data) as RelayControlMessage
 }
 
+function relayControlErrorMessage(
+  message: Extract<RelayControlMessage, { type: 'error' }>,
+) {
+  const detail = message.message || 'relay websocket error'
+  return message.status
+    ? `relay websocket error ${message.status}: ${detail}`
+    : detail
+}
+
 type PendingWebSocketRequest = {
   payload: RelayPayload
   bodyText: string
@@ -837,7 +846,7 @@ class PersistentRelaySession {
       const error =
         message.status === 409
           ? new RelayStateMismatchError(message.message || 'state mismatch')
-          : new Error(message.message || 'relay websocket error')
+          : new Error(relayControlErrorMessage(message))
       this.failPending(error)
     }
   }
