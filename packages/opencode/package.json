@@ -16,7 +16,7 @@
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
-      "import": "./dist/tui.js"
+      "import": "./src/tui.tsx"
     }
   },
   "oc-plugin": [
@@ -31,11 +31,13 @@
   },
   "files": [
     "dist",
+    "src/tui.tsx",
+    "src/sidebar-state.ts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && bun build src/tui.tsx --outfile dist/tui.js --target node --format esm --external @opencode-ai/plugin/tui --external @opentui/core --external @opentui/solid --external solid-js --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "dev": "bun ../../scripts/dev.ts",
     "dev:clean": "bun ../../scripts/dev-clean.ts",

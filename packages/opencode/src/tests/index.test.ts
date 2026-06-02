@@ -153,22 +153,46 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
 }
 
 describe('package metadata', () => {
-  test('exports a built and typed TUI entrypoint', async () => {
+  test('exports a runtime-loadable TUI entrypoint', async () => {
     const packageJson = JSON.parse(
       await readFile(new URL('../../package.json', import.meta.url), 'utf8'),
     ) as {
       exports?: Record<string, { import?: string; types?: string }>
+      files?: string[]
       'oc-plugin'?: string[]
       scripts?: Record<string, string>
     }
 
     expect(packageJson.exports?.['./tui']).toEqual({
       types: './dist/tui.d.ts',
-      import: './dist/tui.js',
+      import: './src/tui.tsx',
     })
+    expect(packageJson.files).toContain('src/tui.tsx')
+    expect(packageJson.files).toContain('src/sidebar-state.ts')
     expect(packageJson['oc-plugin']).toEqual(['server', 'tui'])
-    expect(packageJson.scripts?.build).toContain('src/tui.tsx')
-    expect(packageJson.scripts?.build).toContain('--outfile dist/tui.js')
+    expect(packageJson.scripts?.build).not.toContain('--outfile dist/tui.js')
+  })
+
+  test('package TUI entrypoint imports under OpenTUI runtime support', () => {
+    const result = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure'
+ensureRuntimePluginSupport()
+const mod = await import('@cortexkit/opencode-anthropic-auth/tui')
+if (mod.default?.id !== 'cortexkit.anthropic-auth' || typeof mod.default?.tui !== 'function') {
+  throw new Error('invalid TUI plugin export')
+}
+`,
+      ],
+      cwd: new URL('../..', import.meta.url).pathname,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    if (result.exitCode !== 0) {
+      throw new Error(new TextDecoder().decode(result.stderr))
+    }
   })
 })
 
