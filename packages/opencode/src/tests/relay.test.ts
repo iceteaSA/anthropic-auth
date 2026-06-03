@@ -513,6 +513,192 @@ describe('relay client', () => {
     expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
   })
 
+  test('websocket optimistic response retries when socket closes after response_start before stream bytes', async () => {
+    const originalWebSocket = globalThis.WebSocket
+    const sentPayloads: Array<{ id: string; mode: string }> = []
+    let socketCount = 0
+
+    class ClosingBeforeStreamBytesWebSocket extends EventTarget {
+      binaryType = 'arraybuffer'
+      private readonly socketNumber: number
+
+      constructor() {
+        super()
+        socketCount += 1
+        this.socketNumber = socketCount
+        queueMicrotask(() => {
+          this.dispatchEvent(new Event('open'))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+            }),
+          )
+        })
+      }
+
+      send(data: string) {
+        const payload = JSON.parse(data)
+        sentPayloads.push(payload)
+        queueMicrotask(() => {
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'accepted',
+                id: payload.id,
+                hash: payload.next_hash,
+                revision: payload.revision,
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'response_start',
+                id: payload.id,
+                status: 200,
+              }),
+            }),
+          )
+          if (this.socketNumber === 1) {
+            this.dispatchEvent(
+              new CloseEvent('close', { code: 1011, reason: 'test close' }),
+            )
+            return
+          }
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: Buffer.from('event: message_stop\n\n'),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'done',
+                id: payload.id,
+              }),
+            }),
+          )
+        })
+      }
+
+      close() {
+        this.dispatchEvent(new Event('close'))
+      }
+    }
+
+    globalThis.WebSocket =
+      ClosingBeforeStreamBytesWebSocket as unknown as typeof WebSocket
+    try {
+      const response = await sendViaRelay({
+        config: websocketConfig,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-ws-close-before-stream-bytes'),
+        body: 'body',
+        fallback: async () => new Response('direct'),
+        optimisticResponse: true,
+      })
+      expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
+      expect(await response.text()).toBe('event: message_stop\n\n')
+    } finally {
+      globalThis.WebSocket = originalWebSocket
+    }
+
+    expect(socketCount).toBe(2)
+    expect(sentPayloads.map((payload) => payload.mode)).toEqual([
+      'full_sync',
+      'full_sync',
+    ])
+    expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
+  })
+
+  test('websocket optimistic response reports stream close after bytes without retry', async () => {
+    const originalWebSocket = globalThis.WebSocket
+    const sentPayloads: Array<{ id: string; mode: string }> = []
+    let socketCount = 0
+
+    class ClosingAfterBytesWebSocket extends EventTarget {
+      binaryType = 'arraybuffer'
+
+      constructor() {
+        super()
+        socketCount += 1
+        queueMicrotask(() => {
+          this.dispatchEvent(new Event('open'))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, type: 'ready', state: null }),
+            }),
+          )
+        })
+      }
+
+      send(data: string) {
+        const payload = JSON.parse(data)
+        sentPayloads.push(payload)
+        queueMicrotask(() => {
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'accepted',
+                id: payload.id,
+                hash: payload.next_hash,
+                revision: payload.revision,
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({
+                protocol: 2,
+                type: 'response_start',
+                id: payload.id,
+                status: 200,
+              }),
+            }),
+          )
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: Buffer.from('event: content_block_start\n\n'),
+            }),
+          )
+          this.dispatchEvent(new CloseEvent('close', { code: 1006 }))
+        })
+      }
+
+      close() {
+        this.dispatchEvent(new Event('close'))
+      }
+    }
+
+    globalThis.WebSocket =
+      ClosingAfterBytesWebSocket as unknown as typeof WebSocket
+    try {
+      const response = await sendViaRelay({
+        config: websocketConfig,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-ws-close-after-bytes'),
+        body: 'body',
+        fallback: async () => new Response('direct'),
+        optimisticResponse: true,
+      })
+      expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
+      await expect(response.text()).rejects.toThrow(
+        'relay websocket closed during response stream',
+      )
+    } finally {
+      globalThis.WebSocket = originalWebSocket
+    }
+
+    expect(socketCount).toBe(1)
+    expect(sentPayloads.map((payload) => payload.mode)).toEqual(['full_sync'])
+  })
+
   test('websocket reconnect retry works against a real local server', async () => {
     const sentPayloads: Array<{ id: string; mode: string }> = []
     let socketsOpened = 0

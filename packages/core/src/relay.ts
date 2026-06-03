@@ -406,6 +406,16 @@ function parseRelayControlMessage(data: string): RelayControlMessage {
   return JSON.parse(data) as RelayControlMessage
 }
 
+function formatCloseEvent(event: Event) {
+  const close = event as Partial<CloseEvent>
+  const parts = [
+    `code=${close.code ?? 'unknown'}`,
+    `wasClean=${close.wasClean ?? 'unknown'}`,
+  ]
+  if (close.reason) parts.push(`reason=${JSON.stringify(close.reason)}`)
+  return parts.join(' ')
+}
+
 function relayControlErrorMessage(
   message: Extract<RelayControlMessage, { type: 'error' }>,
 ) {
@@ -431,6 +441,8 @@ type PendingWebSocketRequest = {
   optimisticResponse: boolean
   acceptedAt?: number
   responseStartedAt?: number
+  streamChunkCount: number
+  streamByteCount: number
   retryAttempts: number
   retryingBeforeResponse: boolean
 }
@@ -585,7 +597,7 @@ class PersistentRelaySession {
         this.failPending(error)
       })
 
-      socket.addEventListener('close', () => {
+      socket.addEventListener('close', (event) => {
         clearTimeout(timeout)
         if (this.socket === socket) {
           this.socket = undefined
@@ -594,14 +606,21 @@ class PersistentRelaySession {
         }
         if (this.pending) {
           if (this.pending.retryingBeforeResponse) return
-          if (
-            this.retryPendingBeforeResponse(
-              this.pending,
-              'closed before response',
-            )
-          )
+          const closedAfterResponseStart =
+            this.pending.responseStartedAt != null
+          const reason = closedAfterResponseStart
+            ? 'closed after response_start before stream bytes'
+            : 'closed before response'
+          if (this.retryPendingBeforeResponse(this.pending, reason, event))
             return
-          const error = new Error('relay websocket closed before response')
+          const error = new Error(
+            closedAfterResponseStart
+              ? 'relay websocket closed during response stream'
+              : 'relay websocket closed before response',
+          )
+          relayLog(
+            `websocket ${closedAfterResponseStart ? 'closed during response stream' : 'closed before response without retry'} session=${shortAffinity(this.affinity)} request=${this.pending.payload.id} chunks=${this.pending.streamChunkCount} bytes=${this.pending.streamByteCount} ${formatCloseEvent(event)}`,
+          )
           this.failPending(error)
         }
       })
@@ -642,6 +661,8 @@ class PersistentRelaySession {
         rejectDone,
         sentAt,
         optimisticResponse,
+        streamChunkCount: 0,
+        streamByteCount: 0,
         retryAttempts: 0,
         retryingBeforeResponse: false,
       }
@@ -671,8 +692,10 @@ class PersistentRelaySession {
   private retryPendingBeforeResponse(
     pending: PendingWebSocketRequest,
     reason: string,
+    closeEvent?: Event,
   ) {
-    if (pending.responseStartedAt != null) return false
+    if (pending.responseStartedAt != null && pending.streamByteCount > 0)
+      return false
     if (pending.streamDone) return false
     if (pending.retryAttempts >= 1) return false
 
@@ -682,7 +705,7 @@ class PersistentRelaySession {
     const attempt = pending.retryAttempts
     const originalId = pending.payload.id
     relayLog(
-      `websocket ${reason}; reconnecting and retrying full_sync session=${shortAffinity(this.affinity)} request=${originalId} retry=${attempt}`,
+      `websocket ${reason}; reconnecting and retrying full_sync session=${shortAffinity(this.affinity)} request=${originalId} retry=${attempt} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}${closeEvent ? ` ${formatCloseEvent(closeEvent)}` : ''}`,
     )
 
     this.socket?.close()
@@ -727,10 +750,19 @@ class PersistentRelaySession {
     return true
   }
 
+  private enqueueStreamChunk(
+    pending: PendingWebSocketRequest,
+    chunk: Uint8Array,
+  ) {
+    pending.streamChunkCount += 1
+    pending.streamByteCount += chunk.byteLength
+    pending.streamController?.enqueue(chunk)
+  }
+
   private handleBinaryChunk(data: unknown) {
     const pending = this.pending
     if (!pending?.responseStarted) return
-    pending.streamController?.enqueue(toBinaryChunk(data))
+    this.enqueueStreamChunk(pending, toBinaryChunk(data))
   }
 
   private resolvePendingResponse(
@@ -809,7 +841,7 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'chunk') {
-      pending.streamController?.enqueue(decodeRelayChunk(message.base64))
+      this.enqueueStreamChunk(pending, decodeRelayChunk(message.base64))
       return
     }
     if (message.type === 'done') {
@@ -823,7 +855,7 @@ class PersistentRelaySession {
       // inject an SSE error event and close cleanly.
       if (pending.optimisticResponse && pending.responseStartedAt != null) {
         relayLog(
-          `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${message.status} message=${message.message || 'unknown'}`,
+          `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${message.status} message=${message.message || 'unknown'} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
         )
         pending.streamController?.enqueue(
           new TextEncoder().encode(
@@ -856,7 +888,7 @@ class PersistentRelaySession {
     if (!pending) return
     const finishedAt = perfNowMs()
     relayLog(
-      `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)}`,
+      `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
     )
     clearTimeout(pending.timeout)
     if (!pending.streamDone) {
