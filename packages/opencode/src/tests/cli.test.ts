@@ -295,6 +295,7 @@ describe('CLI relay setup', () => {
   test('deploys worker resources and saves relay config', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const callsPath = join(tempDir, 'calls.jsonl')
+    const metadataPath = join(tempDir, 'metadata.json')
     const preloadPath = join(tempDir, 'relay-preload.ts')
 
     await writeFile(
@@ -306,7 +307,12 @@ globalThis.fetch = async (input, init) => {
   if (url.includes('/storage/kv/namespaces')) return Response.json({ success: true, result: { id: 'kv-id' } })
   if (url.includes('/workers/scripts/opencode-anthropic-relay/subdomain')) return Response.json({ success: true, result: { enabled: true } })
   if (url.includes('/workers/subdomain')) return Response.json({ success: true, result: { subdomain: 'user-subdomain' } })
-  if (url.includes('/workers/scripts/opencode-anthropic-relay')) return Response.json({ success: true, result: {} })
+  if (url.includes('/workers/scripts/opencode-anthropic-relay')) {
+    if (init?.body instanceof FormData) {
+      appendFileSync(${JSON.stringify(metadataPath)}, String(init.body.get('metadata') ?? ''))
+    }
+    return Response.json({ success: true, result: {} })
+  }
   return Response.json({ success: false, errors: [{ message: 'unexpected ' + url }] }, { status: 500 })
 }
 `,
@@ -322,6 +328,7 @@ globalThis.fetch = async (input, init) => {
           OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
           CLOUDFLARE_API_TOKEN: 'cf-token',
           CLOUDFLARE_ACCOUNT_ID: 'account-id',
+          CLOUDFLARE_PLAN: 'paid',
         },
         stdin: 'pipe',
         stdout: 'pipe',
@@ -347,11 +354,21 @@ globalThis.fetch = async (input, init) => {
       enabled: true,
       url: 'https://opencode-anthropic-relay.user-subdomain.workers.dev',
       fallbackToDirect: true,
-      transport: 'http',
+      // CLOUDFLARE_PLAN=paid → websocket transport.
+      transport: 'websocket',
     })
     expect(storage.relay.token).toBeString()
 
+    // The worker deploy must carry the RELAY_PLAN binding (a worker PUT replaces
+    // all bindings, so omitting it would revert the worker to free-plan mode).
+    const metadata = JSON.parse(await readFile(metadataPath, 'utf8'))
+    expect(metadata.bindings).toContainEqual({
+      type: 'plain_text',
+      name: 'RELAY_PLAN',
+      text: 'paid',
+    })
+
     const calls = (await readFile(callsPath, 'utf8')).trim().split('\n')
     expect(calls).toHaveLength(4)
-  })
+  }, 30_000)
 })
