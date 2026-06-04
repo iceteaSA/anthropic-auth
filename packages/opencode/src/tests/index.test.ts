@@ -9,6 +9,7 @@ import {
   resetDumpState,
   resetFastModeState,
   saveAccounts,
+  tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
 import { getSidebarState } from '../sidebar-state'
@@ -2538,6 +2539,89 @@ describe('auth.loader', () => {
     }
   })
 
+  test('async main refresh does not clobber the active fallback in the sidebar', async () => {
+    const staleCheckedAt = Date.now() - 100 * 60_000 // far past → main quota is stale
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          // Cached, stale, and FAILING five_hour policy (used 95% → remaining 5% < 10%).
+          mainQuota: {
+            five_hour: {
+              usedPercent: 95,
+              remainingPercent: 5,
+              checkedAt: staleCheckedAt,
+            },
+            seven_day: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: staleCheckedAt,
+            },
+          },
+          mainQuotaCheckedAt: staleCheckedAt,
+          // Bind the cached main quota to the access token the loader will use.
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+      }),
+    )
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        // Delay the background main refresh so it settles AFTER the fallback
+        // write — this is the race that causes the clobber in production.
+        return Bun.sleep(40).then(
+          () =>
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0.95 },
+                seven_day: { utilization: 0.1 },
+              }),
+              { status: 200 },
+            ),
+        )
+      }
+      // Anthropic messages call — fallback serves 200, main would not be reached.
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    // Fallback served → active id should be the fallback.
+    const state = await waitForSidebarState(
+      (candidate) => candidate.activeId === 'fallback-1',
+    )
+    expect(state.route).toBe('fallback')
+
+    // Let the fire-and-forget refreshMain().then(...) settle.
+    await Bun.sleep(80)
+
+    // REGRESSION: pre-fix the async callback rewrites activeId to 'main'.
+    const after = await getSidebarState()
+    expect(after.activeId).toBe('fallback-1')
+  })
+
   test('fetch wrapper retries with fallback when main streaming body reports rate limit', async () => {
     await useTempAccountFile(createFallbackStorage())
     const authorizations: string[] = []
@@ -2689,5 +2773,71 @@ describe('auth.loader', () => {
 
     expect(response.status).toBe(429)
     expect(calls).toBe(1)
+  })
+
+  test('background fallback refresh updates the sidebar without a request', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              // Stale (old checkedAt) → background pass will refresh it.
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: 1,
+              },
+              seven_day: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: 1,
+              },
+            },
+          },
+        ],
+      }),
+    )
+
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.42 },
+              seven_day: { utilization: 0.1 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    // Running the loader starts the background refresh (immediate first pass).
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    // The background pass refreshes the stale fallback and the hook re-writes the
+    // sidebar — without any request to the messages endpoint.
+    // utilization: 0.42 → usedPercent: 0.42 (stored as-is, not multiplied by 100)
+    const state = await waitForSidebarState(
+      (candidate) =>
+        candidate.fallbacks[0]?.quota?.five_hour?.usedPercent === 0.42,
+    )
+    expect(state.fallbacks[0]?.id).toBe('fallback-1')
   })
 })
