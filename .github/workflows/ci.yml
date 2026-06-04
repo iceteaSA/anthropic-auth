@@ -20,7 +20,7 @@ jobs:
       - run: bun run types
       - run: bun run build
       - run: bun run test
-      - run: npm install -g opencode-ai@1.15.12
+      - run: npm install -g opencode-ai@1.15.13
       - run: bun run test:e2e
       - run: bun run format:check
       - run: bun run lint
