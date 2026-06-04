@@ -117,6 +117,7 @@ async function uploadRelayWorker(options: {
   scriptName: string
   kvNamespaceId: string
   relayToken: string
+  plan: 'free' | 'paid'
 }) {
   const metadata = {
     main_module: 'worker.js',
@@ -131,6 +132,15 @@ async function uploadRelayWorker(options: {
         type: 'secret_text',
         name: 'RELAY_TOKEN',
         text: options.relayToken,
+      },
+      // The worker gates websocket/logging on RELAY_PLAN (see relay.ts
+      // WORKER_SCRIPT). A worker PUT replaces ALL bindings, so this must be set
+      // every deploy or the worker silently reverts to free-plan behavior
+      // (http-only, websocket → 403).
+      {
+        type: 'plain_text',
+        name: 'RELAY_PLAN',
+        text: options.plan,
       },
     ],
   }
@@ -187,16 +197,27 @@ async function relaySetup() {
     'opencode-anthropic-relay'
   const kvTitle = `${scriptName}-state`
   const relayToken = generateRelayToken()
+  // Cloudflare Workers plan. The worker enables websocket transport + logging
+  // only when RELAY_PLAN=paid; free accounts must stay http-only. Source from
+  // env for non-interactive setup, else prompt (default free — the safe option
+  // that works on any account).
+  const planInput = (
+    process.env.RELAY_PLAN?.trim() ||
+    process.env.CLOUDFLARE_PLAN?.trim() ||
+    (await prompt('Cloudflare Workers plan [free/paid] (default free): '))
+  ).toLowerCase()
+  const plan: 'free' | 'paid' = planInput === 'paid' ? 'paid' : 'free'
 
   console.log('Creating Cloudflare KV namespace...')
   const namespace = await createKvNamespace(token, accountId, kvTitle)
-  console.log('Uploading relay Worker...')
+  console.log(`Uploading relay Worker (plan: ${plan})...`)
   await uploadRelayWorker({
     token,
     accountId,
     scriptName,
     kvNamespaceId: namespace.id,
     relayToken,
+    plan,
   })
   await enableWorkersDev(token, accountId, scriptName).catch((error) => {
     console.warn(
@@ -217,7 +238,8 @@ async function relaySetup() {
     url,
     token: relayToken,
     fallbackToDirect: true,
-    transport: 'http',
+    // websocket is a paid-plan capability; free accounts must use http.
+    transport: plan === 'paid' ? 'websocket' : 'http',
   }
   await saveAccounts(storage)
 
