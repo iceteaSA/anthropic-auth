@@ -48,14 +48,28 @@ export type AnthropicRequestBody = {
 }
 
 function sanitize(text: string): string {
-  return text.replace(/[\uD800-\uDFFF]/g, '\uFFFD')
+  return text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
 }
 
+/**
+ * Detect lone (unpaired) UTF-16 surrogates. With the `u` flag the character
+ * class only matches surrogates that are NOT part of a valid pair, since valid
+ * pairs are folded into a single astral code point. Anthropic rejects payloads
+ * containing lone surrogates (invalid UTF-8).
+ */
+function hasLoneSurrogate(text: string): boolean {
+  return /[\uD800-\uDFFF]/u.test(text)
+}
+
+/**
+ * Sanitize a tool-call ID to match Anthropic's `^[a-zA-Z0-9_-]+$` pattern.
+ * Cross-provider IDs (e.g. OpenAI Codex `call_xxx|fc_xxx`) contain characters
+ * Anthropic rejects. Deterministic — same input always yields the same output.
+ */
 function sanitizeToolId(id: string): string {
   if (!id) return 'tool_call_unknown'
-  const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, '_')
-  if (!sanitized) return 'tool_call_unknown'
-  return sanitized.slice(0, 256)
+  const cleaned = id.replace(/[^a-zA-Z0-9_-]/g, '_')
+  return cleaned.length > 256 ? cleaned.slice(0, 256) : cleaned
 }
 
 function toClaudeCodeToolName(name: string): string {
@@ -132,13 +146,24 @@ function convertMessages(
           blocks.push({ type: 'text', text: sanitize(block.text) })
         } else if (block.type === 'thinking' && block.thinking.trim()) {
           const thinking = block as ThinkingContent
-          if (thinking.thinkingSignature) {
+          if (
+            thinking.thinkingSignature &&
+            !hasLoneSurrogate(thinking.thinking)
+          ) {
+            // Signed thinking blocks must be sent back verbatim — the signature
+            // is computed over the original text. Sanitizing would alter it and
+            // Anthropic rejects the block as "modified". Anthropic-origin
+            // thinking is valid UTF-8, so this is the normal path.
             blocks.push({
               type: 'thinking',
-              thinking: sanitize(thinking.thinking),
+              thinking: thinking.thinking,
               signature: thinking.thinkingSignature,
             })
           } else {
+            // Either unsigned, or signed-but-contains a lone surrogate. In the
+            // latter case we cannot keep the signature: sanitizing breaks it and
+            // sending the raw lone surrogate is an invalid-UTF8 400. Drop the
+            // signature and downgrade to sanitized text.
             blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
           }
         } else if (block.type === 'toolCall') {
@@ -157,17 +182,18 @@ function convertMessages(
     if (message.role === 'toolResult') {
       const toolResult = message as ToolResultMessage
       const toolResults: Array<Record<string, unknown>> = []
-      const firstContent = convertTextAndImages(toolResult.content)
-      const firstContentArr = Array.isArray(firstContent)
-        ? firstContent
-        : [{ type: 'text', text: firstContent }]
-      if (toolResult.isError && firstContentArr.length === 0) {
-        firstContentArr.push({ type: 'text', text: 'Error' })
+      let content = convertTextAndImages(toolResult.content)
+      // Anthropic rejects tool_result with is_error=true but empty content
+      if (
+        toolResult.isError &&
+        (!content || (Array.isArray(content) && content.length === 0))
+      ) {
+        content = [{ type: 'text', text: 'Error' }]
       }
       toolResults.push({
         type: 'tool_result',
         tool_use_id: sanitizeToolId(toolResult.toolCallId),
-        content: firstContentArr,
+        content: content,
         is_error: toolResult.isError,
       })
 
@@ -177,17 +203,19 @@ function convertMessages(
         messages[nextIndex]?.role === 'toolResult'
       ) {
         const next = messages[nextIndex] as ToolResultMessage
-        const nextContent = convertTextAndImages(next.content)
-        const nextContentArr = Array.isArray(nextContent)
-          ? nextContent
-          : [{ type: 'text', text: nextContent }]
-        if (next.isError && nextContentArr.length === 0) {
-          nextContentArr.push({ type: 'text', text: 'Error' })
+        let nextContent = convertTextAndImages(next.content)
+        // Anthropic rejects tool_result with is_error=true but empty content
+        if (
+          next.isError &&
+          (!nextContent ||
+            (Array.isArray(nextContent) && nextContent.length === 0))
+        ) {
+          nextContent = [{ type: 'text', text: 'Error' }]
         }
         toolResults.push({
           type: 'tool_result',
           tool_use_id: sanitizeToolId(next.toolCallId),
-          content: nextContentArr,
+          content: nextContent,
           is_error: next.isError,
         })
         nextIndex += 1
@@ -275,6 +303,13 @@ export async function buildAnthropicRequest(
   identity?: ClaudeCodeIdentity,
 ): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
   const messages = convertMessages(context.messages)
+  // Strip trailing assistant messages — Anthropic rejects prefill on some models
+  while (
+    messages.length &&
+    messages[messages.length - 1]?.role === 'assistant'
+  ) {
+    messages.pop()
+  }
   const system = [
     {
       type: 'text',
