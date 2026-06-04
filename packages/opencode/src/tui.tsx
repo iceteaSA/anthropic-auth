@@ -1,17 +1,21 @@
 /** @jsxImportSource @opentui/solid */
 
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
-import { For, Show, createSignal, onCleanup } from 'solid-js'
+import { For, type JSX, Show, createSignal, onCleanup } from 'solid-js'
 
 import {
   type AccountQuota,
   DEFAULT_SIDEBAR_STATE,
   type SidebarState,
   getSidebarState,
+  resolveActiveAccount,
 } from './sidebar-state.js'
 
 const POLL_MS = 1500
@@ -21,6 +25,23 @@ const ID = 'cortexkit.anthropic-auth'
 const BAR_WIDTH = 10
 const BAR_FILLED = '\u2588'
 const BAR_EMPTY = '\u2591'
+
+// Plugin version for the header (mirrors the Magic Context / AFT convention).
+// Read at runtime from package.json relative to this module — NOT a TS JSON
+// import, which would break the declaration build (package.json is outside
+// rootDir). tui.tsx ships as source (package.json exports["./tui"] →
+// "./src/tui.tsx") and is never compiled into a deeper dist tree, so `..` from
+// src/ is always the package root. Empty string on any failure → header shows
+// the badge with no version.
+const PLUGIN_VERSION: string = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const raw = readFileSync(join(here, '..', 'package.json'), 'utf8')
+    return (JSON.parse(raw) as { version?: string }).version ?? ''
+  } catch {
+    return ''
+  }
+})()
 
 // biome-ignore lint/suspicious/noExplicitAny: opentui border prop not typed in plugin tui surface
 const SINGLE_BORDER = { type: 'single' } as any
@@ -116,6 +137,21 @@ function StatRow(props: {
   )
 }
 
+// Compact row for the collapsed view: muted label left, caller-provided value
+// right. Mirrors StatRow's layout so columns line up.
+function CollapsedRow(props: {
+  theme: ThemeCurrent
+  label: string
+  children: JSX.Element
+}) {
+  return (
+    <box width='100%' flexDirection='row' justifyContent='space-between'>
+      <text fg={props.theme.textMuted}>{props.label}</text>
+      {props.children}
+    </box>
+  )
+}
+
 // Quota window row: muted label left, tone-colored bar + percentage right,
 // with an optional muted reset suffix.
 function QuotaRow(props: {
@@ -203,6 +239,7 @@ async function readStateFromFile(): Promise<SidebarState> {
 
 function QuotaSidebar(props: { api: TuiPluginApi }) {
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
+  const [collapsed, setCollapsed] = createSignal(false)
   let lastUpdated = 0
   let debounce: ReturnType<typeof setTimeout> | null = null
 
@@ -241,6 +278,12 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
   const hasData = () =>
     state().main.quota != null || enabledFallbacks().length > 0
 
+  const headerLabel = () =>
+    !hasData() ? 'CLAUDE' : collapsed() ? '\u25b6 CLAUDE' : '\u25bc CLAUDE'
+  const activeAccount = () => resolveActiveAccount(state())
+  const activeFiveHourPct = () =>
+    activeAccount().quota?.five_hour?.usedPercent ?? null
+
   const quotaBackedOff = () => state().main.quotaBackedOff === true
   const refreshBackedOff = () => state().main.refreshBackedOff === true
   const degraded = () => quotaBackedOff() || refreshBackedOff()
@@ -264,19 +307,30 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
       paddingLeft={1}
       paddingRight={1}
     >
-      {/* Header: CLAUDE badge + optional LIMITED degraded badge */}
+      {/* Header: ▼/▶ CLAUDE badge (click to collapse) + version, or LIMITED badge */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: opentui renders to a terminal, not the DOM — ARIA roles do not apply */}
       <box
         width='100%'
         flexDirection='row'
         justifyContent='space-between'
         alignItems='center'
+        onMouseDown={() => {
+          if (hasData()) setCollapsed((value) => !value)
+        }}
       >
         <box paddingLeft={1} paddingRight={1} backgroundColor={theme().accent}>
           <text fg={theme().background}>
-            <b>{'CLAUDE'}</b>
+            <b>{headerLabel()}</b>
           </text>
         </box>
-        <Show when={degraded()}>
+        <Show
+          when={degraded()}
+          fallback={
+            <Show when={PLUGIN_VERSION !== ''}>
+              <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
+            </Show>
+          }
+        >
           <box
             paddingLeft={1}
             paddingRight={1}
@@ -289,93 +343,135 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
         </Show>
       </box>
 
-      <Show
-        when={hasData()}
-        fallback={
-          <box marginTop={1} width='100%'>
-            <text fg={theme().textMuted}>{'Waiting for quota\u2026'}</text>
-          </box>
-        }
-      >
-        {/* Quota */}
-        <SectionHeader theme={theme()} title='Quota' />
-        <AccountBlock
-          theme={theme()}
-          name='main'
-          quota={state().main.quota}
-          active={state().activeId === 'main'}
-        />
-        <For each={enabledFallbacks()}>
-          {(fb) => (
-            <AccountBlock
-              theme={theme()}
-              name={fb.label ?? fb.id}
-              quota={fb.quota}
-              active={state().activeId === fb.id}
-              marginTop={1}
-            />
-          )}
-        </For>
+      {/* Collapsed: active account 5h quota + dot, plus fast-mode when on */}
+      <Show when={collapsed() && hasData()}>
+        <CollapsedRow theme={theme()} label={activeAccount().name}>
+          <Show
+            when={activeFiveHourPct() != null}
+            fallback={<text fg={theme().textMuted}>{'\u2014'}</text>}
+          >
+            <box flexDirection='row'>
+              <text
+                fg={toneColor(
+                  theme(),
+                  usageTone(activeFiveHourPct() as number),
+                )}
+              >
+                <b>
+                  {`${String(Math.round(activeFiveHourPct() as number)).padStart(3)}%`}
+                </b>
+              </text>
+              <text
+                fg={toneColor(
+                  theme(),
+                  usageTone(activeFiveHourPct() as number),
+                )}
+              >
+                {' \u25cf'}
+              </text>
+            </box>
+          </Show>
+        </CollapsedRow>
+        <Show when={state().fastMode}>
+          <CollapsedRow theme={theme()} label='Mode'>
+            <text fg={toneColor(theme(), 'accent')}>
+              <b>{'fast'}</b>
+            </text>
+          </CollapsedRow>
+        </Show>
       </Show>
 
-      {/* Routing */}
-      <SectionHeader theme={theme()} title='Routing' />
-      <StatRow
-        theme={theme()}
-        label='Route'
-        value={state().route}
-        tone='accent'
-      />
-      <StatRow
-        theme={theme()}
-        label='Mode'
-        value={state().fastMode ? 'fast' : 'std'}
-        tone={state().fastMode ? 'accent' : 'muted'}
-      />
-      <StatRow
-        theme={theme()}
-        label='Relay'
-        value={relayValue()}
-        tone={state().relay?.enabled ? 'ok' : 'muted'}
-      />
+      {/* Expanded: full sections. Also render when there's no data so the
+          sidebar can never go blank if data clears while collapsed. */}
+      <Show when={!collapsed() || !hasData()}>
+        <Show
+          when={hasData()}
+          fallback={
+            <box marginTop={1} width='100%'>
+              <text fg={theme().textMuted}>{'Waiting for quota\u2026'}</text>
+            </box>
+          }
+        >
+          {/* Quota */}
+          <SectionHeader theme={theme()} title='Quota' />
+          <AccountBlock
+            theme={theme()}
+            name='main'
+            quota={state().main.quota}
+            active={state().activeId === 'main'}
+          />
+          <For each={enabledFallbacks()}>
+            {(fb) => (
+              <AccountBlock
+                theme={theme()}
+                name={fb.label ?? fb.id}
+                quota={fb.quota}
+                active={state().activeId === fb.id}
+                marginTop={1}
+              />
+            )}
+          </For>
+        </Show>
 
-      {/* Cache */}
-      <Show when={showCache()}>
-        <SectionHeader theme={theme()} title='Cache' />
+        {/* Routing */}
+        <SectionHeader theme={theme()} title='Routing' />
         <StatRow
           theme={theme()}
-          label='1h cache'
-          value={`${cacheKeep()?.window} \u00b7 ${cacheKeep()?.enabled ? 'on' : 'off'}`}
-          tone={cacheKeep()?.enabled ? 'ok' : 'muted'}
+          label='Route'
+          value={state().route}
+          tone='accent'
         />
-        <Show when={(cacheKeep()?.trackedSessions ?? 0) > 0}>
-          <StatRow
-            theme={theme()}
-            label='Tracked'
-            value={String(cacheKeep()?.trackedSessions)}
-            tone='text'
-          />
-        </Show>
-      </Show>
+        <StatRow
+          theme={theme()}
+          label='Mode'
+          value={state().fastMode ? 'fast' : 'std'}
+          tone={state().fastMode ? 'accent' : 'muted'}
+        />
+        <StatRow
+          theme={theme()}
+          label='Relay'
+          value={relayValue()}
+          tone={state().relay?.enabled ? 'ok' : 'muted'}
+        />
 
-      {/* Health — only when something is wrong */}
-      <Show when={degraded()}>
-        <SectionHeader theme={theme()} title='Health' />
-        <Show when={quotaBackedOff()}>
+        {/* Cache */}
+        <Show when={showCache()}>
+          <SectionHeader theme={theme()} title='Cache' />
           <StatRow
             theme={theme()}
-            label='Quota API'
-            value={`backoff ${formatUntil(state().main.quotaBackoffUntil)}`}
-            tone='warn'
+            label='1h cache'
+            value={`${cacheKeep()?.window} \u00b7 ${cacheKeep()?.enabled ? 'on' : 'off'}`}
+            tone={cacheKeep()?.enabled ? 'ok' : 'muted'}
           />
+          <Show when={(cacheKeep()?.trackedSessions ?? 0) > 0}>
+            <StatRow
+              theme={theme()}
+              label='Tracked'
+              value={String(cacheKeep()?.trackedSessions)}
+              tone='text'
+            />
+          </Show>
         </Show>
-        <Show when={refreshBackedOff()}>
-          <StatRow
-            theme={theme()}
-            label='Token refresh'
-            value={`backoff ${formatUntil(state().main.refreshBackoffUntil)}`}
-            tone='warn'
-          />
+
+        {/* Health — only when something is wrong */}
+        <Show when={degraded()}>
+          <SectionHeader theme={theme()} title='Health' />
+          <Show when={quotaBackedOff()}>
+            <StatRow
+              theme={theme()}
+              label='Quota API'
+              value={`backoff ${formatUntil(state().main.quotaBackoffUntil)}`}
+              tone='warn'
+            />
+          </Show>
+          <Show when={refreshBackedOff()}>
+            <StatRow
+              theme={theme()}
+              label='Token refresh'
+              value={`backoff ${formatUntil(state().main.refreshBackoffUntil)}`}
+              tone='warn'
+            />
+          </Show>
         </Show>
       </Show>
     </box>
