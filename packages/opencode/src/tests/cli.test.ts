@@ -398,6 +398,9 @@ describe('CLI relay setup', () => {
   test('deploys worker resources and saves relay config', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const calls: Array<{ url: string; method?: string }> = []
+    // Capture the worker-PUT metadata in-process so we can assert the RELAY_PLAN
+    // binding without spawning a subprocess (the subprocess form hung in CI).
+    let workerMetadata: string | undefined
 
     const fetchImpl = async (
       input: string | URL | Request,
@@ -414,8 +417,12 @@ describe('CLI relay setup', () => {
           success: true,
           result: { subdomain: 'user-subdomain' },
         })
-      if (url.includes('/workers/scripts/opencode-anthropic-relay'))
+      if (url.includes('/workers/scripts/opencode-anthropic-relay')) {
+        if (init?.body instanceof FormData) {
+          workerMetadata = String(init.body.get('metadata') ?? '')
+        }
         return Response.json({ success: true, result: {} })
+      }
       return Response.json(
         { success: false, errors: [{ message: `unexpected ${url}` }] },
         { status: 500 },
@@ -436,9 +443,11 @@ describe('CLI relay setup', () => {
     const prevFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
     const prevToken = process.env.CLOUDFLARE_API_TOKEN
     const prevAccount = process.env.CLOUDFLARE_ACCOUNT_ID
+    const prevPlan = process.env.CLOUDFLARE_PLAN
     process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
     process.env.CLOUDFLARE_API_TOKEN = 'cf-token'
     process.env.CLOUDFLARE_ACCOUNT_ID = 'account-id'
+    process.env.CLOUDFLARE_PLAN = 'paid'
     try {
       await relaySetup({ fetchImpl, prompt })
     } finally {
@@ -449,6 +458,8 @@ describe('CLI relay setup', () => {
       else process.env.CLOUDFLARE_API_TOKEN = prevToken
       if (prevAccount === undefined) delete process.env.CLOUDFLARE_ACCOUNT_ID
       else process.env.CLOUDFLARE_ACCOUNT_ID = prevAccount
+      if (prevPlan === undefined) delete process.env.CLOUDFLARE_PLAN
+      else process.env.CLOUDFLARE_PLAN = prevPlan
     }
 
     // Token + account come from env, so the only prompt is the worker name.
@@ -459,9 +470,20 @@ describe('CLI relay setup', () => {
       enabled: true,
       url: 'https://opencode-anthropic-relay.user-subdomain.workers.dev',
       fallbackToDirect: true,
-      transport: 'http',
+      // CLOUDFLARE_PLAN=paid → websocket transport.
+      transport: 'websocket',
     })
     expect(storage.relay.token).toBeString()
+
+    // The worker deploy must carry the RELAY_PLAN binding (a worker PUT replaces
+    // all bindings, so omitting it would revert the worker to free-plan mode).
+    // Captured in-process from the PUT FormData metadata above.
+    const metadata = JSON.parse(workerMetadata ?? '{}')
+    expect(metadata.bindings).toContainEqual({
+      type: 'plain_text',
+      name: 'RELAY_PLAN',
+      text: 'paid',
+    })
 
     expect(calls).toHaveLength(4)
     expect(calls.map((c) => `${c.method ?? 'GET'} ${c.url}`)).toEqual([
