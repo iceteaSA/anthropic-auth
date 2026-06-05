@@ -172,7 +172,8 @@ Example:
       "five_hour": 10,
       "seven_day": 20
     },
-    "failClosedOnUnknownQuota": true
+    "failClosedOnUnknownQuota": true,
+    "showToasts": false
   },
   "killswitch": {
     "enabled": false,
@@ -205,7 +206,7 @@ Example:
 }
 ```
 
-The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
+The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback accounts.
 
 ## Fallback accounts
 

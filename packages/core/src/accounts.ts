@@ -90,6 +90,8 @@ export type AccountStorage = {
     refreshEveryNRequests?: number
     minimumRemaining?: Partial<Record<QuotaWindowName | '5h' | '1w', number>>
     failClosedOnUnknownQuota?: boolean
+    /** Opt-in OpenCode TUI toast after quota refresh. Default: false. */
+    showToasts?: boolean
     mainQuota?: OAuthQuotaSnapshot
     mainQuotaCheckedAt?: number
     // Fingerprint of the access token that produced mainQuota. Used to avoid

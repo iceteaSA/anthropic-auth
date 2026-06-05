@@ -1890,8 +1890,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace.done('missing_access_error')
                 throw new Error('OAuth access token is missing after refresh')
               }
-              /** Show quota toast from current QuotaManager state */
+              /** Show quota toast from current QuotaManager state. */
               function showQuotaToastFromCache() {
+                if (storage?.quota?.showToasts !== true) return
                 const mainEntry = quotaManager.getMain()
                 if (!mainEntry) return
                 // Prefer the shared QuotaManager cache for fallback quota so the

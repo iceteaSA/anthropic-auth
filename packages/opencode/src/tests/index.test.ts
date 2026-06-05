@@ -2419,6 +2419,98 @@ describe('auth.loader', () => {
     expect(messageAuthorizations).toEqual(['Bearer fallback-access'])
   })
 
+  test('quota refresh toasts are disabled by default', async () => {
+    const storage = createFallbackStorage({ accounts: [] })
+    await useTempAccountFile(storage)
+    const showToast = mock(() => Promise.resolve())
+    const mockClient = {
+      ...createMockClient(),
+      tui: { showToast },
+    }
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('main ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(mockClient as any)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(showToast).not.toHaveBeenCalled()
+  })
+
+  test('quota refresh toasts can be enabled explicitly', async () => {
+    const storage = createFallbackStorage({ accounts: [] })
+    storage.quota = { ...storage.quota, showToasts: true }
+    await useTempAccountFile(storage)
+    const showToast = mock(() => Promise.resolve())
+    const mockClient = {
+      ...createMockClient(),
+      tui: { showToast },
+    }
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('main ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(mockClient as any)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(showToast).toHaveBeenCalledWith({
+      body: {
+        title: 'Claude Quota',
+        message: expect.stringContaining('main · active'),
+        variant: 'info',
+        duration: 5000,
+      },
+    })
+  })
+
   test('fetch wrapper caches exhausted main quota until reset time', async () => {
     await useTempAccountFile(createFallbackStorage())
     let quotaCalls = 0
