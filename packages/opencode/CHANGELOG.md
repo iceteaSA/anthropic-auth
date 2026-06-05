@@ -2,6 +2,21 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.6.0
+
+### Minor Changes
+
+- Add `/claude-killswitch`, allowing requests to be hard-blocked or rerouted when main or fallback Claude quota drops below configured per-account thresholds.
+- Add a collapsible quota sidebar view and opt-in quota refresh toasts controlled by `quota.showToasts`.
+
+### Patch Changes
+
+- Improve WebSocket relay recovery when a socket closes after upstream `response_start` but before any stream bytes reach OpenCode, and add clearer close diagnostics for mid-stream failures.
+- Fix sidebar quota refreshes so async quota updates do not clobber the active account or show stale fallback quota state.
+- Update OpenCode SDK/plugin, OpenTUI, and relay test dependencies.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the killswitch, quota toast, and sidebar contributions.
+
 ## 1.5.0
 
 ### Minor Changes

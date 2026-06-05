@@ -2,6 +2,22 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.6.0
+
+### Minor Changes
+
+- Add `/claude-killswitch` for OpenCode, allowing requests to be hard-blocked or rerouted when main or fallback Claude quota drops below configured per-account thresholds.
+- Add a collapsible OpenCode quota sidebar view and opt-in quota refresh toasts controlled by `quota.showToasts`.
+
+### Patch Changes
+
+- Improve WebSocket relay recovery when a socket closes after upstream `response_start` but before any stream bytes reach OpenCode, and add clearer close diagnostics for mid-stream failures.
+- Harden Pi Anthropic message conversion for tool-result and content-shape edge cases.
+- Fix OpenCode sidebar quota refreshes so async quota updates do not clobber the active account or show stale fallback quota state.
+- Update OpenCode SDK/plugin, OpenTUI, and relay test dependencies.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the killswitch, quota toast, sidebar, and Pi conversion contributions.
+
 ## 1.5.0
 
 ### Minor Changes
