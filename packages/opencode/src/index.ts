@@ -680,6 +680,109 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
+  function quotaBar(pct: number, width = 10): string {
+    const filled = Math.max(0, Math.min(Math.round((pct / 100) * width), width))
+    return '█'.repeat(filled) + '░'.repeat(width - filled)
+  }
+
+  function quotaLine(label: string, pct: number): string {
+    return `${label}  ${quotaBar(pct)}  ${String(Math.round(pct)).padStart(3)}%`
+  }
+
+  function formatResetIn(resetsAt: string | undefined): string {
+    if (!resetsAt) return ''
+    const ts = new Date(resetsAt).getTime()
+    if (Number.isNaN(ts)) return ''
+    const ms = ts - Date.now()
+    if (ms <= 0) return 'resets now'
+    const mins = Math.floor(ms / 60_000)
+    if (mins < 1) return 'resets <1m'
+    if (mins < 60) return `resets ${mins}m`
+    const hrs = Math.floor(mins / 60)
+    const rm = mins % 60
+    return rm > 0 ? `resets ${hrs}h${rm}m` : `resets ${hrs}h`
+  }
+
+  function showQuotaToast(
+    quota: OAuthQuotaSnapshot | null,
+    fallbacks?: Array<{
+      id: string
+      label?: string
+      quota?: OAuthQuotaSnapshot
+    }>,
+    activeAccountId?: string,
+  ) {
+    const sections: string[] = []
+    let globalMaxUsed = 0
+
+    // Main account
+    if (quota) {
+      const fh = quota.five_hour
+      const sd = quota.seven_day
+      if (fh || sd) {
+        const mainActive = activeAccountId === 'main'
+        const status = mainActive ? 'active' : 'idle'
+        const reset = formatResetIn(fh?.resetsAt)
+        const lines: string[] = [
+          `main · ${status}${reset ? ` (${reset})` : ''}`,
+        ]
+        if (fh) {
+          lines.push(quotaLine('5h', fh.usedPercent))
+          globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
+        }
+        if (sd) {
+          lines.push(quotaLine('7d', sd.usedPercent))
+          globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
+        }
+        sections.push(lines.join('\n'))
+      }
+    }
+
+    // Fallback accounts
+    if (fallbacks?.length) {
+      for (const fb of fallbacks) {
+        const q = fb.quota
+        if (!q) continue
+        const fh = q.five_hour
+        const sd = q.seven_day
+        if (!fh && !sd) continue
+        const name = fb.label || 'alt'
+        const fbActive = activeAccountId === fb.id
+        const status = fbActive ? 'active' : 'idle'
+        const fbReset = formatResetIn(fh?.resetsAt)
+        const lines: string[] = [
+          `${name} · ${status}${fbReset ? ` (${fbReset})` : ''}`,
+        ]
+        if (fh) {
+          lines.push(quotaLine('5h', fh.usedPercent))
+          globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
+        }
+        if (sd) {
+          lines.push(quotaLine('7d', sd.usedPercent))
+          globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
+        }
+        sections.push(lines.join('\n'))
+      }
+    }
+
+    if (!sections.length) return
+    const message = sections.join('\n\n')
+    const variant =
+      globalMaxUsed >= 90 ? 'error' : globalMaxUsed >= 70 ? 'warning' : 'info'
+
+    // biome-ignore lint/suspicious/noExplicitAny: SDK client.tui type not exposed to server plugins
+    void (client.tui as any)
+      ?.showToast?.({
+        body: {
+          title: 'Claude Quota',
+          message,
+          variant,
+          duration: variant === 'error' ? 8000 : 5000,
+        },
+      })
+      ?.catch?.(() => {})
+  }
+
   return {
     config: async (config: { command?: Record<string, unknown> }) => {
       config.command = {
@@ -1787,6 +1890,42 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace.done('missing_access_error')
                 throw new Error('OAuth access token is missing after refresh')
               }
+              /** Show quota toast from current QuotaManager state */
+              function showQuotaToastFromCache() {
+                const mainEntry = quotaManager.getMain()
+                if (!mainEntry) return
+                // Prefer the shared QuotaManager cache for fallback quota so the
+                // toast matches the sidebar and reflects background refreshes
+                // rather than the request-start storage snapshot.
+                const fallbacks = (storage?.accounts ?? [])
+                  .filter((a) => a.enabled !== false)
+                  .map((a) => ({
+                    ...a,
+                    // Token-aware read so a cached snapshot bound to a previous
+                    // access token (account re-login) is never shown.
+                    quota:
+                      quotaManager.getFallback(a.id, a.access)?.quota ??
+                      a.quota,
+                  }))
+                const mainPassesPolicy = quotaSnapshotPassesPolicy(
+                  mainEntry.quota,
+                  storage,
+                )
+                let activeId: string | undefined
+                if (mainPassesPolicy) {
+                  activeId = 'main'
+                } else {
+                  // Mirror routing: the active account is the first fallback that
+                  // actually passes quota policy; if none do, routing falls
+                  // through to main, so label main — never a failing fallback.
+                  activeId =
+                    fallbacks.find((f) =>
+                      quotaSnapshotPassesPolicy(f.quota, storage),
+                    )?.id ?? 'main'
+                }
+                showQuotaToast(mainEntry.quota, fallbacks, activeId)
+              }
+
               if (replayableRequest && mainQuotaRoutingEnabled(storage)) {
                 try {
                   const quotaStart = nowMs()
@@ -1796,14 +1935,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   let routingQuota = quotaManager.getMain(auth.access)?.quota
                   if (!routingQuota) {
                     routingQuota = await quotaManager.refreshMain(auth.access)
+                    showQuotaToastFromCache()
                   } else if (quotaManager.needsRefresh(sessionRequestCount)) {
                     // Stale OR every-N request boundary — background refresh,
                     // return current snapshot to avoid blocking. Refresh the
-                    // sidebar again once the new main quota lands.
+                    // sidebar and show the toast once the new main quota lands.
                     void quotaManager
                       .refreshMain(auth.access)
                       .then(() => {
                         void refreshSidebarQuota()
+                        showQuotaToastFromCache()
                       })
                       .catch(() => {})
                   }
