@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.6.1
+
+### Patch Changes
+
+- Mark WebSocket relay stream-close failures as retryable connection resets so OpenCode can show its normal retry countdown instead of bailing on mid-stream relay disconnects.
+
 ## 1.6.0
 
 ### Minor Changes

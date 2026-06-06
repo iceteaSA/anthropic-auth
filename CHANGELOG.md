@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.6.1
+
+### Patch Changes
+
+- Mark WebSocket relay stream-close failures as retryable connection resets so OpenCode can use its normal retry UI instead of treating mid-stream relay disconnects as terminal unknown errors.
+
 ## 1.6.0
 
 ### Minor Changes
