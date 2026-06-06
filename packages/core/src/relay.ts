@@ -92,6 +92,22 @@ type RelaySendResult = {
 
 class RelayStateMismatchError extends Error {}
 
+class RelayWebSocketConnectionResetError extends Error {
+  readonly code = 'ECONNRESET'
+  readonly syscall = 'websocket'
+  readonly closeCode?: number
+  readonly closeReason?: string
+  readonly wasClean?: boolean
+
+  constructor(message: string, event?: CloseEvent) {
+    super(message)
+    this.name = 'RelayWebSocketConnectionResetError'
+    this.closeCode = event?.code
+    this.closeReason = event?.reason
+    this.wasClean = event?.wasClean
+  }
+}
+
 const sessionState = new Map<string, RelaySessionState>()
 const websocketSessions = new Map<string, PersistentRelaySession>()
 const loggedRelayConfigMessages = new Set<string>()
@@ -592,7 +608,9 @@ class PersistentRelaySession {
 
       socket.addEventListener('error', () => {
         clearTimeout(timeout)
-        const error = new Error('relay websocket error')
+        const error = new RelayWebSocketConnectionResetError(
+          'relay websocket error',
+        )
         reject(error)
         this.failPending(error)
       })
@@ -613,11 +631,12 @@ class PersistentRelaySession {
             : 'closed before response'
           if (this.retryPendingBeforeResponse(this.pending, reason, event))
             return
-          const error = new Error(
-            closedAfterResponseStart
-              ? 'relay websocket closed during response stream'
-              : 'relay websocket closed before response',
-          )
+          const error = closedAfterResponseStart
+            ? new RelayWebSocketConnectionResetError(
+                'relay websocket closed during response stream',
+                event,
+              )
+            : new Error('relay websocket closed before response')
           relayLog(
             `websocket ${closedAfterResponseStart ? 'closed during response stream' : 'closed before response without retry'} session=${shortAffinity(this.affinity)} request=${this.pending.payload.id} chunks=${this.pending.streamChunkCount} bytes=${this.pending.streamByteCount} ${formatCloseEvent(event)}`,
           )

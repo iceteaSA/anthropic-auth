@@ -666,7 +666,9 @@ describe('relay client', () => {
               data: Buffer.from('event: content_block_start\n\n'),
             }),
           )
-          this.dispatchEvent(new CloseEvent('close', { code: 1006 }))
+          setTimeout(() => {
+            this.dispatchEvent(new CloseEvent('close', { code: 1006 }))
+          }, 0)
         })
       }
 
@@ -688,9 +690,28 @@ describe('relay client', () => {
         optimisticResponse: true,
       })
       expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
-      await expect(response.text()).rejects.toThrow(
+      const reader = response.body?.getReader()
+      expect(reader).toBeDefined()
+      const firstRead = await reader!.read()
+      expect(Buffer.from(firstRead.value ?? new Uint8Array()).toString()).toBe(
+        'event: content_block_start\n\n',
+      )
+
+      let streamError: unknown
+      try {
+        await reader!.read()
+      } catch (error) {
+        streamError = error
+      }
+      expect(streamError).toBeInstanceOf(Error)
+      expect((streamError as Error).message).toBe(
         'relay websocket closed during response stream',
       )
+      expect(streamError).toMatchObject({
+        code: 'ECONNRESET',
+        syscall: 'websocket',
+        closeCode: 1006,
+      })
     } finally {
       globalThis.WebSocket = originalWebSocket
     }
