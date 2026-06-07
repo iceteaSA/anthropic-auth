@@ -442,6 +442,80 @@ describe('auth.loader', () => {
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
+  test('fallback-first refreshes current main quota for sidebar when persisted main quota belongs to an old token', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 6, remainingPercent: 94 },
+            seven_day: { usedPercent: 75, remainingPercent: 25 },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('old-main-access'),
+        } as AccountStorage['quota'],
+      }),
+    )
+
+    const authorizations: string[] = []
+    let mainQuotaCalls = 0
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        mainQuotaCalls++
+        expect(new Headers(init?.headers).get('authorization')).toBe(
+          'Bearer main-access',
+        )
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 12 },
+              seven_day: { utilization: 34 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    const state = await waitForSidebarState(
+      (candidate) =>
+        candidate.activeId === 'fallback-1' &&
+        candidate.main.quota?.five_hour?.usedPercent === 12,
+    )
+    expect(state.route).toBe('fallback-first')
+    expect(state.main.quota?.seven_day?.usedPercent).toBe(34)
+    expect(mainQuotaCalls).toBe(1)
+    expect(authorizations[0]).toBe('Bearer fallback-access')
+  })
+
   test('fetch wrapper sets OAuth headers and prefixes tools', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
 
@@ -2221,6 +2295,20 @@ describe('auth.loader', () => {
           checkIntervalMinutes: 5,
           minimumRemaining: { five_hour: 10, seven_day: 20 },
           refreshEveryNRequests: 1,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: Date.now(),
+            },
+            seven_day: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: Date.now(),
+            },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('main-access'),
         },
       }),
     )

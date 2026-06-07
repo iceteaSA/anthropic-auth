@@ -469,6 +469,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
+  function scheduleSidebarMainQuotaRefresh(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    accessToken: string | undefined,
+  ) {
+    if (!accessToken) return
+    if (storage?.quota?.enabled !== true) return
+    if (quotaManager.getMain(accessToken)) return
+    if (sidebarMainQuotaRefreshInFlight) return
+
+    sidebarMainQuotaRefreshInFlight = true
+    void quotaManager
+      .refreshMain(accessToken)
+      .then(() => refreshSidebarQuota())
+      .catch(() => {})
+      .finally(() => {
+        sidebarMainQuotaRefreshInFlight = false
+      })
+  }
+
   let latestGetAuth:
     | (() => Promise<{
         type: string
@@ -477,6 +496,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         expires?: number
       }>)
     | null = null
+  let sidebarMainQuotaRefreshInFlight = false
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
   // Per-process counter of replayable model requests. Drives the every-N
   // quota refresh cadence (quota.refreshEveryNRequests) for the active route.
@@ -1782,6 +1802,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               // (quota.refreshEveryNRequests) advances for main and the active
               // fallback route on all paths, including successful fallback-first.
               if (replayableRequest) sessionRequestCount++
+              if (
+                replayableRequest &&
+                auth.access &&
+                (!auth.expires || auth.expires > Date.now())
+              ) {
+                scheduleSidebarMainQuotaRefresh(storage, auth.access)
+              }
               const writeCurrentSidebarState = (
                 activeId: string | undefined,
                 route: string,
