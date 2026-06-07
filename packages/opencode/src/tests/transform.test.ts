@@ -1088,6 +1088,48 @@ describe('rewriteRequestBody', () => {
     })
   })
 
+  test('hybrid mode splits first-message cache anchors when Magic Context m0 and m1 merge into content blocks', async () => {
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'large stable m0 history' },
+            { type: 'text', text: 'volatile m1 history' },
+          ],
+        },
+        { role: 'assistant', content: 'first real assistant turn' },
+        { role: 'user', content: 'latest user boundary' },
+      ],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    expect(result.system[2].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[0].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[0].content[1].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[1].content[0].cache_control).toBeUndefined()
+    expect(result.messages[2].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
   test('hybrid mode does not duplicate the moving marker when the latest user boundary is messages[1]', async () => {
     const body = JSON.stringify({
       system: 'Stable system block',

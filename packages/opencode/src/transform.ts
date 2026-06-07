@@ -504,30 +504,57 @@ function applyAutomaticCache1h(parsed: Record<string, unknown>) {
   parsed.cache_control = { ...CACHE_1H_CONTROL }
 }
 
-function setMessageCacheAnchor(message: unknown) {
-  if (!isRecord(message)) return false
+function isCacheableContentBlock(block: unknown) {
+  return (
+    isRecord(block) &&
+    block.type !== 'thinking' &&
+    block.type !== 'redacted_thinking'
+  )
+}
 
+function getCacheableContentBlocks(message: Record<string, unknown>) {
   // cache_control is only valid on content blocks, never on the message
   // object itself. A message with no cacheable content block (empty content,
   // or only thinking/redacted_thinking blocks) must be skipped entirely;
   // attaching cache_control to the message triggers Anthropic's
   // "messages.N.cache_control: Extra inputs are not permitted" 400.
   const content = normalizeContentToArray(message.content)
-  if (!content?.length) return false
+  if (!content?.length) return undefined
 
-  const lastCacheableBlock = [...content]
-    .reverse()
-    .find(
-      (block) =>
-        isRecord(block) &&
-        block.type !== 'thinking' &&
-        block.type !== 'redacted_thinking',
-    )
-  if (!lastCacheableBlock) return false
+  const cacheableBlocks = content.filter(isCacheableContentBlock)
+  if (!cacheableBlocks.length) return undefined
+
+  return { content, cacheableBlocks }
+}
+
+function setFirstMessageCacheAnchor(message: unknown) {
+  if (!isRecord(message)) return false
+  const cacheableContent = getCacheableContentBlocks(message)
+  if (!cacheableContent) return false
 
   // Only materialize the normalized content array once we know we will anchor.
-  message.content = content
+  message.content = cacheableContent.content
+  return setWireCacheControl(cacheableContent.cacheableBlocks[0], true)
+}
+
+function setMessageCacheAnchor(message: unknown) {
+  if (!isRecord(message)) return false
+  const cacheableContent = getCacheableContentBlocks(message)
+  if (!cacheableContent) return false
+
+  const lastCacheableBlock =
+    cacheableContent.cacheableBlocks[
+      cacheableContent.cacheableBlocks.length - 1
+    ]
+
+  // Only materialize the normalized content array once we know we will anchor.
+  message.content = cacheableContent.content
   return setWireCacheControl(lastCacheableBlock, true)
+}
+
+function hasMultipleCacheableContentBlocks(message: unknown) {
+  if (!isRecord(message)) return false
+  return (getCacheableContentBlocks(message)?.cacheableBlocks.length ?? 0) > 1
 }
 
 function messageContentBlockCount(message: unknown) {
@@ -606,8 +633,14 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   // 20-block lookback window.
   if (!bridge) setHybridSystemAnchor(parsed)
 
+  const firstMessageHasSplitPrefix = hasMultipleCacheableContentBlocks(
+    parsed.messages[0],
+  )
+  if (firstMessageHasSplitPrefix) {
+    setFirstMessageCacheAnchor(parsed.messages[0])
+  }
   setMessageCacheAnchor(parsed.messages[0])
-  setMessageCacheAnchor(parsed.messages[1])
+  if (!firstMessageHasSplitPrefix) setMessageCacheAnchor(parsed.messages[1])
   if (bridge) setMessageCacheAnchor(parsed.messages[bridge.index])
   if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
 }
