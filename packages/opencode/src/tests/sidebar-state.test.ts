@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   type AccountQuota,
   DEFAULT_SIDEBAR_STATE,
+  getCollapsedQuotaSummary,
   resolveActiveAccount,
   type SidebarState,
 } from '../sidebar-state'
@@ -76,5 +77,33 @@ describe('resolveActiveAccount', () => {
     const active = resolveActiveAccount(state)
     expect(active.id).toBe('main')
     expect(active.quota).toBeNull()
+  })
+})
+
+describe('getCollapsedQuotaSummary', () => {
+  test('formats both active-account quota windows', () => {
+    expect(getCollapsedQuotaSummary(quota(13)).text).toBe('5h: 13% 7d: 13%')
+  })
+
+  test('formats different 5h and 7d percentages', () => {
+    expect(
+      getCollapsedQuotaSummary({
+        five_hour: { usedPercent: 13.4, remainingPercent: 86.6 },
+        seven_day: { usedPercent: 7.2, remainingPercent: 92.8 },
+      }).text,
+    ).toBe('5h: 13% 7d: 7%')
+  })
+
+  test('uses a dash for a missing collapsed quota window', () => {
+    expect(
+      getCollapsedQuotaSummary({
+        five_hour: { usedPercent: 13, remainingPercent: 87 },
+      }).text,
+    ).toBe('5h: 13% 7d: —')
+  })
+
+  test('returns no collapsed quota text when no windows are available', () => {
+    expect(getCollapsedQuotaSummary(null).text).toBeNull()
+    expect(getCollapsedQuotaSummary({}).text).toBeNull()
   })
 })

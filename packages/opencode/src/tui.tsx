@@ -1,19 +1,20 @@
 /** @jsxImportSource @opentui/solid */
 
-import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { For, type JSX, Show, createSignal, onCleanup } from 'solid-js'
 
 import {
   type AccountQuota,
   DEFAULT_SIDEBAR_STATE,
   type SidebarState,
+  getCollapsedQuotaSummary,
   getSidebarState,
   resolveActiveAccount,
 } from './sidebar-state.js'
@@ -281,8 +282,16 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
   const headerLabel = () =>
     !hasData() ? 'CLAUDE' : collapsed() ? '\u25b6 CLAUDE' : '\u25bc CLAUDE'
   const activeAccount = () => resolveActiveAccount(state())
-  const activeFiveHourPct = () =>
-    activeAccount().quota?.five_hour?.usedPercent ?? null
+  const activeQuotaSummary = () =>
+    getCollapsedQuotaSummary(activeAccount().quota)
+  const activeQuotaTone = (): Tone => {
+    const summary = activeQuotaSummary()
+    const values = [
+      summary.fiveHourUsedPercent,
+      summary.sevenDayUsedPercent,
+    ].filter((value): value is number => value != null)
+    return values.length > 0 ? usageTone(Math.max(...values)) : 'muted'
+  }
 
   const quotaBackedOff = () => state().main.quotaBackedOff === true
   const refreshBackedOff = () => state().main.refreshBackedOff === true
@@ -343,33 +352,16 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
         </Show>
       </box>
 
-      {/* Collapsed: active account 5h quota + dot, plus fast-mode when on */}
+      {/* Collapsed: active account 5h + 7d quota, plus fast-mode when on */}
       <Show when={collapsed() && hasData()}>
         <CollapsedRow theme={theme()} label={activeAccount().name}>
           <Show
-            when={activeFiveHourPct() != null}
+            when={activeQuotaSummary().text != null}
             fallback={<text fg={theme().textMuted}>{'\u2014'}</text>}
           >
-            <box flexDirection='row'>
-              <text
-                fg={toneColor(
-                  theme(),
-                  usageTone(activeFiveHourPct() as number),
-                )}
-              >
-                <b>
-                  {`${String(Math.round(activeFiveHourPct() as number)).padStart(3)}%`}
-                </b>
-              </text>
-              <text
-                fg={toneColor(
-                  theme(),
-                  usageTone(activeFiveHourPct() as number),
-                )}
-              >
-                {' \u25cf'}
-              </text>
-            </box>
+            <text fg={toneColor(theme(), activeQuotaTone())}>
+              <b>{activeQuotaSummary().text}</b>
+            </text>
           </Show>
         </CollapsedRow>
         <Show when={state().fastMode}>

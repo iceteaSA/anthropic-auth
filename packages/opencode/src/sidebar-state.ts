@@ -105,3 +105,21 @@ export function resolveActiveAccount(state: SidebarState): {
   }
   return { id: 'main', name: 'main', quota: state.main.quota }
 }
+
+export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
+  fiveHourUsedPercent: number | null
+  sevenDayUsedPercent: number | null
+  text: string | null
+} {
+  const fiveHourUsedPercent = quota?.five_hour?.usedPercent ?? null
+  const sevenDayUsedPercent = quota?.seven_day?.usedPercent ?? null
+  if (fiveHourUsedPercent == null && sevenDayUsedPercent == null) {
+    return { fiveHourUsedPercent, sevenDayUsedPercent, text: null }
+  }
+
+  return {
+    fiveHourUsedPercent,
+    sevenDayUsedPercent,
+    text: `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`} 7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
+  }
+}
