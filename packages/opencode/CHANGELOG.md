@@ -2,6 +2,18 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.7.0
+
+### Minor Changes
+
+- Improve `/claude-cache hybrid` for Magic Context sessions whose stable `m[0]` and volatile `m[1]` history blocks are merged into one Anthropic user message: hybrid mode now anchors both the first and last cacheable block of `messages[0]` so stable leading history can remain cached when the trailing delta changes.
+- Include a sanitized session/affinity segment in `/claude-dump` artifact filenames so dumps from different sessions are easier to find.
+
+### Patch Changes
+
+- Refresh current-token main quota in the sidebar without blocking `fallback-first` routing, avoiding a stale `checking…` display after main token rotation.
+- Keep custom/future Claude billing version suffixes stable across date boundaries so the billing header does not rotate at midnight and unexpectedly bust prompt-cache prefixes.
+
 ## 1.6.1
 
 ### Patch Changes
