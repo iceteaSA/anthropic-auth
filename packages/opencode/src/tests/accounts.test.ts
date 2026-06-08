@@ -2,17 +2,18 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-
 import {
   type AccountStorage,
   acquireRefreshFileLock,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
+  getAccountStatePath,
   getCache1hPersistentMode,
   isFastModePersistentlyEnabled,
   loadAccounts,
   QuotaManager,
+  saveAccountState,
   saveAccounts,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -68,9 +69,63 @@ describe('account storage', () => {
 
     await saveAccounts(storage)
 
-    const raw = await readFile(accountPath, 'utf8')
-    expect(JSON.parse(raw).accounts[0].id).toBe('fallback-1')
+    const rawConfig = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(rawConfig.accounts[0].id).toBe('fallback-1')
+    expect(rawConfig.accounts[0].access).toBeUndefined()
+    expect(rawConfig.accounts[0].refresh).toBeUndefined()
+
+    const rawState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(rawState.accounts['fallback-1'].access).toBe('access')
+    expect(rawState.accounts['fallback-1'].refresh).toBe('refresh')
+
     await expect(loadAccounts()).resolves.toEqual(storage)
+  })
+
+  test('runtime state saves do not rewrite user-editable config', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      checkIntervalMinutes: 20,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 11,
+          remainingPercent: 89,
+          checkedAt: 123,
+        },
+      },
+      mainQuotaCheckedAt: 123,
+      mainQuotaToken: 'token-a',
+    }
+    await saveAccounts(storage)
+
+    const staleRuntimeView = await loadAccounts()
+    expect(staleRuntimeView).not.toBeNull()
+    ;(staleRuntimeView as AccountStorage).quota = {
+      ...(staleRuntimeView as AccountStorage).quota,
+      checkIntervalMinutes: 5,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 22,
+          remainingPercent: 78,
+          checkedAt: 456,
+        },
+      },
+      mainQuotaCheckedAt: 456,
+      mainQuotaToken: 'token-b',
+    }
+
+    await saveAccountState(staleRuntimeView as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+
+    const rawConfig = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(rawConfig.quota.checkIntervalMinutes).toBe(20)
+    expect(rawConfig.quota.mainQuota).toBeUndefined()
+
+    const loaded = await loadAccounts()
+    expect(loaded?.quota?.checkIntervalMinutes).toBe(20)
+    expect(loaded?.quota?.mainQuotaToken).toBe('token-b')
+    expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(22)
   })
 
   test('malformed sidecar file is ignored', async () => {
@@ -595,10 +650,14 @@ describe('FallbackAccountManager', () => {
     })
 
     manager.startBackgroundRefresh()
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    let saved: AccountStorage | null = null
+    for (let attempt = 0; attempt < 50; attempt++) {
+      saved = await loadAccounts()
+      if (saved?.accounts[0]?.access === 'fresh-access') break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
     manager.stopBackgroundRefresh()
 
-    const saved = await loadAccounts()
     expect(saved?.accounts[0]?.access).toBe('fresh-access')
     expect(saved?.accounts[0]?.refresh).toBe('fresh-refresh')
     expect(fetchImpl).toHaveBeenCalled()

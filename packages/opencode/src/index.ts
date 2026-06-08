@@ -62,7 +62,7 @@ import {
   refreshBackoffActive,
   refreshClaudeOAuthToken,
   resolveClaudeCodeIdentity,
-  saveAccounts,
+  saveAccountState,
   sendViaRelay,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -290,7 +290,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         storage.quota.mainQuotaCheckedAt = checkedAt
         storage.quota.mainQuotaToken = tokenFingerprint
         storage.quota.mainLastQuotaApiError = undefined
-        await saveAccounts(storage, accountStoragePath)
+        await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (error) {
         log('[quota] failed to persist main quota', {
           error: error instanceof Error ? error.message : String(error),
@@ -305,7 +305,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         }
         storage.quota = storage.quota ?? {}
         storage.quota.mainLastQuotaApiError = error
-        await saveAccounts(storage, accountStoragePath)
+        await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (e) {
         log('[quota] failed to persist backoff state', {
           error: e instanceof Error ? e.message : String(e),
@@ -538,7 +538,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       return
     }
     storage.refresh.mainLastRefreshError = undefined
-    await saveAccounts(storage, accountStoragePath)
+    await saveAccountState(storage, accountStoragePath, { mainRefresh: true })
     log(
       '[refresh] opencode main oauth cleared stale backoff after token rotation',
       {
@@ -992,7 +992,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   }
                   storage.refresh = storage.refresh ?? {}
                   update(storage)
-                  await saveAccounts(storage, accountStoragePath)
+                  await saveAccountState(storage, accountStoragePath, {
+                    mainRefresh: true,
+                  })
                 }
 
                 async function waitForConcurrentMainRefresh(previous: {

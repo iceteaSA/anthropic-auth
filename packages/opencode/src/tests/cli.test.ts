@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { getAccountStatePath } from '@cortexkit/anthropic-auth-core'
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
@@ -84,9 +85,17 @@ describe('CLI login', () => {
     expect(storage.accounts[0]).toMatchObject({
       id: 'cli-label',
       label: 'cli-label',
+      enabled: true,
+    })
+    expect(storage.accounts[0].access).toBeUndefined()
+    expect(storage.accounts[0].refresh).toBeUndefined()
+
+    const runtimeState = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(runtimeState.accounts['cli-label']).toMatchObject({
       access: 'cli-access',
       refresh: 'cli-refresh',
-      enabled: true,
     })
   })
 
@@ -186,15 +195,29 @@ describe('CLI login', () => {
     expect(storage.accounts[0]).toMatchObject({
       id: 'cli-label',
       label: 'cli-label',
-      access: 'new-access',
-      refresh: 'new-refresh',
       enabled: true,
       addedAt: 123,
     })
+    expect(storage.accounts[0].access).toBeUndefined()
+    expect(storage.accounts[0].refresh).toBeUndefined()
     expect(storage.accounts[0].quota).toBeUndefined()
     expect(storage.accounts[0].lastRefreshedAt).toBeUndefined()
     expect(storage.accounts[0].lastRefreshError).toBeUndefined()
     expect(storage.accounts[0].lastQuotaRefreshError).toBeUndefined()
+
+    const runtimeState = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(runtimeState.accounts['cli-label']).toMatchObject({
+      access: 'new-access',
+      refresh: 'new-refresh',
+    })
+    expect(runtimeState.accounts['cli-label'].quota).toBeUndefined()
+    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeUndefined()
+    expect(runtimeState.accounts['cli-label'].lastRefreshError).toBeUndefined()
+    expect(
+      runtimeState.accounts['cli-label'].lastQuotaRefreshError,
+    ).toBeUndefined()
   })
 })
 

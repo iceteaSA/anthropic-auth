@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { QuotaManager, tokenFingerprint } from '@cortexkit/anthropic-auth-core'
+import {
+  acquireRefreshFileLock,
+  QuotaManager,
+  tokenFingerprint,
+} from '@cortexkit/anthropic-auth-core'
 
 function makeQuotaResponse(now: number) {
   return new Response(
@@ -44,6 +48,30 @@ describe('QuotaManager', () => {
       now: () => now,
     })
   }
+
+  describe('cross-process quota locks', () => {
+    test('fallback quota refresh does not call the API while another process holds the account lock', async () => {
+      const lock = await acquireRefreshFileLock({
+        name: 'opencode-fallback-quota-refresh-fallback-1',
+        ttlMs: 30_000,
+      })
+      expect(lock).not.toBeNull()
+
+      let fetchCalls = 0
+      const fetchMock = mock(() => {
+        fetchCalls++
+        return Promise.resolve(makeQuotaResponse(now))
+      }) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+
+      await expect(
+        qm.refreshFallback('fallback-1', 'fallback-token'),
+      ).rejects.toThrow('Quota refresh is already in progress')
+      expect(fetchCalls).toBe(0)
+
+      await lock?.release()
+    })
+  })
 
   describe('backoff', () => {
     test('first 429 backs off for 60s', async () => {

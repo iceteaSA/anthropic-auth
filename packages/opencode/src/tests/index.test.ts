@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
+  getAccountStatePath,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   resetCache1hState,
   resetDumpState,
@@ -1752,10 +1753,12 @@ describe('auth.loader', () => {
     ).rejects.toThrow('Claude OAuth refresh is backed off')
 
     expect(tokenRefreshCalls).toBe(1)
-    const saved = JSON.parse(
+    const savedConfig = JSON.parse(
       await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
     )
-    expect(saved.refresh.mainLastRefreshError.nextRetryAt).toBeGreaterThan(
+    expect(savedConfig.refresh?.mainLastRefreshError).toBeUndefined()
+    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(savedState.main.lastRefreshError.nextRetryAt).toBeGreaterThan(
       Date.now(),
     )
   })

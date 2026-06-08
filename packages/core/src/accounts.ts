@@ -16,6 +16,7 @@ const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
 
 export const ACCOUNT_FILE_NAME = 'anthropic-auth.json'
+export const ACCOUNT_STATE_FILE_NAME = 'anthropic-auth-state.json'
 export const QUOTA_URL = 'https://api.anthropic.com/api/oauth/usage'
 
 export type QuotaWindowName = 'five_hour' | 'seven_day'
@@ -125,6 +126,39 @@ export type AccountStorage = {
   accounts: OAuthAccount[]
 }
 
+export type OAuthAccountRuntimeState = Pick<
+  OAuthAccount,
+  | 'access'
+  | 'refresh'
+  | 'expires'
+  | 'lastUsed'
+  | 'lastRefreshedAt'
+  | 'lastRefreshError'
+  | 'lastQuotaRefreshError'
+  | 'quota'
+>
+
+export type AccountRuntimeState = {
+  version: 1
+  main?: {
+    quota?: OAuthQuotaSnapshot
+    quotaCheckedAt?: number
+    quotaToken?: string
+    lastQuotaApiError?: AccountOperationError
+    lastRefreshError?: AccountOperationError
+    refreshLeaseId?: string
+    refreshLeaseUntil?: number
+    refreshLeaseTokenHash?: string
+  }
+  accounts?: Record<string, Partial<OAuthAccountRuntimeState>>
+}
+
+export type AccountStateSaveScope = {
+  mainQuota?: boolean
+  mainRefresh?: boolean
+  accounts?: true | string[]
+}
+
 type OAuthUsageWindow = {
   utilization?: number
   resets_at?: string
@@ -193,6 +227,14 @@ export function getAccountStoragePath() {
     process.env.OPENCODE_ANTHROPIC_AUTH_FILE?.trim() ||
     join(getConfigDir(), ACCOUNT_FILE_NAME)
   )
+}
+
+export function getAccountStatePath(configPath = getAccountStoragePath()) {
+  const explicit = process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE?.trim()
+  if (explicit) return explicit
+  return configPath.endsWith(ACCOUNT_FILE_NAME)
+    ? join(dirname(configPath), ACCOUNT_STATE_FILE_NAME)
+    : `${configPath}.state.json`
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -296,45 +338,258 @@ function normalizeStorage(value: unknown): AccountStorage | null {
   }
 }
 
-export async function loadAccounts(path = getAccountStoragePath()) {
+async function readJsonIfPresent(path: string): Promise<{
+  exists: boolean
+  value: unknown
+}> {
   try {
-    const raw = await readFile(path, 'utf8')
-    return normalizeStorage(JSON.parse(raw))
+    return { exists: true, value: JSON.parse(await readFile(path, 'utf8')) }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    return null
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { exists: false, value: null }
+    }
+    return { exists: false, value: null }
   }
 }
 
-async function loadExistingTopLevelFields(path: string) {
-  try {
-    const raw = await readFile(path, 'utf8')
-    const parsed = JSON.parse(raw)
-    return isRecord(parsed) ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-function omitUndefinedTopLevel(value: AccountStorage) {
+function objectWithDefinedEntries(value: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(value).filter(([, entry]) => entry !== undefined),
   )
+}
+
+function mergeConfigAndState(
+  configValue: unknown,
+  stateValue: unknown,
+): unknown {
+  if (!isRecord(configValue)) return configValue
+  const state = isRecord(stateValue) ? stateValue : {}
+  const mainState = isRecord(state.main) ? state.main : undefined
+  const stateAccounts = isRecord(state.accounts) ? state.accounts : {}
+
+  const quotaConfig = isRecord(configValue.quota) ? configValue.quota : {}
+  const refreshConfig = isRecord(configValue.refresh) ? configValue.refresh : {}
+  const mainQuotaSource = mainState ?? quotaConfig
+  const mainRefreshSource = mainState ?? refreshConfig
+
+  const accounts = Array.isArray(configValue.accounts)
+    ? configValue.accounts.map((account) => {
+        if (!isRecord(account)) return account
+        const stateAccount: Record<string, unknown> =
+          typeof account.id === 'string' && isRecord(stateAccounts[account.id])
+            ? (stateAccounts[account.id] as Record<string, unknown>)
+            : {}
+        return { ...account, ...stateAccount }
+      })
+    : []
+
+  return {
+    ...configValue,
+    refresh: objectWithDefinedEntries({
+      ...refreshConfig,
+      mainLastRefreshError: mainRefreshSource.lastRefreshError,
+      mainRefreshLeaseId: mainRefreshSource.refreshLeaseId,
+      mainRefreshLeaseUntil: mainRefreshSource.refreshLeaseUntil,
+      mainRefreshLeaseTokenHash: mainRefreshSource.refreshLeaseTokenHash,
+    }),
+    quota: objectWithDefinedEntries({
+      ...quotaConfig,
+      mainQuota: mainQuotaSource.quota,
+      mainQuotaCheckedAt: mainQuotaSource.quotaCheckedAt,
+      mainQuotaToken: mainQuotaSource.quotaToken,
+      mainLastQuotaApiError: mainQuotaSource.lastQuotaApiError,
+    }),
+    accounts,
+  }
+}
+
+export async function loadAccounts(path = getAccountStoragePath()) {
+  const config = await readJsonIfPresent(path)
+  if (!config.exists) return null
+  const state = await readJsonIfPresent(getAccountStatePath(path))
+  return normalizeStorage(mergeConfigAndState(config.value, state.value))
+}
+
+async function loadExistingTopLevelFields(path: string) {
+  const existing = await readJsonIfPresent(path)
+  return isRecord(existing.value) ? existing.value : {}
+}
+
+function omitUndefinedTopLevel(value: Record<string, unknown>) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== undefined),
+  )
+}
+
+function accountConfig(account: OAuthAccount) {
+  return objectWithDefinedEntries({
+    id: account.id,
+    label: account.label,
+    type: account.type,
+    enabled: account.enabled,
+    addedAt: account.addedAt,
+  })
+}
+
+function accountRuntimeState(account: OAuthAccount) {
+  return objectWithDefinedEntries({
+    access: account.access,
+    refresh: account.refresh,
+    expires: account.expires,
+    lastUsed: account.lastUsed,
+    lastRefreshedAt: account.lastRefreshedAt,
+    lastRefreshError: account.lastRefreshError,
+    lastQuotaRefreshError: account.lastQuotaRefreshError,
+    quota: account.quota,
+  })
+}
+
+function configFromStorage(storage: AccountStorage): Record<string, unknown> {
+  const refresh = storage.refresh
+    ? objectWithDefinedEntries({
+        enabled: storage.refresh.enabled,
+        intervalMinutes: storage.refresh.intervalMinutes,
+        refreshBeforeExpiryMinutes: storage.refresh.refreshBeforeExpiryMinutes,
+      })
+    : undefined
+  const quota = storage.quota
+    ? objectWithDefinedEntries({
+        enabled: storage.quota.enabled,
+        checkIntervalMinutes: storage.quota.checkIntervalMinutes,
+        refreshEveryNRequests: storage.quota.refreshEveryNRequests,
+        minimumRemaining: storage.quota.minimumRemaining,
+        failClosedOnUnknownQuota: storage.quota.failClosedOnUnknownQuota,
+        showToasts: storage.quota.showToasts,
+      })
+    : undefined
+
+  return omitUndefinedTopLevel({
+    version: 1,
+    main: storage.main,
+    routing: storage.routing,
+    fallbackOn: storage.fallbackOn,
+    refresh,
+    quota,
+    claudeCache: storage.claudeCache,
+    dump: storage.dump,
+    claudeFast: storage.claudeFast,
+    cacheKeep: storage.cacheKeep,
+    relay: storage.relay,
+    killswitch: storage.killswitch,
+    accounts: storage.accounts.map(accountConfig),
+  })
+}
+
+function stateFromStorage(storage: AccountStorage): AccountRuntimeState {
+  const accounts = Object.fromEntries(
+    storage.accounts.map((account) => [
+      account.id,
+      accountRuntimeState(account),
+    ]),
+  )
+  return {
+    version: 1,
+    main: objectWithDefinedEntries({
+      quota: storage.quota?.mainQuota,
+      quotaCheckedAt: storage.quota?.mainQuotaCheckedAt,
+      quotaToken: storage.quota?.mainQuotaToken,
+      lastQuotaApiError: storage.quota?.mainLastQuotaApiError,
+      lastRefreshError: storage.refresh?.mainLastRefreshError,
+      refreshLeaseId: storage.refresh?.mainRefreshLeaseId,
+      refreshLeaseUntil: storage.refresh?.mainRefreshLeaseUntil,
+      refreshLeaseTokenHash: storage.refresh?.mainRefreshLeaseTokenHash,
+    }),
+    accounts,
+  }
+}
+
+async function writeJsonAtomic(path: string, value: unknown) {
+  await mkdir(dirname(path), { recursive: true })
+  const tempPath = `${path}.${randomUUID()}.tmp`
+  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
+  await rename(tempPath, path)
 }
 
 export async function saveAccounts(
   storage: AccountStorage,
   path = getAccountStoragePath(),
 ) {
-  await mkdir(dirname(path), { recursive: true })
   const existing = await loadExistingTopLevelFields(path)
-  const next = { ...existing, ...omitUndefinedTopLevel(storage) }
-  const tempPath = `${path}.${randomUUID()}.tmp`
-  await writeFile(tempPath, `${JSON.stringify(next, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  })
-  await rename(tempPath, path)
+  const nextConfig = { ...existing, ...configFromStorage(storage) }
+  await writeJsonAtomic(path, nextConfig)
+  await writeJsonAtomic(getAccountStatePath(path), stateFromStorage(storage))
+}
+
+function applyMainQuotaStatePatch(
+  state: AccountRuntimeState,
+  storage: AccountStorage,
+) {
+  state.main = state.main ?? {}
+  state.main.quota = storage.quota?.mainQuota
+  state.main.quotaCheckedAt = storage.quota?.mainQuotaCheckedAt
+  state.main.quotaToken = storage.quota?.mainQuotaToken
+  state.main.lastQuotaApiError = storage.quota?.mainLastQuotaApiError
+}
+
+function applyMainRefreshStatePatch(
+  state: AccountRuntimeState,
+  storage: AccountStorage,
+) {
+  state.main = state.main ?? {}
+  state.main.lastRefreshError = storage.refresh?.mainLastRefreshError
+  state.main.refreshLeaseId = storage.refresh?.mainRefreshLeaseId
+  state.main.refreshLeaseUntil = storage.refresh?.mainRefreshLeaseUntil
+  state.main.refreshLeaseTokenHash = storage.refresh?.mainRefreshLeaseTokenHash
+}
+
+function pruneUndefined(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(pruneUndefined)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, entry]) => entry !== undefined)
+      .map(([key, entry]) => [key, pruneUndefined(entry)]),
+  )
+}
+
+export async function saveAccountState(
+  storage: AccountStorage,
+  path = getAccountStoragePath(),
+  scope: AccountStateSaveScope = {
+    mainQuota: true,
+    mainRefresh: true,
+    accounts: true,
+  },
+) {
+  const statePath = getAccountStatePath(path)
+  const existing = (await readJsonIfPresent(statePath)).value
+  const next: AccountRuntimeState = isRecord(existing)
+    ? ({ ...existing, version: 1 } as AccountRuntimeState)
+    : { version: 1 }
+
+  if (scope.mainQuota) applyMainQuotaStatePatch(next, storage)
+  if (scope.mainRefresh) applyMainRefreshStatePatch(next, storage)
+
+  if (scope.accounts) {
+    const ids = scope.accounts === true ? null : new Set(scope.accounts)
+    next.accounts = { ...(isRecord(next.accounts) ? next.accounts : {}) }
+    for (const account of storage.accounts) {
+      if (ids && !ids.has(account.id)) continue
+      next.accounts[account.id] = accountRuntimeState(account)
+    }
+    if (ids) {
+      for (const id of ids) {
+        if (!storage.accounts.some((account) => account.id === id)) {
+          delete next.accounts[id]
+        }
+      }
+    }
+  }
+
+  await writeJsonAtomic(statePath, pruneUndefined(next))
 }
 
 export async function acquireRefreshFileLock(options: {
@@ -1153,8 +1408,10 @@ export class FallbackAccountManager {
     return loadAccounts(this.configPath)
   }
 
-  async save(storage: AccountStorage) {
-    await saveAccounts(storage, this.configPath)
+  async save(storage: AccountStorage, accountIds?: string[]) {
+    await saveAccountState(storage, this.configPath, {
+      accounts: accountIds ?? true,
+    })
   }
 
   startBackgroundRefresh() {

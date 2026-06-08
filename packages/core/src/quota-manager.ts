@@ -372,6 +372,11 @@ export class QuotaManager {
     return JSON.stringify([accountId, tokenFingerprint(accessToken)])
   }
 
+  private static quotaLockName(accountId: string): string {
+    const safeId = accountId.replace(/[^a-zA-Z0-9._-]+/g, '-')
+    return `opencode-fallback-quota-refresh-${safeId || 'account'}`
+  }
+
   /**
    * Serialize API calls through a shared gate so only one
    * quota API request runs at a time, with a minimum gap
@@ -453,24 +458,37 @@ export class QuotaManager {
           if (cached) return cached.quota
           throw new Error('Quota API rate-limited — try again later')
         }
-        const quota = await fetchOAuthQuotaSnapshot({
-          accessToken,
-          fetchImpl: this.fetchImpl,
-          now: this.now,
+        const fileLock = await acquireRefreshFileLock({
+          name: QuotaManager.quotaLockName(accountId),
+          ttlMs: 30_000,
         })
-        const now = this.now()
-        this.setFallback(
-          accountId,
-          {
-            quota,
-            refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
-            checkedAt: now,
-          },
-          accessToken,
-        )
-        this.fallbackApiErrors.delete(accountId)
-        this.fallbackErrorTokenFps.delete(accountId)
-        return quota
+        if (!fileLock) {
+          const cached = this.getFallback(accountId, accessToken)
+          if (cached) return cached.quota
+          throw new Error('Quota refresh is already in progress')
+        }
+        try {
+          const quota = await fetchOAuthQuotaSnapshot({
+            accessToken,
+            fetchImpl: this.fetchImpl,
+            now: this.now,
+          })
+          const now = this.now()
+          this.setFallback(
+            accountId,
+            {
+              quota,
+              refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
+              checkedAt: now,
+            },
+            accessToken,
+          )
+          this.fallbackApiErrors.delete(accountId)
+          this.fallbackErrorTokenFps.delete(accountId)
+          return quota
+        } finally {
+          await fileLock.release()
+        }
       } catch (error) {
         this._handleFallbackFetchError(accountId, accessToken, error)
         throw error
