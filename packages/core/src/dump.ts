@@ -104,6 +104,15 @@ function shortAffinity(affinity: string) {
   return affinity.length <= 16 ? affinity : `${affinity.slice(0, 12)}…`
 }
 
+function dumpFileSessionSegment(affinity: string) {
+  const normalized = affinity
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  if (!normalized) return 'session-unknown'
+  return normalized.length <= 80 ? normalized : normalized.slice(0, 80)
+}
+
 function hashText(value: string) {
   return createHash('sha256').update(value).digest('hex')
 }
@@ -234,7 +243,7 @@ export async function dumpRelayRequest(input: {
 }) {
   if (!dumpEnabled) return
   nextDumpId += 1
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${input.transport}-p${input.protocol}-${input.mode}`
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${dumpFileSessionSegment(input.affinity)}-${input.transport}-p${input.protocol}-${input.mode}`
   const dumpDir = getDumpDirectory()
   const prefix = join(dumpDir, id)
 

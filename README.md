@@ -467,7 +467,7 @@ When enabled, the plugin writes artifacts under the OS temp directory:
 ls "$(node -p 'require("node:os").tmpdir()')/opencode-anthropic-auth-dumps"
 ```
 
-Each request gets:
+Each filename includes a sanitized session/affinity segment so dumps from different sessions are easier to find. Each request gets:
 
 - `*.body.json` — final rewritten Anthropic request body.
 - `*.relay.json` — redacted relay payload/frame metadata.

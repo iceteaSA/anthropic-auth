@@ -115,7 +115,7 @@ describe('relay client', () => {
         config,
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
-        headers: headers('session-relay-dump'),
+        headers: headers('session relay/dump:alpha'),
         body: JSON.stringify({
           model: 'claude-sonnet-4-6',
           stream: true,
@@ -142,6 +142,9 @@ describe('relay client', () => {
       expect(metaPath).toBeString()
       expect(bodyPath).toBeString()
       expect(relayPath).toBeString()
+      expect(metaPath).toInclude('session-relay-dump-alpha')
+      expect(bodyPath).toInclude('session-relay-dump-alpha')
+      expect(relayPath).toInclude('session-relay-dump-alpha')
 
       const meta = JSON.parse(
         await readFile(`${getDumpDirectory()}/${metaPath}`, 'utf8'),
