@@ -272,6 +272,23 @@ function appendParallelToolPrompt(system: string[]) {
   return true
 }
 
+const ZERO_MODEL_COST = {
+  input: 0,
+  output: 0,
+  cache: { read: 0, write: 0 },
+}
+
+function zeroModelCosts<T extends Record<string, { cost?: unknown }>>(
+  models: T,
+) {
+  return Object.fromEntries(
+    Object.entries(models).map(([id, model]) => [
+      id,
+      { ...model, cost: ZERO_MODEL_COST },
+    ]),
+  ) as T
+}
+
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
@@ -854,6 +871,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       if (!shouldInjectParallelToolPrompt(input)) return
       appendParallelToolPrompt(output.system)
     },
+    provider: {
+      id: 'anthropic',
+      async models(
+        provider: { models: Record<string, { cost?: unknown }> },
+        context: { auth?: { type?: string } },
+      ) {
+        if (context.auth?.type !== 'oauth') return provider.models
+        return zeroModelCosts(provider.models)
+      },
+    },
     'command.execute.before': async (input: {
       command: string
       arguments: string
@@ -950,23 +977,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           refresh?: string
           expires?: number
         }>,
-        provider: { models: Record<string, { cost: unknown }> },
+        _provider: { models: Record<string, { cost: unknown }> },
       ) {
         latestGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type === 'oauth') {
-          // zero out cost for max plan
-          for (const model of Object.values(provider.models)) {
-            model.cost = {
-              input: 0,
-              output: 0,
-              cache: {
-                read: 0,
-                write: 0,
-              },
-            }
-          }
-
           // Shared inflight refresh promise — prevents concurrent token refreshes
           // from racing against each other (and causing 401 cascades with token rotation)
           let refreshPromise: Promise<string> | null = null

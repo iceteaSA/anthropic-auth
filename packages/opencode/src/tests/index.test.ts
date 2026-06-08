@@ -205,6 +205,8 @@ describe('AnthropicAuthPlugin', () => {
     expect(plugin.auth.provider).toBe('anthropic')
     expect(plugin.auth.loader).toBeFunction()
     expect(plugin.auth.methods).toBeArray()
+    expect(plugin.provider?.id).toBe('anthropic')
+    expect(plugin.provider?.models).toBeFunction()
   })
 })
 
@@ -309,6 +311,56 @@ describe('auth.methods', () => {
   })
 })
 
+describe('provider.models', () => {
+  test('zeros out Anthropic model costs for OAuth auth', async () => {
+    const plugin = await getPlugin()
+    const models = {
+      'claude-3': {
+        id: 'claude-3',
+        cost: { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'oauth' } } as never,
+    )
+
+    expect(result?.['claude-3']?.cost).toEqual({
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    })
+    expect(models['claude-3'].cost).toEqual({
+      input: 3,
+      output: 15,
+      cache: { read: 0.3, write: 3.75 },
+    })
+  })
+
+  test('keeps Anthropic API-key model costs unchanged', async () => {
+    const plugin = await getPlugin()
+    const models = {
+      'claude-3': {
+        id: 'claude-3',
+        cost: { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'api' } } as never,
+    )
+
+    expect(result).toBe(models)
+    expect(result?.['claude-3']?.cost).toEqual({
+      input: 3,
+      output: 15,
+      cache: { read: 0.3, write: 3.75 },
+    })
+  })
+})
+
 describe('auth.loader', () => {
   const originalFetch = globalThis.fetch
   const originalSetTimeout = globalThis.setTimeout
@@ -349,30 +401,6 @@ describe('auth.loader', () => {
       { models: {} },
     )
     expect(result).toEqual({})
-  })
-
-  test('zeros out model costs for oauth auth', async () => {
-    const plugin = await getPlugin()
-    const models = {
-      'claude-3': {
-        cost: { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
-      },
-    }
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'token',
-          refresh: 'refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models },
-    )
-    expect(models['claude-3'].cost).toEqual({
-      input: 0,
-      output: 0,
-      cache: { read: 0, write: 0 },
-    })
   })
 
   test('returns fetch wrapper for oauth auth', async () => {
