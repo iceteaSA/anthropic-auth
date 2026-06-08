@@ -80,21 +80,16 @@ export async function signRequestBody(bodyString: string): Promise<string> {
 /**
  * Compute a stable 3-character suffix for cc_version.
  *
- * The previous implementation sampled the first user message, which could make
- * the system billing header change with conversation content. Keep this suffix
- * stable for a day so it resembles a rotating Claude Code fingerprint without
- * busting prompt-cache prefixes on every turn.
+ * The captured Claude Code version uses its observed build hash. Custom/future
+ * versions get a deterministic version-only suffix so date changes never rotate
+ * the billing header and bust prompt-cache prefixes.
  */
 export function computeVersionSuffix(
   version: string = CLAUDE_CODE_VERSION,
-  date: Date = new Date(),
+  _date: Date = new Date(),
 ): string {
   if (version === CLAUDE_CODE_VERSION) return CLAUDE_CODE_BUILD_HASH
-  const dayStamp = date.toISOString().slice(0, 10)
-  return createHash('sha256')
-    .update(`${dayStamp}${version}`)
-    .digest('hex')
-    .slice(0, 3)
+  return createHash('sha256').update(version).digest('hex').slice(0, 3)
 }
 
 /**

@@ -29,8 +29,14 @@ describe('billing header helpers', () => {
     ).toBe('5236e')
   })
 
-  test('computes a stable daily 3-character version suffix', () => {
-    expect(computeVersionSuffix('2.1.87', new Date('2026-04-29'))).toBe('623')
+  test('computes the captured Claude Code build suffix for the default version', () => {
+    expect(computeVersionSuffix('2.1.141', new Date('2026-04-29'))).toBe('67b')
+  })
+
+  test('keeps custom version suffixes stable across date boundaries', () => {
+    expect(computeVersionSuffix('2.1.87', new Date('2026-04-29'))).toBe(
+      computeVersionSuffix('2.1.87', new Date('2026-04-30')),
+    )
   })
 
   test('signs serialized request body cch placeholder', async () => {
@@ -80,7 +86,7 @@ describe('billing header helpers', () => {
         new Date('2026-04-29'),
       ),
     ).toBe(
-      'x-anthropic-billing-header: cc_version=2.1.87.623; cc_entrypoint=sdk-cli; cch=00000;',
+      'x-anthropic-billing-header: cc_version=2.1.87.398; cc_entrypoint=sdk-cli; cch=00000;',
     )
   })
 })
