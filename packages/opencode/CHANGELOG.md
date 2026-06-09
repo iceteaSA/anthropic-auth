@@ -2,6 +2,21 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.8.0
+
+### Minor Changes
+
+- Add Claude Fable 5 and limited-access Claude Mythos 5 to the Anthropic provider catalog so OpenCode can select them before upstream catalog updates land.
+- Add API-key fallback routes for Anthropic-compatible providers such as Kie, with strict fresh-quota exhaustion checks before spending API-key credits.
+- Split editable config from runtime auth state so background refresh and quota writers cannot clobber user-managed settings.
+
+### Patch Changes
+
+- Normalize Fable/Mythos requests by removing top-level adaptive `thinking` and preserving `output_config.effort`, matching Anthropic's migration guidance.
+- Show both 5-hour and 7-day quota windows in the collapsed sidebar active-account summary.
+- Display Anthropic OAuth models as zero-cost through the provider model hook while preserving token accounting and API-key pricing.
+- Bound relay/cachekeep/identity in-memory caches, propagate relay abort signals, and add opt-in request/relay/stream performance instrumentation under `OPENCODE_ANTHROPIC_AUTH_PERF=1`.
+
 ## 1.7.0
 
 ### Minor Changes

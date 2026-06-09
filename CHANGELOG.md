@@ -2,6 +2,22 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.8.0
+
+### Minor Changes
+
+- Add Claude Fable 5 and limited-access Claude Mythos 5 support across shared model metadata, OpenCode's Anthropic provider catalog, Pi's provider catalog, and the cache-usage analyzer.
+- Add API-key fallback routes for Anthropic-compatible providers such as Kie, with route secrets stored in runtime state and API-key spending gated behind fresh, token-bound confirmation that main OAuth quota is exhausted.
+- Split editable sidecar config from volatile auth runtime state so background refresh, quota, and routing writers cannot overwrite user configuration such as quota intervals or relay settings.
+
+### Patch Changes
+
+- Normalize Fable/Mythos OpenCode requests by removing top-level adaptive `thinking` and preserving `output_config.effort`, matching Anthropic's migration guidance.
+- Show both 5-hour and 7-day quota windows in the collapsed OpenCode sidebar active-account summary.
+- Display Anthropic OAuth models as zero-cost in OpenCode through the provider model hook while preserving token accounting and API-key model pricing.
+- Bound relay/cachekeep/identity in-memory caches, propagate relay abort signals, improve Pi stream cancellation, and document intentional relay tradeoffs in `AUDITOR.md`.
+- Add opt-in performance instrumentation for Anthropic request rewriting, relay payloads, and downstream stream consumption under `OPENCODE_ANTHROPIC_AUTH_PERF=1`.
+
 ## 1.7.0
 
 ### Minor Changes
