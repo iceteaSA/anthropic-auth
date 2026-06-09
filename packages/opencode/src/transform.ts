@@ -870,48 +870,110 @@ export function createStrippedStream(
   const encoder = new TextEncoder()
   let pending = ''
   let chunkCount = 0
+  let pullCount = 0
   let inputBytes = 0
   let outputBytes = 0
   let rewriteMs = 0
+  let firstPullLogged = false
+  let readerReleased = false
+  let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
+
+  const releaseReader = () => {
+    if (readerReleased) return
+    readerReleased = true
+    reader.releaseLock()
+  }
+  const streamStats = (extra: Record<string, unknown> = {}) => ({
+    chunks: chunkCount,
+    pulls: pullCount,
+    inputBytes,
+    outputBytes,
+    pendingChars: pending.length,
+    rewriteMs: rewriteRoundMs(rewriteMs),
+    totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
+    ...extra,
+  })
+  const logProgress = (stage: string, extra: Record<string, unknown> = {}) => {
+    options.perf?.(stage, streamStats(extra))
+  }
+
+  options.perf?.('stream_tool_prefix_wrapper_created', {
+    status: response.status,
+    hasBody: true,
+  })
 
   const stream = new ReadableStream({
     async pull(controller) {
-      const { done, value } = await reader.read()
-      if (done) {
+      pullCount++
+      if (!firstPullLogged) {
+        firstPullLogged = true
+        logProgress('stream_tool_prefix_first_pull')
+      }
+
+      const readStart = rewriteNowMs()
+      try {
+        const { done, value } = await reader.read()
+        const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
+        if (done) {
+          const rewriteStart = rewriteNowMs()
+          const flushed = splitToolPrefixRewriteBuffer(
+            `${pending}${decoder.decode()}`,
+            true,
+          )
+          rewriteMs += rewriteNowMs() - rewriteStart
+          if (flushed.ready) {
+            const encoded = encoder.encode(flushed.ready)
+            outputBytes += encoded.byteLength
+            controller.enqueue(encoded)
+          }
+          logProgress('stream_tool_prefix_rewrite', { readMs })
+          releaseReader()
+          controller.close()
+          return
+        }
+
+        chunkCount++
+        inputBytes += value.byteLength
+        const text = pending + decoder.decode(value, { stream: true })
         const rewriteStart = rewriteNowMs()
-        const flushed = splitToolPrefixRewriteBuffer(
-          `${pending}${decoder.decode()}`,
-          true,
-        )
+        const rewritten = splitToolPrefixRewriteBuffer(text)
         rewriteMs += rewriteNowMs() - rewriteStart
-        if (flushed.ready) {
-          const encoded = encoder.encode(flushed.ready)
+        pending = rewritten.pending
+        if (rewritten.ready) {
+          const encoded = encoder.encode(rewritten.ready)
           outputBytes += encoded.byteLength
           controller.enqueue(encoded)
         }
-        options.perf?.('stream_tool_prefix_rewrite', {
-          chunks: chunkCount,
-          inputBytes,
-          outputBytes,
-          rewriteMs: rewriteRoundMs(rewriteMs),
-          totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
-        })
-        controller.close()
-        return
-      }
 
-      chunkCount++
-      inputBytes += value.byteLength
-      const text = pending + decoder.decode(value, { stream: true })
-      const rewriteStart = rewriteNowMs()
-      const rewritten = splitToolPrefixRewriteBuffer(text)
-      rewriteMs += rewriteNowMs() - rewriteStart
-      pending = rewritten.pending
-      if (rewritten.ready) {
-        const encoded = encoder.encode(rewritten.ready)
-        outputBytes += encoded.byteLength
-        controller.enqueue(encoded)
+        const now = rewriteNowMs()
+        if (
+          chunkCount === 1 ||
+          chunkCount % 25 === 0 ||
+          now - lastProgressAt > 5000
+        ) {
+          lastProgressAt = now
+          logProgress('stream_tool_prefix_progress', {
+            readMs,
+            lastChunkBytes: value.byteLength,
+          })
+        }
+      } catch (error) {
+        logProgress('stream_tool_prefix_error', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+        releaseReader()
+        throw error
+      }
+    },
+    async cancel(reason) {
+      logProgress('stream_tool_prefix_cancel', {
+        reason: reason instanceof Error ? reason.message : String(reason),
+      })
+      try {
+        await reader.cancel(reason)
+      } finally {
+        releaseReader()
       }
     },
   })
