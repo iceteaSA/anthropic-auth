@@ -17,6 +17,51 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true })
 })
 
+describe('CLI api add', () => {
+  test('saves API route config and stores API key in runtime state', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const proc = Bun.spawn(['bun', 'src/cli.ts', 'api', 'add', 'kie-opus'], {
+      cwd: packageRoot,
+      env: {
+        ...process.env,
+        OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
+        OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: 'https://api.kie.ai/claude',
+        OPENCODE_ANTHROPIC_AUTH_API_KEY: 'kie-key',
+        OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: 'authorization-bearer',
+      },
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ])
+
+    expect(stderr).toBe('')
+    expect(exitCode).toBe(0)
+    expect(stdout).toContain('Saved API fallback route "kie-opus"')
+
+    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(storage.accounts[0]).toMatchObject({
+      id: 'kie-opus',
+      label: 'kie-opus',
+      type: 'api',
+      enabled: true,
+      baseURL: 'https://api.kie.ai/claude',
+      authHeader: 'authorization-bearer',
+    })
+    expect(storage.accounts[0].apiKey).toBeUndefined()
+
+    const runtimeState = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(runtimeState.accounts['kie-opus'].apiKey).toBe('kie-key')
+  })
+})
+
 describe('CLI login', () => {
   test('continues from label prompt to OAuth callback prompt and saves account', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')

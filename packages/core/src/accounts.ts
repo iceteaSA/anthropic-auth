@@ -21,20 +21,44 @@ export const QUOTA_URL = 'https://api.anthropic.com/api/oauth/usage'
 
 export type QuotaWindowName = 'five_hour' | 'seven_day'
 
-export type OAuthAccount = {
+export type AccountBase = {
   id: string
   label?: string
+  enabled?: boolean
+  addedAt?: number
+  lastUsed?: number
+}
+
+export type OAuthAccount = AccountBase & {
   type: 'oauth'
   access?: string
   refresh: string
   expires?: number
-  enabled?: boolean
-  addedAt?: number
-  lastUsed?: number
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
   quota?: Partial<Record<QuotaWindowName, AccountQuotaWindow>>
+}
+
+export type ApiKeyAccount = AccountBase & {
+  type: 'api'
+  apiKey?: string
+  baseURL: string
+  authHeader?: 'authorization-bearer' | 'x-api-key'
+}
+
+export type FallbackAccount = OAuthAccount | ApiKeyAccount
+
+export function isOAuthAccount(
+  account: FallbackAccount,
+): account is OAuthAccount {
+  return account.type === 'oauth'
+}
+
+export function isApiKeyAccount(
+  account: FallbackAccount,
+): account is ApiKeyAccount {
+  return account.type === 'api'
 }
 
 export type AccountOperationError = {
@@ -123,19 +147,22 @@ export type AccountStorage = {
     transport?: 'http' | 'websocket'
   }
   killswitch?: KillswitchConfig
-  accounts: OAuthAccount[]
+  accounts: FallbackAccount[]
 }
 
-export type OAuthAccountRuntimeState = Pick<
-  OAuthAccount,
-  | 'access'
-  | 'refresh'
-  | 'expires'
-  | 'lastUsed'
-  | 'lastRefreshedAt'
-  | 'lastRefreshError'
-  | 'lastQuotaRefreshError'
-  | 'quota'
+export type AccountRuntimeEntry = Partial<
+  Pick<
+    OAuthAccount,
+    | 'access'
+    | 'refresh'
+    | 'expires'
+    | 'lastUsed'
+    | 'lastRefreshedAt'
+    | 'lastRefreshError'
+    | 'lastQuotaRefreshError'
+    | 'quota'
+  > &
+    Pick<ApiKeyAccount, 'apiKey' | 'lastUsed'>
 >
 
 export type AccountRuntimeState = {
@@ -150,7 +177,7 @@ export type AccountRuntimeState = {
     refreshLeaseUntil?: number
     refreshLeaseTokenHash?: string
   }
-  accounts?: Record<string, Partial<OAuthAccountRuntimeState>>
+  accounts?: Record<string, AccountRuntimeEntry>
 }
 
 export type AccountStateSaveScope = {
@@ -241,24 +268,46 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function normalizeAccount(value: unknown): OAuthAccount | null {
-  if (!isRecord(value)) return null
-  if (value.type !== 'oauth') return null
-  if (typeof value.refresh !== 'string' || !value.refresh.trim()) return null
-
+function normalizeAccountBase(value: Record<string, unknown>): AccountBase {
   return {
     id:
       typeof value.id === 'string' && value.id.trim()
         ? value.id.trim()
         : randomUUID(),
     label: typeof value.label === 'string' ? value.label : undefined,
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : undefined,
+    addedAt: typeof value.addedAt === 'number' ? value.addedAt : undefined,
+    lastUsed: typeof value.lastUsed === 'number' ? value.lastUsed : undefined,
+  }
+}
+
+function normalizeAccount(value: unknown): FallbackAccount | null {
+  if (!isRecord(value)) return null
+  if (value.type === 'api') {
+    const baseURL =
+      typeof value.baseURL === 'string' ? value.baseURL.trim() : ''
+    const apiKey = typeof value.apiKey === 'string' ? value.apiKey.trim() : ''
+    if (!baseURL) return null
+    const authHeader =
+      value.authHeader === 'x-api-key' ? 'x-api-key' : 'authorization-bearer'
+    return {
+      ...normalizeAccountBase(value),
+      type: 'api',
+      apiKey: apiKey || undefined,
+      baseURL,
+      authHeader,
+    }
+  }
+
+  if (value.type !== 'oauth') return null
+  if (typeof value.refresh !== 'string' || !value.refresh.trim()) return null
+
+  return {
+    ...normalizeAccountBase(value),
     type: 'oauth',
     access: typeof value.access === 'string' ? value.access : undefined,
     refresh: value.refresh,
     expires: typeof value.expires === 'number' ? value.expires : undefined,
-    enabled: typeof value.enabled === 'boolean' ? value.enabled : undefined,
-    addedAt: typeof value.addedAt === 'number' ? value.addedAt : undefined,
-    lastUsed: typeof value.lastUsed === 'number' ? value.lastUsed : undefined,
     lastRefreshedAt:
       typeof value.lastRefreshedAt === 'number'
         ? value.lastRefreshedAt
@@ -334,7 +383,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
     accounts: value.accounts
       .map(normalizeAccount)
-      .filter((account): account is OAuthAccount => account != null),
+      .filter((account): account is FallbackAccount => account != null),
   }
 }
 
@@ -421,17 +470,25 @@ function omitUndefinedTopLevel(value: Record<string, unknown>) {
   )
 }
 
-function accountConfig(account: OAuthAccount) {
+function accountConfig(account: FallbackAccount) {
   return objectWithDefinedEntries({
     id: account.id,
     label: account.label,
     type: account.type,
     enabled: account.enabled,
     addedAt: account.addedAt,
+    baseURL: account.type === 'api' ? account.baseURL : undefined,
+    authHeader: account.type === 'api' ? account.authHeader : undefined,
   })
 }
 
-function accountRuntimeState(account: OAuthAccount) {
+function accountRuntimeState(account: FallbackAccount) {
+  if (account.type === 'api') {
+    return objectWithDefinedEntries({
+      apiKey: account.apiKey,
+      lastUsed: account.lastUsed,
+    })
+  }
   return objectWithDefinedEntries({
     access: account.access,
     refresh: account.refresh,
@@ -1312,7 +1369,10 @@ export async function fetchOAuthQuotaSnapshot(input: {
   } satisfies OAuthQuotaSnapshot
 }
 
-function updateStoredAccount(storage: AccountStorage, account: OAuthAccount) {
+function updateStoredAccount(
+  storage: AccountStorage,
+  account: FallbackAccount,
+) {
   const index = storage.accounts.findIndex(
     (candidate) => candidate.id === account.id,
   )
@@ -1443,7 +1503,7 @@ export class FallbackAccountManager {
     let changed = false
 
     for (const account of storage.accounts) {
-      if (account.enabled === false) continue
+      if (account.enabled === false || !isOAuthAccount(account)) continue
       try {
         let next = account
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -1508,7 +1568,7 @@ export class FallbackAccountManager {
     return usable
   }
 
-  async markUsed(account: OAuthAccount) {
+  async markUsed(account: FallbackAccount) {
     const storage = await this.load()
     if (!storage) return
     const stored = storage.accounts.find(
@@ -1546,7 +1606,7 @@ export class FallbackAccountManager {
     if (!storage || !refreshEnabled(storage)) return
     let changed = false
     for (const account of storage.accounts) {
-      if (account.enabled === false) continue
+      if (account.enabled === false || !isOAuthAccount(account)) continue
       if (!tokenNeedsRefresh(account, storage, this.now())) continue
       if (
         refreshBackoffActive(
@@ -1590,7 +1650,7 @@ export class FallbackAccountManager {
     if (!storage || !quotaEnabled(storage)) return
     let changed = false
     for (const account of storage.accounts) {
-      if (account.enabled === false) continue
+      if (account.enabled === false || !isOAuthAccount(account)) continue
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -1638,7 +1698,7 @@ export class FallbackAccountManager {
     const force = options.force ?? false
     let changed = false
     for (const account of storage.accounts) {
-      if (account.enabled === false) continue
+      if (account.enabled === false || !isOAuthAccount(account)) continue
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -1685,7 +1745,7 @@ export class FallbackAccountManager {
     account: OAuthAccount,
     storage: AccountStorage,
     options: { force?: boolean } = {},
-  ) {
+  ): Promise<OAuthAccount> {
     const existing = this.refreshPromises.get(account.id)
     if (existing) {
       const refreshed = await existing
@@ -1709,7 +1769,7 @@ export class FallbackAccountManager {
     storage: AccountStorage,
     previous: OAuthAccount,
     options: { force?: boolean },
-  ) {
+  ): Promise<OAuthAccount | null> {
     const deadline = Date.now() + FALLBACK_REFRESH_JOIN_WAIT_MS
     while (Date.now() < deadline) {
       await new Promise((resolve) =>
@@ -1717,7 +1777,8 @@ export class FallbackAccountManager {
       )
       const latestStorage = await this.load()
       const latestAccount = latestStorage?.accounts.find(
-        (candidate) => candidate.id === account.id,
+        (candidate): candidate is OAuthAccount =>
+          candidate.id === account.id && isOAuthAccount(candidate),
       )
       if (!latestAccount) continue
 
@@ -1756,10 +1817,11 @@ export class FallbackAccountManager {
     account: OAuthAccount,
     storage: AccountStorage,
     options: { force?: boolean },
-  ) {
+  ): Promise<OAuthAccount> {
     let latestStorage = await this.load()
     let latestAccount = latestStorage?.accounts.find(
-      (candidate) => candidate.id === account.id,
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === account.id && isOAuthAccount(candidate),
     )
     if (
       latestAccount &&
@@ -1795,7 +1857,8 @@ export class FallbackAccountManager {
     try {
       latestStorage = await this.load()
       latestAccount = latestStorage?.accounts.find(
-        (candidate) => candidate.id === account.id,
+        (candidate): candidate is OAuthAccount =>
+          candidate.id === account.id && isOAuthAccount(candidate),
       )
       if (
         latestAccount &&

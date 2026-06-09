@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-
 import {
   type AccountStorage,
+  type ApiKeyAccount,
   acquireRefreshFileLock,
   authorize,
   buildClaudeQuotaSummary,
@@ -34,6 +34,7 @@ import {
   getRelayConfig,
   getRoutingMode,
   hashRefreshToken,
+  isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
@@ -43,12 +44,14 @@ import {
   isFastModePersistentlyEnabled,
   isFastModeSupportedModel,
   isKillswitchEnabled,
+  isOAuthAccount,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
   loadAccounts,
   log,
   mergeAnthropicBetas,
+  type OAuthAccount,
   type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   parseCache1hCommandAction,
@@ -78,6 +81,7 @@ import {
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
+
 import { resolvePromptContext } from './prompt-context.ts'
 import { type SidebarState, setSidebarState } from './sidebar-state.ts'
 import {
@@ -419,7 +423,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         refreshBackoffUntil: mainRefreshError?.nextRetryAt,
       },
       fallbacks: (storage?.accounts ?? [])
-        .filter((account) => account.enabled !== false)
+        .filter(
+          (account): account is OAuthAccount =>
+            account.enabled !== false && isOAuthAccount(account),
+        )
         .map((account) => ({
           id: account.id,
           label: account.label,
@@ -1373,7 +1380,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           }
 
           startMainBackgroundRefresh()
-          quotaManager.seedFallbacksFromAccounts(initialStorage?.accounts ?? [])
+          quotaManager.seedFallbacksFromAccounts(
+            (initialStorage?.accounts ?? []).filter(isOAuthAccount),
+          )
           writeSidebarState(initialStorage, {
             activeId: 'main',
             route: 'main',
@@ -1480,6 +1489,93 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }),
               rateLimited: false,
             }
+          }
+
+          function configureApiRouteHeaders(
+            headers: Headers,
+            account: ApiKeyAccount,
+          ) {
+            headers.delete('authorization')
+            headers.delete('x-api-key')
+            if (account.authHeader === 'x-api-key') {
+              headers.set('x-api-key', account.apiKey ?? '')
+            } else {
+              headers.set('Authorization', `Bearer ${account.apiKey ?? ''}`)
+            }
+            headers.set('Content-Type', 'application/json')
+          }
+
+          async function sendWithApiAccount(
+            input: string | URL | Request,
+            init: RequestInit | undefined,
+            account: ApiKeyAccount,
+            trace?: PerfTrace,
+            route = 'api_fallback',
+            currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+          ) {
+            void currentStorage
+            const start = nowMs()
+            const requestHeaders = mergeHeaders(input, init)
+            const subagentRequest = isSubagentRequest(requestHeaders)
+            requestHeaders.delete('x-parent-session-id')
+            requestHeaders.delete('x-session-affinity')
+            requestHeaders.delete('x-opencode-session')
+            let body = init?.body
+
+            const originalBytes =
+              typeof body === 'string' ? body.length : undefined
+            if (body && typeof body === 'string') {
+              const rewriteStart = nowMs()
+              const fastModeRequested = (() => {
+                if (!isFastModeEnabled()) return false
+                try {
+                  return isFastModeSupportedModel(JSON.parse(body).model)
+                } catch {
+                  return false
+                }
+              })()
+              body = await rewriteRequestBody(body, {
+                cache1hEnabled: !subagentRequest && isCache1hEnabled(),
+                cache1hMode: getCache1hMode(),
+                fastModeEnabled: fastModeRequested,
+              })
+              configureApiRouteHeaders(requestHeaders, account)
+              requestHeaders.set(
+                'anthropic-beta',
+                mergeAnthropicBetas(requestHeaders.get('anthropic-beta'), []),
+              )
+              if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
+              trace?.mark('rewrite_body', {
+                route,
+                ms: roundMs(nowMs() - rewriteStart),
+                originalBytes,
+                rewrittenBytes: body.length,
+                cacheEnabled: !subagentRequest && isCache1hEnabled(),
+                cacheMode: getCache1hMode(),
+                fastModeEnabled: fastModeRequested,
+                subagent: subagentRequest,
+              })
+            } else {
+              configureApiRouteHeaders(requestHeaders, account)
+            }
+
+            const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
+            const sendStart = nowMs()
+            const response = await fetch(rewritten.input, {
+              ...init,
+              body,
+              headers: requestHeaders,
+              ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+            })
+            trace?.mark('send_headers_received', {
+              route,
+              ms: roundMs(nowMs() - sendStart),
+              status: response.status,
+              relayConfigured: false,
+              totalSendWithAccessMs: roundMs(nowMs() - start),
+              baseURL: account.baseURL,
+            })
+            return response
           }
 
           async function sendWithAccessToken(
@@ -1632,21 +1728,36 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           // even if it still passes the softer routing quota policy.
           async function getRoutableFallbackAccounts(
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const usable =
+          ): Promise<Array<OAuthAccount | ApiKeyAccount>> {
+            const usableOAuth =
               await fallbackManager.getUsableFallbackAccounts(storageArg)
+            const usableApi = (storageArg?.accounts ?? []).filter(
+              (account): account is ApiKeyAccount =>
+                isApiKeyAccount(account) &&
+                account.enabled !== false &&
+                Boolean(account.apiKey) &&
+                Boolean(account.baseURL),
+            )
+            const usable: Array<OAuthAccount | ApiKeyAccount> = [
+              ...usableOAuth,
+              ...usableApi,
+            ]
             if (!isKillswitchEnabled(storageArg)) return usable
-            return usable.filter((a) =>
-              killswitchPassesPolicy(getFallbackQuota(a), storageArg, a.id),
+            return usable.filter((account) =>
+              isOAuthAccount(account)
+                ? killswitchPassesPolicy(
+                    getFallbackQuota(account),
+                    storageArg,
+                    account.id,
+                  )
+                : true,
             )
           }
 
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
-            accounts: Awaited<
-              ReturnType<FallbackAccountManager['getUsableFallbackAccounts']>
-            >,
+            accounts: Array<OAuthAccount | ApiKeyAccount>,
             storage: Awaited<ReturnType<typeof loadAccounts>>,
             currentResponse?: Response,
             trace?: PerfTrace,
@@ -1662,16 +1773,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             let lastResponse: Response | null = currentResponse ?? null
 
             for (const [index, account] of accounts.entries()) {
-              const access = account.access
-              if (!access) continue
-              let response = await sendWithAccessToken(
-                input,
-                init,
-                access,
-                trace,
-                `fallback_${index}`,
-                storage,
-              )
+              let response: Response
+              if (isApiKeyAccount(account)) {
+                if (!account.apiKey) continue
+                response = await sendWithApiAccount(
+                  input,
+                  init,
+                  account,
+                  trace,
+                  `api_fallback_${index}`,
+                  storage,
+                )
+              } else {
+                const access = account.access
+                if (!access) continue
+                response = await sendWithAccessToken(
+                  input,
+                  init,
+                  access,
+                  trace,
+                  `fallback_${index}`,
+                  storage,
+                )
+              }
               lastResponse = response
               let fallbackAgain = shouldFallbackStatus(response.status, storage)
               if (!fallbackAgain) {
@@ -1690,11 +1814,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 // request, so keep its quota fresh on the same cadence as main.
                 // Non-blocking; only the served account, never idle fallbacks.
                 if (
-                  access &&
+                  isOAuthAccount(account) &&
+                  account.access &&
                   quotaManager.shouldRefreshOnRequestCount(sessionRequestCount)
                 ) {
                   void quotaManager
-                    .refreshFallback(account.id, access)
+                    .refreshFallback(account.id, account.access)
                     .then(() => options?.onSuccess?.(account))
                     .catch(() => {})
                 }
@@ -1712,9 +1837,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             input: string | URL | Request,
             init: RequestInit | undefined,
             mainResponse: Response,
-            preselectedAccounts?: Awaited<
-              ReturnType<FallbackAccountManager['getUsableFallbackAccounts']>
-            >,
+            preselectedAccounts?: Array<OAuthAccount | ApiKeyAccount>,
             trace?: PerfTrace,
             existingStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             onFallbackSuccess?: (account: {
@@ -1812,7 +1935,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               const storage = await loadAccounts()
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
               quotaManager.updateStorage(storage)
-              quotaManager.seedFallbacksFromAccounts(storage?.accounts ?? [])
+              quotaManager.seedFallbacksFromAccounts(
+                (storage?.accounts ?? []).filter(isOAuthAccount),
+              )
               const replayableRequest = isReplayableRequest(input, init?.body)
               // Count every replayable request up front — before the
               // fallback-first early return — so the every-N refresh cadence
@@ -1837,11 +1962,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   mainRefreshToken: auth.refresh,
                 })
               let preselectedFallbackAccounts:
-                | Awaited<
-                    ReturnType<
-                      FallbackAccountManager['getUsableFallbackAccounts']
-                    >
-                  >
+                | Array<OAuthAccount | ApiKeyAccount>
                 | undefined
 
               if (
@@ -1943,7 +2064,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 // toast matches the sidebar and reflects background refreshes
                 // rather than the request-start storage snapshot.
                 const fallbacks = (storage?.accounts ?? [])
-                  .filter((a) => a.enabled !== false)
+                  .filter(
+                    (a): a is OAuthAccount =>
+                      a.enabled !== false && isOAuthAccount(a),
+                  )
                   .map((a) => ({
                     ...a,
                     // Token-aware read so a cached snapshot bound to a previous
@@ -2089,7 +2213,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 if (needsRefresh) {
                   try {
                     const fallbackAccts = (storage?.accounts ?? []).filter(
-                      (a) => a.enabled !== false && a.access,
+                      (a): a is OAuthAccount =>
+                        a.enabled !== false &&
+                        isOAuthAccount(a) &&
+                        Boolean(a.access),
                     )
                     await Promise.all([
                       quotaManager.refreshMain(auth.access),
@@ -2167,7 +2294,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 // response): hard-block instead of using the killed main.
                 const now = Date.now()
                 const fallbackAccounts = (storage?.accounts ?? [])
-                  .filter((a) => a.enabled !== false)
+                  .filter(
+                    (a): a is OAuthAccount =>
+                      a.enabled !== false && isOAuthAccount(a),
+                  )
                   .map((a) => ({ ...a, quota: getFallbackQuota(a) }))
                 const retryAfter = killswitchRetryAfterSeconds(
                   mainQuota,

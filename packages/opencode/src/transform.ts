@@ -239,11 +239,11 @@ export function isInsecure(): boolean {
  * Parse ANTHROPIC_BASE_URL from the environment.
  * Returns a valid HTTP(S) URL or null if unset/invalid.
  */
-function resolveBaseUrl(): URL | null {
-  const raw = process.env.ANTHROPIC_BASE_URL?.trim()
-  if (!raw) return null
+function parseBaseUrl(raw: string | undefined): URL | null {
+  const value = raw?.trim()
+  if (!value) return null
   try {
-    const baseUrl = new URL(raw)
+    const baseUrl = new URL(value)
     if (
       (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') ||
       baseUrl.username ||
@@ -257,13 +257,20 @@ function resolveBaseUrl(): URL | null {
   }
 }
 
+function resolveBaseUrl(): URL | null {
+  return parseBaseUrl(process.env.ANTHROPIC_BASE_URL)
+}
+
 /**
  * Rewrite the request URL to add ?beta=true for /v1/messages requests.
  * When ANTHROPIC_BASE_URL is set, overrides the origin (protocol + host)
  * for all API requests flowing through the fetch wrapper.
  * Returns the modified input and URL (if applicable).
  */
-export function rewriteUrl(input: FetchInput): {
+export function rewriteUrl(
+  input: FetchInput,
+  options: { baseURL?: string } = {},
+): {
   input: FetchInput
   url: URL | null
 } {
@@ -282,14 +289,19 @@ export function rewriteUrl(input: FetchInput): {
 
   const originalHref = requestUrl.href
 
-  const baseUrl = resolveBaseUrl()
+  const baseUrl = options.baseURL
+    ? parseBaseUrl(options.baseURL)
+    : resolveBaseUrl()
   if (baseUrl) {
     requestUrl.protocol = baseUrl.protocol
     requestUrl.host = baseUrl.host
+    if (options.baseURL) {
+      requestUrl.pathname = `${baseUrl.pathname.replace(/\/$/, '')}${requestUrl.pathname}`
+    }
   }
 
   if (
-    requestUrl.pathname === '/v1/messages' &&
+    requestUrl.pathname.endsWith('/v1/messages') &&
     !requestUrl.searchParams.has('beta')
   ) {
     requestUrl.searchParams.set('beta', 'true')

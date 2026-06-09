@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import type { AccountStorage } from '@cortexkit/anthropic-auth-core'
+import type {
+  AccountStorage,
+  OAuthAccount,
+} from '@cortexkit/anthropic-auth-core'
 import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
@@ -100,10 +103,28 @@ describe('quota summaries', () => {
         name: 'personal',
         role: 'fallback',
         enabled: false,
-        quota: storage.accounts[0]?.quota,
+        quota: (storage.accounts[0] as OAuthAccount).quota,
         lastRefreshedAt: 2,
       },
     ])
+  })
+
+  test('skips API-key fallback routes in OAuth quota summaries', () => {
+    const storage: AccountStorage = {
+      version: 1,
+      main: { type: 'opencode', provider: 'anthropic' },
+      accounts: [
+        {
+          id: 'kie-opus',
+          label: 'Kie Opus',
+          type: 'api',
+          apiKey: 'kie-key',
+          baseURL: 'https://api.kie.ai/claude',
+        },
+      ],
+    }
+
+    expect(buildFallbackQuotaSummaries(storage)).toEqual([])
   })
 
   test('includes fallback quota refresh errors when available', () => {

@@ -211,11 +211,11 @@ Example:
 
 The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
 
-Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, token refresh backoff, quota snapshots, and quota API backoff. Background refresh and quota checks write only the state file, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
+Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Background refresh and quota checks write only the state file, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
 ## Fallback accounts
 
-Fallback accounts are separate Claude OAuth accounts managed by this plugin. By default, the main account is tried first unless quota policy says it is currently unusable. Fallbacks are then tried in sidecar order when the primary request returns a configured fallback status.
+Fallback accounts are separate Claude OAuth accounts or Anthropic-compatible API-key routes managed by this plugin. By default, the main account is tried first unless quota policy says it is currently unusable. Fallbacks are then tried in sidecar order when the primary request returns a configured fallback status.
 
 Use `/claude-routing fallback-first` to prefer usable fallback accounts before the main account. Use `/claude-routing main-first` to restore the default. The command persists `routing.mode` and takes effect on the next request without restarting.
 
@@ -229,10 +229,15 @@ Add and inspect OpenCode fallback accounts with the CLI:
 
 ```bash
 bunx @cortexkit/opencode-anthropic-auth login personal-alt
+bunx @cortexkit/opencode-anthropic-auth api add kie-opus
 bunx @cortexkit/opencode-anthropic-auth list
 ```
 
 Prefer npm? Use `npx -y @cortexkit/opencode-anthropic-auth ...` with the same subcommands.
+
+API fallback routes use `Authorization: Bearer <key>` by default and rewrite requests to the configured Anthropic-compatible base URL. For Kie, use `https://api.kie.ai/claude` as the base URL; the plugin appends `/v1/messages` automatically. API-route keys are stored in `anthropic-auth-state.json`, while `anthropic-auth.json` keeps the route label, type, enabled flag, base URL, and auth-header mode.
+
+OpenCode cost accounting stays simple: when the native Anthropic auth entry is OAuth, OpenCode sees zero-cost Claude OAuth models. If a request falls through to an API-key route, token accounting is still recorded, but OpenCode's built-in dollar cost is not route-aware.
 
 For Pi fallback accounts, write the same account JSON shape to `~/.pi/agent/anthropic-auth.json`. The CLI helper currently lives in the OpenCode package, so you can also point it at Pi's sidecar path when logging in a fallback account:
 

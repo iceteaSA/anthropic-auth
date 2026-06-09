@@ -471,6 +471,71 @@ describe('auth.loader', () => {
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
+  test('routes to API-key fallback when main OAuth quota is exhausted', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 99, remainingPercent: 1 },
+            seven_day: { usedPercent: 99, remainingPercent: 1 },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'kie-opus',
+            label: 'Kie Opus',
+            type: 'api',
+            apiKey: 'kie-key',
+            baseURL: 'https://api.kie.ai/claude',
+            authHeader: 'authorization-bearer',
+          },
+        ],
+      }),
+    )
+
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      requests.push({
+        url,
+        authorization: new Headers(init?.headers).get('authorization'),
+      })
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.url).toBe(
+      'https://api.kie.ai/claude/v1/messages?beta=true',
+    )
+    expect(requests[0]?.authorization).toBe('Bearer kie-key')
+  })
+
   test('fallback-first refreshes current main quota for sidebar when persisted main quota belongs to an old token', async () => {
     await useTempAccountFile(
       createFallbackStorage({

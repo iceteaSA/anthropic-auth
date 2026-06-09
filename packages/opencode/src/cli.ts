@@ -6,10 +6,11 @@ import {
   type AccountStorage,
   authorize,
   exchange,
+  type FallbackAccount,
   generateRelayToken,
   getAccountStoragePath,
+  isOAuthAccount,
   loadAccounts,
-  type OAuthAccount,
   saveAccounts,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
@@ -40,6 +41,7 @@ function defaultStorage(): AccountStorage {
 function usage() {
   console.log(`Usage:
   opencode-anthropic-auth login [label]
+  opencode-anthropic-auth api add [label]
   opencode-anthropic-auth list
   opencode-anthropic-auth relay setup
 
@@ -222,16 +224,19 @@ async function relaySetup() {
   console.log(`Config saved to ${getAccountStoragePath()}.`)
 }
 
+let promptInterface: ReturnType<typeof createInterface> | null = null
+
 async function prompt(message: string) {
-  const rl = createInterface({ input, output })
-  try {
-    return (await rl.question(message)).trim()
-  } finally {
-    rl.close()
-  }
+  promptInterface ??= createInterface({ input, output })
+  return (await promptInterface.question(message)).trim()
 }
 
-function upsertAccount(storage: AccountStorage, account: OAuthAccount) {
+function closePromptInterface() {
+  promptInterface?.close()
+  promptInterface = null
+}
+
+function upsertAccount(storage: AccountStorage, account: FallbackAccount) {
   const index = storage.accounts.findIndex(
     (candidate) =>
       candidate.id === account.id ||
@@ -242,10 +247,12 @@ function upsertAccount(storage: AccountStorage, account: OAuthAccount) {
       ...storage.accounts[index],
       ...account,
       addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
-      quota: account.quota,
-      lastRefreshedAt: account.lastRefreshedAt,
-      lastRefreshError: account.lastRefreshError,
-      lastQuotaRefreshError: account.lastQuotaRefreshError,
+      ...(account.type === 'oauth' && {
+        quota: account.quota,
+        lastRefreshedAt: account.lastRefreshedAt,
+        lastRefreshError: account.lastRefreshError,
+        lastQuotaRefreshError: account.lastQuotaRefreshError,
+      }),
     }
     return
   }
@@ -291,6 +298,52 @@ async function login(labelArg?: string) {
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }
 
+async function addApiRoute(labelArg?: string) {
+  const storage = (await loadAccounts()) ?? defaultStorage()
+  const label =
+    labelArg?.trim() || (await prompt('API fallback label (optional): '))
+  const baseURL =
+    process.env.OPENCODE_ANTHROPIC_AUTH_API_BASE_URL?.trim() ||
+    (
+      await prompt(
+        'Anthropic-compatible base URL [https://api.kie.ai/claude]: ',
+      )
+    ).trim() ||
+    'https://api.kie.ai/claude'
+  const apiKey =
+    process.env.OPENCODE_ANTHROPIC_AUTH_API_KEY?.trim() ||
+    (await prompt('API key: '))
+  if (!apiKey.trim()) throw new Error('API key is required')
+  const authHeaderInput = (
+    process.env.OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER?.trim() ||
+    (await prompt(
+      'Auth header [authorization-bearer|x-api-key] (default authorization-bearer): ',
+    ))
+  )
+    .trim()
+    .toLowerCase()
+  const authHeader =
+    authHeaderInput === 'x-api-key' ? 'x-api-key' : 'authorization-bearer'
+  const now = Date.now()
+
+  upsertAccount(storage, {
+    id: label || crypto.randomUUID(),
+    label: label || undefined,
+    type: 'api',
+    apiKey: apiKey.trim(),
+    baseURL,
+    authHeader,
+    enabled: true,
+    addedAt: now,
+    lastUsed: now,
+  })
+  await saveAccounts(storage)
+
+  console.log(
+    `\nSaved API fallback route${label ? ` "${label}"` : ''} (${baseURL}).`,
+  )
+}
+
 async function listAccounts() {
   const storage = await loadAccounts()
   if (!storage?.accounts.length) {
@@ -301,6 +354,12 @@ async function listAccounts() {
   for (const [index, account] of storage.accounts.entries()) {
     const label = account.label || account.id
     const status = account.enabled === false ? 'disabled' : 'enabled'
+    if (!isOAuthAccount(account)) {
+      console.log(
+        `${index + 1}. ${label} (${status}) — API route ${account.baseURL}`,
+      )
+      continue
+    }
     const fiveHour = account.quota?.five_hour?.remainingPercent
     const sevenDay = account.quota?.seven_day?.remainingPercent
     const quota =
@@ -312,7 +371,7 @@ async function listAccounts() {
 }
 
 async function main() {
-  const [command, label] = process.argv.slice(2)
+  const [command, subcommandOrLabel, maybeLabel] = process.argv.slice(2)
   if (
     !command ||
     command === 'help' ||
@@ -324,7 +383,12 @@ async function main() {
   }
 
   if (command === 'login') {
-    await login(label)
+    await login(subcommandOrLabel)
+    return
+  }
+
+  if (command === 'api' && subcommandOrLabel === 'add') {
+    await addApiRoute(maybeLabel)
     return
   }
 
@@ -333,7 +397,7 @@ async function main() {
     return
   }
 
-  if (command === 'relay' && label === 'setup') {
+  if (command === 'relay' && subcommandOrLabel === 'setup') {
     await relaySetup()
     return
   }
@@ -347,4 +411,6 @@ try {
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error))
   process.exitCode = 1
+} finally {
+  closePromptInterface()
 }

@@ -12,6 +12,7 @@ import {
   getCache1hPersistentMode,
   isFastModePersistentlyEnabled,
   loadAccounts,
+  type OAuthAccount,
   QuotaManager,
   saveAccountState,
   saveAccounts,
@@ -25,6 +26,13 @@ import {
 
 let tempDir: string
 let accountPath: string
+
+function expectOAuthAccount(
+  account: AccountStorage['accounts'][number] | undefined,
+): OAuthAccount {
+  expect(account?.type).toBe('oauth')
+  return account as OAuthAccount
+}
 
 const baseStorage = (): AccountStorage => ({
   version: 1,
@@ -77,6 +85,35 @@ describe('account storage', () => {
     const rawState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
     expect(rawState.accounts['fallback-1'].access).toBe('access')
     expect(rawState.accounts['fallback-1'].refresh).toBe('refresh')
+
+    await expect(loadAccounts()).resolves.toEqual(storage)
+  })
+
+  test('stores API fallback route secret in runtime state and endpoint in config', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'kie-opus',
+      label: 'Kie Opus',
+      type: 'api',
+      apiKey: 'kie-key',
+      baseURL: 'https://api.kie.ai/claude',
+      authHeader: 'authorization-bearer',
+    })
+
+    await saveAccounts(storage)
+
+    const rawConfig = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(rawConfig.accounts[0]).toMatchObject({
+      id: 'kie-opus',
+      label: 'Kie Opus',
+      type: 'api',
+      baseURL: 'https://api.kie.ai/claude',
+      authHeader: 'authorization-bearer',
+    })
+    expect(rawConfig.accounts[0].apiKey).toBeUndefined()
+
+    const rawState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(rawState.accounts['kie-opus'].apiKey).toBe('kie-key')
 
     await expect(loadAccounts()).resolves.toEqual(storage)
   })
@@ -366,9 +403,9 @@ describe('FallbackAccountManager', () => {
     expect(accounts[0]?.access).toBe('new-access')
 
     const saved = await loadAccounts()
-    expect(saved?.accounts[0]?.refresh).toBe('new-refresh')
-    expect(saved?.accounts[0]?.expires).toBe(3_601_000)
-    expect(saved?.accounts[0]?.lastRefreshedAt).toBe(1_000)
+    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
+    expect(expectOAuthAccount(saved?.accounts[0]).expires).toBe(3_601_000)
+    expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
   })
 
   test('refreshes fallback tokens within the four-hour minimum window', async () => {
@@ -414,7 +451,7 @@ describe('FallbackAccountManager', () => {
 
     const saved = await loadAccounts()
     expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(saved?.accounts[0]?.refresh).toBe('new-refresh')
+    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
   })
 
   test('refresh backoff retry count resets after token rotation', () => {
@@ -473,10 +510,12 @@ describe('FallbackAccountManager', () => {
 
     const saved = await loadAccounts()
     expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(saved?.accounts[0]?.lastRefreshError?.nextRetryAt).toBeGreaterThan(
-      2_000,
-    )
-    expect(saved?.accounts[0]?.lastRefreshError?.retryCount).toBe(1)
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).lastRefreshError?.nextRetryAt,
+    ).toBeGreaterThan(2_000)
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).lastRefreshError?.retryCount,
+    ).toBe(1)
   })
 
   test('preserves existing refresh token when refresh response omits rotation', async () => {
@@ -510,9 +549,9 @@ describe('FallbackAccountManager', () => {
     await manager.refreshDueAccounts()
 
     const saved = await loadAccounts()
-    expect(saved?.accounts[0]?.access).toBe('new-access')
-    expect(saved?.accounts[0]?.refresh).toBe('old-refresh')
-    expect(saved?.accounts[0]?.lastRefreshedAt).toBe(1_000)
+    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('new-access')
+    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('old-refresh')
+    expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
   })
 
   test('re-reads latest stored token before refreshing stale snapshots', async () => {
@@ -546,10 +585,13 @@ describe('FallbackAccountManager', () => {
     })
     await saveAccounts(newer)
 
-    const refreshed = await manager.refreshAccount(stale.accounts[0]!, stale)
+    const refreshed = await manager.refreshAccount(
+      expectOAuthAccount(stale.accounts[0]),
+      stale,
+    )
 
     expect(refreshed.access).toBe('fresh-access')
-    expect(stale.accounts[0]?.refresh).toBe('fresh-refresh')
+    expect(expectOAuthAccount(stale.accounts[0]).refresh).toBe('fresh-refresh')
   })
 
   test('serializes concurrent fallback refreshes across manager instances', async () => {
@@ -614,9 +656,11 @@ describe('FallbackAccountManager', () => {
 
     const saved = await loadAccounts()
     expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(saved?.accounts[0]?.access).toBe('new-access')
-    expect(saved?.accounts[0]?.refresh).toBe('new-refresh')
-    expect(saved?.accounts[0]?.lastRefreshError).toBeUndefined()
+    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('new-access')
+    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).lastRefreshError,
+    ).toBeUndefined()
   })
 
   test('starts an immediate background refresh pass for unused expired fallbacks', async () => {
@@ -653,13 +697,14 @@ describe('FallbackAccountManager', () => {
     let saved: AccountStorage | null = null
     for (let attempt = 0; attempt < 50; attempt++) {
       saved = await loadAccounts()
-      if (saved?.accounts[0]?.access === 'fresh-access') break
+      if (expectOAuthAccount(saved?.accounts[0]).access === 'fresh-access')
+        break
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
     manager.stopBackgroundRefresh()
 
-    expect(saved?.accounts[0]?.access).toBe('fresh-access')
-    expect(saved?.accounts[0]?.refresh).toBe('fresh-refresh')
+    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('fresh-access')
+    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('fresh-refresh')
     expect(fetchImpl).toHaveBeenCalled()
   })
 
@@ -760,9 +805,9 @@ describe('FallbackAccountManager', () => {
     await manager.refreshQuotaForDueAccounts()
 
     const saved = await loadAccounts()
-    expect(saved?.accounts[0]?.access).toBe('new-access')
-    expect(saved?.accounts[0]?.refresh).toBe('new-refresh')
-    expect(saved?.accounts[0]?.lastRefreshedAt).toBe(1_000)
+    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('new-access')
+    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
+    expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
     expect(fetchImpl).toHaveBeenCalledTimes(1)
   })
 
@@ -871,7 +916,7 @@ describe('FallbackAccountManager', () => {
     expect(seen).toEqual(['Bearer old-access', 'Bearer fresh-access'])
 
     const saved = await loadAccounts()
-    expect(saved?.accounts[0]?.refresh).toBe('fresh-refresh')
+    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('fresh-refresh')
   })
 
   test('uses cached passing quota when a stale quota refresh is rate limited', async () => {
@@ -1001,8 +1046,12 @@ describe('FallbackAccountManager', () => {
     expect(result.errors).toEqual([])
     expect(fetchImpl).not.toHaveBeenCalled()
     const saved = await loadAccounts()
-    expect(saved?.accounts[0]?.quota?.five_hour?.remainingPercent).toBe(90)
-    expect(saved?.accounts[0]?.lastQuotaRefreshError).toBeUndefined()
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).quota?.five_hour?.remainingPercent,
+    ).toBe(90)
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).lastQuotaRefreshError,
+    ).toBeUndefined()
   })
 
   test('returns refresh errors from explicit quota refresh', async () => {
@@ -1026,7 +1075,9 @@ describe('FallbackAccountManager', () => {
     })
 
     const result = await manager.refreshQuotaForAllAccounts()
-    expect(result.storage?.accounts[0]?.quota).toBeUndefined()
+    expect(
+      expectOAuthAccount(result.storage?.accounts[0]).quota,
+    ).toBeUndefined()
     expect(result.errors).toEqual([
       {
         accountId: 'invalid-refresh',
@@ -1034,9 +1085,9 @@ describe('FallbackAccountManager', () => {
       },
     ])
     const saved = await loadAccounts()
-    expect(saved?.accounts[0]?.lastQuotaRefreshError?.message).toBe(
-      'Claude OAuth refresh failed: 400 — invalid_grant',
-    )
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).lastQuotaRefreshError?.message,
+    ).toBe('Claude OAuth refresh failed: 400 — invalid_grant')
   })
 
   test('force refreshes fresh accounts and persists the new quota', async () => {
@@ -1076,8 +1127,12 @@ describe('FallbackAccountManager', () => {
     expect(fetchImpl).toHaveBeenCalled()
     // Refreshed numbers are PERSISTED to disk (regression guard for #2).
     const saved = await loadAccounts()
-    expect(saved?.accounts[0]?.quota?.five_hour?.remainingPercent).toBe(30)
-    expect(saved?.accounts[0]?.quota?.seven_day?.remainingPercent).toBe(70)
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).quota?.five_hour?.remainingPercent,
+    ).toBe(30)
+    expect(
+      expectOAuthAccount(saved?.accounts[0]).quota?.seven_day?.remainingPercent,
+    ).toBe(70)
   })
 
   test('fallback policy uses the QuotaManager cache, not stale storage quota', async () => {
@@ -1226,7 +1281,10 @@ describe('FallbackAccountManager', () => {
       (await manager.getUsableFallbackAccounts(storage)).map((a) => a.id),
     ).toContain('same-label')
     expect(quotaProbeTokens).toEqual(['Bearer new-access'])
-    expect(storage.accounts[0]?.quota?.five_hour?.remainingPercent).toBe(90)
+    expect(
+      expectOAuthAccount(storage.accounts[0]).quota?.five_hour
+        ?.remainingPercent,
+    ).toBe(90)
   })
 })
 

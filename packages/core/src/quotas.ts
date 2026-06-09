@@ -5,6 +5,7 @@ import type {
   OAuthQuotaSnapshot,
   QuotaWindowName,
 } from './accounts.ts'
+import { isOAuthAccount } from './accounts.ts'
 
 export const CLAUDE_QUOTAS_COMMAND_NAME = 'claude-quota'
 
@@ -87,7 +88,7 @@ export function buildFallbackQuotaSummaries(
   errors: ReadonlyMap<string, string> = new Map(),
 ) {
   if (!storage?.accounts.length) return []
-  return storage.accounts.map((account) => {
+  return storage.accounts.filter(isOAuthAccount).map((account) => {
     const error = errors.get(account.id) ?? accountStoredError(account)
     return {
       name: accountName(account),

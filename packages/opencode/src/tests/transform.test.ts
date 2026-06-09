@@ -312,6 +312,16 @@ describe('rewriteUrl', () => {
     expect(url.pathname).toBe('/v1/messages')
   })
 
+  test('applies explicit fallback base URL path before /v1/messages', () => {
+    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages', {
+      baseURL: 'https://api.kie.ai/claude',
+    })
+    const url = new URL(input.toString())
+    expect(url.origin).toBe('https://api.kie.ai')
+    expect(url.pathname).toBe('/claude/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
+  })
+
   test('preserves beta=true when ANTHROPIC_BASE_URL is set', () => {
     process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080'
     const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
