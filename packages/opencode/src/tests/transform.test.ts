@@ -742,6 +742,20 @@ describe('rewriteRequestBody', () => {
     }
   })
 
+  test('removes top-level thinking from Fable requests', async () => {
+    const body = JSON.stringify({
+      model: 'claude-fable-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'adaptive', display: 'summarized' },
+      output_config: { effort: 'xhigh' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toBeUndefined()
+    expect(result.output_config).toEqual({ effort: 'xhigh' })
+  })
+
   test('removes existing fast speed when fast mode is disabled', async () => {
     const body = JSON.stringify({
       model: 'claude-opus-4-7',

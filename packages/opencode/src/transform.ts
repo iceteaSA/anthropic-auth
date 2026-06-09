@@ -7,6 +7,7 @@ import {
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
+  isClaudeFableOrMythos5Model,
   isFastModeSupportedModel,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
@@ -657,6 +658,13 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
 }
 
+function normalizeFableMythosRequest(parsed: Record<string, unknown>) {
+  if (!isClaudeFableOrMythos5Model(parsed.model)) return false
+  const hadThinking = Object.hasOwn(parsed, 'thinking')
+  delete parsed.thinking
+  return hadThinking
+}
+
 function applyCache1hStrategy(
   parsed: Record<string, unknown>,
   options: { enabled: boolean; mode: Cache1hMode },
@@ -778,6 +786,15 @@ export async function rewriteRequestBody(
         typeof messagesAfterStrip === 'number'
           ? messagesBeforeStrip - messagesAfterStrip
           : undefined,
+    })
+
+    const modelNormalizeStart = rewriteNowMs()
+    const removedFableThinking = normalizeFableMythosRequest(parsed)
+    options.perf?.('model_normalize', {
+      ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
+      model: typeof parsed.model === 'string' ? parsed.model : undefined,
+      removedFableThinking,
+      hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
 
     const billingStart = rewriteNowMs()
