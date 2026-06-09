@@ -2,6 +2,8 @@ import { describe, expect, mock, test } from 'bun:test'
 import {
   type AccountStorage,
   buildCacheKeepPrewarmBody,
+  CACHE_KEEP_MAX_BODY_BYTES,
+  CACHE_KEEP_MAX_TARGETS,
   CacheKeepManager,
   executeCacheKeepCommand,
   parseCacheKeepCommandAction,
@@ -227,5 +229,44 @@ describe('CacheKeepManager', () => {
     ).toBe(false)
     manager.stop()
     inside.stop()
+  })
+
+  test('bounds tracked sessions and rejects bodies over the memory budget', async () => {
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      now: () => new Date('2026-05-18T10:00:00').getTime(),
+    })
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+
+    for (let index = 0; index < CACHE_KEEP_MAX_TARGETS + 5; index++) {
+      await manager.track({
+        sessionId: `ses_${index}`,
+        url: 'https://api.anthropic.com/v1/messages?beta=true',
+        headers: new Headers(),
+        bodyText: body,
+        storage: hybridStorage(),
+        cacheMode: 'hybrid',
+      })
+    }
+    expect(manager.trackedCount()).toBe(CACHE_KEEP_MAX_TARGETS)
+
+    const tooLarge = await manager.track({
+      sessionId: 'too-large',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: 'x'.repeat(CACHE_KEEP_MAX_BODY_BYTES + 1),
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+    expect(tooLarge).toEqual({
+      tracked: false,
+      reason: 'body exceeds cachekeep memory budget',
+    })
+    manager.stop()
   })
 })

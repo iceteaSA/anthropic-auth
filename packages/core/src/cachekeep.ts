@@ -7,6 +7,9 @@ export const CACHE_KEEP_TTL_MS = 60 * 60_000
 export const CACHE_KEEP_PREWARM_LEAD_MS = 5 * 60_000
 export const CACHE_KEEP_TICK_MS = 60_000
 export const CACHE_KEEP_EXTENDED_TTL_BETA = 'extended-cache-ttl-2025-04-11'
+export const CACHE_KEEP_MAX_TARGETS = 32
+export const CACHE_KEEP_MAX_BODY_BYTES = 16 * 1024 * 1024
+export const CACHE_KEEP_STALE_TARGET_MS = 2 * CACHE_KEEP_TTL_MS
 
 const STATUS_TITLE = '## Claude Cache Keep Status'
 const ENABLED_TITLE = '## Claude Cache Keep Enabled'
@@ -305,6 +308,36 @@ export class CacheKeepManager {
     return this.targets.size
   }
 
+  private totalBodyBytes() {
+    return [...this.targets.values()].reduce(
+      (sum, target) => sum + target.bodyText.length,
+      0,
+    )
+  }
+
+  private evictOldestTarget() {
+    const oldest = this.targets.keys().next().value
+    if (oldest !== undefined) this.targets.delete(oldest)
+  }
+
+  private pruneTargets(now: number, today?: string) {
+    for (const [id, target] of this.targets) {
+      if (today && target.dayKey !== today) {
+        this.targets.delete(id)
+        continue
+      }
+      if (now - target.cacheExpiresAt > CACHE_KEEP_STALE_TARGET_MS) {
+        this.targets.delete(id)
+      }
+    }
+    while (this.targets.size > CACHE_KEEP_MAX_TARGETS) this.evictOldestTarget()
+    while (this.totalBodyBytes() > CACHE_KEEP_MAX_BODY_BYTES) {
+      const before = this.targets.size
+      this.evictOldestTarget()
+      if (this.targets.size === before) break
+    }
+  }
+
   track(input: {
     sessionId?: string | null
     url: string
@@ -321,11 +354,18 @@ export class CacheKeepManager {
     if (input.cacheMode !== 'hybrid') {
       return { tracked: false, reason: 'cache mode is not hybrid' }
     }
+    if (input.bodyText.length > CACHE_KEEP_MAX_BODY_BYTES) {
+      return { tracked: false, reason: 'body exceeds cachekeep memory budget' }
+    }
     const now = this.options.now?.() ?? Date.now()
     const window = getCacheKeepWindow(input.storage)
     if (!isWithinCacheKeepWindow(window, new Date(now))) {
       return { tracked: false, reason: 'outside configured window' }
     }
+
+    const today = localWindowKey(window, new Date(now))
+    this.pruneTargets(now, today)
+    if (this.targets.has(input.sessionId)) this.targets.delete(input.sessionId)
 
     const headers: Record<string, string> = {}
     input.headers.forEach((value, key) => {
@@ -338,8 +378,9 @@ export class CacheKeepManager {
       headers,
       bodyText: input.bodyText,
       cacheExpiresAt: now + CACHE_KEEP_TTL_MS,
-      dayKey: localWindowKey(window, new Date(now)),
+      dayKey: today,
     })
+    this.pruneTargets(now, today)
     this.start()
     return { tracked: true }
   }
@@ -350,9 +391,7 @@ export class CacheKeepManager {
     const now = this.options.now?.() ?? Date.now()
     const today = localWindowKey(window, new Date(now))
 
-    for (const [id, target] of this.targets) {
-      if (target.dayKey !== today) this.targets.delete(id)
-    }
+    this.pruneTargets(now, today)
     if (!this.targets.size) {
       this.stop()
       return

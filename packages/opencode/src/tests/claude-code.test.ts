@@ -186,6 +186,18 @@ describe('Claude Code bootstrap identity lookup', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  test('negative-caches failed bootstrap lookups briefly', async () => {
+    const fetchMock = mock(async () => new Response('nope', { status: 503 }))
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity('sk-ant-oat-negative-cache')
+    const second = await resolveClaudeCodeIdentity('sk-ant-oat-negative-cache')
+
+    expect(first.accountUuid).toBeUndefined()
+    expect(second.accountUuid).toBeUndefined()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   test('keeps identity stable across rotated access tokens for the same account UUID', async () => {
     const accountUuid = 'c7b3bc43-f4d8-48c6-a30f-7fd81a8db03f'
     const fetchMock = mock(

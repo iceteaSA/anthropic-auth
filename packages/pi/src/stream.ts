@@ -180,23 +180,32 @@ async function* parseSse(response: Response): AsyncGenerator<AnthropicEvent> {
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  let completed = false
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let boundary = buffer.indexOf('\n\n')
-    while (boundary !== -1) {
-      const frame = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + 2)
-      boundary = buffer.indexOf('\n\n')
-      for (const line of frame.split('\n')) {
-        if (!line.startsWith('data:')) continue
-        const data = line.slice(5).trim()
-        if (!data || data === '[DONE]') continue
-        yield JSON.parse(data) as AnthropicEvent
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        completed = true
+        break
+      }
+      buffer += decoder.decode(value, { stream: true })
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        boundary = buffer.indexOf('\n\n')
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data:')) continue
+          const data = line.slice(5).trim()
+          if (!data || data === '[DONE]') continue
+          yield JSON.parse(data) as AnthropicEvent
+        }
       }
     }
+  } finally {
+    if (!completed) await reader.cancel().catch(() => {})
+    reader.releaseLock()
   }
 }
 
@@ -379,6 +388,7 @@ async function executeWithFallback(options: {
       ) {
         return preflight
       }
+      await response.body?.cancel().catch(() => {})
     }
     return null
   }
@@ -407,7 +417,12 @@ async function executeWithFallback(options: {
     const fallback = await tryFallbackAccounts({
       includeApiRoutes: allowApiFallback,
     })
-    if (fallback) return fallback
+    if (fallback) {
+      if (primaryPreflight instanceof Response) {
+        await primaryPreflight.body?.cancel().catch(() => {})
+      }
+      return fallback
+    }
   }
 
   return primaryPreflight instanceof Response ? primaryPreflight : primary

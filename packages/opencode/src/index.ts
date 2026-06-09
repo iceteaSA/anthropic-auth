@@ -1903,6 +1903,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               ms: roundMs(nowMs() - loadStart),
               cached: !!existingStorage,
             })
+            const hasPotentialFallbackRoute = (storage?.accounts ?? []).some(
+              (account) =>
+                account.enabled !== false &&
+                (isOAuthAccount(account) ||
+                  (isApiKeyAccount(account) &&
+                    Boolean(account.apiKey) &&
+                    isValidApiBaseURL(account.baseURL))),
+            )
+            if (!hasPotentialFallbackRoute) return mainResponse
+
             let currentResponse = mainResponse
             let shouldFallback = shouldFallbackStatus(
               currentResponse.status,

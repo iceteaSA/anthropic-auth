@@ -24,6 +24,7 @@ type RelaySessionState = {
   hash: string
   revision: number
   body: string
+  updatedAt: number
 }
 
 type RelayPayload = {
@@ -111,6 +112,10 @@ class RelayWebSocketConnectionResetError extends Error {
 const sessionState = new Map<string, RelaySessionState>()
 const websocketSessions = new Map<string, PersistentRelaySession>()
 const loggedRelayConfigMessages = new Set<string>()
+const RELAY_SESSION_STATE_TTL_MS = 2 * 60 * 60_000
+const RELAY_WEBSOCKET_IDLE_TTL_MS = 30 * 60_000
+const MAX_RELAY_SESSION_STATES = 128
+const MAX_RELAY_WEBSOCKET_SESSIONS = 32
 let nextRequestId = 0
 
 function createRequestId() {
@@ -265,6 +270,7 @@ function jsonHeaders(headers: Headers) {
 async function postRelay(
   config: RelayConfig,
   payload: RelayPayload,
+  signal?: AbortSignal | null,
 ): Promise<Response> {
   return fetch(config.url, {
     method: 'POST',
@@ -273,6 +279,7 @@ async function postRelay(
       'x-relay-token': config.token,
     },
     body: JSON.stringify(payload),
+    signal: signal ?? undefined,
   })
 }
 
@@ -351,11 +358,15 @@ function updateLocalRelayState(
   nextHash: string,
   revision: number,
 ) {
+  const now = Date.now()
+  sessionState.delete(affinity)
   sessionState.set(affinity, {
     body: bodyText,
     hash: nextHash,
     revision,
+    updatedAt: now,
   })
+  cleanupRelaySessionCaches(now)
 }
 
 async function sendRelayHttp(options: {
@@ -363,17 +374,18 @@ async function sendRelayHttp(options: {
   payload: RelayPayload
   bodyText: string
   fallback: () => Promise<Response>
+  signal?: AbortSignal | null
 }): Promise<RelaySendResult> {
-  const { config, payload, bodyText, fallback } = options
+  const { config, payload, bodyText, fallback, signal } = options
   let actualPayload = payload
-  let response = await postRelay(config, actualPayload)
+  let response = await postRelay(config, actualPayload, signal)
   if (response.status === 409 && actualPayload.mode === 'patch') {
     relayLog(
       `state mismatch from relay session=${shortAffinity(actualPayload.affinity)}; retrying full_sync`,
     )
     await response.body?.cancel().catch(() => {})
     actualPayload = createFullSyncPayload(actualPayload, bodyText)
-    response = await postRelay(config, actualPayload)
+    response = await postRelay(config, actualPayload, signal)
   }
   if (!response.ok && response.status >= 500 && config.fallbackToDirect) {
     relayLog(
@@ -469,17 +481,38 @@ class PersistentRelaySession {
   private queue: Promise<void> = Promise.resolve()
   private pending?: PendingWebSocketRequest
   private serverState: { hash: string; revision: number } | null | undefined
+  private lastUsedAt = Date.now()
 
   constructor(
     private readonly config: RelayConfig,
     private readonly affinity: string,
   ) {}
 
+  touch(now = Date.now()) {
+    this.lastUsedAt = now
+  }
+
+  canEvict(now = Date.now()) {
+    return (
+      !this.pending &&
+      !this.connecting &&
+      now - this.lastUsedAt > RELAY_WEBSOCKET_IDLE_TTL_MS
+    )
+  }
+
+  dispose() {
+    this.socket?.close()
+    this.socket = undefined
+    this.serverState = undefined
+    this.connecting = undefined
+  }
+
   send(
     payload: RelayPayload,
     bodyText: string,
     optimisticResponse = false,
   ): Promise<RelaySendResult> {
+    this.touch()
     const enqueuedAt = perfNowMs()
     const start = this.queue
       .catch(() => {})
@@ -932,11 +965,47 @@ class PersistentRelaySession {
   }
 }
 
+function cleanupRelaySessionCaches(now = Date.now()) {
+  for (const [affinity, state] of sessionState) {
+    if (now - state.updatedAt > RELAY_SESSION_STATE_TTL_MS) {
+      sessionState.delete(affinity)
+    }
+  }
+  while (sessionState.size > MAX_RELAY_SESSION_STATES) {
+    const oldest = sessionState.keys().next().value
+    if (oldest === undefined) break
+    sessionState.delete(oldest)
+  }
+
+  for (const [affinity, session] of websocketSessions) {
+    if (session.canEvict(now)) {
+      session.dispose()
+      websocketSessions.delete(affinity)
+    }
+  }
+  while (websocketSessions.size > MAX_RELAY_WEBSOCKET_SESSIONS) {
+    let evicted = false
+    for (const [affinity, session] of websocketSessions) {
+      if (!session.canEvict(now)) continue
+      session.dispose()
+      websocketSessions.delete(affinity)
+      evicted = true
+      break
+    }
+    if (!evicted) break
+  }
+}
+
 function getPersistentRelaySession(config: RelayConfig, affinity: string) {
+  cleanupRelaySessionCaches()
   const existing = websocketSessions.get(affinity)
-  if (existing) return existing
+  if (existing) {
+    existing.touch()
+    return existing
+  }
   const session = new PersistentRelaySession(config, affinity)
   websocketSessions.set(affinity, session)
+  cleanupRelaySessionCaches()
   return session
 }
 
@@ -997,10 +1066,22 @@ export async function sendViaRelay(options: {
         relayLog(
           `websocket relay failed session=${shortAffinity(affinity)}; trying http relay: ${error instanceof Error ? error.message : String(error)}`,
         )
-        result = await sendRelayHttp({ config, payload, bodyText, fallback })
+        result = await sendRelayHttp({
+          config,
+          payload,
+          bodyText,
+          fallback,
+          signal: init?.signal,
+        })
       }
     } else {
-      result = await sendRelayHttp({ config, payload, bodyText, fallback })
+      result = await sendRelayHttp({
+        config,
+        payload,
+        bodyText,
+        fallback,
+        signal: init?.signal,
+      })
     }
 
     if (!result.usedRelay) return result.response

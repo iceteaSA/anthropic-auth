@@ -39,7 +39,13 @@ export function getClaudeCodeIdentity(seed: string): ClaudeCodeIdentity {
   return identity
 }
 
+const BOOTSTRAP_IDENTITY_CACHE_TTL_MS = 24 * 60 * 60_000
+const BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS = 5 * 60_000
 const bootstrapFetches = new Map<string, Promise<string | null>>()
+const bootstrapResults = new Map<
+  string,
+  { accountUuid: string | null; expiresAt: number }
+>()
 
 async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
   if (!accessToken.startsWith('sk-ant-oat')) return null
@@ -81,17 +87,36 @@ export async function resolveClaudeCodeIdentity(
   const identity = getClaudeCodeIdentity(accessToken)
   if (!accessToken.startsWith('sk-ant-oat')) return identity
 
+  const now = Date.now()
+  const cachedResult = bootstrapResults.get(accessToken)
+  if (cachedResult && cachedResult.expiresAt > now) {
+    if (!cachedResult.accountUuid) return identity
+    const accountCacheKey = `account:${cachedResult.accountUuid}`
+    const accountIdentity = identityCache.get(accountCacheKey)
+    if (accountIdentity) {
+      setBounded(identityCache, accessToken, accountIdentity)
+      return accountIdentity
+    }
+  }
+
   let fetchPromise = bootstrapFetches.get(accessToken)
   if (!fetchPromise) {
     fetchPromise = fetchClaudeCodeAccountUuid(accessToken, model)
     bootstrapFetches.set(accessToken, fetchPromise)
   }
 
-  const accountUuid = await fetchPromise
-  if (!accountUuid) {
+  const accountUuid = await fetchPromise.finally(() => {
     bootstrapFetches.delete(accessToken)
-    return identity
-  }
+  })
+  setBounded(bootstrapResults, accessToken, {
+    accountUuid,
+    expiresAt:
+      now +
+      (accountUuid
+        ? BOOTSTRAP_IDENTITY_CACHE_TTL_MS
+        : BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS),
+  })
+  if (!accountUuid) return identity
 
   const accountCacheKey = `account:${accountUuid}`
   const accountIdentity = identityCache.get(accountCacheKey)
