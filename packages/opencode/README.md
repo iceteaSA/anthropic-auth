@@ -233,7 +233,7 @@ bunx @cortexkit/opencode-anthropic-auth list
 
 Prefer npm? Use `npx -y @cortexkit/opencode-anthropic-auth ...` with the same subcommands.
 
-API fallback routes use `Authorization: Bearer <key>` by default and rewrite requests to the configured Anthropic-compatible base URL. For Kie, use `https://api.kie.ai/claude` as the base URL; the plugin appends `/v1/messages` automatically. API-route keys are stored in `anthropic-auth-state.json`, while `anthropic-auth.json` keeps the route label, type, enabled flag, base URL, and auth-header mode.
+API fallback routes use `Authorization: Bearer <key>` by default and rewrite requests to the configured Anthropic-compatible base URL. For Kie, use `https://api.kie.ai/claude` as the base URL; the plugin appends `/v1/messages` automatically. API-key routes are only eligible after direct evidence that the main OAuth quota is exhausted: a fresh token-bound quota snapshot at 0% remaining, or an actual main OAuth model response with HTTP 429 / streaming rate-limit error followed by a live quota check that confirms 0% remaining. Low-but-nonzero quota, stale cached quota, unconfirmed 429s, 401, or 403 do not trigger API-key routes. API-route keys are stored in `anthropic-auth-state.json`, while `anthropic-auth.json` keeps the route label, type, enabled flag, base URL, and auth-header mode.
 
 OpenCode cost accounting stays simple: when the native Anthropic auth entry is OAuth, OpenCode sees zero-cost Claude OAuth models. If a request falls through to an API-key route, token accounting is still recorded, but OpenCode's built-in dollar cost is not route-aware.
 

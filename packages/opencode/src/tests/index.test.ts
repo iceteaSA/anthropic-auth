@@ -471,7 +471,7 @@ describe('auth.loader', () => {
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
-  test('routes to API-key fallback when main OAuth quota is exhausted', async () => {
+  test('does not route to API-key fallback when main OAuth quota is low but not exhausted', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         quota: {
@@ -531,12 +531,156 @@ describe('auth.loader', () => {
 
     expect(requests).toHaveLength(1)
     expect(requests[0]?.url).toBe(
-      'https://api.kie.ai/claude/v1/messages?beta=true',
+      'https://api.anthropic.com/v1/messages?beta=true',
     )
-    expect(requests[0]?.authorization).toBe('Bearer kie-key')
+    expect(requests[0]?.authorization).toBe('Bearer main-access')
   })
 
-  test('preserves sidecar fallback order across OAuth and API-key routes', async () => {
+  test('routes to API-key fallback when cached main OAuth quota is exhausted', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 100, remainingPercent: 0 },
+            seven_day: { usedPercent: 50, remainingPercent: 50 },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'kie-opus',
+            label: 'Kie Opus',
+            type: 'api',
+            apiKey: 'kie-key',
+            baseURL: 'https://api.kie.ai/claude',
+            authHeader: 'authorization-bearer',
+          },
+        ],
+      }),
+    )
+
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      requests.push({
+        url,
+        authorization: new Headers(init?.headers).get('authorization'),
+      })
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({
+      url: 'https://api.kie.ai/claude/v1/messages?beta=true',
+      authorization: 'Bearer kie-key',
+    })
+  })
+
+  test('does not route to API-key fallback from stale cached main OAuth exhaustion', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 100, remainingPercent: 0 },
+            seven_day: { usedPercent: 50, remainingPercent: 50 },
+          },
+          mainQuotaCheckedAt: Date.now() - 60 * 60 * 1000,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'kie-opus',
+            label: 'Kie Opus',
+            type: 'api',
+            apiKey: 'kie-key',
+            baseURL: 'https://api.kie.ai/claude',
+            authHeader: 'authorization-bearer',
+          },
+        ],
+      }),
+    )
+
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    let quotaCalls = 0
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        quotaCalls++
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      requests.push({
+        url,
+        authorization: new Headers(init?.headers).get('authorization'),
+      })
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(quotaCalls).toBe(1)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      authorization: 'Bearer main-access',
+    })
+  })
+
+  test('does not use API-key route in fallback-first before main quota is exhausted', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
@@ -621,12 +765,12 @@ describe('auth.loader', () => {
 
     expect(requests).toHaveLength(1)
     expect(requests[0]).toMatchObject({
-      url: 'https://api.kie.ai/claude/v1/messages?beta=true',
-      authorization: 'Bearer kie-key',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      authorization: 'Bearer fallback-access',
     })
   })
 
-  test('routes to API-key fallback after main OAuth returns fallback status', async () => {
+  test('routes to API-key fallback after main OAuth returns 429 and quota confirms exhaustion', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         quota: {
@@ -649,9 +793,23 @@ describe('auth.loader', () => {
     )
 
     const requests: Array<{ url: string; authorization: string | null }> = []
+    let quotaCalls = 0
     globalThis.fetch = mock((input: any, init: any) => {
       const url = extractUrl(input)
       const authorization = new Headers(init?.headers).get('authorization')
+      if (url.includes('/api/oauth/usage')) {
+        quotaCalls++
+        expect(authorization).toBe('Bearer main-access')
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 100 },
+              seven_day: { utilization: 50 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       requests.push({ url, authorization })
       if (requests.length === 1) {
         return Promise.resolve(new Response('main exhausted', { status: 429 }))
@@ -680,6 +838,7 @@ describe('auth.loader', () => {
     })
 
     expect(response.status).toBe(200)
+    expect(quotaCalls).toBe(1)
     expect(requests).toHaveLength(2)
     expect(requests[0]).toMatchObject({
       url: 'https://api.anthropic.com/v1/messages?beta=true',
@@ -688,6 +847,139 @@ describe('auth.loader', () => {
     expect(requests[1]).toMatchObject({
       url: 'https://api.kie.ai/claude/v1/messages?beta=true',
       authorization: 'Bearer kie-key',
+    })
+  })
+
+  test('does not route to API-key fallback after main 429 when quota does not confirm exhaustion', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'kie-opus',
+            label: 'Kie Opus',
+            type: 'api',
+            apiKey: 'kie-key',
+            baseURL: 'https://api.kie.ai/claude',
+            authHeader: 'authorization-bearer',
+          },
+        ],
+      }),
+    )
+
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    let quotaCalls = 0
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      const authorization = new Headers(init?.headers).get('authorization')
+      if (url.includes('/api/oauth/usage')) {
+        quotaCalls++
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.25 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      requests.push({ url, authorization })
+      return Promise.resolve(
+        new Response('transient rate limit', { status: 429 }),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(429)
+    expect(quotaCalls).toBe(1)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      authorization: 'Bearer main-access',
+    })
+  })
+
+  test('does not route to API-key fallback after non-quota main OAuth fallback status', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'kie-opus',
+            label: 'Kie Opus',
+            type: 'api',
+            apiKey: 'kie-key',
+            baseURL: 'https://api.kie.ai/claude',
+            authHeader: 'authorization-bearer',
+          },
+        ],
+      }),
+    )
+
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      requests.push({
+        url: extractUrl(input),
+        authorization: new Headers(init?.headers).get('authorization'),
+      })
+      return Promise.resolve(new Response('auth failure', { status: 403 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(403)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      authorization: 'Bearer main-access',
     })
   })
 

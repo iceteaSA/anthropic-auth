@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildExplicitBaseMessagesUrl,
   configureApiRouteHeaders,
+  primaryResponseAllowsApiFallback,
 } from '../stream.ts'
 
 describe('Pi API fallback routing helpers', () => {
@@ -30,6 +31,22 @@ describe('Pi API fallback routing helpers', () => {
     expect(headers.get('x-api-key')).toBeNull()
     expect(headers.get('anthropic-version')).toBe('2023-06-01')
     expect(headers.get('content-type')).toBe('application/json')
+  })
+
+  test('only allows API fallback for direct primary quota exhaustion evidence', () => {
+    expect(
+      primaryResponseAllowsApiFallback(new Response(null, { status: 429 })),
+    ).toBe(true)
+    expect(primaryResponseAllowsApiFallback('rate_limit_error')).toBe(true)
+    expect(
+      primaryResponseAllowsApiFallback(new Response(null, { status: 403 })),
+    ).toBe(false)
+    expect(
+      primaryResponseAllowsApiFallback(new Response(null, { status: 401 })),
+    ).toBe(false)
+    expect(
+      primaryResponseAllowsApiFallback(new Response(null, { status: 200 })),
+    ).toBe(false)
   })
 
   test('supports x-api-key auth mode for API fallback routes', () => {

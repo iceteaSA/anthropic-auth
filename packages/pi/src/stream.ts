@@ -16,6 +16,7 @@ import {
   isValidApiBaseURL,
   loadAccounts,
   mergeAnthropicBetas,
+  QuotaManager,
   resolveClaudeCodeIdentity,
   sendViaRelay,
   shouldFallbackStatus,
@@ -269,6 +270,21 @@ async function sendAnthropicRequest(options: {
   })
 }
 
+function quotaSnapshotIsExhausted(
+  quota: Awaited<ReturnType<QuotaManager['refreshMain']>> | undefined,
+) {
+  return Object.values(quota ?? {}).some(
+    (window) => window && window.remainingPercent <= 0,
+  )
+}
+
+export function primaryResponseAllowsApiFallback(preflight: Response | string) {
+  return (
+    preflight === 'rate_limit_error' ||
+    (preflight instanceof Response && preflight.status === 429)
+  )
+}
+
 async function firstStreamingError(
   response: Response,
 ): Promise<Response | string> {
@@ -302,8 +318,25 @@ async function executeWithFallback(options: {
     configPath: options.storagePath,
   })
   const storage = await loadAccounts(options.storagePath)
+  const quotaManager = new QuotaManager({ storage })
 
-  async function tryFallbackAccounts() {
+  async function primaryQuotaRefreshConfirmsExhausted() {
+    try {
+      const quota = await quotaManager.refreshMain(options.primaryAccessToken)
+      const entry = quotaManager.getMain(options.primaryAccessToken)
+      return Boolean(
+        entry &&
+          entry.refreshAfter > Date.now() &&
+          quotaSnapshotIsExhausted(quota),
+      )
+    } catch {
+      return false
+    }
+  }
+
+  async function tryFallbackAccounts(
+    routeOptions: { includeApiRoutes?: boolean } = {},
+  ) {
     const usableOAuth = await manager.getUsableFallbackAccounts(storage)
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
@@ -322,6 +355,7 @@ async function executeWithFallback(options: {
           accessToken: account.access,
         })
       } else if (
+        routeOptions.includeApiRoutes === true &&
         isApiKeyAccount(account) &&
         account.enabled !== false &&
         account.apiKey &&
@@ -365,8 +399,14 @@ async function executeWithFallback(options: {
       return primaryPreflight
   }
 
-  if (!fallbackFirst) {
-    const fallback = await tryFallbackAccounts()
+  const allowApiFallback =
+    primaryResponseAllowsApiFallback(primaryPreflight) &&
+    (await primaryQuotaRefreshConfirmsExhausted())
+
+  if (!fallbackFirst || allowApiFallback) {
+    const fallback = await tryFallbackAccounts({
+      includeApiRoutes: allowApiFallback,
+    })
     if (fallback) return fallback
   }
 

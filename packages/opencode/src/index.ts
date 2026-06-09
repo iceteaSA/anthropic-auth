@@ -1727,8 +1727,46 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           // retries) must go through this so the killswitch is a hard block on
           // ALL routes — a killswitch-killed account must never serve a request,
           // even if it still passes the softer routing quota policy.
+          function quotaSnapshotIsExhausted(
+            quota: OAuthQuotaSnapshot | null | undefined,
+          ) {
+            return Object.values(quota ?? {}).some(
+              (window) => window && window.remainingPercent <= 0,
+            )
+          }
+
+          function responseShowsMainQuotaExhausted(
+            response: Response,
+            streamingRateLimited: boolean,
+          ) {
+            return response.status === 429 || streamingRateLimited
+          }
+
+          function mainQuotaEntryIsFreshExhausted(accessToken?: string) {
+            if (!accessToken) return false
+            const entry = quotaManager.getMain(accessToken)
+            return Boolean(
+              entry &&
+                entry.refreshAfter > Date.now() &&
+                quotaSnapshotIsExhausted(entry.quota),
+            )
+          }
+
+          async function refreshMainQuotaConfirmsExhausted(
+            accessToken?: string,
+          ) {
+            if (!accessToken) return false
+            try {
+              await quotaManager.refreshMain(accessToken)
+              return mainQuotaEntryIsFreshExhausted(accessToken)
+            } catch {
+              return false
+            }
+          }
+
           async function getRoutableFallbackAccounts(
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
+            options: { includeApiRoutes?: boolean } = {},
           ): Promise<Array<OAuthAccount | ApiKeyAccount>> {
             const usableOAuth =
               await fallbackManager.getUsableFallbackAccounts(storageArg)
@@ -1743,6 +1781,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 continue
               }
               if (
+                options.includeApiRoutes === true &&
                 isApiKeyAccount(account) &&
                 account.enabled !== false &&
                 account.apiKey &&
@@ -1849,6 +1888,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             preselectedAccounts?: Array<OAuthAccount | ApiKeyAccount>,
             trace?: PerfTrace,
             existingStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+            mainAccessToken?: string,
             onFallbackSuccess?: (account: {
               id: string
               access?: string
@@ -1868,6 +1908,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               currentResponse.status,
               storage,
             )
+            let mainQuotaExhaustedByResponse = responseShowsMainQuotaExhausted(
+              currentResponse,
+              false,
+            )
             if (!shouldFallback) {
               const inspected = await inspectStreamingRateLimit(
                 currentResponse,
@@ -1875,15 +1919,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               )
               currentResponse = inspected.response
               shouldFallback = inspected.rateLimited
+              mainQuotaExhaustedByResponse = responseShowsMainQuotaExhausted(
+                currentResponse,
+                inspected.rateLimited,
+              )
             }
             if (!shouldFallback) {
               return currentResponse
             }
 
+            let includeApiRoutes = false
+            if (preselectedAccounts) {
+              includeApiRoutes = preselectedAccounts.some(isApiKeyAccount)
+            } else if (mainQuotaExhaustedByResponse) {
+              includeApiRoutes =
+                await refreshMainQuotaConfirmsExhausted(mainAccessToken)
+            }
+
             let accounts = preselectedAccounts
             if (!accounts) {
               const accountsStart = nowMs()
-              accounts = await getRoutableFallbackAccounts(storage)
+              accounts = await getRoutableFallbackAccounts(storage, {
+                includeApiRoutes,
+              })
               trace?.mark('fallback_get_accounts', {
                 ms: roundMs(nowMs() - accountsStart),
                 accounts: accounts.length,
@@ -1983,7 +2041,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 try {
                   const fallbackStart = nowMs()
                   preselectedFallbackAccounts =
-                    await getRoutableFallbackAccounts(storage)
+                    await getRoutableFallbackAccounts(storage, {
+                      includeApiRoutes: mainQuotaEntryIsFreshExhausted(
+                        auth.access,
+                      ),
+                    })
                   trace.mark('fallback_first_get_accounts', {
                     ms: roundMs(nowMs() - fallbackStart),
                     accounts: preselectedFallbackAccounts.length,
@@ -2007,7 +2069,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     })
                     return createStrippedStream(fallbackResponse)
                   }
-                  preselectedFallbackAccounts = []
+                  preselectedFallbackAccounts = undefined
                 } catch (error) {
                   trace.mark('fallback_first_error', {
                     error:
@@ -2112,21 +2174,33 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   // Token-aware read: getMain(auth.access) drops a cached entry
                   // bound to a different access token (main-account switch) so
                   // routing never uses the previous account's quota.
-                  let routingQuota = quotaManager.getMain(auth.access)?.quota
+                  let routingQuotaEntry = quotaManager.getMain(auth.access)
+                  let routingQuota = routingQuotaEntry?.quota
                   if (!routingQuota) {
                     routingQuota = await quotaManager.refreshMain(auth.access)
+                    routingQuotaEntry = quotaManager.getMain(auth.access)
                     showQuotaToastFromCache()
                   } else if (quotaManager.needsRefresh(sessionRequestCount)) {
-                    // Stale OR every-N request boundary — background refresh,
-                    // return current snapshot to avoid blocking. Refresh the
-                    // sidebar and show the toast once the new main quota lands.
-                    void quotaManager
-                      .refreshMain(auth.access)
-                      .then(() => {
-                        void refreshSidebarQuota()
-                        showQuotaToastFromCache()
-                      })
-                      .catch(() => {})
+                    if (quotaSnapshotIsExhausted(routingQuota)) {
+                      // A stale exhausted snapshot is not strong enough evidence
+                      // to spend API-key credits. Re-check synchronously; if the
+                      // quota API is backed off and only stale data is returned,
+                      // the API route gate below still refuses it because the
+                      // entry is not fresh.
+                      routingQuota = await quotaManager.refreshMain(auth.access)
+                      routingQuotaEntry = quotaManager.getMain(auth.access)
+                    } else {
+                      // Stale OR every-N request boundary — background refresh,
+                      // return current snapshot to avoid blocking. Refresh the
+                      // sidebar and show the toast once the new main quota lands.
+                      void quotaManager
+                        .refreshMain(auth.access)
+                        .then(() => {
+                          void refreshSidebarQuota()
+                          showQuotaToastFromCache()
+                        })
+                        .catch(() => {})
+                    }
                   }
                   // Update the sidebar every replayable request so fallback
                   // quota refreshed by the background timer is reflected too.
@@ -2143,7 +2217,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   if (!quotaSnapshotPassesPolicy(routingQuota, storage)) {
                     const fallbackStart = nowMs()
                     preselectedFallbackAccounts =
-                      await getRoutableFallbackAccounts(storage)
+                      await getRoutableFallbackAccounts(storage, {
+                        includeApiRoutes: Boolean(
+                          routingQuotaEntry &&
+                            routingQuotaEntry.refreshAfter > Date.now() &&
+                            quotaSnapshotIsExhausted(routingQuotaEntry.quota),
+                        ),
+                      })
                     trace.mark('preselect_fallback_accounts', {
                       ms: roundMs(nowMs() - fallbackStart),
                       accounts: preselectedFallbackAccounts.length,
@@ -2269,7 +2349,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   init?.body,
                 )
                 const survivingFallbacks = canReplayToFallback
-                  ? await getRoutableFallbackAccounts(storage)
+                  ? await getRoutableFallbackAccounts(storage, {
+                      includeApiRoutes: mainQuotaEntryIsFreshExhausted(
+                        auth.access,
+                      ),
+                    })
                   : []
 
                 if (survivingFallbacks.length > 0) {
@@ -2349,6 +2433,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 preselectedFallbackAccounts,
                 trace,
                 storage,
+                auth.access,
                 (account) => {
                   fallbackServed = true
                   writeCurrentSidebarState(account.id, 'fallback')
