@@ -1,4 +1,5 @@
 import {
+  type ApiKeyAccount,
   applyClaudeCodeHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
@@ -7,9 +8,12 @@ import {
   getCache1hPersistentMode,
   getRelayConfig,
   getRoutingMode,
+  isApiKeyAccount,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isFastModePersistentlyEnabled,
+  isOAuthAccount,
+  isValidApiBaseURL,
   loadAccounts,
   mergeAnthropicBetas,
   resolveClaudeCodeIdentity,
@@ -140,6 +144,36 @@ function updateUsage(
   calculateCost(model, output.usage)
 }
 
+export function buildExplicitBaseMessagesUrl(baseURL: string) {
+  const url = new URL(baseURL)
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/v1/messages`
+  url.searchParams.set('beta', 'true')
+  return url
+}
+
+export function configureApiRouteHeaders(
+  account: ApiKeyAccount,
+  fastMode: boolean,
+) {
+  const headers = new Headers()
+  headers.set('accept', 'application/json')
+  headers.set('content-type', 'application/json')
+  headers.set('anthropic-version', '2023-06-01')
+  headers.set('anthropic-beta', mergeAnthropicBetas(null, []))
+  if (account.authHeader === 'x-api-key') {
+    headers.set('x-api-key', account.apiKey ?? '')
+  } else {
+    headers.set('authorization', `Bearer ${account.apiKey ?? ''}`)
+  }
+  if (fastMode) {
+    headers.set(
+      'anthropic-beta',
+      mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
+    )
+  }
+  return headers
+}
+
 async function* parseSse(response: Response): AsyncGenerator<AnthropicEvent> {
   if (!response.body) return
   const reader = response.body.getReader()
@@ -169,14 +203,14 @@ async function sendAnthropicRequest(options: {
   model: Model<Api>
   context: Context
   streamOptions?: SimpleStreamOptions
-  accessToken: string
+  accessToken?: string
+  apiAccount?: ApiKeyAccount
   storagePath: string
 }): Promise<Response> {
   const storage = await loadAccounts(options.storagePath)
-  const identity = await resolveClaudeCodeIdentity(
-    options.accessToken,
-    options.model.id,
-  )
+  const identity = options.accessToken
+    ? await resolveClaudeCodeIdentity(options.accessToken, options.model.id)
+    : undefined
   const { body, bodyText } = await buildAnthropicRequest(
     options.model.id,
     options.context,
@@ -188,11 +222,14 @@ async function sendAnthropicRequest(options: {
     isFastModePersistentlyEnabled(storage),
     identity,
   )
-  const headers = applyClaudeCodeHeaders(new Headers(), options.accessToken, {
-    body,
-    identity,
-  })
-  if (body.speed === 'fast') {
+  const fastMode = body.speed === 'fast'
+  const headers = options.apiAccount
+    ? configureApiRouteHeaders(options.apiAccount, fastMode)
+    : applyClaudeCodeHeaders(new Headers(), options.accessToken ?? '', {
+        body,
+        identity,
+      })
+  if (!options.apiAccount && fastMode) {
     headers.set(
       'anthropic-beta',
       mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
@@ -200,7 +237,9 @@ async function sendAnthropicRequest(options: {
   }
   const relayAffinity = options.streamOptions?.sessionId ?? null
 
-  const input = new URL('/v1/messages?beta=true', options.model.baseUrl)
+  const input = options.apiAccount
+    ? buildExplicitBaseMessagesUrl(options.apiAccount.baseURL)
+    : new URL('/v1/messages?beta=true', options.model.baseUrl)
   const init: RequestInit = {
     method: 'POST',
     headers,
@@ -216,6 +255,8 @@ async function sendAnthropicRequest(options: {
     storage,
     cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
   })
+
+  if (options.apiAccount) return fetch(input, init)
 
   return sendViaRelay({
     config: getRelayConfig(storage),
@@ -263,12 +304,36 @@ async function executeWithFallback(options: {
   const storage = await loadAccounts(options.storagePath)
 
   async function tryFallbackAccounts() {
-    for (const account of await manager.getUsableFallbackAccounts(storage)) {
-      if (!account.access) continue
-      const response = await sendAnthropicRequest({
-        ...options,
-        accessToken: account.access,
-      })
+    const usableOAuth = await manager.getUsableFallbackAccounts(storage)
+    const usableOAuthById = new Map(
+      usableOAuth.map((account) => [account.id, account]),
+    )
+    for (const configured of storage?.accounts ?? []) {
+      let response: Response | null = null
+      const account = isOAuthAccount(configured)
+        ? usableOAuthById.get(configured.id)
+        : configured
+      if (!account) continue
+
+      if (isOAuthAccount(account)) {
+        if (!account.access) continue
+        response = await sendAnthropicRequest({
+          ...options,
+          accessToken: account.access,
+        })
+      } else if (
+        isApiKeyAccount(account) &&
+        account.enabled !== false &&
+        account.apiKey &&
+        isValidApiBaseURL(account.baseURL)
+      ) {
+        response = await sendAnthropicRequest({
+          ...options,
+          apiAccount: account,
+        })
+      }
+      if (!response) continue
+
       const preflight = await firstStreamingError(response)
       if (preflight instanceof Response && preflight.ok) {
         await manager.markUsed(account)

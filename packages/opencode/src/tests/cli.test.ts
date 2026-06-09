@@ -60,6 +60,31 @@ describe('CLI api add', () => {
     )
     expect(runtimeState.accounts['kie-opus'].apiKey).toBe('kie-key')
   })
+
+  test('rejects invalid API base URL before saving route state', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const proc = Bun.spawn(['bun', 'src/cli.ts', 'api', 'add', 'bad-api'], {
+      cwd: packageRoot,
+      env: {
+        ...process.env,
+        OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
+        OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: 'https://secret@example.com/v1',
+        OPENCODE_ANTHROPIC_AUTH_API_KEY: 'kie-key',
+        OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: 'authorization-bearer',
+      },
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+
+    const [exitCode, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stderr).text(),
+    ])
+
+    expect(exitCode).toBe(1)
+    expect(stderr).toContain('API fallback base URL must be an http(s) URL')
+  })
 })
 
 describe('CLI login', () => {

@@ -10,6 +10,7 @@ import {
   generateRelayToken,
   getAccountStoragePath,
   isOAuthAccount,
+  isValidApiBaseURL,
   loadAccounts,
   saveAccounts,
   WORKER_SCRIPT,
@@ -310,6 +311,11 @@ async function addApiRoute(labelArg?: string) {
       )
     ).trim() ||
     'https://api.kie.ai/claude'
+  if (!isValidApiBaseURL(baseURL)) {
+    throw new Error(
+      'API fallback base URL must be an http(s) URL without embedded credentials',
+    )
+  }
   const apiKey =
     process.env.OPENCODE_ANTHROPIC_AUTH_API_KEY?.trim() ||
     (await prompt('API key: '))

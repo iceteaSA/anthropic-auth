@@ -71,7 +71,7 @@ The sidecar uses the same JSON shape as the OpenCode package, including `routing
 /claude-quota
 ```
 
-`/claude-quota` reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`. `/claude-routing fallback-first` prefers usable fallback accounts before the main account; `/claude-routing main-first` restores the default. `/claude-cachekeep HH-HH` keeps recently used hybrid-mode session caches warm during the configured local time window by sending `max_tokens: 0` pre-warm requests about five minutes before the 1-hour TTL expires. `/claude-fast on` adds Anthropic `speed: "fast"` plus the `fast-mode-2026-02-01` beta header for supported Opus models (`claude-opus-4-6`, `claude-opus-4-7`, and `claude-opus-4-8`).
+`/claude-quota` reports sidecar OAuth fallback quota state from `~/.pi/agent/anthropic-auth.json`. `/claude-routing fallback-first` prefers usable fallback accounts and API-key routes before the main account; `/claude-routing main-first` restores the default. API-key routes use the same sidecar shape as OpenCode and are sent directly to their configured Anthropic-compatible base URL, such as Kie's `https://api.kie.ai/claude`. `/claude-cachekeep HH-HH` keeps recently used hybrid-mode session caches warm during the configured local time window by sending `max_tokens: 0` pre-warm requests about five minutes before the 1-hour TTL expires. `/claude-fast on` adds Anthropic `speed: "fast"` plus the `fast-mode-2026-02-01` beta header for supported Opus models (`claude-opus-4-6`, `claude-opus-4-7`, and `claude-opus-4-8`).
 
 ## Relay
 

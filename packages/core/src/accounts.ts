@@ -61,6 +61,21 @@ export function isApiKeyAccount(
   return account.type === 'api'
 }
 
+export function isValidApiBaseURL(value: string | undefined) {
+  const raw = value?.trim()
+  if (!raw) return false
+  try {
+    const url = new URL(raw)
+    return (
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      !url.username &&
+      !url.password
+    )
+  } catch {
+    return false
+  }
+}
+
 export type AccountOperationError = {
   message: string
   checkedAt: number
@@ -287,7 +302,7 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     const baseURL =
       typeof value.baseURL === 'string' ? value.baseURL.trim() : ''
     const apiKey = typeof value.apiKey === 'string' ? value.apiKey.trim() : ''
-    if (!baseURL) return null
+    if (!isValidApiBaseURL(baseURL)) return null
     const authHeader =
       value.authHeader === 'x-api-key' ? 'x-api-key' : 'authorization-bearer'
     return {

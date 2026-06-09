@@ -45,6 +45,7 @@ import {
   isFastModeSupportedModel,
   isKillswitchEnabled,
   isOAuthAccount,
+  isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
@@ -1731,17 +1732,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ): Promise<Array<OAuthAccount | ApiKeyAccount>> {
             const usableOAuth =
               await fallbackManager.getUsableFallbackAccounts(storageArg)
-            const usableApi = (storageArg?.accounts ?? []).filter(
-              (account): account is ApiKeyAccount =>
+            const usableOAuthById = new Map(
+              usableOAuth.map((account) => [account.id, account]),
+            )
+            const usable: Array<OAuthAccount | ApiKeyAccount> = []
+            for (const account of storageArg?.accounts ?? []) {
+              if (isOAuthAccount(account)) {
+                const usableAccount = usableOAuthById.get(account.id)
+                if (usableAccount) usable.push(usableAccount)
+                continue
+              }
+              if (
                 isApiKeyAccount(account) &&
                 account.enabled !== false &&
-                Boolean(account.apiKey) &&
-                Boolean(account.baseURL),
-            )
-            const usable: Array<OAuthAccount | ApiKeyAccount> = [
-              ...usableOAuth,
-              ...usableApi,
-            ]
+                account.apiKey &&
+                isValidApiBaseURL(account.baseURL)
+              ) {
+                usable.push(account)
+              }
+            }
             if (!isKillswitchEnabled(storageArg)) return usable
             return usable.filter((account) =>
               isOAuthAccount(account)
@@ -1874,7 +1883,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             let accounts = preselectedAccounts
             if (!accounts) {
               const accountsStart = nowMs()
-              accounts = await fallbackManager.getUsableFallbackAccounts()
+              accounts = await getRoutableFallbackAccounts(storage)
               trace?.mark('fallback_get_accounts', {
                 ms: roundMs(nowMs() - accountsStart),
                 accounts: accounts.length,
@@ -1883,10 +1892,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             if (isKillswitchEnabled(storage)) {
               const before = accounts.length
               accounts = accounts.filter((a) =>
-                // Prefer the fresh QuotaManager cache (updated by the eager
-                // killswitch refresh) over the request-start storage snapshot,
-                // matching the other killswitch fallback filters.
-                killswitchPassesPolicy(getFallbackQuota(a), storage, a.id),
+                isOAuthAccount(a)
+                  ? // Prefer the fresh QuotaManager cache (updated by the eager
+                    // killswitch refresh) over the request-start storage snapshot,
+                    // matching the other killswitch fallback filters.
+                    killswitchPassesPolicy(getFallbackQuota(a), storage, a.id)
+                  : true,
               )
               if (accounts.length < before) {
                 log('[killswitch] filtered fallbacks', {

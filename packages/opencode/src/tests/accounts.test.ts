@@ -118,6 +118,34 @@ describe('account storage', () => {
     await expect(loadAccounts()).resolves.toEqual(storage)
   })
 
+  test('drops API fallback routes with invalid base URLs on load', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [
+          {
+            id: 'bad-api',
+            type: 'api',
+            baseURL: 'https://token@example.com/v1',
+            enabled: true,
+          },
+          {
+            id: 'good-api',
+            type: 'api',
+            baseURL: 'https://api.kie.ai/claude',
+            enabled: true,
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts.map((account) => account.id)).toEqual(['good-api'])
+  })
+
   test('runtime state saves do not rewrite user-editable config', async () => {
     const storage = baseStorage()
     storage.quota = {
