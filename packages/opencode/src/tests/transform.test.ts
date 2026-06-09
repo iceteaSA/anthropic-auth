@@ -9,6 +9,7 @@ import dedent from 'dedent'
 import {
   addFastModeBetaHeader,
   createStrippedStream,
+  getSanitizeMemoStats,
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
@@ -640,6 +641,37 @@ describe('sanitizeSystemText', () => {
       Normal content.
     `)
     expect(onError).not.toHaveBeenCalled()
+  })
+
+  test('memoised output equals a fresh sanitation and is stable on repeat', () => {
+    const text = dedent`
+      You are OpenCode, an AI assistant.
+
+      Keep this paragraph intact.
+    `
+    const first = sanitizeSystemText(text)
+    const second = sanitizeSystemText(text)
+    expect(second).toBe(first)
+    // identity-bearing paragraph is still stripped (behaviour unchanged)
+    expect(first).not.toContain(OPENCODE_IDENTITY_PREFIX)
+  })
+
+  test('getSanitizeMemoStats records a hit on identical repeat input', () => {
+    // Force the memo on regardless of the ambient OPENCODE_ANTHROPIC_AUTH_MEMO
+    // env (baseline test runs may export =0, which would disable caching).
+    const prev = process.env.OPENCODE_ANTHROPIC_AUTH_MEMO
+    process.env.OPENCODE_ANTHROPIC_AUTH_MEMO = '1'
+    try {
+      const before = getSanitizeMemoStats()
+      const text = `unique-memo-probe-${Date.now()}`
+      sanitizeSystemText(text)
+      sanitizeSystemText(text)
+      const after = getSanitizeMemoStats()
+      expect(after.hits - before.hits).toBeGreaterThanOrEqual(1)
+    } finally {
+      if (prev === undefined) delete process.env.OPENCODE_ANTHROPIC_AUTH_MEMO
+      else process.env.OPENCODE_ANTHROPIC_AUTH_MEMO = prev
+    }
   })
 })
 
