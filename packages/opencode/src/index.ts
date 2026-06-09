@@ -12,6 +12,11 @@ import {
   CacheKeepManager,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
+  CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
+  CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
+  CLAUDE_FABLE_MYTHOS_5_PRICING,
+  CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
@@ -283,7 +288,61 @@ const ZERO_MODEL_COST = {
   cache: { read: 0, write: 0 },
 }
 
-function zeroModelCosts<T extends Record<string, { cost?: unknown }>>(
+type AnthropicProviderModel = {
+  id?: string
+  name?: string
+  cost?: unknown
+  limit?: { context?: number; output?: number; [key: string]: unknown }
+  capabilities?: Record<string, unknown>
+  release_date?: string
+  [key: string]: unknown
+}
+
+function addFableMythos5Models<
+  T extends Record<string, AnthropicProviderModel>,
+>(models: T) {
+  const base =
+    models['claude-opus-4-8'] ??
+    models['claude-opus-4-5'] ??
+    Object.values(models)[0]
+  if (!base) return models
+
+  return {
+    ...models,
+    ...Object.fromEntries(
+      Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((spec) => [
+        spec.id,
+        {
+          ...base,
+          id: spec.id,
+          name: spec.name,
+          cost: {
+            input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
+            output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,
+            cache: {
+              read: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheRead,
+              write: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
+            },
+          },
+          limit: {
+            ...(base.limit ?? {}),
+            context: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
+            output: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+          },
+          capabilities: {
+            ...(base.capabilities ?? {}),
+            reasoning: true,
+            attachment: true,
+            toolcall: true,
+          },
+          release_date: CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
+        },
+      ]),
+    ),
+  } as T
+}
+
+function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   models: T,
 ) {
   return Object.fromEntries(
@@ -882,11 +941,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     provider: {
       id: 'anthropic',
       async models(
-        provider: { models: Record<string, { cost?: unknown }> },
+        provider: { models: Record<string, AnthropicProviderModel> },
         context: { auth?: { type?: string } },
       ) {
-        if (context.auth?.type !== 'oauth') return provider.models
-        return zeroModelCosts(provider.models)
+        const models = addFableMythos5Models(provider.models)
+        if (context.auth?.type !== 'oauth') return models
+        return zeroModelCosts(models)
       },
     },
     'command.execute.before': async (input: {

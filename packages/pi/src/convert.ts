@@ -5,6 +5,7 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
+  isClaudeFableOrMythos5Model,
   isFastModeSupportedModel,
   orderClaudeCodeBody,
   signRequestBody,
@@ -43,6 +44,7 @@ export type AnthropicRequestBody = {
   messages: Array<Record<string, unknown>>
   tools?: Array<Record<string, unknown>>
   thinking?: { type: 'enabled'; budget_tokens: number }
+  output_config?: { effort: string }
   cache_control?: { type: 'ephemeral' }
   speed?: 'fast'
 }
@@ -341,23 +343,27 @@ export async function buildAnthropicRequest(
   }
 
   if (options?.reasoning) {
-    const budgets: Record<string, number> = {
-      minimal: 1024,
-      low: 4096,
-      medium: 10_240,
-      high: 20_480,
-      xhigh: 32_000,
-    }
-    body.thinking = {
-      type: 'enabled',
-      budget_tokens:
-        (
-          options.thinkingBudgets as
-            | Record<string, number | undefined>
-            | undefined
-        )?.[options.reasoning] ??
-        budgets[options.reasoning] ??
-        10_240,
+    if (isClaudeFableOrMythos5Model(modelId)) {
+      body.output_config = { effort: options.reasoning }
+    } else {
+      const budgets: Record<string, number> = {
+        minimal: 1024,
+        low: 4096,
+        medium: 10_240,
+        high: 20_480,
+        xhigh: 32_000,
+      }
+      body.thinking = {
+        type: 'enabled',
+        budget_tokens:
+          (
+            options.thinkingBudgets as
+              | Record<string, number | undefined>
+              | undefined
+          )?.[options.reasoning] ??
+          budgets[options.reasoning] ??
+          10_240,
+      }
     }
   }
 

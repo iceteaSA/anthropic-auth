@@ -267,6 +267,32 @@ describe('convertMessages — empty base64 image guard', () => {
   })
 })
 
+describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
+  test('maps Pi reasoning to output_config effort for Claude Fable 5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'high' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toBeUndefined()
+    expect(body.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('keeps manual thinking budgets for non-Fable models', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-4-8',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'high' } as any,
+      defaultCache,
+    )
+
+    expect(body.output_config).toBeUndefined()
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 20_480 })
+  })
+})
+
 describe('convertMessages — empty error tool_result guard', () => {
   test('injects Error placeholder when is_error=true and content is empty', async () => {
     const messages = await buildMessages([

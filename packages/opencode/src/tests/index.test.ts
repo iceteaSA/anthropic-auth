@@ -315,9 +315,13 @@ describe('provider.models', () => {
   test('zeros out Anthropic model costs for OAuth auth', async () => {
     const plugin = await getPlugin()
     const models = {
-      'claude-3': {
-        id: 'claude-3',
-        cost: { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+      'claude-opus-4-8': {
+        id: 'claude-opus-4-8',
+        name: 'Claude Opus 4.8',
+        cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+        limit: { context: 1_000_000, output: 128_000 },
+        capabilities: { reasoning: true, attachment: true, toolcall: true },
+        release_date: '2026-01-01',
       },
     }
 
@@ -326,24 +330,39 @@ describe('provider.models', () => {
       { auth: { type: 'oauth' } } as never,
     )
 
-    expect(result?.['claude-3']?.cost).toEqual({
+    expect(result?.['claude-opus-4-8']?.cost).toEqual({
       input: 0,
       output: 0,
       cache: { read: 0, write: 0 },
     })
-    expect(models['claude-3'].cost).toEqual({
-      input: 3,
-      output: 15,
-      cache: { read: 0.3, write: 3.75 },
+    expect(result?.['claude-fable-5']?.name).toBe('Claude Fable 5')
+    expect(result?.['claude-fable-5']?.cost).toEqual({
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    })
+    expect(result?.['claude-fable-5']?.limit).toMatchObject({
+      context: 1_000_000,
+      output: 128_000,
+    })
+    expect(result?.['claude-mythos-5']?.name).toBe('Claude Mythos 5')
+    expect(models['claude-opus-4-8'].cost).toEqual({
+      input: 5,
+      output: 25,
+      cache: { read: 0.5, write: 6.25 },
     })
   })
 
-  test('keeps Anthropic API-key model costs unchanged', async () => {
+  test('keeps Anthropic API-key model costs unchanged and prices Fable 5', async () => {
     const plugin = await getPlugin()
     const models = {
-      'claude-3': {
-        id: 'claude-3',
-        cost: { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+      'claude-opus-4-8': {
+        id: 'claude-opus-4-8',
+        name: 'Claude Opus 4.8',
+        cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+        limit: { context: 1_000_000, output: 128_000 },
+        capabilities: { reasoning: true, attachment: true, toolcall: true },
+        release_date: '2026-01-01',
       },
     }
 
@@ -352,11 +371,16 @@ describe('provider.models', () => {
       { auth: { type: 'api' } } as never,
     )
 
-    expect(result).toBe(models)
-    expect(result?.['claude-3']?.cost).toEqual({
-      input: 3,
-      output: 15,
-      cache: { read: 0.3, write: 3.75 },
+    expect(result).not.toBe(models)
+    expect(result?.['claude-opus-4-8']?.cost).toEqual({
+      input: 5,
+      output: 25,
+      cache: { read: 0.5, write: 6.25 },
+    })
+    expect(result?.['claude-fable-5']?.cost).toEqual({
+      input: 10,
+      output: 50,
+      cache: { read: 1, write: 12.5 },
     })
   })
 })

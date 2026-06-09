@@ -728,16 +728,18 @@ describe('rewriteRequestBody', () => {
   })
 
   test('does not set fast speed for unsupported models', async () => {
-    const body = JSON.stringify({
-      model: 'claude-sonnet-4-5',
-      messages: [{ role: 'user', content: 'hi' }],
-    })
+    for (const model of ['claude-sonnet-4-5', 'claude-fable-5']) {
+      const body = JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'hi' }],
+      })
 
-    const result = JSON.parse(
-      await rewriteRequestBody(body, { fastModeEnabled: true }),
-    )
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { fastModeEnabled: true }),
+      )
 
-    expect(result.speed).toBeUndefined()
+      expect(result.speed).toBeUndefined()
+    }
   })
 
   test('removes existing fast speed when fast mode is disabled', async () => {
