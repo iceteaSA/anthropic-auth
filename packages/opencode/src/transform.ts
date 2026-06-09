@@ -701,6 +701,49 @@ function stripTrailingAssistantMessages(parsed: Record<string, unknown>) {
 /**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
+type RewritePerfCallback = (
+  stage: string,
+  data?: Record<string, unknown>,
+) => void
+
+function rewriteNowMs() {
+  return performance.now()
+}
+
+function rewriteRoundMs(value: number) {
+  return Math.round(value * 10) / 10
+}
+
+function countRewriteShape(parsed: Record<string, unknown>) {
+  let messageCount = 0
+  let contentBlockCount = 0
+  let toolUseCount = 0
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+  messageCount = messages.length
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue
+    const content = (message as { content?: unknown }).content
+    if (!Array.isArray(content)) continue
+    contentBlockCount += content.length
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === 'object' &&
+        (block as { type?: unknown }).type === 'tool_use'
+      ) {
+        toolUseCount++
+      }
+    }
+  }
+  return {
+    messageCount,
+    contentBlockCount,
+    toolDefinitionCount: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
+    toolUseCount,
+    systemBlockCount: Array.isArray(parsed.system) ? parsed.system.length : 0,
+  }
+}
+
 export async function rewriteRequestBody(
   body: string,
   options: {
@@ -708,11 +751,36 @@ export async function rewriteRequestBody(
     cache1hMode?: Cache1hMode
     fastModeEnabled?: boolean
     identity?: ClaudeCodeIdentity
+    perf?: RewritePerfCallback
   } = {},
 ): Promise<string> {
   try {
+    const parseStart = rewriteNowMs()
     const parsed = JSON.parse(body)
+    options.perf?.('parse', {
+      ms: rewriteRoundMs(rewriteNowMs() - parseStart),
+      inputBytes: body.length,
+      ...countRewriteShape(parsed),
+    })
+
+    const trailingStart = rewriteNowMs()
+    const messagesBeforeStrip = Array.isArray(parsed.messages)
+      ? parsed.messages.length
+      : undefined
     stripTrailingAssistantMessages(parsed)
+    const messagesAfterStrip = Array.isArray(parsed.messages)
+      ? parsed.messages.length
+      : undefined
+    options.perf?.('strip_trailing_assistant', {
+      ms: rewriteRoundMs(rewriteNowMs() - trailingStart),
+      removedMessages:
+        typeof messagesBeforeStrip === 'number' &&
+        typeof messagesAfterStrip === 'number'
+          ? messagesBeforeStrip - messagesAfterStrip
+          : undefined,
+    })
+
+    const billingStart = rewriteNowMs()
     const billingHeader =
       Array.isArray(parsed.messages) &&
       parsed.messages.some(
@@ -724,9 +792,18 @@ export async function rewriteRequestBody(
             CLAUDE_CODE_ENTRYPOINT,
           )
         : null
+    options.perf?.('billing_header', {
+      ms: rewriteRoundMs(rewriteNowMs() - billingStart),
+      hasBillingHeader: Boolean(billingHeader),
+    })
 
     // Sanitize system prompt and prepend Claude Code identity
+    const identityStart = rewriteNowMs()
     parsed.system = prependClaudeCodeIdentity(parsed.system)
+    options.perf?.('system_identity', {
+      ms: rewriteRoundMs(rewriteNowMs() - identityStart),
+      systemBlockCount: Array.isArray(parsed.system) ? parsed.system.length : 0,
+    })
 
     // Prepend the billing header as a separate system block so the
     // final layout is: [billing header, identity, ...rest]
@@ -734,7 +811,13 @@ export async function rewriteRequestBody(
       parsed.system.unshift({ type: 'text', text: billingHeader })
     }
 
+    const cacheStart = rewriteNowMs()
     applyCache1hStrategy(parsed, {
+      enabled: options.cache1hEnabled ?? false,
+      mode: options.cache1hMode ?? 'explicit',
+    })
+    options.perf?.('cache_strategy', {
+      ms: rewriteRoundMs(rewriteNowMs() - cacheStart),
       enabled: options.cache1hEnabled ?? false,
       mode: options.cache1hMode ?? 'explicit',
     })
@@ -745,9 +828,29 @@ export async function rewriteRequestBody(
       delete parsed.speed
     }
 
+    const metadataStart = rewriteNowMs()
     if (options.identity) applyClaudeCodeMetadata(parsed, options.identity)
+    options.perf?.('metadata', {
+      ms: rewriteRoundMs(rewriteNowMs() - metadataStart),
+      hasAccountUuid: Boolean(options.identity?.accountUuid),
+    })
 
-    return await signRequestBody(prefixToolNames(parsed))
+    const prefixStart = rewriteNowMs()
+    const prefixed = prefixToolNames(parsed)
+    options.perf?.('prefix_tools_stringify', {
+      ms: rewriteRoundMs(rewriteNowMs() - prefixStart),
+      outputBytesBeforeSign: prefixed.length,
+      ...countRewriteShape(parsed),
+    })
+
+    const signStart = rewriteNowMs()
+    const signed = await signRequestBody(prefixed)
+    options.perf?.('cch_sign', {
+      ms: rewriteRoundMs(rewriteNowMs() - signStart),
+      outputBytes: signed.length,
+    })
+
+    return signed
   } catch {
     return body
   }
@@ -756,31 +859,60 @@ export async function rewriteRequestBody(
 /**
  * Create a streaming response that strips the tool prefix from tool names.
  */
-export function createStrippedStream(response: Response): Response {
+export function createStrippedStream(
+  response: Response,
+  options: { perf?: RewritePerfCallback } = {},
+): Response {
   if (!response.body) return response
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let pending = ''
+  let chunkCount = 0
+  let inputBytes = 0
+  let outputBytes = 0
+  let rewriteMs = 0
+  const streamStart = rewriteNowMs()
 
   const stream = new ReadableStream({
     async pull(controller) {
       const { done, value } = await reader.read()
       if (done) {
+        const rewriteStart = rewriteNowMs()
         const flushed = splitToolPrefixRewriteBuffer(
           `${pending}${decoder.decode()}`,
           true,
         )
-        if (flushed.ready) controller.enqueue(encoder.encode(flushed.ready))
+        rewriteMs += rewriteNowMs() - rewriteStart
+        if (flushed.ready) {
+          const encoded = encoder.encode(flushed.ready)
+          outputBytes += encoded.byteLength
+          controller.enqueue(encoded)
+        }
+        options.perf?.('stream_tool_prefix_rewrite', {
+          chunks: chunkCount,
+          inputBytes,
+          outputBytes,
+          rewriteMs: rewriteRoundMs(rewriteMs),
+          totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
+        })
         controller.close()
         return
       }
 
+      chunkCount++
+      inputBytes += value.byteLength
       const text = pending + decoder.decode(value, { stream: true })
+      const rewriteStart = rewriteNowMs()
       const rewritten = splitToolPrefixRewriteBuffer(text)
+      rewriteMs += rewriteNowMs() - rewriteStart
       pending = rewritten.pending
-      if (rewritten.ready) controller.enqueue(encoder.encode(rewritten.ready))
+      if (rewritten.ready) {
+        const encoded = encoder.encode(rewritten.ready)
+        outputBytes += encoded.byteLength
+        controller.enqueue(encoded)
+      }
     },
   })
 

@@ -272,13 +272,21 @@ async function postRelay(
   payload: RelayPayload,
   signal?: AbortSignal | null,
 ): Promise<Response> {
+  const stringifyStart = perfNowMs()
+  const body = JSON.stringify(payload)
+  relayPerfLog('http_payload_stringify', {
+    session: shortAffinity(payload.affinity),
+    ms: formatMs(perfNowMs() - stringifyStart),
+    relayBytes: body.length,
+    mode: payload.mode,
+  })
   return fetch(config.url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       'x-relay-token': config.token,
     },
-    body: JSON.stringify(payload),
+    body,
     signal: signal ?? undefined,
   })
 }
@@ -293,6 +301,15 @@ function perfNowMs() {
 
 function formatMs(value: number) {
   return Math.round(value * 10) / 10
+}
+
+function relayPerfLoggingEnabled() {
+  return process.env.OPENCODE_ANTHROPIC_AUTH_PERF === '1'
+}
+
+function relayPerfLog(stage: string, data: Record<string, unknown>) {
+  if (!relayPerfLoggingEnabled()) return
+  relayLog(`[perf] relay ${stage} ${JSON.stringify(data)}`)
 }
 
 function createRelayPayload(options: {
@@ -1041,8 +1058,15 @@ export async function sendViaRelay(options: {
   }
 
   const bodyText = body as string
+  const hashStart = perfNowMs()
   const nextHash = hashBody(bodyText)
+  relayPerfLog('hash_body', {
+    session: shortAffinity(affinity),
+    ms: formatMs(perfNowMs() - hashStart),
+    bodyBytes: bodyText.length,
+  })
   const previous = sessionState.get(affinity)
+  const payloadStart = perfNowMs()
   const payload = createRelayPayload({
     input,
     init,
@@ -1052,8 +1076,16 @@ export async function sendViaRelay(options: {
     previous,
     nextHash,
   })
+  relayPerfLog('create_payload', {
+    session: shortAffinity(affinity),
+    ms: formatMs(perfNowMs() - payloadStart),
+    mode: payload.mode,
+    bodyBytes: bodyText.length,
+    previousBytes: previous?.body.length,
+  })
   try {
     let result: RelaySendResult
+    const sendStart = perfNowMs()
     if (config.transport === 'websocket') {
       try {
         const session = getPersistentRelaySession(config, affinity)
@@ -1084,6 +1116,16 @@ export async function sendViaRelay(options: {
       })
     }
 
+    relayPerfLog('send', {
+      session: shortAffinity(affinity),
+      ms: formatMs(perfNowMs() - sendStart),
+      transport: result.transport,
+      protocol: result.protocol,
+      mode: result.payload.mode,
+      status: result.response.status,
+      usedRelay: result.usedRelay,
+    })
+
     if (!result.usedRelay) return result.response
 
     if (result.transport === 'http') {
@@ -1095,10 +1137,17 @@ export async function sendViaRelay(options: {
       )
     }
 
+    const payloadStringifyStart = perfNowMs()
     const actualPayloadBytes = JSON.stringify(result.payload).length
+    relayPerfLog('payload_stringify', {
+      session: shortAffinity(affinity),
+      ms: formatMs(perfNowMs() - payloadStringifyStart),
+      relayBytes: actualPayloadBytes,
+    })
     relayLog(
       `used relay transport=${result.transport} protocol=${result.protocol} mode=${result.payload.mode} status=${result.response.status} session=${shortAffinity(affinity)} bodyBytes=${bodyText.length} relayBytes=${actualPayloadBytes}`,
     )
+    const dumpStart = perfNowMs()
     await dumpRelayRequest({
       affinity,
       transport: result.transport,
@@ -1109,6 +1158,11 @@ export async function sendViaRelay(options: {
       previousBodyText: previous?.body,
       payload: result.payload,
       relayBytes: actualPayloadBytes,
+    })
+    relayPerfLog('dump', {
+      session: shortAffinity(affinity),
+      ms: formatMs(perfNowMs() - dumpStart),
+      enabled: true,
     })
     return result.response
   } catch (error) {

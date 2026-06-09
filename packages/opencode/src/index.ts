@@ -1539,6 +1539,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                 cache1hMode: getCache1hMode(),
                 fastModeEnabled: fastModeRequested,
+                perf: (stage, data) =>
+                  trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
               })
               configureApiRouteHeaders(requestHeaders, account)
               requestHeaders.set(
@@ -1604,17 +1606,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             let body = init?.body
             let modelForIdentity: string | undefined
             if (body && typeof body === 'string') {
+              const modelParseStart = nowMs()
               try {
                 const parsedBody = JSON.parse(body) as { model?: unknown }
                 if (typeof parsedBody.model === 'string') {
                   modelForIdentity = parsedBody.model
                 }
               } catch {}
+              trace?.mark('model_parse_for_identity', {
+                route,
+                ms: roundMs(nowMs() - modelParseStart),
+                bodyBytes: body.length,
+              })
             }
+            const identityStart = nowMs()
             const identity = await resolveClaudeCodeIdentity(
               accessToken,
               modelForIdentity,
             )
+            trace?.mark('resolve_claude_code_identity', {
+              route,
+              ms: roundMs(nowMs() - identityStart),
+              hasAccountUuid: Boolean(identity.accountUuid),
+            })
 
             const originalBytes =
               typeof body === 'string' ? body.length : undefined
@@ -1633,14 +1647,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 cache1hMode: getCache1hMode(),
                 fastModeEnabled: fastModeRequested,
                 identity,
+                perf: (stage, data) =>
+                  trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
               })
+              const headerBodyParseStart = nowMs()
               try {
                 setOAuthHeaders(requestHeaders, accessToken, {
                   body: JSON.parse(body),
                   identity,
                 })
+                trace?.mark('set_oauth_headers_body_parse', {
+                  route,
+                  ms: roundMs(nowMs() - headerBodyParseStart),
+                  bodyBytes: body.length,
+                  parsed: true,
+                })
               } catch {
                 setOAuthHeaders(requestHeaders, accessToken, { identity })
+                trace?.mark('set_oauth_headers_body_parse', {
+                  route,
+                  ms: roundMs(nowMs() - headerBodyParseStart),
+                  bodyBytes: body.length,
+                  parsed: false,
+                })
               }
               if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
               trace?.mark('rewrite_body', {
@@ -1664,6 +1693,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               getCache1hMode() === 'hybrid'
             ) {
               const storage = await getRequestStorage()
+              const cacheKeepStart = nowMs()
               const tracked = cacheKeepManager.track({
                 sessionId: relayAffinity,
                 url: rewritten.url?.toString() ?? rewritten.input.toString(),
@@ -1672,9 +1702,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 storage,
                 cacheMode: 'hybrid',
               })
-              if (tracked.tracked) {
-                trace?.mark('cachekeep_track', { session: relayAffinity })
-              }
+              trace?.mark('cachekeep_track', {
+                session: relayAffinity,
+                ms: roundMs(nowMs() - cacheKeepStart),
+                tracked: tracked.tracked,
+                reason: tracked.tracked ? undefined : tracked.reason,
+                bodyBytes: body.length,
+              })
             }
 
             const directFetch = () =>
@@ -2077,7 +2111,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     trace.done('return_fallback_first', {
                       status: fallbackResponse.status,
                     })
-                    return createStrippedStream(fallbackResponse)
+                    return createStrippedStream(fallbackResponse, {
+                      perf: (stage, data) => trace.mark(stage, data),
+                    })
                   }
                   preselectedFallbackAccounts = undefined
                 } catch (error) {
@@ -2254,7 +2290,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       trace.done('return_preselected_fallback', {
                         status: fallbackResponse.status,
                       })
-                      return createStrippedStream(fallbackResponse)
+                      return createStrippedStream(fallbackResponse, {
+                        perf: (stage, data) => trace.mark(stage, data),
+                      })
                     }
                   }
                 } catch (error) {
@@ -2392,7 +2430,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     trace.done('return_killswitch_fallback', {
                       status: fallbackResponse.status,
                     })
-                    return createStrippedStream(fallbackResponse)
+                    return createStrippedStream(fallbackResponse, {
+                      perf: (stage, data) => trace.mark(stage, data),
+                    })
                   }
                 }
                 // Nowhere to route (no surviving fallback, or none produced a
@@ -2452,7 +2492,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 
               trace.done('return_response', { status: response.status })
-              return createStrippedStream(response)
+              return createStrippedStream(response, {
+                perf: (stage, data) => trace.mark(stage, data),
+              })
             },
           }
         }
