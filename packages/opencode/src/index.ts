@@ -291,6 +291,7 @@ const ZERO_MODEL_COST = {
 type AnthropicProviderModel = {
   id?: string
   name?: string
+  api?: { id?: string; [key: string]: unknown }
   cost?: unknown
   limit?: { context?: number; output?: number; [key: string]: unknown }
   capabilities?: Record<string, unknown>
@@ -316,6 +317,7 @@ function addFableMythos5Models<
           ...base,
           id: spec.id,
           name: spec.name,
+          api: base.api ? { ...base.api, id: spec.id } : undefined,
           cost: {
             input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
             output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,

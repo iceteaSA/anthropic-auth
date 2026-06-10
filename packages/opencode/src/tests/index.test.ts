@@ -318,6 +318,11 @@ describe('provider.models', () => {
       'claude-opus-4-8': {
         id: 'claude-opus-4-8',
         name: 'Claude Opus 4.8',
+        api: {
+          id: 'claude-opus-4-8',
+          type: 'aisdk',
+          package: '@ai-sdk/anthropic',
+        },
         cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
         limit: { context: 1_000_000, output: 128_000 },
         capabilities: { reasoning: true, attachment: true, toolcall: true },
@@ -336,6 +341,7 @@ describe('provider.models', () => {
       cache: { read: 0, write: 0 },
     })
     expect(result?.['claude-fable-5']?.name).toBe('Claude Fable 5')
+    expect(result?.['claude-fable-5']?.api?.id).toBe('claude-fable-5')
     expect(result?.['claude-fable-5']?.cost).toEqual({
       input: 0,
       output: 0,
@@ -359,6 +365,11 @@ describe('provider.models', () => {
       'claude-opus-4-8': {
         id: 'claude-opus-4-8',
         name: 'Claude Opus 4.8',
+        api: {
+          id: 'claude-opus-4-8',
+          type: 'aisdk',
+          package: '@ai-sdk/anthropic',
+        },
         cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
         limit: { context: 1_000_000, output: 128_000 },
         capabilities: { reasoning: true, attachment: true, toolcall: true },
@@ -377,6 +388,7 @@ describe('provider.models', () => {
       output: 25,
       cache: { read: 0.5, write: 6.25 },
     })
+    expect(result?.['claude-fable-5']?.api?.id).toBe('claude-fable-5')
     expect(result?.['claude-fable-5']?.cost).toEqual({
       input: 10,
       output: 50,
