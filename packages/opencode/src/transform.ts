@@ -576,6 +576,18 @@ function setFirstMessageCacheAnchor(message: unknown) {
   return setWireCacheControl(cacheableContent.cacheableBlocks[0], true)
 }
 
+function setSecondMessageCacheAnchor(message: unknown) {
+  if (!isRecord(message)) return false
+  const cacheableContent = getCacheableContentBlocks(message)
+  if (!cacheableContent || cacheableContent.cacheableBlocks.length < 2) {
+    return false
+  }
+
+  // Only materialize the normalized content array once we know we will anchor.
+  message.content = cacheableContent.content
+  return setWireCacheControl(cacheableContent.cacheableBlocks[1], true)
+}
+
 function setMessageCacheAnchor(message: unknown) {
   if (!isRecord(message)) return false
   const cacheableContent = getCacheableContentBlocks(message)
@@ -676,10 +688,16 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
     parsed.messages[0],
   )
   if (firstMessageHasSplitPrefix) {
+    // Magic Context can merge the stable prefix and volatile history prefix into
+    // the first two content blocks of messages[0]. Do not anchor the last block
+    // here: later blocks can be the live turn or truncated tail and change every
+    // request, which would make the useful history prefix fall back to m0 only.
     setFirstMessageCacheAnchor(parsed.messages[0])
+    setSecondMessageCacheAnchor(parsed.messages[0])
+  } else {
+    setMessageCacheAnchor(parsed.messages[0])
+    setMessageCacheAnchor(parsed.messages[1])
   }
-  setMessageCacheAnchor(parsed.messages[0])
-  if (!firstMessageHasSplitPrefix) setMessageCacheAnchor(parsed.messages[1])
   if (bridge) setMessageCacheAnchor(parsed.messages[bridge.index])
   if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
 }

@@ -1274,6 +1274,57 @@ describe('rewriteRequestBody', () => {
     })
   })
 
+  test('hybrid mode anchors the second merged Magic Context prefix block, not the live tail', async () => {
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '<project-docs>stable project docs</project-docs>',
+            },
+            {
+              type: 'text',
+              text: '<session-history-since>recent session history</session-history-since>',
+            },
+            { type: 'text', text: 'current user turn' },
+            {
+              type: 'text',
+              text: '[truncated tool output]',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+        { role: 'assistant', content: 'assistant response' },
+        { role: 'user', content: 'latest user boundary' },
+      ],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    expect(result.messages[0].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[0].content[1].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(result.messages[0].content[2].cache_control).toBeUndefined()
+    expect(result.messages[0].content[3].cache_control).toBeUndefined()
+    expect(result.messages[2].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
   test('hybrid mode does not duplicate the moving marker when the latest user boundary is messages[1]', async () => {
     const body = JSON.stringify({
       system: 'Stable system block',
