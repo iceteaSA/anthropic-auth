@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.9.2
+
+### Patch Changes
+
+- Fix `/claude-cache hybrid` anchors for Magic Context requests where stable project context and session history are merged into `messages[0]`, preserving cache breakpoints on the first two prefix blocks instead of the volatile tail.
+
 ## 1.9.1
 
 ### Patch Changes

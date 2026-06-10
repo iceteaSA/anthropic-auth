@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.9.2
+
+### Patch Changes
+
+- Fix `/claude-cache hybrid` anchors for Magic Context requests where stable project context and session history are merged into `messages[0]`, preserving cache breakpoints on the first two prefix blocks instead of the volatile tail.
+
 ## 1.9.1
 
 ### Patch Changes
