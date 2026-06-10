@@ -536,6 +536,57 @@ function accountRuntimeState(account: FallbackAccount) {
   })
 }
 
+function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
+  return Math.max(
+    quota?.five_hour?.checkedAt ?? 0,
+    quota?.seven_day?.checkedAt ?? 0,
+  )
+}
+
+function mergeAccountRuntimeState(
+  existing: unknown,
+  incoming: AccountRuntimeEntry,
+): AccountRuntimeEntry {
+  if (!isRecord(existing)) return incoming
+  const existingEntry = existing as AccountRuntimeEntry
+  const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
+  const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
+  if (existingQuotaCheckedAt > incomingQuotaCheckedAt) {
+    const tokenChanged = Boolean(
+      existingEntry.access &&
+        incoming.access &&
+        existingEntry.access !== incoming.access,
+    )
+    const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
+    const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
+    if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
+      const merged: AccountRuntimeEntry = { ...existingEntry }
+      if (
+        typeof incoming.lastUsed === 'number' &&
+        (!(typeof existingEntry.lastUsed === 'number') ||
+          incoming.lastUsed > existingEntry.lastUsed)
+      ) {
+        merged.lastUsed = incoming.lastUsed
+      }
+      return merged
+    }
+    return {
+      ...existingEntry,
+      ...incoming,
+      quota: existingEntry.quota,
+      lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
+    }
+  }
+  const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
+  if (!('lastQuotaRefreshError' in incoming)) {
+    delete merged.lastQuotaRefreshError
+  }
+  if (!('lastRefreshError' in incoming)) {
+    delete merged.lastRefreshError
+  }
+  return merged
+}
+
 function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   const refresh = storage.refresh
     ? objectWithDefinedEntries({
@@ -621,6 +672,16 @@ function applyMainQuotaStatePatch(
   storage: AccountStorage,
 ) {
   state.main = state.main ?? {}
+  const existingCheckedAt =
+    typeof state.main.quotaCheckedAt === 'number'
+      ? state.main.quotaCheckedAt
+      : quotaSnapshotCheckedAt(state.main.quota)
+  const incomingCheckedAt =
+    typeof storage.quota?.mainQuotaCheckedAt === 'number'
+      ? storage.quota.mainQuotaCheckedAt
+      : quotaSnapshotCheckedAt(storage.quota?.mainQuota)
+  if (existingCheckedAt > incomingCheckedAt) return
+
   state.main.quota = storage.quota?.mainQuota
   state.main.quotaCheckedAt = storage.quota?.mainQuotaCheckedAt
   state.main.quotaToken = storage.quota?.mainQuotaToken
@@ -671,7 +732,10 @@ export async function saveAccountState(
     next.accounts = { ...(isRecord(next.accounts) ? next.accounts : {}) }
     for (const account of storage.accounts) {
       if (ids && !ids.has(account.id)) continue
-      next.accounts[account.id] = accountRuntimeState(account)
+      next.accounts[account.id] = mergeAccountRuntimeState(
+        next.accounts[account.id],
+        accountRuntimeState(account),
+      )
     }
     if (ids) {
       for (const id of ids) {
@@ -1295,17 +1359,25 @@ function tokenNeedsRefresh(
   )
 }
 
+function quotaSnapshotIsFresh(
+  quota: OAuthQuotaSnapshot | undefined,
+  storage: AccountStorage | null,
+  now: number,
+) {
+  if (!quotaEnabled(storage)) return true
+  const maxAge = getQuotaCheckIntervalMs(storage)
+  return (['five_hour', 'seven_day'] as const).every((key) => {
+    const window = quota?.[key]
+    return Boolean(window && now - window.checkedAt < maxAge)
+  })
+}
+
 function quotaIsStale(
   account: OAuthAccount,
   storage: AccountStorage | null,
   now: number,
 ) {
-  if (!quotaEnabled(storage)) return false
-  const maxAge = getQuotaCheckIntervalMs(storage)
-  return (['five_hour', 'seven_day'] as const).some((key) => {
-    const window = account.quota?.[key]
-    return !window || now - window.checkedAt >= maxAge
-  })
+  return !quotaSnapshotIsFresh(account.quota, storage, now)
 }
 
 function cachedQuotaWindowStillRelevant(
@@ -1481,13 +1553,14 @@ export class FallbackAccountManager {
     storage: AccountStorage,
   ): void {
     if (!this.quotaManager) return
-    if (this.quotaManager.getFallback(account.id, account.access)) return
     if (!account.quota) return
     const checkedAt = Math.max(
       account.quota.five_hour?.checkedAt ?? 0,
       account.quota.seven_day?.checkedAt ?? 0,
     )
     if (checkedAt <= 0) return
+    const existing = this.quotaManager.getFallback(account.id, account.access)
+    if (existing && existing.checkedAt >= checkedAt) return
     const checkInterval = getQuotaCheckIntervalMs(storage)
     this.quotaManager.setFallback(
       account.id,
@@ -1955,6 +2028,7 @@ export class FallbackAccountManager {
             fetchImpl: this.fetchImpl,
             now: this.now,
           })
+    const fetchStartedAt = this.now()
     try {
       target.quota = await fetchSnapshot(target.access)
     } catch (error) {
@@ -1967,6 +2041,33 @@ export class FallbackAccountManager {
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
       target.quota = await fetchSnapshot(target.access)
     }
+
+    const latestStorage = await this.load()
+    const latestAccount = latestStorage?.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === target.id && isOAuthAccount(candidate),
+    )
+    if (
+      latestStorage &&
+      latestAccount &&
+      latestAccount.access !== target.access
+    ) {
+      this.seedFallbackQuota(latestAccount, latestStorage)
+      updateStoredAccount(storage, latestAccount)
+      return latestAccount
+    }
+    if (
+      latestStorage &&
+      latestAccount?.access === target.access &&
+      latestAccount.quota &&
+      quotaSnapshotCheckedAt(latestAccount.quota) >= fetchStartedAt &&
+      quotaSnapshotIsFresh(latestAccount.quota, latestStorage, this.now())
+    ) {
+      this.seedFallbackQuota(latestAccount, latestStorage)
+      updateStoredAccount(storage, latestAccount)
+      return latestAccount
+    }
+
     target.lastQuotaRefreshError = undefined
     updateStoredAccount(storage, target)
     // Sync to shared QuotaManager so all consumers see the same cache. The

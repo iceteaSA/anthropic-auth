@@ -372,6 +372,58 @@ describe('QuotaManager', () => {
       expect(qm.getMain()).toBeNull()
     })
 
+    test('updateStorage seeds main quota written by another process', () => {
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: {
+            checkIntervalMinutes: 5,
+          },
+        },
+        now: () => 1_000_000,
+      })
+      expect(qm.getMain('main-token')).toBeNull()
+
+      qm.updateStorage({
+        version: 1,
+        accounts: [],
+        quota: {
+          checkIntervalMinutes: 5,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 12,
+              remainingPercent: 88,
+              checkedAt: 999_000,
+            },
+          },
+          mainQuotaCheckedAt: 999_000,
+          mainQuotaToken: tokenFingerprint('main-token'),
+        },
+      })
+      qm.seedMainFromStorage(
+        {
+          version: 1,
+          accounts: [],
+          quota: {
+            checkIntervalMinutes: 5,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 12,
+                remainingPercent: 88,
+                checkedAt: 999_000,
+              },
+            },
+            mainQuotaCheckedAt: 999_000,
+            mainQuotaToken: tokenFingerprint('main-token'),
+          },
+        },
+        'main-token',
+      )
+
+      expect(qm.getMain('main-token')?.quota.five_hour?.usedPercent).toBe(12)
+    })
+
     test('seedFallbacksFromAccounts token-binds persisted fallback quota', () => {
       // Regression: persisted fallback quota seeds must be tied to the access
       // token that produced them. Otherwise same-label re-login can reuse a
@@ -409,6 +461,57 @@ describe('QuotaManager', () => {
 
       expect(qm.getFallback('fallback-1', 'old-fallback-token')).not.toBeNull()
       expect(qm.getFallback('fallback-1', 'new-fallback-token')).toBeNull()
+    })
+
+    test('seedFallbacksFromAccounts updates older in-memory quota from disk', () => {
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: { checkIntervalMinutes: 5 },
+        },
+        now: () => 1_000_000,
+      })
+      qm.setFallback(
+        'fallback-1',
+        {
+          quota: {
+            five_hour: {
+              usedPercent: 90,
+              remainingPercent: 10,
+              checkedAt: 900_000,
+            },
+          },
+          refreshAfter: 900_000,
+          checkedAt: 900_000,
+        },
+        'fallback-token',
+      )
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'fallback-token',
+          refresh: 'refresh-token',
+          expires: 2_000_000,
+          quota: {
+            five_hour: {
+              usedPercent: 12,
+              remainingPercent: 88,
+              checkedAt: 999_000,
+            },
+          },
+        },
+      ])
+
+      expect(qm.getFallback('fallback-1', 'fallback-token')?.checkedAt).toBe(
+        999_000,
+      )
+      expect(
+        qm.getFallback('fallback-1', 'fallback-token')?.quota.five_hour
+          ?.usedPercent,
+      ).toBe(12)
     })
 
     test('drops persisted main seed during backoff when the token changed', async () => {

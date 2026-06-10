@@ -1,22 +1,22 @@
 /** @jsxImportSource @opentui/solid */
 
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
-import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { For, type JSX, Show, createSignal, onCleanup } from 'solid-js'
+import { createSignal, For, type JSX, onCleanup, Show } from 'solid-js'
 
 import {
   type AccountQuota,
   DEFAULT_SIDEBAR_STATE,
-  type SidebarState,
   getCollapsedQuotaSummary,
   getSidebarState,
   resolveActiveAccount,
+  type SidebarState,
 } from './sidebar-state.js'
 
 const POLL_MS = 1500

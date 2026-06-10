@@ -5,10 +5,12 @@ import { join } from 'node:path'
 import {
   type AccountStorage,
   getAccountStatePath,
+  loadAccounts,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   resetCache1hState,
   resetDumpState,
   resetFastModeState,
+  saveAccountState,
   saveAccounts,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -482,6 +484,76 @@ describe('auth.loader', () => {
     )
     expect(result.apiKey).toBe('')
     expect(result.fetch).toBeFunction()
+  })
+
+  test('sidebar shows persisted main quota written after plugin startup', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+      }),
+    )
+
+    const plugin = await getPlugin()
+    const storage = await loadAccounts()
+    expect(storage).not.toBeNull()
+    ;(storage as AccountStorage).quota = {
+      ...(storage as AccountStorage).quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 12,
+          remainingPercent: 88,
+          checkedAt: Date.now(),
+        },
+        seven_day: {
+          usedPercent: 2,
+          remainingPercent: 98,
+          checkedAt: Date.now(),
+        },
+      },
+      mainQuotaCheckedAt: Date.now(),
+      mainQuotaToken: tokenFingerprint('main-access'),
+    }
+    await saveAccountState(storage as AccountStorage, undefined, {
+      mainQuota: true,
+    })
+
+    let quotaApiCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) quotaApiCalls++
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    const state = await waitForSidebarState(
+      (candidate) => candidate.main.quota?.five_hour?.usedPercent === 12,
+    )
+    expect(state.main.quota?.seven_day?.usedPercent).toBe(2)
+    expect(quotaApiCalls).toBe(0)
   })
 
   test('sidebar state records the actual fallback-first route', async () => {

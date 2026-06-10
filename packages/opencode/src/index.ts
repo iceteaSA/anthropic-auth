@@ -36,6 +36,8 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getKillswitchConfig,
+  getPersistedMainQuota,
+  getQuotaNextRefreshAt,
   getRelayConfig,
   getRoutingMode,
   hashRefreshToken,
@@ -363,11 +365,26 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const initialStorage = await loadAccounts(accountStoragePath)
   const quotaManager = new QuotaManager({
     storage: initialStorage,
-    onMainQuotaFetched: async (quota, checkedAt, tokenFingerprint) => {
+    onMainQuotaFetched: async (
+      quota,
+      checkedAt,
+      tokenFingerprint,
+      fetchStartedAt,
+    ) => {
       try {
         const storage = (await loadAccounts(accountStoragePath)) ?? {
           version: 1 as const,
           accounts: [],
+        }
+        const persisted = getPersistedMainQuota(storage)
+        if (
+          persisted &&
+          persisted.checkedAt >= fetchStartedAt &&
+          getQuotaNextRefreshAt(persisted.quota, storage, persisted.checkedAt) >
+            Date.now()
+        ) {
+          quotaManager.seedMainFromStorage(storage)
+          return
         }
         storage.quota = storage.quota ?? {}
         storage.quota.mainQuota = quota
@@ -468,6 +485,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     },
   ) {
     lastSidebarRouting = { activeId: options.activeId, route: options.route }
+    quotaManager.updateStorage(storage)
+    quotaManager.seedMainFromStorage(storage, options.mainAccessToken)
+    quotaManager.seedFallbacksFromAccounts(
+      (storage?.accounts ?? []).filter(isOAuthAccount),
+    )
     const mainEntry = quotaManager.getMain(options.mainAccessToken)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
@@ -2118,6 +2140,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               const storage = await loadAccounts()
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
               quotaManager.updateStorage(storage)
+              quotaManager.seedMainFromStorage(storage, auth.access)
               quotaManager.seedFallbacksFromAccounts(
                 (storage?.accounts ?? []).filter(isOAuthAccount),
               )

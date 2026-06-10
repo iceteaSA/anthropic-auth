@@ -219,6 +219,136 @@ describe('account storage', () => {
     expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(22)
   })
 
+  test('runtime state saves do not overwrite newer quota snapshots', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 11,
+          remainingPercent: 89,
+          checkedAt: 500,
+        },
+      },
+      mainQuotaCheckedAt: 500,
+      mainQuotaToken: 'token-newer',
+    }
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access-newer',
+      refresh: 'refresh-newer',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 500,
+        },
+      },
+    })
+    await saveAccounts(storage)
+
+    const staleRuntimeView = await loadAccounts()
+    expect(staleRuntimeView).not.toBeNull()
+    ;(staleRuntimeView as AccountStorage).quota = {
+      ...(staleRuntimeView as AccountStorage).quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 99,
+          remainingPercent: 1,
+          checkedAt: 100,
+        },
+      },
+      mainQuotaCheckedAt: 100,
+      mainQuotaToken: 'token-older',
+    }
+    ;(staleRuntimeView as AccountStorage).accounts[0] = {
+      ...((staleRuntimeView as AccountStorage).accounts[0] as OAuthAccount),
+      access: 'access-older',
+      refresh: 'refresh-older',
+      quota: {
+        five_hour: {
+          usedPercent: 99,
+          remainingPercent: 1,
+          checkedAt: 100,
+        },
+      },
+      lastQuotaRefreshError: {
+        checkedAt: 100,
+        nextRetryAt: 200,
+        retryCount: 1,
+        message: 'stale failure',
+      },
+    }
+
+    await saveAccountState(staleRuntimeView as AccountStorage, accountPath, {
+      mainQuota: true,
+      accounts: true,
+    })
+
+    const loaded = await loadAccounts()
+    expect(loaded?.quota?.mainQuotaToken).toBe('token-newer')
+    expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(11)
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.access).toBe('access-newer')
+    expect(account.refresh).toBe('refresh-newer')
+    expect(account.quota?.five_hour?.usedPercent).toBe(20)
+    expect(account.lastQuotaRefreshError).toBeUndefined()
+  })
+
+  test('runtime state saves can update refreshed tokens without downgrading quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1_000,
+      lastRefreshedAt: 100,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 500,
+        },
+      },
+    })
+    await saveAccounts(storage)
+
+    const refreshedRuntimeView = await loadAccounts()
+    expect(refreshedRuntimeView).not.toBeNull()
+    ;(refreshedRuntimeView as AccountStorage).accounts[0] = {
+      ...((refreshedRuntimeView as AccountStorage).accounts[0] as OAuthAccount),
+      access: 'new-access',
+      refresh: 'new-refresh',
+      expires: 2_000,
+      lastRefreshedAt: 600,
+      quota: {
+        five_hour: {
+          usedPercent: 99,
+          remainingPercent: 1,
+          checkedAt: 100,
+        },
+      },
+    }
+
+    await saveAccountState(
+      refreshedRuntimeView as AccountStorage,
+      accountPath,
+      {
+        accounts: true,
+      },
+    )
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.access).toBe('new-access')
+    expect(account.refresh).toBe('new-refresh')
+    expect(account.lastRefreshedAt).toBe(600)
+    expect(account.quota?.five_hour?.usedPercent).toBe(20)
+  })
+
   test('malformed sidecar file is ignored', async () => {
     await writeFile(accountPath, '{nope', 'utf8')
     await expect(loadAccounts()).resolves.toBeNull()
@@ -813,6 +943,55 @@ describe('FallbackAccountManager', () => {
     const accounts = await manager.getUsableFallbackAccounts()
     expect(accounts).toHaveLength(1)
     expect(accounts[0]?.quota?.five_hour?.remainingPercent).toBe(75)
+  })
+
+  test('does not overwrite a concurrently refreshed token after quota fetch', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'concurrent-refresh',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 20_000_000,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(async (input: string | URL | Request) => {
+      expect(String(input)).toContain('/api/oauth/usage')
+      const latest = await loadAccounts()
+      expect(latest).not.toBeNull()
+      ;(latest as AccountStorage).accounts[0] = {
+        ...((latest as AccountStorage).accounts[0] as OAuthAccount),
+        access: 'new-access',
+        refresh: 'new-refresh',
+        expires: 30_000_000,
+        lastRefreshedAt: 2_000,
+      }
+      await saveAccountState(latest as AccountStorage, accountPath, {
+        accounts: true,
+      })
+      return new Response(
+        JSON.stringify({
+          five_hour: { utilization: 25, resets_at: '2026-01-01T00:00:00Z' },
+          seven_day: { utilization: 50, resets_at: '2026-01-07T00:00:00Z' },
+        }),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 2_000,
+    })
+
+    const result = await manager.refreshQuotaForAllAccounts()
+
+    expect(result.errors).toEqual([])
+    const saved = await loadAccounts()
+    const account = expectOAuthAccount(saved?.accounts[0])
+    expect(account.access).toBe('new-access')
+    expect(account.refresh).toBe('new-refresh')
+    expect(account.quota).toBeUndefined()
   })
 
   test('persists token rotation from background quota refresh even when quota is still fresh', async () => {

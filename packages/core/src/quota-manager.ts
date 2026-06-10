@@ -55,6 +55,7 @@ export type QuotaManagerOptions = {
     quota: OAuthQuotaSnapshot,
     checkedAt: number,
     tokenFingerprint: string,
+    fetchStartedAt: number,
   ) => void
   onApiError?: (error: AccountOperationError) => void
 }
@@ -105,25 +106,8 @@ export class QuotaManager {
     // that produced it. refreshMain() drops this seed if the live token's
     // fingerprint differs (main-account switch), preventing stale wrong-account
     // quota from being served during backoff.
-    const persisted = getPersistedMainQuota(opts.storage)
-    if (persisted) {
-      this.main = {
-        quota: persisted.quota,
-        refreshAfter: getQuotaNextRefreshAt(
-          persisted.quota,
-          opts.storage,
-          persisted.checkedAt,
-        ),
-        checkedAt: persisted.checkedAt,
-      }
-      this.mainTokenFp = persisted.tokenFingerprint ?? null
-    }
-
-    // Seed backoff state from persisted storage
-    const persistedError = opts.storage?.quota?.mainLastQuotaApiError
-    if (persistedError && quotaBackoffActive(persistedError, this.now())) {
-      this.mainLastApiError = persistedError
-    }
+    this.seedMainFromStorage(opts.storage)
+    this.seedMainBackoffFromStorage(opts.storage)
   }
 
   // =========================================================================
@@ -306,24 +290,80 @@ export class QuotaManager {
 
   updateStorage(storage: AccountStorage | null): void {
     this.storage = storage
+    this.seedMainFromStorage(storage)
+    this.seedMainBackoffFromStorage(storage)
+  }
+
+  /**
+   * Seed/update the main quota cache from persisted state. This is deliberately
+   * callable after every disk load so another plugin process's fresh quota write
+   * can stop this process from showing "checking…" or making a redundant quota
+   * API call.
+   */
+  seedMainFromStorage(
+    storage: AccountStorage | null,
+    accessToken?: string,
+  ): void {
+    const persisted = getPersistedMainQuota(storage)
+    if (!persisted) return
+
+    const accessTokenFp = accessToken ? tokenFingerprint(accessToken) : null
+    if (
+      accessTokenFp &&
+      persisted.tokenFingerprint &&
+      persisted.tokenFingerprint !== accessTokenFp
+    ) {
+      return
+    }
+
+    const entry: QuotaEntry = {
+      quota: persisted.quota,
+      refreshAfter: getQuotaNextRefreshAt(
+        persisted.quota,
+        storage,
+        persisted.checkedAt,
+      ),
+      checkedAt: persisted.checkedAt,
+    }
+    if (
+      this.main &&
+      this.main.checkedAt >= entry.checkedAt &&
+      (!accessTokenFp ||
+        !this.mainTokenFp ||
+        this.mainTokenFp === accessTokenFp)
+    ) {
+      return
+    }
+
+    this.main = entry
+    this.mainTokenFp = persisted.tokenFingerprint ?? null
+  }
+
+  private seedMainBackoffFromStorage(storage: AccountStorage | null): void {
+    const persistedError = storage?.quota?.mainLastQuotaApiError
+    this.mainLastApiError =
+      persistedError && quotaBackoffActive(persistedError, this.now())
+        ? persistedError
+        : undefined
   }
 
   /**
    * Seed fallback cache entries from persisted account.quota data.
-   * Only seeds accounts that don't already have a cache entry.
-   * Prevents unnecessary API calls when persisted quota is still fresh.
+   * Updates older in-memory entries so a fresh quota write from another plugin
+   * process prevents redundant checks and stale sidebar writes.
    */
   seedFallbacksFromAccounts(accounts: OAuthAccount[]): void {
     const checkInterval = getQuotaCheckIntervalMs(this.storage)
     for (const account of accounts) {
       if (account.enabled === false) continue
-      if (this.getFallback(account.id, account.access)) continue
       if (!account.quota) continue
       const checkedAt = Math.max(
         account.quota.five_hour?.checkedAt ?? 0,
         account.quota.seven_day?.checkedAt ?? 0,
       )
       if (checkedAt <= 0) continue
+      const existing = this.getFallback(account.id, account.access)
+      if (existing && existing.checkedAt >= checkedAt) continue
       this.setFallback(
         account.id,
         {
@@ -416,10 +456,12 @@ export class QuotaManager {
           ttlMs: 30_000,
         })
         if (!fileLock) {
-          if (this.main) return this.main.quota
+          const cached = this.main
+          if (cached && this.now() < cached.refreshAfter) return cached.quota
           throw new Error('Quota refresh is already in progress')
         }
         try {
+          const fetchStartedAt = this.now()
           const quota = await fetchOAuthQuotaSnapshot({
             accessToken,
             fetchImpl: this.fetchImpl,
@@ -433,7 +475,12 @@ export class QuotaManager {
             checkedAt: now,
           }
           this.mainLastApiError = undefined
-          this.onMainQuotaFetched?.(quota, now, this.mainTokenFp)
+          this.onMainQuotaFetched?.(
+            quota,
+            now,
+            this.mainTokenFp,
+            fetchStartedAt,
+          )
           return quota
         } catch (error) {
           this._handleMainFetchError(error)
@@ -465,7 +512,7 @@ export class QuotaManager {
         })
         if (!fileLock) {
           const cached = this.getFallback(accountId, accessToken)
-          if (cached) return cached.quota
+          if (cached && this.now() < cached.refreshAfter) return cached.quota
           throw new Error('Quota refresh is already in progress')
         }
         try {
