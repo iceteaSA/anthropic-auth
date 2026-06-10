@@ -44,6 +44,7 @@ import {
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
+  isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
   isFastModeEnabled,
   isFastModePersistentlyEnabled,
@@ -947,7 +948,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         context: { auth?: { type?: string } },
       ) {
         const models = addFableMythos5Models(provider.models)
-        if (context.auth?.type !== 'oauth') return models
+        // Zero OAuth model costs by default (quota-based, not per-token billed).
+        // Opt out via persisted config costZeroing.enabled=false to show real costs.
+        // initialStorage is nullable (no config file yet) → default to enabled.
+        if (
+          context.auth?.type !== 'oauth' ||
+          !isCostZeroingEnabled(initialStorage ?? {})
+        )
+          return models
         return zeroModelCosts(models)
       },
     },
