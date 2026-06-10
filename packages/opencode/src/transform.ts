@@ -18,6 +18,7 @@ import {
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
 } from '@cortexkit/anthropic-auth-core'
+import { makeByteBoundedMemo } from './sanitize-memo'
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
@@ -333,7 +334,7 @@ export function rewriteUrl(
  * prompt — as long as the anchor strings (URLs, etc.) still appear
  * somewhere in the paragraph, the removal works.
  */
-export function sanitizeSystemText(text: string): string {
+function _sanitizeSystemText(text: string): string {
   // Split into paragraphs (separated by one or more blank lines)
   const paragraphs = text.split(/\n\n+/)
 
@@ -359,6 +360,30 @@ export function sanitizeSystemText(text: string): string {
   }
 
   return result.trim()
+}
+
+const SANITIZE_MEMO_MAX_BYTES = 8 * 1024 * 1024
+
+/** Memo on by default; OPENCODE_ANTHROPIC_AUTH_MEMO=0 disables (baseline). */
+function sanitizeMemoEnabled(): boolean {
+  return process.env.OPENCODE_ANTHROPIC_AUTH_MEMO !== '0'
+}
+
+const sanitizeSystemMemo = makeByteBoundedMemo(_sanitizeSystemText, {
+  maxBytes: SANITIZE_MEMO_MAX_BYTES,
+  enabled: sanitizeMemoEnabled,
+})
+
+/**
+ * Sanitize a system-prompt block. Memoised: the prompt is stable within a
+ * session, so the paragraph-filter + regex pass is skipped on cache hits.
+ */
+export function sanitizeSystemText(text: string): string {
+  return sanitizeSystemMemo.call(text)
+}
+
+export function getSanitizeMemoStats() {
+  return sanitizeSystemMemo.stats()
 }
 
 type SystemBlock = { type: string; text: string; [k: string]: unknown }
