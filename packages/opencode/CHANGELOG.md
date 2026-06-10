@@ -2,6 +2,18 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.9.0
+
+### Minor Changes
+
+- Add a `costZeroing.enabled` opt-out so advanced users can show Anthropic model pricing for OAuth sessions instead of the default zero-cost subscription/quota display.
+
+### Patch Changes
+
+- Fix synthetic Claude Fable 5 and Mythos 5 catalog entries so `model.api.id` matches the selected model, ensuring the wire request sends Fable/Mythos rather than the cloned Opus fallback model.
+- Coalesce WebSocket relay upstream SSE chunks before binary WebSocket sends, reducing tiny frame fragmentation while preserving response bytes exactly.
+- Memoize repeated system-prompt sanitation work with a bounded byte-aware cache.
+
 ## 1.8.0
 
 ### Minor Changes

@@ -596,19 +596,19 @@ This repo uses CortexKit's tag-driven release workflow.
 Preview a release:
 
 ```bash
-./scripts/release.sh 1.8.0 --dry
+./scripts/release.sh 1.9.0 --dry
 ```
 
 Create and push the release tag:
 
 ```bash
-./scripts/release.sh 1.8.0
+./scripts/release.sh 1.9.0
 ```
 
 Wait for GitHub Actions:
 
 ```bash
-./scripts/wait-release.sh v1.8.0
+./scripts/wait-release.sh v1.9.0
 ```
 
 The release workflow runs checks, publishes the core, OpenCode, and Pi packages to npm with provenance, and creates the GitHub release.
