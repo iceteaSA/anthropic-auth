@@ -32,7 +32,7 @@ function headers(affinity: string) {
 function workerInternals() {
   const source = WORKER_SCRIPT.replace(
     /export default[\s\S]*$/,
-    'return { hashBody, applyPatchSet, prepareWebSocketUpstream }',
+    'return { hashBody, applyPatchSet, prepareWebSocketUpstream, createWebSocketStreamCoalescer }',
   )
   return new Function(source)() as {
     hashBody: (body: string) => Promise<string>
@@ -47,6 +47,20 @@ function workerInternals() {
       state: { body: string; hash: string; revision: number } | null,
       payload: Record<string, unknown>,
     ) => Promise<Record<string, unknown>>
+    createWebSocketStreamCoalescer: (
+      socket: { send: (frame: Uint8Array) => void },
+      options?: { flushBytes?: number; flushMs?: number },
+    ) => {
+      push: (chunk: Uint8Array) => void
+      flush: () => void
+      stats: () => {
+        upstreamChunks: number
+        upstreamBytes: number
+        frames: number
+        frameBytes: number
+        pendingBytes: number
+      }
+    }
   }
 }
 
@@ -57,6 +71,32 @@ describe('relay client', () => {
       'hello cheap world',
     )
     expect(patch).toEqual({ start: 6, deleteCount: 9, insert: 'cheap' })
+  })
+
+  test('coalesces tiny Worker websocket stream chunks byte-exactly', () => {
+    const { createWebSocketStreamCoalescer } = workerInternals()
+    const frames: Uint8Array[] = []
+    const coalescer = createWebSocketStreamCoalescer(
+      { send: (frame) => frames.push(frame) },
+      { flushBytes: 10, flushMs: 10_000 },
+    )
+
+    coalescer.push(new Uint8Array([1, 2, 3]))
+    coalescer.push(new Uint8Array([4, 5]))
+    coalescer.push(new Uint8Array([6, 7, 8, 9, 10]))
+    coalescer.push(new Uint8Array([11, 12]))
+    coalescer.flush()
+
+    expect(frames).toHaveLength(2)
+    expect([...(frames[0] ?? [])]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    expect([...(frames[1] ?? [])]).toEqual([11, 12])
+    expect(coalescer.stats()).toEqual({
+      upstreamChunks: 4,
+      upstreamBytes: 12,
+      frames: 2,
+      frameBytes: 12,
+      pendingBytes: 0,
+    })
   })
 
   test('sends full sync first and patch on next request', async () => {

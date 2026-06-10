@@ -54,7 +54,14 @@ type RelayResponseStart = {
 }
 
 type RelayChunk = { type: 'chunk'; id?: string; base64: string }
-type RelayDone = { type: 'done'; id?: string }
+type RelayDone = {
+  type: 'done'
+  id?: string
+  upstreamChunks?: number
+  upstreamBytes?: number
+  frames?: number
+  frameBytes?: number
+}
 type RelayKeepalive = { type: 'keepalive' }
 type RelayReady = {
   protocol: 2
@@ -914,7 +921,7 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'done') {
-      this.finishPending()
+      this.finishPending(message)
       return
     }
     if (message.type === 'error') {
@@ -952,12 +959,16 @@ class PersistentRelaySession {
     }
   }
 
-  private finishPending() {
+  private finishPending(done?: RelayDone) {
     const pending = this.pending
     if (!pending) return
     const finishedAt = perfNowMs()
+    const workerStats =
+      done && 'frames' in done
+        ? ` upstreamChunks=${done.upstreamChunks ?? 'unknown'} upstreamBytes=${done.upstreamBytes ?? 'unknown'} frames=${done.frames} frameBytes=${done.frameBytes ?? 'unknown'}`
+        : ''
     relayLog(
-      `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
+      `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}${workerStats}`,
     )
     clearTimeout(pending.timeout)
     if (!pending.streamDone) {
@@ -1267,6 +1278,73 @@ function deferWorkerTask(task) {
   return new Promise((resolve) => setTimeout(resolve, 0)).then(task)
 }
 
+const WEBSOCKET_STREAM_FLUSH_BYTES = 1024
+const WEBSOCKET_STREAM_FLUSH_MS = 20
+
+function createWebSocketStreamCoalescer(socket, options = {}) {
+  const flushBytes = options.flushBytes || WEBSOCKET_STREAM_FLUSH_BYTES
+  const flushMs = options.flushMs ?? WEBSOCKET_STREAM_FLUSH_MS
+  let chunks = []
+  let byteLength = 0
+  let flushTimer = null
+  const stats = {
+    upstreamChunks: 0,
+    upstreamBytes: 0,
+    frames: 0,
+    frameBytes: 0,
+  }
+
+  const clearFlushTimer = () => {
+    if (flushTimer === null) return
+    clearTimeout(flushTimer)
+    flushTimer = null
+  }
+
+  const mergeChunks = () => {
+    if (chunks.length === 1) return chunks[0]
+    const frame = new Uint8Array(byteLength)
+    let offset = 0
+    for (const chunk of chunks) {
+      frame.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return frame
+  }
+
+  const flush = () => {
+    clearFlushTimer()
+    if (byteLength === 0) return
+    const frame = mergeChunks()
+    chunks = []
+    byteLength = 0
+    socket.send(frame)
+    stats.frames += 1
+    stats.frameBytes += frame.byteLength
+  }
+
+  const scheduleFlush = () => {
+    if (flushTimer !== null) return
+    flushTimer = setTimeout(flush, flushMs)
+  }
+
+  return {
+    push(value) {
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value)
+      if (chunk.byteLength === 0) return
+      stats.upstreamChunks += 1
+      stats.upstreamBytes += chunk.byteLength
+      chunks.push(chunk)
+      byteLength += chunk.byteLength
+      if (byteLength >= flushBytes) flush()
+      else scheduleFlush()
+    },
+    flush,
+    stats() {
+      return { ...stats, pendingBytes: byteLength }
+    },
+  }
+}
+
 function checkpointWebSocketState(env, payload, body, nextState) {
   return deferWorkerTask(async () => {
     try {
@@ -1337,6 +1415,7 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
       clearInterval(heartbeat)
     }
   }, 15000)
+  let streamCoalescer = null
   try {
     const result = await prepareWebSocketUpstream(env, getState(), payload)
     if (result.error) {
@@ -1366,14 +1445,20 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
 
     const reader = upstream.body?.getReader()
     if (reader) {
+      streamCoalescer = createWebSocketStreamCoalescer(socket)
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        socket.send(value)
+        streamCoalescer.push(value)
       }
+      streamCoalescer.flush()
     }
-    socket.send(JSON.stringify({ protocol: 2, type: 'done', id: payload.id }))
+    const stats = streamCoalescer?.stats?.() || {}
+    socket.send(JSON.stringify({ protocol: 2, type: 'done', id: payload.id, ...stats }))
   } catch (error) {
+    try {
+      streamCoalescer?.flush?.()
+    } catch {}
     socket.send(JSON.stringify({ protocol: 2, type: 'error', id: payload.id, status: 500, message: error instanceof Error ? error.message : String(error) }))
   } finally {
     clearInterval(heartbeat)
