@@ -2,6 +2,13 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.9.1
+
+### Patch Changes
+
+- Request summarized adaptive thinking for Claude Fable 5 and Mythos 5 so OpenCode can display readable reasoning summaries instead of blank signed-thinking blocks.
+- Add opt-in structural SSE diagnostics under `OPENCODE_ANTHROPIC_AUTH_PERF=1`, counting Anthropic event, block, and delta types without logging response text or tool input content.
+
 ## 1.9.0
 
 ### Minor Changes
