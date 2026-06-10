@@ -383,6 +383,35 @@ describe('provider.models', () => {
       cache: { read: 1, write: 12.5 },
     })
   })
+
+  test('does not zero OAuth model costs when costZeroing is disabled', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], costZeroing: { enabled: false } }),
+    )
+    const plugin = await getPlugin()
+    const models = {
+      'claude-opus-4-8': {
+        id: 'claude-opus-4-8',
+        name: 'Claude Opus 4.8',
+        cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+        limit: { context: 1_000_000, output: 128_000 },
+        capabilities: { reasoning: true, attachment: true, toolcall: true },
+        release_date: '2026-01-01',
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'oauth' } } as never,
+    )
+
+    // OAuth auth but opted out → real costs preserved, not zeroed.
+    expect(result?.['claude-opus-4-8']?.cost).toEqual({
+      input: 5,
+      output: 25,
+      cache: { read: 0.5, write: 6.25 },
+    })
+  })
 })
 
 describe('auth.loader', () => {

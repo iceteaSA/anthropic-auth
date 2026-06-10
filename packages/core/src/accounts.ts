@@ -149,6 +149,14 @@ export type AccountStorage = {
   claudeFast?: {
     enabled?: boolean
   }
+  /**
+   * Zero out Anthropic OAuth model costs in the provider hook. Default: enabled
+   * (OAuth usage is quota-based, not per-token billed, so costs show as $0).
+   * Set `enabled: false` to opt out and display the provider's real model costs.
+   */
+  costZeroing?: {
+    enabled?: boolean
+  }
   cacheKeep?: {
     enabled?: boolean
     startHour?: number
@@ -163,6 +171,17 @@ export type AccountStorage = {
   }
   killswitch?: KillswitchConfig
   accounts: FallbackAccount[]
+}
+
+/**
+ * Whether Anthropic OAuth model costs should be zeroed in the provider hook.
+ * Defaults to enabled; only an explicit `costZeroing.enabled === false` opts out
+ * (to display the provider's real model costs).
+ */
+export function isCostZeroingEnabled(
+  storage: Pick<AccountStorage, 'costZeroing'>,
+): boolean {
+  return storage.costZeroing?.enabled !== false
 }
 
 export type AccountRuntimeEntry = Partial<
@@ -393,6 +412,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     claudeCache: isRecord(value.claudeCache) ? value.claudeCache : undefined,
     dump: isRecord(value.dump) ? value.dump : undefined,
     claudeFast: isRecord(value.claudeFast) ? value.claudeFast : undefined,
+    costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
@@ -545,6 +565,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     claudeCache: storage.claudeCache,
     dump: storage.dump,
     claudeFast: storage.claudeFast,
+    costZeroing: storage.costZeroing,
     cacheKeep: storage.cacheKeep,
     relay: storage.relay,
     killswitch: storage.killswitch,

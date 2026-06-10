@@ -10,6 +10,7 @@ import {
   FallbackAccountManager,
   getAccountStatePath,
   getCache1hPersistentMode,
+  isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
   loadAccounts,
   type OAuthAccount,
@@ -62,6 +63,31 @@ afterEach(async () => {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   await rm(tempDir, { recursive: true, force: true })
   mock.restore()
+})
+
+describe('isCostZeroingEnabled', () => {
+  test('defaults to enabled when costZeroing is absent', () => {
+    expect(isCostZeroingEnabled(baseStorage())).toBe(true)
+  })
+
+  test('stays enabled when explicitly enabled', () => {
+    expect(isCostZeroingEnabled({ costZeroing: { enabled: true } })).toBe(true)
+  })
+
+  test('is disabled only when explicitly set to false', () => {
+    expect(isCostZeroingEnabled({ costZeroing: { enabled: false } })).toBe(
+      false,
+    )
+  })
+
+  test('persists across save/load round-trip', async () => {
+    const storage = baseStorage()
+    storage.costZeroing = { enabled: false }
+    await saveAccounts(storage)
+    const loaded = await loadAccounts()
+    expect(loaded!.costZeroing).toEqual({ enabled: false })
+    expect(isCostZeroingEnabled(loaded!)).toBe(false)
+  })
 })
 
 describe('account storage', () => {
