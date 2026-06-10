@@ -898,6 +898,223 @@ export async function rewriteRequestBody(
   }
 }
 
+type SseEventSummary = {
+  event?: string
+  type?: string
+  index?: number
+  contentBlockType?: string
+  deltaType?: string
+  stopReason?: string
+  rawBytes: number
+  dataBytes: number
+  textDeltaBytes?: number
+  thinkingDeltaBytes?: number
+  inputJsonDeltaBytes?: number
+  signatureDeltaBytes?: number
+  redactedThinkingBytes?: number
+}
+
+type SseDiagnosticState = {
+  pending: string
+  events: number
+  parseErrors: number
+  eventCounts: Record<string, number>
+  typeCounts: Record<string, number>
+  deltaTypeCounts: Record<string, number>
+  contentBlockTypeCounts: Record<string, number>
+  textDeltaBytes: number
+  thinkingDeltaBytes: number
+  inputJsonDeltaBytes: number
+  signatureDeltaBytes: number
+  redactedThinkingBytes: number
+  last?: SseEventSummary
+}
+
+const sseDiagnosticEncoder = new TextEncoder()
+
+function createSseDiagnosticState(): SseDiagnosticState {
+  return {
+    pending: '',
+    events: 0,
+    parseErrors: 0,
+    eventCounts: {},
+    typeCounts: {},
+    deltaTypeCounts: {},
+    contentBlockTypeCounts: {},
+    textDeltaBytes: 0,
+    thinkingDeltaBytes: 0,
+    inputJsonDeltaBytes: 0,
+    signatureDeltaBytes: 0,
+    redactedThinkingBytes: 0,
+  }
+}
+
+function incrementCount(
+  counts: Record<string, number>,
+  key: string | undefined,
+) {
+  if (!key) return
+  counts[key] = (counts[key] ?? 0) + 1
+}
+
+function stringBytes(value: string) {
+  return sseDiagnosticEncoder.encode(value).byteLength
+}
+
+function asDiagnosticRecord(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function stringField(record: Record<string, unknown> | undefined, key: string) {
+  const value = record?.[key]
+  return typeof value === 'string' ? value : undefined
+}
+
+function numberField(record: Record<string, unknown> | undefined, key: string) {
+  const value = record?.[key]
+  return typeof value === 'number' ? value : undefined
+}
+
+function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
+  if (!rawEvent.trim()) return null
+
+  let eventName: string | undefined
+  const dataLines: string[] = []
+  for (const line of rawEvent.split(/\r?\n/)) {
+    if (line.startsWith('event:')) {
+      eventName = line.slice('event:'.length).trim()
+      continue
+    }
+    if (line.startsWith('data:')) {
+      const value = line.slice('data:'.length)
+      dataLines.push(value.startsWith(' ') ? value.slice(1) : value)
+    }
+  }
+
+  const dataText = dataLines.join('\n')
+  const summary: SseEventSummary = {
+    event: eventName,
+    rawBytes: stringBytes(rawEvent),
+    dataBytes: stringBytes(dataText),
+  }
+
+  if (!dataText || dataText === '[DONE]') {
+    summary.type = dataText === '[DONE]' ? 'done' : undefined
+    summary.event ??= summary.type
+    return summary
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(dataText)
+  } catch {
+    return summary
+  }
+
+  const data = asDiagnosticRecord(parsed)
+  const delta = asDiagnosticRecord(data?.delta)
+  const contentBlock = asDiagnosticRecord(data?.content_block)
+  const message = asDiagnosticRecord(data?.message)
+  const usage =
+    asDiagnosticRecord(data?.usage) ?? asDiagnosticRecord(message?.usage)
+
+  summary.type = stringField(data, 'type')
+  summary.event ??= summary.type
+  summary.index = numberField(data, 'index')
+  summary.contentBlockType = stringField(contentBlock, 'type')
+  summary.deltaType = stringField(delta, 'type')
+  summary.stopReason = stringField(data, 'stop_reason')
+
+  if (summary.deltaType === 'text_delta') {
+    summary.textDeltaBytes = stringBytes(stringField(delta, 'text') ?? '')
+  }
+  if (summary.deltaType === 'thinking_delta') {
+    summary.thinkingDeltaBytes = stringBytes(
+      stringField(delta, 'thinking') ?? '',
+    )
+  }
+  if (summary.deltaType === 'input_json_delta') {
+    summary.inputJsonDeltaBytes = stringBytes(
+      stringField(delta, 'partial_json') ?? '',
+    )
+  }
+  if (summary.deltaType === 'signature_delta') {
+    summary.signatureDeltaBytes = stringBytes(
+      stringField(delta, 'signature') ?? '',
+    )
+  }
+  if (summary.contentBlockType === 'redacted_thinking') {
+    summary.redactedThinkingBytes = stringBytes(
+      stringField(contentBlock, 'data') ?? '',
+    )
+  }
+  if (usage) {
+    summary.stopReason ??= stringField(message, 'stop_reason')
+  }
+
+  return summary
+}
+
+function findSseBoundary(value: string) {
+  const lf = value.indexOf('\n\n')
+  const crlf = value.indexOf('\r\n\r\n')
+  if (lf === -1) return crlf === -1 ? null : { index: crlf, length: 4 }
+  if (crlf === -1 || lf < crlf) return { index: lf, length: 2 }
+  return { index: crlf, length: 4 }
+}
+
+function updateSseDiagnostics(state: SseDiagnosticState, text: string) {
+  if (!text) return
+  state.pending += text
+
+  while (true) {
+    const boundary = findSseBoundary(state.pending)
+    if (!boundary) break
+
+    const rawEvent = state.pending.slice(0, boundary.index)
+    state.pending = state.pending.slice(boundary.index + boundary.length)
+    const summary = summarizeSseEvent(rawEvent)
+    if (!summary) continue
+
+    state.events++
+    incrementCount(state.eventCounts, summary.event ?? 'unknown')
+    incrementCount(state.typeCounts, summary.type)
+    incrementCount(state.deltaTypeCounts, summary.deltaType)
+    incrementCount(state.contentBlockTypeCounts, summary.contentBlockType)
+    state.textDeltaBytes += summary.textDeltaBytes ?? 0
+    state.thinkingDeltaBytes += summary.thinkingDeltaBytes ?? 0
+    state.inputJsonDeltaBytes += summary.inputJsonDeltaBytes ?? 0
+    state.signatureDeltaBytes += summary.signatureDeltaBytes ?? 0
+    state.redactedThinkingBytes += summary.redactedThinkingBytes ?? 0
+    state.last = summary
+    if (summary.dataBytes > 0 && !summary.type && !summary.event) {
+      state.parseErrors++
+    }
+  }
+}
+
+function sseDiagnosticStats(state: SseDiagnosticState) {
+  return {
+    sseEvents: state.events,
+    ssePendingChars: state.pending.length,
+    sseParseErrors: state.parseErrors,
+    sseEventCounts: { ...state.eventCounts },
+    sseTypeCounts: { ...state.typeCounts },
+    sseDeltaTypeCounts: { ...state.deltaTypeCounts },
+    sseContentBlockTypeCounts: { ...state.contentBlockTypeCounts },
+    sseTextDeltaBytes: state.textDeltaBytes,
+    sseThinkingDeltaBytes: state.thinkingDeltaBytes,
+    sseInputJsonDeltaBytes: state.inputJsonDeltaBytes,
+    sseSignatureDeltaBytes: state.signatureDeltaBytes,
+    sseRedactedThinkingBytes: state.redactedThinkingBytes,
+    sseLastEvent: state.last ? { ...state.last } : undefined,
+  }
+}
+
 /**
  * Create a streaming response that strips the tool prefix from tool names.
  */
@@ -920,6 +1137,7 @@ export function createStrippedStream(
   let readerReleased = false
   let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
+  const sseDiagnostics = options.perf ? createSseDiagnosticState() : undefined
 
   const releaseReader = () => {
     if (readerReleased) return
@@ -934,6 +1152,7 @@ export function createStrippedStream(
     pendingChars: pending.length,
     rewriteMs: rewriteRoundMs(rewriteMs),
     totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
+    ...(sseDiagnostics ? sseDiagnosticStats(sseDiagnostics) : {}),
     ...extra,
   })
   const logProgress = (stage: string, extra: Record<string, unknown> = {}) => {
@@ -958,9 +1177,11 @@ export function createStrippedStream(
         const { done, value } = await reader.read()
         const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
         if (done) {
+          const finalDecoded = decoder.decode()
+          if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, finalDecoded)
           const rewriteStart = rewriteNowMs()
           const flushed = splitToolPrefixRewriteBuffer(
-            `${pending}${decoder.decode()}`,
+            `${pending}${finalDecoded}`,
             true,
           )
           rewriteMs += rewriteNowMs() - rewriteStart
@@ -977,7 +1198,9 @@ export function createStrippedStream(
 
         chunkCount++
         inputBytes += value.byteLength
-        const text = pending + decoder.decode(value, { stream: true })
+        const decoded = decoder.decode(value, { stream: true })
+        if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
+        const text = pending + decoded
         const rewriteStart = rewriteNowMs()
         const rewritten = splitToolPrefixRewriteBuffer(text)
         rewriteMs += rewriteNowMs() - rewriteStart

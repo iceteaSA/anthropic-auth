@@ -502,6 +502,92 @@ describe('createStrippedStream', () => {
     expect(text).not.toContain('mcp_Read')
   })
 
+  test('logs structural SSE diagnostics without response text', async () => {
+    const sse = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    const payload = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { usage: { input_tokens: 10, output_tokens: 0 } },
+      }),
+      sse('ping', { type: 'ping' }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'thinking' },
+      }),
+      sse('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'thinking_delta', thinking: 'secret-thought' },
+      }),
+      sse('content_block_delta', {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'text_delta', text: 'secret-output' },
+      }),
+      sse('content_block_delta', {
+        type: 'content_block_delta',
+        index: 2,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: '{"query":"secret-tool-input"}',
+        },
+      }),
+    ].join('')
+    const chunks = [
+      payload.slice(0, 41),
+      payload.slice(41, 143),
+      payload.slice(143),
+    ]
+    const perf: Array<{ stage: string; data: Record<string, unknown> }> = []
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk))
+        }
+        controller.close()
+      },
+    })
+
+    const stripped = createStrippedStream(
+      new Response(stream, { status: 200 }),
+      {
+        perf: (stage, data) => perf.push({ stage, data: data ?? {} }),
+      },
+    )
+
+    await stripped.text()
+    const final = perf.find(
+      (entry) => entry.stage === 'stream_tool_prefix_rewrite',
+    )?.data
+    expect(final).toBeDefined()
+    expect(final?.sseEventCounts).toEqual({
+      message_start: 1,
+      ping: 1,
+      content_block_start: 1,
+      content_block_delta: 3,
+    })
+    expect(final?.sseTypeCounts).toEqual({
+      message_start: 1,
+      ping: 1,
+      content_block_start: 1,
+      content_block_delta: 3,
+    })
+    expect(final?.sseDeltaTypeCounts).toEqual({
+      thinking_delta: 1,
+      text_delta: 1,
+      input_json_delta: 1,
+    })
+    expect(final?.sseContentBlockTypeCounts).toEqual({ thinking: 1 })
+    expect(final?.sseThinkingDeltaBytes).toBeGreaterThan(0)
+    expect(final?.sseTextDeltaBytes).toBeGreaterThan(0)
+    expect(final?.sseInputJsonDeltaBytes).toBeGreaterThan(0)
+    expect(JSON.stringify(perf)).not.toContain('secret')
+  })
+
   test('preserves response status and headers', async () => {
     const stream = new ReadableStream({
       start(controller) {
