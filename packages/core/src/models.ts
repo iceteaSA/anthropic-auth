@@ -9,6 +9,11 @@ export const CLAUDE_FABLE_MYTHOS_5_MODEL_IDS = [
 export type ClaudeFableMythos5ModelId =
   (typeof CLAUDE_FABLE_MYTHOS_5_MODEL_IDS)[number]
 
+export const CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING = {
+  type: 'adaptive',
+  display: 'summarized',
+} as const
+
 export const CLAUDE_FABLE_MYTHOS_5_PRICING = {
   input: 10,
   output: 50,

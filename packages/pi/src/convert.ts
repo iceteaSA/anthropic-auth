@@ -4,6 +4,7 @@ import {
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   type ClaudeCodeIdentity,
   isClaudeFableOrMythos5Model,
   isFastModeSupportedModel,
@@ -43,7 +44,9 @@ export type AnthropicRequestBody = {
   system?: Array<Record<string, unknown>>
   messages: Array<Record<string, unknown>>
   tools?: Array<Record<string, unknown>>
-  thinking?: { type: 'enabled'; budget_tokens: number }
+  thinking?:
+    | { type: 'enabled'; budget_tokens: number }
+    | { type: 'adaptive'; display: 'summarized' }
   output_config?: { effort: string }
   cache_control?: { type: 'ephemeral' }
   speed?: 'fast'
@@ -342,8 +345,13 @@ export async function buildAnthropicRequest(
     body.speed = 'fast'
   }
 
+  const isFableOrMythos5 = isClaudeFableOrMythos5Model(modelId)
+  if (isFableOrMythos5) {
+    body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  }
+
   if (options?.reasoning) {
-    if (isClaudeFableOrMythos5Model(modelId)) {
+    if (isFableOrMythos5) {
       body.output_config = { effort: options.reasoning }
     } else {
       const budgets: Record<string, number> = {

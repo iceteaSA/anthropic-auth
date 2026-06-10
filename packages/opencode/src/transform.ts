@@ -5,6 +5,7 @@ import {
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
@@ -683,11 +684,13 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
 }
 
-function normalizeFableMythosRequest(parsed: Record<string, unknown>) {
-  if (!isClaudeFableOrMythos5Model(parsed.model)) return false
+function normalizeFableMythosRequest(
+  parsed: Record<string, unknown>,
+): { replacedExisting: boolean } | null {
+  if (!isClaudeFableOrMythos5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
-  delete parsed.thinking
-  return hadThinking
+  parsed.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  return { replacedExisting: hadThinking }
 }
 
 function applyCache1hStrategy(
@@ -814,11 +817,15 @@ export async function rewriteRequestBody(
     })
 
     const modelNormalizeStart = rewriteNowMs()
-    const removedFableThinking = normalizeFableMythosRequest(parsed)
+    const fableMythosThinking = normalizeFableMythosRequest(parsed)
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
-      removedFableThinking,
+      fableMythosThinkingDisplay: fableMythosThinking
+        ? 'summarized'
+        : undefined,
+      replacedFableMythosThinking:
+        fableMythosThinking?.replacedExisting ?? false,
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
 

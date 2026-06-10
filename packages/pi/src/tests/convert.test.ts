@@ -276,8 +276,20 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
       defaultCache,
     )
 
-    expect(body.thinking).toBeUndefined()
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
     expect(body.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('requests summarized adaptive thinking for Claude Fable 5 without explicit reasoning', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toBeUndefined()
   })
 
   test('keeps manual thinking budgets for non-Fable models', async () => {

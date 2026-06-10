@@ -860,17 +860,17 @@ describe('rewriteRequestBody', () => {
     }
   })
 
-  test('removes top-level thinking from Fable requests', async () => {
+  test('requests summarized adaptive thinking for Fable requests', async () => {
     const body = JSON.stringify({
       model: 'claude-fable-5',
       messages: [{ role: 'user', content: 'hi' }],
-      thinking: { type: 'adaptive', display: 'summarized' },
+      thinking: { type: 'adaptive', display: 'omitted' },
       output_config: { effort: 'xhigh' },
     })
 
     const result = JSON.parse(await rewriteRequestBody(body))
 
-    expect(result.thinking).toBeUndefined()
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
     expect(result.output_config).toEqual({ effort: 'xhigh' })
   })
 
