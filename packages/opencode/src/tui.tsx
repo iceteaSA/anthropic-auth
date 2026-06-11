@@ -262,20 +262,77 @@ async function readStateFromFile(): Promise<SidebarState> {
   return getSidebarState()
 }
 
+interface SidebarController {
+  prefs: () => AnthropicAuthTuiPrefs
+  collapsed: () => boolean
+  toggleCollapsed: () => void
+}
+
+// The TUI may unmount and remount sidebar_content when the user switches
+// views (e.g. main -> subagent -> main). A remount re-runs the component
+// body, so any signal created inside the component would reset to its
+// seed. The controller lives in the plugin closure (process lifetime)
+// and owns the durable prefs/collapse signals plus the single shared
+// watcher subscription, so collapse and live pref reloads survive the
+// remount. No effects or memos here — those need a Solid owner, so the
+// poll-interval createEffect stays inside the component.
+function createSidebarController(
+  initialPrefs: AnthropicAuthTuiPrefs,
+): SidebarController {
+  const [prefs, setPrefs] = createSignal<AnthropicAuthTuiPrefs>(initialPrefs)
+  const seedCollapsed =
+    initialPrefs.rememberCollapsed && initialPrefs.collapsed != null
+      ? initialPrefs.collapsed
+      : initialPrefs.startCollapsed
+  const [collapsed, setCollapsed] = createSignal(seedCollapsed)
+  let lastPersistedCollapsed: boolean | null = initialPrefs.collapsed
+  let lastApplied = JSON.stringify(initialPrefs)
+
+  // The watcher lives for the plugin/process lifetime — it is intentionally
+  // never disposed. Collapse guard mirrors the race-fix in toggleCollapsed:
+  // lastPersistedCollapsed is advanced only once our own write lands, so
+  // watcher echoes of the previous persisted value are rejected by the
+  // `!==` check and cannot revert a user click.
+  watchTuiPreferences(() => {
+    void (async () => {
+      const next = resolveAnthropicAuthPrefs(await readTuiPreferencesFile())
+      const serialized = JSON.stringify(next)
+      if (serialized === lastApplied) return
+      lastApplied = serialized
+      setPrefs(next)
+      if (
+        next.rememberCollapsed &&
+        next.collapsed != null &&
+        next.collapsed !== lastPersistedCollapsed
+      ) {
+        lastPersistedCollapsed = next.collapsed
+        setCollapsed(next.collapsed)
+      }
+    })()
+  })
+
+  function toggleCollapsed() {
+    const next = !collapsed()
+    setCollapsed(next)
+    if (prefs().rememberCollapsed) {
+      void queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], next).then(
+        () => {
+          lastPersistedCollapsed = next
+        },
+      )
+    }
+  }
+
+  return { prefs, collapsed, toggleCollapsed }
+}
+
 function QuotaSidebar(props: {
   api: TuiPluginApi
-  initialPrefs: AnthropicAuthTuiPrefs
+  controller: SidebarController
 }) {
+  const prefs = props.controller.prefs
+  const collapsed = props.controller.collapsed
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
-  const [prefs, setPrefs] = createSignal<AnthropicAuthTuiPrefs>(
-    props.initialPrefs,
-  )
-  const seedCollapsed =
-    props.initialPrefs.rememberCollapsed && props.initialPrefs.collapsed != null
-      ? props.initialPrefs.collapsed
-      : props.initialPrefs.startCollapsed
-  const [collapsed, setCollapsed] = createSignal(seedCollapsed)
-  let lastPersistedCollapsed: boolean | null = props.initialPrefs.collapsed
   let lastUpdated = 0
   let debounce: ReturnType<typeof setTimeout> | null = null
 
@@ -308,52 +365,10 @@ function QuotaSidebar(props: {
   ]
   setTimeout(refresh, 300)
 
-  // Live preference reload. Skip no-op updates so our own collapse writes
-  // (which echo back through the watcher) don't churn the UI, and only sync
-  // the collapsed signal when the persisted value actually changed — a local
-  // click must not be clobbered by an unrelated file edit.
-  //
-  // `lastPersistedCollapsed` is advanced in the `.then()` of the write (see
-  // `toggleCollapsed`), not optimistically. While our write is in flight the
-  // marker still holds the previous persisted value, so any watcher event
-  // echoing that stale value is correctly rejected by the `!==` guard.
-  let lastApplied = JSON.stringify(props.initialPrefs)
-  const unwatch = watchTuiPreferences(() => {
-    void (async () => {
-      const next = resolveAnthropicAuthPrefs(await readTuiPreferencesFile())
-      const serialized = JSON.stringify(next)
-      if (serialized === lastApplied) return
-      lastApplied = serialized
-      setPrefs(next)
-      if (
-        next.rememberCollapsed &&
-        next.collapsed != null &&
-        next.collapsed !== lastPersistedCollapsed
-      ) {
-        lastPersistedCollapsed = next.collapsed
-        setCollapsed(next.collapsed)
-      }
-    })()
-  })
-
   onCleanup(() => {
     if (debounce) clearTimeout(debounce)
     for (const u of unsubs) u()
-    unwatch()
   })
-
-  function toggleCollapsed() {
-    if (!hasData()) return
-    const next = !collapsed()
-    setCollapsed(next)
-    if (prefs().rememberCollapsed) {
-      void queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], next).then(
-        () => {
-          lastPersistedCollapsed = next
-        },
-      )
-    }
-  }
 
   const theme = () => props.api.theme.current
   const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
@@ -409,7 +424,9 @@ function QuotaSidebar(props: {
         flexDirection='row'
         justifyContent='space-between'
         alignItems='center'
-        onMouseDown={toggleCollapsed}
+        onMouseDown={() => {
+          if (hasData()) props.controller.toggleCollapsed()
+        }}
       >
         <box paddingLeft={1} paddingRight={1} backgroundColor={theme().accent}>
           <text fg={theme().background}>
@@ -564,12 +581,12 @@ function QuotaSidebar(props: {
 
 const tui: TuiPlugin = async (api) => {
   const root = await readTuiPreferencesFile()
-  const initialPrefs = resolveAnthropicAuthPrefs(root)
+  const controller = createSidebarController(resolveAnthropicAuthPrefs(root))
   api.slots.register({
     order: computeEffectiveOrder(root, PLUGIN_KEY, DEFAULT_SLOT_ORDER),
     slots: {
       sidebar_content(_ctx: unknown, _props: { session_id: string }) {
-        return <QuotaSidebar api={api} initialPrefs={initialPrefs} />
+        return <QuotaSidebar api={api} controller={controller} />
       },
     },
   })
