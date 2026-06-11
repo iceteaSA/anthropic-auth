@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   computeEffectiveOrder,
   DEFAULT_PREFS,
   getTuiPreferencesFile,
+  PLUGIN_KEY,
+  queueTuiPreferenceUpdate,
   readTuiPreferencesFile,
   resolveAnthropicAuthPrefs,
   TUI_PREFS_FILE_ENV,
@@ -249,5 +251,64 @@ describe('computeEffectiveOrder', () => {
         160,
       ),
     ).toBe(160)
+  })
+})
+
+describe('queueTuiPreferenceUpdate', () => {
+  test('creates file with template on first write', async () => {
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+    const text = await readFile(file, 'utf8')
+    expect(text).toContain('Shared preferences for opencode TUI plugins')
+    const root = await readTuiPreferencesFile()
+    expect(root).toEqual({ 'anthropic-auth': { collapsed: true } })
+  })
+
+  test('preserves comments and unrelated keys on update', async () => {
+    const original = `// my notes
+{
+  // keep me
+  "other-plugin": { "forceToTop": true },
+  "anthropic-auth": {
+    "pollMs": 2000, // tuned
+    "collapsed": false
+  }
+}
+`
+    await writeFile(file, original, 'utf8')
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+    const text = await readFile(file, 'utf8')
+    expect(text).toContain('// my notes')
+    expect(text).toContain('// keep me')
+    expect(text).toContain('// tuned')
+    expect(text).toContain('"pollMs": 2000')
+    const root = await readTuiPreferencesFile()
+    expect(root['other-plugin']).toEqual({ forceToTop: true })
+    expect((root['anthropic-auth'] as Record<string, unknown>).collapsed).toBe(
+      true,
+    )
+  })
+
+  test('writes nested paths', async () => {
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['header', 'label'], 'Q')
+    const root = await readTuiPreferencesFile()
+    expect(root).toEqual({ 'anthropic-auth': { header: { label: 'Q' } } })
+  })
+
+  test('rapid sequential updates land the final value', async () => {
+    const writes = [true, false, true, false].map((value) =>
+      queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], value),
+    )
+    await Promise.all(writes)
+    const root = await readTuiPreferencesFile()
+    expect((root['anthropic-auth'] as Record<string, unknown>).collapsed).toBe(
+      false,
+    )
+  })
+
+  test('no temp files are left behind', async () => {
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+    const { readdir } = await import('node:fs/promises')
+    const entries = await readdir(dir)
+    expect(entries).toEqual(['tui-preferences.jsonc'])
   })
 })

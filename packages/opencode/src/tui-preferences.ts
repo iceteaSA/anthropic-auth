@@ -1,7 +1,7 @@
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { parse } from 'jsonc-parser'
+import { dirname, join } from 'node:path'
+import { applyEdits, modify, parse } from 'jsonc-parser'
 
 export const TUI_PREFS_FILE_ENV = 'OPENCODE_TUI_PREFERENCES_FILE'
 const FILE_NAME = 'tui-preferences.jsonc'
@@ -201,4 +201,53 @@ export function computeEffectiveOrder(
     return FORCE_TOP_BASE + Object.keys(root).indexOf(pluginKey)
   }
   return int(entry.order, defaultOrder, -10000, 10000)
+}
+
+const TEMPLATE = `// Shared preferences for opencode TUI plugins.
+// One top-level key per plugin (short name). See each plugin's README for
+// its supported settings. This file is safe to hand-edit; plugins update
+// individual keys in place and preserve comments.
+{}
+`
+
+type JsonValue = string | number | boolean | null
+
+async function writePreference(
+  pluginKey: string,
+  path: string[],
+  value: JsonValue,
+): Promise<void> {
+  const file = getTuiPreferencesFile()
+  await mkdir(dirname(file), { recursive: true })
+  let text: string
+  try {
+    text = await readFile(file, 'utf8')
+  } catch {
+    text = ''
+  }
+  if (text.trim() === '') text = TEMPLATE
+  const edits = modify(text, [pluginKey, ...path], value, {
+    formattingOptions: { insertSpaces: true, tabSize: 2 },
+  })
+  const next = applyEdits(text, edits)
+  const tmp = `${file}.${process.pid}.tmp`
+  await writeFile(tmp, next, 'utf8')
+  await rename(tmp, file)
+}
+
+let writeChain: Promise<void> = Promise.resolve()
+
+// Writes are serialized on a promise chain: each update re-reads the file,
+// applies a minimal comment-preserving edit to one property, and replaces the
+// file atomically (temp + rename in the same directory). Best-effort by
+// design — preferences are never worth crashing the TUI over.
+export function queueTuiPreferenceUpdate(
+  pluginKey: string,
+  path: string[],
+  value: JsonValue,
+): Promise<void> {
+  writeChain = writeChain
+    .then(() => writePreference(pluginKey, path, value))
+    .catch(() => {})
+  return writeChain
 }
