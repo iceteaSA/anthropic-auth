@@ -21,6 +21,7 @@ import {
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   ClaudeOAuthRefreshError,
+  dumpDirectRequest,
   exchange,
   executeCache1hCommand,
   executeCacheKeepCommand,
@@ -159,6 +160,23 @@ function roundMs(value: number) {
 
 function jitterMs(maxMs: number) {
   return Math.floor(Math.random() * Math.max(0, maxMs))
+}
+
+function fetchInputUrl(input: string | URL | Request) {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.toString()
+  return input.url
+}
+
+function fetchMethod(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+) {
+  return init?.method ?? (input instanceof Request ? input.method : undefined)
+}
+
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function startEventLoopLagMonitor() {
@@ -1609,6 +1627,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             void currentStorage
             const start = nowMs()
             const requestHeaders = mergeHeaders(input, init)
+            const directAffinity =
+              requestHeaders.get('x-session-affinity') ||
+              requestHeaders.get('x-opencode-session')
             const subagentRequest = isSubagentRequest(requestHeaders)
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
@@ -1656,12 +1677,41 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
             const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
             const sendStart = nowMs()
-            const response = await fetch(rewritten.input, {
-              ...init,
-              body,
-              headers: requestHeaders,
-              ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-            })
+            let response: Response
+            try {
+              response = await fetch(rewritten.input, {
+                ...init,
+                body,
+                headers: requestHeaders,
+                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+              })
+            } catch (error) {
+              if (typeof body === 'string') {
+                await dumpDirectRequest({
+                  affinity: directAffinity,
+                  route,
+                  error: errorText(error),
+                  bodyText: body,
+                  url:
+                    rewritten.url?.toString() ?? fetchInputUrl(rewritten.input),
+                  method: fetchMethod(input, init),
+                  headers: requestHeaders,
+                })
+              }
+              throw error
+            }
+            if (typeof body === 'string') {
+              await dumpDirectRequest({
+                affinity: directAffinity,
+                route,
+                status: response.status,
+                bodyText: body,
+                url:
+                  rewritten.url?.toString() ?? fetchInputUrl(rewritten.input),
+                method: fetchMethod(input, init),
+                headers: requestHeaders,
+              })
+            }
             trace?.mark('send_headers_received', {
               route,
               ms: roundMs(nowMs() - sendStart),
@@ -1803,13 +1853,45 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               })
             }
 
-            const directFetch = () =>
-              fetch(rewritten.input, {
-                ...init,
-                body,
-                headers: requestHeaders,
-                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-              })
+            const directFetch = async () => {
+              try {
+                const response = await fetch(rewritten.input, {
+                  ...init,
+                  body,
+                  headers: requestHeaders,
+                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                })
+                if (typeof body === 'string') {
+                  await dumpDirectRequest({
+                    affinity: relayAffinity,
+                    route,
+                    status: response.status,
+                    bodyText: body,
+                    url:
+                      rewritten.url?.toString() ??
+                      fetchInputUrl(rewritten.input),
+                    method: fetchMethod(input, init),
+                    headers: requestHeaders,
+                  })
+                }
+                return response
+              } catch (error) {
+                if (typeof body === 'string') {
+                  await dumpDirectRequest({
+                    affinity: relayAffinity,
+                    route,
+                    error: errorText(error),
+                    bodyText: body,
+                    url:
+                      rewritten.url?.toString() ??
+                      fetchInputUrl(rewritten.input),
+                    method: fetchMethod(input, init),
+                    headers: requestHeaders,
+                  })
+                }
+                throw error
+              }
+            }
 
             const relayConfig = getRelayConfig(await getRequestStorage())
             const sendStart = nowMs()

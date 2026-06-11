@@ -482,8 +482,9 @@ ls "$(node -p 'require("node:os").tmpdir()')/opencode-anthropic-auth-dumps"
 Each filename includes a sanitized session/affinity segment so dumps from different sessions are easier to find. Each request gets:
 
 - `*.body.json` — final rewritten Anthropic request body.
-- `*.relay.json` — redacted relay payload/frame metadata.
 - `*.meta.json` — hashes, byte counts, diff ranges, model, `messages[0]` hash, later-message hash, and cache-relevant structure.
+- `*.relay.json` — redacted relay payload/frame metadata for relay requests.
+- `*.request.json` — redacted direct request URL, method, and headers for direct requests.
 
 Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.config/opencode/anthropic-auth.json` for OpenCode, `~/.pi/agent/anthropic-auth.json` for Pi). Dumps may contain prompt content and should be treated as sensitive local debugging artifacts.
 

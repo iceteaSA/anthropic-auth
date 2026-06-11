@@ -26,6 +26,7 @@ import {
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
+  setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModePersistentEnabled,
   setRoutingMode,
@@ -132,8 +133,12 @@ export function registerCommands(pi: ExtensionAPI) {
 
       if (action.type === 'enable') {
         await setDumpPersistentEnabled(true, path)
+        setDumpEnabled(true)
       } else if (action.type === 'disable') {
         await setDumpPersistentEnabled(false, path)
+        setDumpEnabled(false)
+      } else {
+        setDumpEnabled(enabled)
       }
 
       notify(

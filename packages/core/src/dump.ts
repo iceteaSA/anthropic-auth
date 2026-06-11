@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
 import { relayLog } from './logger.ts'
 
+type DumpHeaders = ConstructorParameters<typeof Headers>[0]
+
 export const CLAUDE_DUMP_COMMAND_NAME = 'claude-dump'
 
 const DUMP_STATUS_TITLE = '## Claude Dump Status'
@@ -18,6 +20,9 @@ const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
 
 let dumpEnabled = false
 let nextDumpId = 0
+
+const DIRECT_DUMP_PREVIOUS_BODY_LIMIT = 100
+const directDumpPreviousBodies = new Map<string, string>()
 
 export type DumpCommandAction =
   | { type: 'status' }
@@ -35,6 +40,8 @@ export function setDumpEnabled(enabled: boolean) {
 
 export function resetDumpState() {
   dumpEnabled = false
+  nextDumpId = 0
+  directDumpPreviousBodies.clear()
 }
 
 export function getDumpDirectory() {
@@ -61,7 +68,7 @@ export function buildDumpStatusSummary(input?: { enabled?: boolean }) {
     `- Enabled: ${enabled ? 'enabled' : 'disabled'}`,
     `- Directory: ${getDumpDirectory()}`,
     '- Persisted: ~/.config/opencode/anthropic-auth.json',
-    '- Captures: final rewritten Anthropic body plus redacted relay payload metadata',
+    '- Captures: final rewritten Anthropic body in direct and relay modes; request/relay metadata is redacted',
     '- Warning: body dumps may contain prompt/session content; turn this off after debugging',
   ].join('\n')
 }
@@ -111,6 +118,45 @@ function dumpFileSessionSegment(affinity: string) {
     .replace(/^-+|-+$/g, '')
   if (!normalized) return 'session-unknown'
   return normalized.length <= 80 ? normalized : normalized.slice(0, 80)
+}
+
+function dumpRequestSegment(input: {
+  transport: 'direct' | 'http' | 'websocket'
+  protocol?: 1 | 2
+  mode?: 'full_sync' | 'patch'
+  route?: string
+}) {
+  if (input.transport !== 'direct') {
+    return `${input.transport}-p${input.protocol}-${input.mode}`
+  }
+  const route = input.route ? `-${dumpFileSessionSegment(input.route)}` : ''
+  return `direct${route}`
+}
+
+function directDumpPreviousKey(input: {
+  affinity?: string | null
+  route?: string
+  url?: string
+}) {
+  const affinity = input.affinity?.trim()
+  if (affinity) return `session:${affinity}`
+  return `request:${input.route ?? 'direct'}:${input.url ?? ''}`
+}
+
+function rememberDirectDumpBody(key: string, bodyText: string) {
+  if (!directDumpPreviousBodies.has(key)) {
+    while (directDumpPreviousBodies.size >= DIRECT_DUMP_PREVIOUS_BODY_LIMIT) {
+      const oldest = directDumpPreviousBodies.keys().next().value
+      if (oldest === undefined) break
+      directDumpPreviousBodies.delete(oldest)
+    }
+  }
+  directDumpPreviousBodies.set(key, bodyText)
+}
+
+function headersToRecord(headers: DumpHeaders | undefined) {
+  if (headers == null) return undefined
+  return Object.fromEntries(new Headers(headers).entries())
 }
 
 function hashText(value: string) {
@@ -230,6 +276,140 @@ function redactForDump(value: unknown): unknown {
   return redacted
 }
 
+async function dumpRequest(input: {
+  affinity?: string | null
+  transport: 'direct' | 'http' | 'websocket'
+  protocol?: 1 | 2
+  mode?: 'full_sync' | 'patch'
+  route?: string
+  status?: number
+  error?: string
+  bodyText: string
+  previousBodyText?: string
+  payload?: unknown
+  relayBytes?: number
+  request?: {
+    url?: string
+    method?: string
+    headers?: DumpHeaders
+  }
+}) {
+  if (!dumpEnabled) return
+  nextDumpId += 1
+  const affinity = input.affinity?.trim() || 'session-unknown'
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${dumpFileSessionSegment(affinity)}-${dumpRequestSegment(input)}`
+  const dumpDir = getDumpDirectory()
+  const prefix = join(dumpDir, id)
+  const files: {
+    body: string
+    metadata: string
+    relay?: string
+    request?: string
+  } = {
+    body: `${prefix}.body.json`,
+    metadata: `${prefix}.meta.json`,
+  }
+  if (input.payload !== undefined) files.relay = `${prefix}.relay.json`
+  if (input.request !== undefined) files.request = `${prefix}.request.json`
+
+  try {
+    await mkdir(dumpDir, { recursive: true })
+    const metadata = {
+      id,
+      createdAt: new Date().toISOString(),
+      session: shortAffinity(affinity),
+      transport: input.transport,
+      protocol: input.protocol,
+      mode: input.mode,
+      route: input.route,
+      status: input.status,
+      error: input.error,
+      bodyBytes: input.bodyText.length,
+      relayBytes: input.relayBytes,
+      bodyHash: hashText(input.bodyText),
+      diff: diffSummary(input.previousBodyText, input.bodyText),
+      body: bodyStructureSummary(input.bodyText),
+      files,
+    }
+
+    const writes = [
+      writeFile(files.body, input.bodyText, 'utf8'),
+      writeFile(
+        files.metadata,
+        `${JSON.stringify(metadata, null, 2)}\n`,
+        'utf8',
+      ),
+    ]
+
+    if (input.payload !== undefined && files.relay) {
+      writes.push(
+        writeFile(
+          files.relay,
+          `${JSON.stringify(redactForDump(input.payload), null, 2)}\n`,
+          'utf8',
+        ),
+      )
+    }
+
+    if (input.request !== undefined && files.request) {
+      writes.push(
+        writeFile(
+          files.request,
+          `${JSON.stringify(
+            redactForDump({
+              ...input.request,
+              headers: headersToRecord(input.request.headers),
+            }),
+            null,
+            2,
+          )}\n`,
+          'utf8',
+        ),
+      )
+    }
+
+    await Promise.all(writes)
+
+    relayLog(
+      `dumped request id=${id} session=${shortAffinity(affinity)} body=${files.body} meta=${files.metadata}`,
+    )
+  } catch (error) {
+    relayLog(
+      `dump failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+export async function dumpDirectRequest(input: {
+  affinity?: string | null
+  route?: string
+  status?: number
+  error?: string
+  bodyText: string
+  url?: string
+  method?: string
+  headers?: DumpHeaders
+}) {
+  if (!dumpEnabled) return
+  const previousKey = directDumpPreviousKey(input)
+  const previousBodyText = directDumpPreviousBodies.get(previousKey)
+  await dumpRequest({
+    affinity: input.affinity,
+    transport: 'direct',
+    route: input.route,
+    status: input.status,
+    error: input.error,
+    bodyText: input.bodyText,
+    previousBodyText,
+    request: {
+      url: input.url,
+      method: input.method,
+      headers: input.headers,
+    },
+  })
+  rememberDirectDumpBody(previousKey, input.bodyText)
+}
+
 export async function dumpRelayRequest(input: {
   affinity: string
   transport: 'http' | 'websocket'
@@ -241,54 +421,15 @@ export async function dumpRelayRequest(input: {
   payload: unknown
   relayBytes: number
 }) {
-  if (!dumpEnabled) return
-  nextDumpId += 1
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${dumpFileSessionSegment(input.affinity)}-${input.transport}-p${input.protocol}-${input.mode}`
-  const dumpDir = getDumpDirectory()
-  const prefix = join(dumpDir, id)
-
-  try {
-    await mkdir(dumpDir, { recursive: true })
-    const metadata = {
-      id,
-      createdAt: new Date().toISOString(),
-      session: shortAffinity(input.affinity),
-      transport: input.transport,
-      protocol: input.protocol,
-      mode: input.mode,
-      status: input.status,
-      bodyBytes: input.bodyText.length,
-      relayBytes: input.relayBytes,
-      bodyHash: hashText(input.bodyText),
-      diff: diffSummary(input.previousBodyText, input.bodyText),
-      body: bodyStructureSummary(input.bodyText),
-      files: {
-        body: `${prefix}.body.json`,
-        relay: `${prefix}.relay.json`,
-        metadata: `${prefix}.meta.json`,
-      },
-    }
-
-    await Promise.all([
-      writeFile(`${prefix}.body.json`, input.bodyText, 'utf8'),
-      writeFile(
-        `${prefix}.relay.json`,
-        `${JSON.stringify(redactForDump(input.payload), null, 2)}\n`,
-        'utf8',
-      ),
-      writeFile(
-        `${prefix}.meta.json`,
-        `${JSON.stringify(metadata, null, 2)}\n`,
-        'utf8',
-      ),
-    ])
-
-    relayLog(
-      `dumped request id=${id} session=${shortAffinity(input.affinity)} body=${prefix}.body.json meta=${prefix}.meta.json`,
-    )
-  } catch (error) {
-    relayLog(
-      `dump failed: ${error instanceof Error ? error.message : String(error)}`,
-    )
-  }
+  await dumpRequest({
+    affinity: input.affinity,
+    transport: input.transport,
+    protocol: input.protocol,
+    mode: input.mode,
+    status: input.status,
+    bodyText: input.bodyText,
+    previousBodyText: input.previousBodyText,
+    payload: input.payload,
+    relayBytes: input.relayBytes,
+  })
 }

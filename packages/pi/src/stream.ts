@@ -3,6 +3,7 @@ import {
   applyClaudeCodeHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
+  dumpDirectRequest,
   FAST_MODE_BETA,
   FallbackAccountManager,
   getCache1hPersistentMode,
@@ -11,6 +12,7 @@ import {
   isApiKeyAccount,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
+  isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
   isOAuthAccount,
   isValidApiBaseURL,
@@ -19,6 +21,7 @@ import {
   QuotaManager,
   resolveClaudeCodeIdentity,
   sendViaRelay,
+  setDumpEnabled,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -38,6 +41,10 @@ import {
 
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import { getPiAccountStoragePath } from './paths.ts'
+
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
 
 const cacheKeepManager = new CacheKeepManager({
   loadStorage: () => loadAccounts(getPiAccountStoragePath()),
@@ -218,6 +225,7 @@ async function sendAnthropicRequest(options: {
   storagePath: string
 }): Promise<Response> {
   const storage = await loadAccounts(options.storagePath)
+  setDumpEnabled(isDumpPersistentlyEnabled(storage))
   const identity = options.accessToken
     ? await resolveClaudeCodeIdentity(options.accessToken, options.model.id)
     : undefined
@@ -266,7 +274,34 @@ async function sendAnthropicRequest(options: {
     cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
   })
 
-  if (options.apiAccount) return fetch(input, init)
+  const directFetch = async () => {
+    try {
+      const response = await fetch(input, init)
+      await dumpDirectRequest({
+        affinity: relayAffinity,
+        route: options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth',
+        status: response.status,
+        bodyText,
+        url: input.toString(),
+        method: init.method,
+        headers,
+      })
+      return response
+    } catch (error) {
+      await dumpDirectRequest({
+        affinity: relayAffinity,
+        route: options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth',
+        error: errorText(error),
+        bodyText,
+        url: input.toString(),
+        method: init.method,
+        headers,
+      })
+      throw error
+    }
+  }
+
+  if (options.apiAccount) return directFetch()
 
   return sendViaRelay({
     config: getRelayConfig(storage),
@@ -274,7 +309,7 @@ async function sendAnthropicRequest(options: {
     init,
     headers,
     body: bodyText,
-    fallback: () => fetch(input, init),
+    fallback: directFetch,
     affinity: relayAffinity,
   })
 }

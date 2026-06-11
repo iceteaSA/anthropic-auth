@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -484,6 +484,85 @@ describe('auth.loader', () => {
     )
     expect(result.apiKey).toBe('')
     expect(result.fetch).toBeFunction()
+  })
+
+  test('dumps direct Anthropic requests when relay is disabled', async () => {
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-direct-dump-test-'))
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+
+    try {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          dump: { enabled: true },
+          quota: { enabled: false },
+        }),
+      )
+
+      globalThis.fetch = mock((_input: any, _init: any) =>
+        Promise.resolve(
+          new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+        ),
+      ) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-direct-dump' },
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+
+      const files = await readdir(dumpDir)
+      const bodyPath = files.find((file) => file.endsWith('.body.json'))
+      const metaPath = files.find((file) => file.endsWith('.meta.json'))
+      const requestPath = files.find((file) => file.endsWith('.request.json'))
+      expect(bodyPath).toBeString()
+      expect(metaPath).toBeString()
+      expect(requestPath).toBeString()
+      expect(files.some((file) => file.endsWith('.relay.json'))).toBe(false)
+
+      const body = JSON.parse(await readFile(join(dumpDir, bodyPath!), 'utf8'))
+      const meta = JSON.parse(await readFile(join(dumpDir, metaPath!), 'utf8'))
+      const request = JSON.parse(
+        await readFile(join(dumpDir, requestPath!), 'utf8'),
+      )
+
+      expect(body.model).toBe('claude-fable-5')
+      expect(meta).toMatchObject({
+        transport: 'direct',
+        route: 'main',
+        status: 200,
+        session: 'ses-direct-dump',
+      })
+      expect(meta.files.relay).toBeUndefined()
+      expect(request).toMatchObject({
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages?beta=true',
+      })
+      expect(request.headers.authorization).toBe('[redacted]')
+    } finally {
+      if (originalDumpDir === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
+      }
+      await rm(dumpDir, { recursive: true, force: true })
+    }
   })
 
   test('sidebar shows persisted main quota written after plugin startup', async () => {
