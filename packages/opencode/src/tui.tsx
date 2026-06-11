@@ -312,6 +312,11 @@ function QuotaSidebar(props: {
   // (which echo back through the watcher) don't churn the UI, and only sync
   // the collapsed signal when the persisted value actually changed — a local
   // click must not be clobbered by an unrelated file edit.
+  //
+  // `lastPersistedCollapsed` is advanced in the `.then()` of the write (see
+  // `toggleCollapsed`), not optimistically. While our write is in flight the
+  // marker still holds the previous persisted value, so any watcher event
+  // echoing that stale value is correctly rejected by the `!==` guard.
   let lastApplied = JSON.stringify(props.initialPrefs)
   const unwatch = watchTuiPreferences(() => {
     void (async () => {
@@ -342,8 +347,11 @@ function QuotaSidebar(props: {
     const next = !collapsed()
     setCollapsed(next)
     if (prefs().rememberCollapsed) {
-      lastPersistedCollapsed = next
-      void queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], next)
+      void queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], next).then(
+        () => {
+          lastPersistedCollapsed = next
+        },
+      )
     }
   }
 

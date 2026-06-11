@@ -314,14 +314,15 @@ The sidebar polls plugin state and refreshes on OpenCode session and message eve
 - **Cache** — the 1-hour cache keepalive window and the number of tracked sessions, shown when cache keepalive is configured.
 - **Health** — quota-API and token-refresh backoff countdowns. This section is hidden unless a backoff is active, and a `LIMITED` badge appears in the header.
 
-Click the `CLAUDE` header to collapse or expand the sidebar. Collapsed, it shows the active account's 5-hour quota usage and a fast-mode row when fast mode is on; the header shows the plugin version (or a `LIMITED` badge when degraded). Collapse state is per-session and resets when OpenCode restarts.
+Click the `CLAUDE` header to collapse or expand the sidebar. Collapsed, it shows the active account's 5-hour quota usage and a fast-mode row when fast mode is on; the header shows the plugin version (or a `LIMITED` badge when degraded). Collapse state persists across restarts by default via `tui-preferences.jsonc` (`rememberCollapsed`); set `"rememberCollapsed": false` for the old per-session behavior.
 
 ## TUI preferences
 
 The TUI sidebar reads `tui-preferences.jsonc` from the opencode config
-directory (`$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else
-`~/.config/opencode`). The file is optional — defaults apply without it — and
-safe to hand-edit: the plugin updates single keys in place, preserving
+directory, resolved in this order: `OPENCODE_TUI_PREFERENCES_FILE` (full file
+path override), else `$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`,
+else `~/.config/opencode`. The file is optional — defaults apply without it —
+and safe to hand-edit: the plugin updates single keys in place, preserving
 comments, and picks up edits live while the TUI runs.
 
 The file is shared: any opencode TUI plugin can claim one top-level key
