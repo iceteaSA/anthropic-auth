@@ -316,6 +316,84 @@ The sidebar polls plugin state and refreshes on OpenCode session and message eve
 
 Click the `CLAUDE` header to collapse or expand the sidebar. Collapsed, it shows the active account's 5-hour quota usage and a fast-mode row when fast mode is on; the header shows the plugin version (or a `LIMITED` badge when degraded). Collapse state is per-session and resets when OpenCode restarts.
 
+## TUI preferences
+
+The TUI sidebar reads `tui-preferences.jsonc` from the opencode config
+directory (`$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else
+`~/.config/opencode`). The file is optional — defaults apply without it — and
+safe to hand-edit: the plugin updates single keys in place, preserving
+comments, and picks up edits live while the TUI runs.
+
+The file is shared: any opencode TUI plugin can claim one top-level key
+(short plugin name). This plugin uses `anthropic-auth`:
+
+```jsonc
+{
+  "anthropic-auth": {
+    // Layout — applied at TUI startup; restart to change
+    "forceToTop": false,        // jump to the first sidebar slot
+    "order": 160,               // slot order when not forced (-10000..10000)
+
+    // Behavior
+    "startCollapsed": false,    // initial state when nothing persisted
+    "rememberCollapsed": true,  // persist header clicks across restarts
+    "collapsed": false,         // written by the plugin on header click
+    "pollMs": 1500,             // state poll interval (500..30000)
+    "refreshDebounceMs": 200,   // event debounce (50..5000)
+
+    // Header
+    "header": {
+      "label": "CLAUDE",        // badge text (1..20 chars)
+      "showVersion": true
+    },
+
+    // Sections
+    "sections": {
+      "quota": true,
+      "fallbackAccounts": true,
+      "routing": true,
+      "cache": true,
+      "health": true
+    },
+
+    // Appearance
+    "appearance": {
+      "barWidth": 10,           // quota bar width (4..40)
+      "barFilledChar": "█",
+      "barEmptyChar": "░",
+      "warnThreshold": 50,      // used% where bars turn warn-colored
+      "errorThreshold": 80      // used% where bars turn error-colored
+    }
+  }
+}
+```
+
+Out-of-range numbers are clamped, wrong types fall back to defaults per key,
+and a malformed file is ignored entirely — the sidebar never crashes on bad
+preferences. The LIMITED badge always renders when an account is degraded,
+regardless of preferences.
+
+### forceToTop convention
+
+Sidebar slots render in ascending `order` (opencode built-ins use 100-500).
+Plugins adopting this convention compute their order as
+`-100000 + indexOfKeyInFile` when their `forceToTop` is `true`, so all forced
+plugins float above everything else, ordered by their key's position in the
+file. Reorder keys to reprioritize. Manual `order` values clamp to
+-10000..10000 and can never beat a forced plugin.
+
+Other plugins can reuse the helpers:
+
+```ts
+import {
+  computeEffectiveOrder,
+  readTuiPreferencesFile,
+} from '@cortexkit/opencode-anthropic-auth/tui-prefs'
+
+const root = await readTuiPreferencesFile()
+const order = computeEffectiveOrder(root, 'my-plugin', 200)
+```
+
 ## Claude prompt cache control
 
 Both OpenCode and Pi packages add a slash command for Anthropic's 1-hour ephemeral prompt-cache TTL:
