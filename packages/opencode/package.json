@@ -17,6 +17,10 @@
     "./tui": {
       "types": "./dist/tui.d.ts",
       "import": "./src/tui.tsx"
+    },
+    "./tui-prefs": {
+      "types": "./dist/tui-preferences.d.ts",
+      "import": "./dist/tui-preferences.js"
     }
   },
   "oc-plugin": [
@@ -33,11 +37,12 @@
     "dist",
     "src/tui.tsx",
     "src/sidebar-state.ts",
+    "src/tui-preferences.ts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "dev": "bun ../../scripts/dev.ts",
     "dev:clean": "bun ../../scripts/dev-clean.ts",
@@ -54,6 +59,7 @@
     "@cortexkit/anthropic-auth-core": "1.9.2",
     "@opentui/core": ">=0.4.0",
     "@opentui/solid": ">=0.4.0",
+    "jsonc-parser": "^3.3.1",
     "solid-js": "^1.9.10"
   }
 }
