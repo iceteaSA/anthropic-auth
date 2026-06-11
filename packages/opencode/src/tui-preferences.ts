@@ -2,7 +2,7 @@ import { watch } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { applyEdits, modify, parse } from 'jsonc-parser'
+import { applyEdits, modify, type ParseError, parse } from 'jsonc-parser'
 
 export const TUI_PREFS_FILE_ENV = 'OPENCODE_TUI_PREFERENCES_FILE'
 const FILE_NAME = 'tui-preferences.jsonc'
@@ -25,13 +25,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 // Tolerant read: missing file, parse errors, or a non-object root all resolve
 // to {} so the sidebar never crashes on user-edited content. jsonc-parser's
-// fault-tolerant parse handles comments and trailing commas.
+// fault-tolerant parse can still hand back a partial object for an
+// unterminated/bracketed file or trailing garbage, so we collect errors and
+// treat any reported fault as malformed.
 export async function readTuiPreferencesFile(): Promise<
   Record<string, unknown>
 > {
   try {
     const raw = await readFile(getTuiPreferencesFile(), 'utf8')
-    const root: unknown = parse(raw)
+    const errors: ParseError[] = []
+    const root: unknown = parse(raw, errors, { allowTrailingComma: true })
+    if (errors.length > 0) return {}
     return isRecord(root) ? root : {}
   } catch {
     return {}
@@ -139,7 +143,7 @@ export function resolveAnthropicAuthPrefs(
     appearance.warnThreshold,
     d.appearance.warnThreshold,
     0,
-    100,
+    99,
   )
   const errorThreshold = Math.max(
     int(appearance.errorThreshold, d.appearance.errorThreshold, 0, 100),
@@ -191,6 +195,13 @@ const FORCE_TOP_BASE = -100000
 // to -10000..10000, strictly above the forced band, so a manual order can
 // never beat forceToTop. Host slots render ascending by order; opencode's
 // built-ins occupy 100-500.
+//
+// Key-naming requirement: plugin keys must be non-integer-like short names
+// (e.g. "anthropic-auth"). JavaScript object key iteration order hoists
+// integer-like keys ("0", "1", "42") ahead of any string keys, which would
+// skew the indexOf-based ordering of forced plugins. The shared
+// `tui-preferences.jsonc` convention requires non-numeric names, so this
+// implementation does not paper over the JS quirk.
 export function computeEffectiveOrder(
   root: Record<string, unknown>,
   pluginKey: string,
@@ -257,15 +268,26 @@ const WATCH_DEBOUNCE_MS = 150
 
 // Watches the directory rather than the file: editors and our own atomic
 // writes replace the file via rename, which kills file-level watchers. Events
-// are filtered to the preferences file name (temp-file events share the
-// prefix) and debounced. Returns a disposer; never throws.
+// are filtered to the preferences file name and our atomic-write temp files
+// (sibling files like `tui-preferences.jsonc.backup` share the name as a
+// prefix but don't match either pattern, so they don't fire spuriously) and
+// debounced. Returns a disposer; never throws.
 export function watchTuiPreferences(onChange: () => void): () => void {
   const file = getTuiPreferencesFile()
   const name = basename(file)
   let timer: ReturnType<typeof setTimeout> | null = null
   try {
     const watcher = watch(dirname(file), (_event, filename) => {
-      if (filename != null && !filename.startsWith(name)) return
+      // Exact match against the preferences file name, plus the temp file
+      // we use for atomic writes (carrying our pid + `.tmp`). Sibling files
+      // like `tui-preferences.jsonc.backup` share the name as a prefix but
+      // don't match either pattern, so they no longer fire spurious
+      // callbacks. Direct edits to the file (e.g. an editor save) emit
+      // `change` events with the final filename, which still match.
+      const isOurs =
+        filename === name ||
+        (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
+      if (filename != null && !isOurs) return
       if (timer) clearTimeout(timer)
       timer = setTimeout(() => {
         timer = null

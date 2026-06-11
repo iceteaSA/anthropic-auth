@@ -76,6 +76,20 @@ describe('readTuiPreferencesFile', () => {
     expect(await readTuiPreferencesFile()).toEqual({})
   })
 
+  test('unterminated object returns empty object', async () => {
+    await writeFile(file, '{"anthropic-auth": {"order": 5}', 'utf8')
+    expect(await readTuiPreferencesFile()).toEqual({})
+  })
+
+  test('trailing garbage after object returns empty object', async () => {
+    await writeFile(
+      file,
+      '{"anthropic-auth":{"order":5}} trailing garbage',
+      'utf8',
+    )
+    expect(await readTuiPreferencesFile()).toEqual({})
+  })
+
   test('non-object root returns empty object', async () => {
     await writeFile(file, '[1, 2, 3]', 'utf8')
     expect(await readTuiPreferencesFile()).toEqual({})
@@ -150,6 +164,16 @@ describe('resolveAnthropicAuthPrefs', () => {
     })
     expect(prefs.appearance.warnThreshold).toBe(80)
     expect(prefs.appearance.errorThreshold).toBe(81)
+  })
+
+  test('warnThreshold is clamped to 0..99 so error can stay strictly above it', () => {
+    const prefs = resolveAnthropicAuthPrefs({
+      'anthropic-auth': {
+        appearance: { warnThreshold: 100, errorThreshold: 30 },
+      },
+    })
+    expect(prefs.appearance.warnThreshold).toBe(99)
+    expect(prefs.appearance.errorThreshold).toBe(100)
   })
 
   test('label is truncated to 20 chars and empty label falls back', () => {
@@ -368,5 +392,28 @@ describe('watchTuiPreferences', () => {
     await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
     await new Promise((resolve) => setTimeout(resolve, 300))
     expect(fired).toBe(0)
+  })
+
+  test('ignores sibling files that share the preferences name as a prefix', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(() => {
+      fired += 1
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      await writeFile(
+        join(dir, 'tui-preferences.jsonc.backup'),
+        'noise',
+        'utf8',
+      )
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(fired).toBe(0)
+      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(fired).toBeGreaterThanOrEqual(1)
+    } finally {
+      dispose()
+    }
   })
 })
