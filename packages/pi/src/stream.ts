@@ -204,7 +204,12 @@ async function* parseSse(response: Response): AsyncGenerator<AnthropicEvent> {
       }
     }
   } finally {
-    if (!completed) await reader.cancel().catch(() => {})
+    // Do not cancel the reader on early abandon. `firstStreamingError()` peeks
+    // the first SSE event from a `response.clone()` and then abandons this
+    // generator; cancelling the cloned (tee'd) reader tears down the shared
+    // underlying body, so the real `parseSse(response)` that streams the reply
+    // reads zero events and the assistant message comes back empty. Releasing
+    // the lock is enough — the abandoned clone branch is garbage-collected.
     reader.releaseLock()
   }
 }
