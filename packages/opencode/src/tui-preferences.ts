@@ -36,3 +36,148 @@ export async function readTuiPreferencesFile(): Promise<
     return {}
   }
 }
+
+export const PLUGIN_KEY = 'anthropic-auth'
+export const DEFAULT_SLOT_ORDER = 160
+
+export interface AnthropicAuthTuiPrefs {
+  forceToTop: boolean
+  order: number
+  startCollapsed: boolean
+  rememberCollapsed: boolean
+  // null = never persisted; seed the UI from startCollapsed instead.
+  collapsed: boolean | null
+  pollMs: number
+  refreshDebounceMs: number
+  header: {
+    label: string
+    showVersion: boolean
+  }
+  sections: {
+    quota: boolean
+    fallbackAccounts: boolean
+    routing: boolean
+    cache: boolean
+    health: boolean
+  }
+  appearance: {
+    barWidth: number
+    barFilledChar: string
+    barEmptyChar: string
+    warnThreshold: number
+    errorThreshold: number
+  }
+}
+
+export type AppearancePrefs = AnthropicAuthTuiPrefs['appearance']
+
+export const DEFAULT_PREFS: AnthropicAuthTuiPrefs = {
+  forceToTop: false,
+  order: DEFAULT_SLOT_ORDER,
+  startCollapsed: false,
+  rememberCollapsed: true,
+  collapsed: null,
+  pollMs: 1500,
+  refreshDebounceMs: 200,
+  header: { label: 'CLAUDE', showVersion: true },
+  sections: {
+    quota: true,
+    fallbackAccounts: true,
+    routing: true,
+    cache: true,
+    health: true,
+  },
+  appearance: {
+    barWidth: 10,
+    barFilledChar: '\u2588',
+    barEmptyChar: '\u2591',
+    warnThreshold: 50,
+    errorThreshold: 80,
+  },
+}
+
+function bool(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+function int(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.min(Math.max(Math.round(value), min), max)
+}
+
+function label(value: unknown, fallback: string, maxLength: number): string {
+  if (typeof value !== 'string' || value.length === 0) return fallback
+  return value.slice(0, maxLength)
+}
+
+function char(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const first = [...value][0]
+  return first ?? fallback
+}
+
+// Per-key validation: every value is independently clamped/defaulted so one
+// bad entry never poisons the rest. Never throws.
+export function resolveAnthropicAuthPrefs(
+  root: Record<string, unknown>,
+): AnthropicAuthTuiPrefs {
+  const entry = root[PLUGIN_KEY]
+  if (!isRecord(entry)) return structuredClone(DEFAULT_PREFS)
+
+  const d = DEFAULT_PREFS
+  const header = isRecord(entry.header) ? entry.header : {}
+  const sections = isRecord(entry.sections) ? entry.sections : {}
+  const appearance = isRecord(entry.appearance) ? entry.appearance : {}
+
+  const warnThreshold = int(
+    appearance.warnThreshold,
+    d.appearance.warnThreshold,
+    0,
+    100,
+  )
+  const errorThreshold = Math.max(
+    int(appearance.errorThreshold, d.appearance.errorThreshold, 0, 100),
+    Math.min(warnThreshold + 1, 100),
+  )
+
+  return {
+    forceToTop: bool(entry.forceToTop, d.forceToTop),
+    order: int(entry.order, d.order, -10000, 10000),
+    startCollapsed: bool(entry.startCollapsed, d.startCollapsed),
+    rememberCollapsed: bool(entry.rememberCollapsed, d.rememberCollapsed),
+    collapsed: typeof entry.collapsed === 'boolean' ? entry.collapsed : null,
+    pollMs: int(entry.pollMs, d.pollMs, 500, 30000),
+    refreshDebounceMs: int(
+      entry.refreshDebounceMs,
+      d.refreshDebounceMs,
+      50,
+      5000,
+    ),
+    header: {
+      label: label(header.label, d.header.label, 20),
+      showVersion: bool(header.showVersion, d.header.showVersion),
+    },
+    sections: {
+      quota: bool(sections.quota, d.sections.quota),
+      fallbackAccounts: bool(
+        sections.fallbackAccounts,
+        d.sections.fallbackAccounts,
+      ),
+      routing: bool(sections.routing, d.sections.routing),
+      cache: bool(sections.cache, d.sections.cache),
+      health: bool(sections.health, d.sections.health),
+    },
+    appearance: {
+      barWidth: int(appearance.barWidth, d.appearance.barWidth, 4, 40),
+      barFilledChar: char(appearance.barFilledChar, d.appearance.barFilledChar),
+      barEmptyChar: char(appearance.barEmptyChar, d.appearance.barEmptyChar),
+      warnThreshold,
+      errorThreshold,
+    },
+  }
+}
