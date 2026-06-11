@@ -1,6 +1,7 @@
+import { watch } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { applyEdits, modify, parse } from 'jsonc-parser'
 
 export const TUI_PREFS_FILE_ENV = 'OPENCODE_TUI_PREFERENCES_FILE'
@@ -250,4 +251,32 @@ export function queueTuiPreferenceUpdate(
     .then(() => writePreference(pluginKey, path, value))
     .catch(() => {})
   return writeChain
+}
+
+const WATCH_DEBOUNCE_MS = 150
+
+// Watches the directory rather than the file: editors and our own atomic
+// writes replace the file via rename, which kills file-level watchers. Events
+// are filtered to the preferences file name (temp-file events share the
+// prefix) and debounced. Returns a disposer; never throws.
+export function watchTuiPreferences(onChange: () => void): () => void {
+  const file = getTuiPreferencesFile()
+  const name = basename(file)
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    const watcher = watch(dirname(file), (_event, filename) => {
+      if (filename != null && !filename.startsWith(name)) return
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = null
+        onChange()
+      }, WATCH_DEBOUNCE_MS)
+    })
+    return () => {
+      if (timer) clearTimeout(timer)
+      watcher.close()
+    }
+  } catch {
+    return () => {}
+  }
 }

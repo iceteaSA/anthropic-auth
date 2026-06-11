@@ -11,6 +11,7 @@ import {
   readTuiPreferencesFile,
   resolveAnthropicAuthPrefs,
   TUI_PREFS_FILE_ENV,
+  watchTuiPreferences,
 } from '../tui-preferences'
 
 let dir: string
@@ -310,5 +311,62 @@ describe('queueTuiPreferenceUpdate', () => {
     const { readdir } = await import('node:fs/promises')
     const entries = await readdir(dir)
     expect(entries).toEqual(['tui-preferences.jsonc'])
+  })
+})
+
+describe('watchTuiPreferences', () => {
+  test('fires after the file changes', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(() => {
+      fired += 1
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(fired).toBeGreaterThanOrEqual(1)
+    } finally {
+      dispose()
+    }
+  })
+
+  test('debounces bursts into few callbacks', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(() => {
+      fired += 1
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      for (let i = 0; i < 5; i++) {
+        await queueTuiPreferenceUpdate(PLUGIN_KEY, ['pollMs'], 1000 + i)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(fired).toBeGreaterThanOrEqual(1)
+      expect(fired).toBeLessThan(5)
+    } finally {
+      dispose()
+    }
+  })
+
+  test('missing directory returns a no-op disposer', () => {
+    process.env[TUI_PREFS_FILE_ENV] = join(dir, 'nope', 'missing.jsonc')
+    const dispose = watchTuiPreferences(() => {})
+    expect(typeof dispose).toBe('function')
+    dispose()
+  })
+
+  test('dispose stops callbacks', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(() => {
+      fired += 1
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    dispose()
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(fired).toBe(0)
   })
 })
