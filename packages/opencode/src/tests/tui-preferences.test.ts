@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  computeEffectiveOrder,
   DEFAULT_PREFS,
   getTuiPreferencesFile,
   readTuiPreferencesFile,
@@ -194,5 +195,59 @@ describe('resolveAnthropicAuthPrefs', () => {
     expect(resolveAnthropicAuthPrefs({ 'anthropic-auth': 42 })).toEqual(
       DEFAULT_PREFS,
     )
+  })
+})
+
+describe('computeEffectiveOrder', () => {
+  test('missing key returns default order', () => {
+    expect(computeEffectiveOrder({}, 'anthropic-auth', 160)).toBe(160)
+  })
+
+  test('explicit order knob is used and clamped', () => {
+    expect(
+      computeEffectiveOrder(
+        { 'anthropic-auth': { order: 42 } },
+        'anthropic-auth',
+        160,
+      ),
+    ).toBe(42)
+    expect(
+      computeEffectiveOrder(
+        { 'anthropic-auth': { order: -99999999 } },
+        'anthropic-auth',
+        160,
+      ),
+    ).toBe(-10000)
+  })
+
+  test('forceToTop beats any explicit order', () => {
+    expect(
+      computeEffectiveOrder(
+        { 'anthropic-auth': { forceToTop: true, order: -10000 } },
+        'anthropic-auth',
+        160,
+      ),
+    ).toBe(-100000)
+  })
+
+  test('multiple forced plugins order by key position in file', () => {
+    const root = {
+      'plugin-a': { forceToTop: true },
+      'plugin-b': { order: 5 },
+      'plugin-c': { forceToTop: true },
+    }
+    expect(computeEffectiveOrder(root, 'plugin-a', 0)).toBe(-100000)
+    expect(computeEffectiveOrder(root, 'plugin-c', 0)).toBe(-99998)
+    expect(computeEffectiveOrder(root, 'plugin-b', 0)).toBe(5)
+  })
+
+  test('non-boolean forceToTop is ignored', () => {
+    expect(
+      computeEffectiveOrder(
+        { 'anthropic-auth': { forceToTop: 'yes' } },
+        'anthropic-auth',
+        160,
+      ),
+    ).toBe(160)
   })
 })

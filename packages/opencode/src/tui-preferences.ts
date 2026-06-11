@@ -181,3 +181,24 @@ export function resolveAnthropicAuthPrefs(
     },
   }
 }
+
+const FORCE_TOP_BASE = -100000
+
+// Shared forceToTop convention: forced plugins sort below FORCE_TOP_BASE,
+// ordered among themselves by their top-level key's position in the file, so
+// users reprioritize by reordering keys. The user-facing `order` knob clamps
+// to -10000..10000, strictly above the forced band, so a manual order can
+// never beat forceToTop. Host slots render ascending by order; opencode's
+// built-ins occupy 100-500.
+export function computeEffectiveOrder(
+  root: Record<string, unknown>,
+  pluginKey: string,
+  defaultOrder: number,
+): number {
+  const entry = root[pluginKey]
+  if (!isRecord(entry)) return defaultOrder
+  if (entry.forceToTop === true) {
+    return FORCE_TOP_BASE + Object.keys(root).indexOf(pluginKey)
+  }
+  return int(entry.order, defaultOrder, -10000, 10000)
+}
