@@ -486,15 +486,20 @@ function QuotaSidebar(props: {
     )
   }
   const activeQuotaTone = (): Tone => {
-    if (activePacingDeficit()) return 'err'
     const summary = activeQuotaSummary()
     const values = [
       summary.fiveHourUsedPercent,
       summary.sevenDayUsedPercent,
     ].filter((value): value is number => value != null)
-    return values.length > 0
-      ? usageTone(Math.max(...values), prefs().appearance)
-      : 'muted'
+    // Pacing deficit is an advisory projection, not actual quota exhaustion,
+    // so it can only BUMP the usage tone up to warn at most — never soften a
+    // real warn/err usage reading and never paint a true red.
+    const base: Tone =
+      values.length > 0
+        ? usageTone(Math.max(...values), prefs().appearance)
+        : 'muted'
+    if (!activePacingDeficit()) return base
+    return base === 'ok' || base === 'muted' ? 'warn' : base
   }
 
   const quotaBackedOff = () => state().main.quotaBackedOff === true

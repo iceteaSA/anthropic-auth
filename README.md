@@ -379,8 +379,10 @@ With `sections.pacing` on (default), quota bars show an even-burn pace
 segment — `▒` headroom when under pace, `▓` overshoot when over — and
 off-pace windows add a subline with the reserve/deficit percentage and, when
 the current burn rate would exhaust the window before it resets, the
-projected `out in …` time. The collapsed summary turns red when the active
-account is over pace in any window.
+projected `out in …` time. The collapsed summary turns the warning color
+(amber) when the active account is over pace in any window — this is a
+pacing projection, not quota exhaustion, and never paints the row red
+unless real usage already warrants it.
 
 ### forceToTop convention
 
