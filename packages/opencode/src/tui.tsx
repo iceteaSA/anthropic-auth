@@ -104,6 +104,8 @@ const PACE_DEFICIT_CHAR = '\u2593'
 // segment covering the gap — headroom being banked (reserve, ok tone) or the
 // overshoot itself (deficit, err tone) — then empty cells. Without pacing the
 // bar renders as a single fill+empty pair, identical to the pre-pacing look.
+// Empty text nodes still occupy a phantom cell in the opentui flex row, so
+// zero-length segments are dropped from every return path (plain and pacing).
 function quotaBarSegments(
   usedPct: number,
   appearance: AppearancePrefs,
@@ -121,20 +123,24 @@ function quotaBarSegments(
       tone: fillTone,
     },
   ]
-  if (!pacing) return plain
+  if (!pacing) return plain.filter((segment) => segment.text.length > 0)
   const paceCells = cells(pacing.pacePercent)
   const lo = Math.min(usedCells, paceCells)
   const hi = Math.max(usedCells, paceCells)
-  if (hi === lo) return plain
+  if (hi === lo) return plain.filter((segment) => segment.text.length > 0)
   const overspent = usedCells > paceCells
-  return [
-    { text: appearance.barFilledChar.repeat(lo), tone: fillTone },
-    {
-      text: (overspent ? PACE_DEFICIT_CHAR : PACE_RESERVE_CHAR).repeat(hi - lo),
-      tone: overspent ? 'err' : 'ok',
-    },
-    { text: appearance.barEmptyChar.repeat(width - hi), tone: fillTone },
-  ]
+  return (
+    [
+      { text: appearance.barFilledChar.repeat(lo), tone: fillTone },
+      {
+        text: (overspent ? PACE_DEFICIT_CHAR : PACE_RESERVE_CHAR).repeat(
+          hi - lo,
+        ),
+        tone: overspent ? 'err' : 'ok',
+      },
+      { text: appearance.barEmptyChar.repeat(width - hi), tone: fillTone },
+    ] as BarSegment[]
+  ).filter((segment) => segment.text.length > 0)
 }
 
 function formatResetIn(resetsAt: string | undefined): string {
