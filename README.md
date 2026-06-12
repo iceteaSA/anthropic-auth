@@ -354,7 +354,8 @@ The file is shared: any opencode TUI plugin can claim one top-level key
       "fallbackAccounts": true,
       "routing": true,
       "cache": true,
-      "health": true
+      "health": true,
+      "pacing": true
     },
 
     // Appearance
@@ -373,6 +374,13 @@ Out-of-range numbers are clamped, wrong types fall back to defaults per key,
 and a malformed file is ignored entirely — the sidebar never crashes on bad
 preferences. The LIMITED badge always renders when an account is degraded,
 regardless of preferences.
+
+With `sections.pacing` on (default), quota bars show an even-burn pace
+segment — `▒` headroom when under pace, `▓` overshoot when over — and
+off-pace windows add a subline with the reserve/deficit percentage and, when
+the current burn rate would exhaust the window before it resets, the
+projected `out in …` time. The collapsed summary turns red when the active
+account is over pace in any window.
 
 ### forceToTop convention
 
