@@ -416,4 +416,20 @@ describe('watchTuiPreferences', () => {
       dispose()
     }
   })
+
+  test('does not fire when the file is rewritten with identical content', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(() => {
+      fired += 1
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      await writeFile(file, '{}', 'utf8')
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(fired).toBe(0)
+    } finally {
+      dispose()
+    }
+  })
 })

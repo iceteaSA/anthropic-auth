@@ -267,23 +267,40 @@ export function queueTuiPreferenceUpdate(
 const WATCH_DEBOUNCE_MS = 150
 
 // Watches the directory rather than the file: editors and our own atomic
-// writes replace the file via rename, which kills file-level watchers. Events
-// are filtered to the preferences file name and our atomic-write temp files
-// (sibling files like `tui-preferences.jsonc.backup` share the name as a
-// prefix but don't match either pattern, so they don't fire spuriously) and
-// debounced. Returns a disposer; never throws.
+// writes replace the file via rename, which kills file-level watchers.
+//
+// Filtering is two-stage:
+//   1. Filename pre-filter: only debounce events for the preferences file
+//      name, or our atomic-write temp file. This is a cheap first pass that
+//      drops the common case (unrelated sibling files).
+//   2. Content check inside the debounce: after the timer fires, re-read
+//      the file and compare it against the last seen content. Only fire
+//      `onChange` when the content actually changed. This is the authority.
+//      Some platforms (notably macOS FSEvents and a few inotify backends)
+//      can misattribute a rename of an unrelated sibling file to the
+//      real preferences filename in addition to emitting the sibling's
+//      own event, so a name-only filter still produces a stray callback.
+//      A content comparison is robust against that, against coalesced
+//      events, and against mtime granularity.
+//
+// Returns a disposer; never throws.
 export function watchTuiPreferences(onChange: () => void): () => void {
   const file = getTuiPreferencesFile()
   const name = basename(file)
   let timer: ReturnType<typeof setTimeout> | null = null
+  let lastSeen: string | null = null
+  // Seed asynchronously; a real change that fires before the seed resolves
+  // still wins because the debounce re-reads the file fresh and compares
+  // against `lastSeen` (which will be `null` → does not match → fires).
+  void readFile(file, 'utf8')
+    .then((text) => {
+      if (lastSeen === null) lastSeen = text
+    })
+    .catch(() => {})
   try {
     const watcher = watch(dirname(file), (_event, filename) => {
       // Exact match against the preferences file name, plus the temp file
-      // we use for atomic writes (carrying our pid + `.tmp`). Sibling files
-      // like `tui-preferences.jsonc.backup` share the name as a prefix but
-      // don't match either pattern, so they no longer fire spurious
-      // callbacks. Direct edits to the file (e.g. an editor save) emit
-      // `change` events with the final filename, which still match.
+      // we use for atomic writes (carrying our pid + `.tmp`).
       const isOurs =
         filename === name ||
         (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
@@ -291,7 +308,14 @@ export function watchTuiPreferences(onChange: () => void): () => void {
       if (timer) clearTimeout(timer)
       timer = setTimeout(() => {
         timer = null
-        onChange()
+        void readFile(file, 'utf8')
+          .catch(() => null)
+          .then((text) => {
+            if (text === null) return
+            if (text === lastSeen) return
+            lastSeen = text
+            onChange()
+          })
       }, WATCH_DEBOUNCE_MS)
     })
     return () => {
