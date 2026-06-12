@@ -19,10 +19,14 @@ import {
 
 import {
   type AccountQuota,
+  computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
+  FIVE_HOUR_MS,
   getCollapsedQuotaSummary,
   getSidebarState,
+  type QuotaPacing,
   resolveActiveAccount,
+  SEVEN_DAY_MS,
   type SidebarState,
 } from './sidebar-state.js'
 import {
@@ -88,16 +92,49 @@ function usageTone(usedPct: number, appearance: AppearancePrefs): Tone {
   return 'err'
 }
 
-function quotaBar(usedPct: number, appearance: AppearancePrefs): string {
+interface BarSegment {
+  text: string
+  tone: Tone
+}
+
+const PACE_RESERVE_CHAR = '\u2592'
+const PACE_DEFICIT_CHAR = '\u2593'
+
+// Variant C pacing bar: normal fill up to min(used, pace), then a pace
+// segment covering the gap — headroom being banked (reserve, ok tone) or the
+// overshoot itself (deficit, err tone) — then empty cells. Without pacing the
+// bar renders as a single fill+empty pair, identical to the pre-pacing look.
+function quotaBarSegments(
+  usedPct: number,
+  appearance: AppearancePrefs,
+  pacing: QuotaPacing | null,
+): BarSegment[] {
   const width = appearance.barWidth
-  const filled = Math.max(
-    0,
-    Math.min(Math.round((usedPct / 100) * width), width),
-  )
-  return (
-    appearance.barFilledChar.repeat(filled) +
-    appearance.barEmptyChar.repeat(width - filled)
-  )
+  const cells = (pct: number) =>
+    Math.max(0, Math.min(Math.round((pct / 100) * width), width))
+  const usedCells = cells(usedPct)
+  const fillTone = usageTone(usedPct, appearance)
+  const plain: BarSegment[] = [
+    { text: appearance.barFilledChar.repeat(usedCells), tone: fillTone },
+    {
+      text: appearance.barEmptyChar.repeat(width - usedCells),
+      tone: fillTone,
+    },
+  ]
+  if (!pacing) return plain
+  const paceCells = cells(pacing.pacePercent)
+  const lo = Math.min(usedCells, paceCells)
+  const hi = Math.max(usedCells, paceCells)
+  if (hi === lo) return plain
+  const overspent = usedCells > paceCells
+  return [
+    { text: appearance.barFilledChar.repeat(lo), tone: fillTone },
+    {
+      text: (overspent ? PACE_DEFICIT_CHAR : PACE_RESERVE_CHAR).repeat(hi - lo),
+      tone: overspent ? 'err' : 'ok',
+    },
+    { text: appearance.barEmptyChar.repeat(width - hi), tone: fillTone },
+  ]
 }
 
 function formatResetIn(resetsAt: string | undefined): string {
@@ -107,8 +144,13 @@ function formatResetIn(resetsAt: string | undefined): string {
   const mins = Math.floor(ms / 60_000)
   if (mins < 60) return `${mins}m`
   const hrs = Math.floor(mins / 60)
-  const rm = mins % 60
-  return rm > 0 ? `${hrs}h${rm}m` : `${hrs}h`
+  if (hrs < 24) {
+    const rm = mins % 60
+    return rm > 0 ? `${hrs}h${rm}m` : `${hrs}h`
+  }
+  const days = Math.floor(hrs / 24)
+  const rh = hrs % 24
+  return rh > 0 ? `${days}d${rh}h` : `${days}d`
 }
 
 function formatUntil(until: number | undefined): string {
@@ -170,15 +212,27 @@ function CollapsedRow(props: {
 }
 
 // Quota window row: muted label left, tone-colored bar + percentage right,
-// with an optional muted reset suffix.
+// with an optional muted reset suffix. When pacing data is present, the bar
+// gains a pace segment and an off-pace window adds a muted subline with the
+// reserve/deficit delta and the projected runout.
 function QuotaRow(props: {
   theme: ThemeCurrent
   appearance: AppearancePrefs
   label: string
   window: { usedPercent: number; resetsAt?: string } | undefined
+  pacing: QuotaPacing | null
 }) {
   const used = () => props.window?.usedPercent ?? 0
   const reset = () => formatResetIn(props.window?.resetsAt)
+  const paceLine = () => {
+    const pacing = props.pacing
+    if (!pacing || pacing.state === 'on-pace') return null
+    const pct = Math.round(Math.abs(pacing.deltaPercent))
+    if (pacing.state === 'reserve') return `reserve ${pct}% \u00b7 lasts`
+    return pacing.runsOutAt
+      ? `deficit ${pct}% \u00b7 out in ${formatResetIn(pacing.runsOutAt)}`
+      : `deficit ${pct}% \u00b7 lasts`
+  }
   return (
     <Show
       when={props.window}
@@ -195,11 +249,13 @@ function QuotaRow(props: {
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <box flexDirection='row'>
           <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
-          <text
-            fg={toneColor(props.theme, usageTone(used(), props.appearance))}
-          >
-            {quotaBar(used(), props.appearance)}
-          </text>
+          <For each={quotaBarSegments(used(), props.appearance, props.pacing)}>
+            {(segment) => (
+              <text fg={toneColor(props.theme, segment.tone)}>
+                {segment.text}
+              </text>
+            )}
+          </For>
           <text
             fg={toneColor(props.theme, usageTone(used(), props.appearance))}
           >
@@ -210,21 +266,46 @@ function QuotaRow(props: {
           <text fg={props.theme.textMuted}>{reset()}</text>
         </Show>
       </box>
+      <Show when={paceLine()}>
+        <box width='100%' flexDirection='row'>
+          <text fg={props.theme.textMuted}>{'   '}</text>
+          <text
+            fg={toneColor(
+              props.theme,
+              props.pacing?.state === 'deficit' ? 'warn' : 'muted',
+            )}
+          >
+            {paceLine()}
+          </text>
+        </box>
+      </Show>
     </Show>
   )
 }
 
 // Account block: header row (name + status word) then per-window quota rows.
+// Pacing is computed here — per window, against the wall clock at render time
+// (re-evaluated on every state poll) — and disabled by passing false.
 function AccountBlock(props: {
   theme: ThemeCurrent
   appearance: AppearancePrefs
   name: string
   quota: AccountQuota | null
   active: boolean
+  pacingEnabled: boolean
   marginTop?: number
 }) {
   const statusWord = () => (props.active ? 'active' : 'idle')
   const statusTone = (): Tone => (props.active ? 'ok' : 'muted')
+  const pacingFor = (
+    window:
+      | { usedPercent: number; remainingPercent: number; resetsAt?: string }
+      | undefined,
+    windowMs: number,
+  ) =>
+    props.pacingEnabled && window
+      ? computeQuotaPacing(window, windowMs, Date.now())
+      : null
   return (
     <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
       <box width='100%' flexDirection='row' justifyContent='space-between'>
@@ -244,12 +325,14 @@ function AccountBlock(props: {
           appearance={props.appearance}
           label='5h'
           window={props.quota?.five_hour}
+          pacing={pacingFor(props.quota?.five_hour, FIVE_HOUR_MS)}
         />
         <QuotaRow
           theme={props.theme}
           appearance={props.appearance}
           label='7d'
           window={props.quota?.seven_day}
+          pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
         />
       </Show>
     </box>
@@ -382,7 +465,22 @@ function QuotaSidebar(props: {
   const activeAccount = () => resolveActiveAccount(state())
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota)
+  const activePacingDeficit = () => {
+    if (!prefs().sections.pacing) return false
+    const quota = activeAccount().quota
+    if (!quota) return false
+    const now = Date.now()
+    const windows: Array<[typeof quota.five_hour, number]> = [
+      [quota.five_hour, FIVE_HOUR_MS],
+      [quota.seven_day, SEVEN_DAY_MS],
+    ]
+    return windows.some(
+      ([w, ms]) =>
+        w != null && computeQuotaPacing(w, ms, now)?.state === 'deficit',
+    )
+  }
   const activeQuotaTone = (): Tone => {
+    if (activePacingDeficit()) return 'err'
     const summary = activeQuotaSummary()
     const values = [
       summary.fiveHourUsedPercent,
@@ -494,6 +592,7 @@ function QuotaSidebar(props: {
               name='main'
               quota={state().main.quota}
               active={state().activeId === 'main'}
+              pacingEnabled={prefs().sections.pacing}
             />
             <Show when={prefs().sections.fallbackAccounts}>
               <For each={enabledFallbacks()}>
@@ -504,6 +603,7 @@ function QuotaSidebar(props: {
                     name={fb.label ?? fb.id}
                     quota={fb.quota}
                     active={state().activeId === fb.id}
+                    pacingEnabled={prefs().sections.pacing}
                     marginTop={1}
                   />
                 )}
