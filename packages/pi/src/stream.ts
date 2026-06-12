@@ -182,20 +182,18 @@ export function configureApiRouteHeaders(
   return headers
 }
 
-async function* parseSse(response: Response): AsyncGenerator<AnthropicEvent> {
+export async function* parseSse(
+  response: Response,
+): AsyncGenerator<AnthropicEvent> {
   if (!response.body) return
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
-  let completed = false
 
   try {
     while (true) {
       const { done, value } = await reader.read()
-      if (done) {
-        completed = true
-        break
-      }
+      if (done) break
       buffer += decoder.decode(value, { stream: true })
       let boundary = buffer.indexOf('\n\n')
       while (boundary !== -1) {

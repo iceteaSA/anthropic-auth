@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildExplicitBaseMessagesUrl,
   configureApiRouteHeaders,
+  parseSse,
   primaryResponseAllowsApiFallback,
 } from '../stream.ts'
 
@@ -64,5 +65,27 @@ describe('Pi API fallback routing helpers', () => {
     expect(headers.get('authorization')).toBeNull()
     expect(headers.get('x-api-key')).toBe('provider-key')
     expect(headers.get('anthropic-beta')).toContain('fast-mode-2026-02-01')
+  })
+
+  test('releases early-abandoned SSE readers without cancelling the stream', async () => {
+    let cancelled = false
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode('data: {"type":"message_start"}\n\n'),
+        )
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+
+    const events = parseSse(new Response(body))
+    const first = await events.next()
+    expect(first.value?.type).toBe('message_start')
+
+    await events.return(undefined)
+
+    expect(cancelled).toBe(false)
   })
 })
