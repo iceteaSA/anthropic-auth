@@ -133,6 +133,7 @@ describe('resolveAnthropicAuthPrefs', () => {
       routing: false,
       cache: false,
       health: true,
+      pacing: true,
     })
     expect(prefs.appearance.barWidth).toBe(20)
     expect(prefs.appearance.warnThreshold).toBe(60)
@@ -222,6 +223,20 @@ describe('resolveAnthropicAuthPrefs', () => {
     expect(resolveAnthropicAuthPrefs({ 'anthropic-auth': 42 })).toEqual(
       DEFAULT_PREFS,
     )
+  })
+
+  test('sections.pacing defaults true, accepts false, rejects wrong type', () => {
+    expect(resolveAnthropicAuthPrefs({}).sections.pacing).toBe(true)
+    expect(
+      resolveAnthropicAuthPrefs({
+        'anthropic-auth': { sections: { pacing: false } },
+      }).sections.pacing,
+    ).toBe(false)
+    expect(
+      resolveAnthropicAuthPrefs({
+        'anthropic-auth': { sections: { pacing: 'off' } },
+      }).sections.pacing,
+    ).toBe(true)
   })
 })
 
