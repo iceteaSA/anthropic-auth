@@ -123,3 +123,57 @@ export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
     text: `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`} 7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
   }
 }
+
+export const FIVE_HOUR_MS = 5 * 60 * 60 * 1000
+export const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000
+
+const PACING_MIN_ELAPSED_MS = 5 * 60 * 1000
+const PACING_MIN_ELAPSED_FRACTION = 0.01
+const ON_PACE_DELTA = 1
+
+export interface QuotaPacing {
+  pacePercent: number
+  deltaPercent: number
+  state: 'deficit' | 'reserve' | 'on-pace'
+  runsOutAt: string | null
+}
+
+// Even-burn pacing for a quota window. The window start is inferred from the
+// reset timestamp minus the window length. Two metrics: deltaPercent compares
+// usage against a uniform burn-down (positive = deficit), and runsOutAt
+// projects the current average burn rate forward — null means the window
+// lasts until reset at that rate. Returns null when there is no reset
+// timestamp or the elapsed time is too small to give a meaningful rate.
+export function computeQuotaPacing(
+  window: QuotaWindow,
+  windowMs: number,
+  now: number,
+): QuotaPacing | null {
+  if (!window.resetsAt) return null
+  const resetsAt = new Date(window.resetsAt).getTime()
+  if (!Number.isFinite(resetsAt)) return null
+  const start = resetsAt - windowMs
+  const elapsed = now - start
+  if (elapsed < PACING_MIN_ELAPSED_MS) return null
+  if (elapsed < windowMs * PACING_MIN_ELAPSED_FRACTION) return null
+  if (elapsed >= windowMs) return null
+
+  const used = window.usedPercent
+  const pacePercent = Math.min(Math.max((elapsed / windowMs) * 100, 0), 100)
+  const deltaPercent = used - pacePercent
+  const state =
+    Math.abs(deltaPercent) < ON_PACE_DELTA
+      ? 'on-pace'
+      : deltaPercent > 0
+        ? 'deficit'
+        : 'reserve'
+
+  let runsOutAt: string | null = null
+  if (used > 0) {
+    const msToFull = (elapsed * 100) / used
+    const runOut = start + msToFull
+    if (runOut < resetsAt) runsOutAt = new Date(runOut).toISOString()
+  }
+
+  return { pacePercent, deltaPercent, state, runsOutAt }
+}
