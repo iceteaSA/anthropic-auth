@@ -87,6 +87,45 @@ export function fromClaudeCodeToolName(name: string, tools?: Tool[]): string {
   return tools?.find((tool) => tool.name.toLowerCase() === lower)?.name ?? name
 }
 
+function getAssistantToolCallIds(message: Message | undefined): Set<string> {
+  const ids = new Set<string>()
+  if (message?.role !== 'assistant' || !Array.isArray(message.content)) {
+    return ids
+  }
+
+  for (const block of message.content) {
+    if (block.type === 'toolCall') ids.add(sanitizeToolId(block.id))
+  }
+  return ids
+}
+
+function getImmediateToolResultIds(
+  messages: Message[],
+  assistantIndex: number,
+): Set<string> {
+  const ids = new Set<string>()
+  let index = assistantIndex + 1
+  while (messages[index]?.role === 'toolResult') {
+    ids.add(sanitizeToolId((messages[index] as ToolResultMessage).toolCallId))
+    index += 1
+  }
+  return ids
+}
+
+function assistantToolCallsHaveImmediateResults(
+  messages: Message[],
+  assistantIndex: number,
+): boolean {
+  const toolCallIds = getAssistantToolCallIds(messages[assistantIndex])
+  if (toolCallIds.size === 0) return true
+
+  const resultIds = getImmediateToolResultIds(messages, assistantIndex)
+  for (const id of toolCallIds) {
+    if (!resultIds.has(id)) return false
+  }
+  return true
+}
+
 function convertTextAndImages(
   content: Array<TextContent | ImageContent>,
 ): string | Array<Record<string, unknown>> {
@@ -146,6 +185,18 @@ function convertMessages(
     }
 
     if (message.role === 'assistant') {
+      const toolCallIds = getAssistantToolCallIds(message)
+      if (
+        toolCallIds.size > 0 &&
+        !assistantToolCallsHaveImmediateResults(messages, index)
+      ) {
+        // Anthropic requires every tool_use block to be followed immediately by
+        // a matching tool_result message. Interrupted Pi runs can leave an
+        // aborted assistant message with a partial toolCall and no result; drop
+        // that incomplete assistant turn from the replayed history.
+        continue
+      }
+
       const blocks: Array<Record<string, unknown>> = []
       for (const block of message.content) {
         if (block.type === 'text' && block.text.trim()) {
@@ -192,48 +243,50 @@ function convertMessages(
     }
 
     if (message.role === 'toolResult') {
+      const previous = messages[index - 1]
+      if (
+        previous?.role !== 'assistant' ||
+        !assistantToolCallsHaveImmediateResults(messages, index - 1)
+      ) {
+        while (messages[index + 1]?.role === 'toolResult') index += 1
+        continue
+      }
+
+      const expectedToolCallIds = getAssistantToolCallIds(previous)
+      const appendToolResult = (toolResult: ToolResultMessage) => {
+        const toolUseId = sanitizeToolId(toolResult.toolCallId)
+        if (!expectedToolCallIds.delete(toolUseId)) return
+        let content = convertTextAndImages(toolResult.content)
+        // Anthropic rejects tool_result with is_error=true but empty content
+        if (
+          toolResult.isError &&
+          (!content || (Array.isArray(content) && content.length === 0))
+        ) {
+          content = [{ type: 'text', text: 'Error' }]
+        }
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content: content,
+          is_error: toolResult.isError,
+        })
+      }
+
       const toolResult = message as ToolResultMessage
       const toolResults: Array<Record<string, unknown>> = []
-      let content = convertTextAndImages(toolResult.content)
-      // Anthropic rejects tool_result with is_error=true but empty content
-      if (
-        toolResult.isError &&
-        (!content || (Array.isArray(content) && content.length === 0))
-      ) {
-        content = [{ type: 'text', text: 'Error' }]
-      }
-      toolResults.push({
-        type: 'tool_result',
-        tool_use_id: sanitizeToolId(toolResult.toolCallId),
-        content: content,
-        is_error: toolResult.isError,
-      })
+      appendToolResult(toolResult)
 
       let nextIndex = index + 1
       while (
         nextIndex < messages.length &&
         messages[nextIndex]?.role === 'toolResult'
       ) {
-        const next = messages[nextIndex] as ToolResultMessage
-        let nextContent = convertTextAndImages(next.content)
-        // Anthropic rejects tool_result with is_error=true but empty content
-        if (
-          next.isError &&
-          (!nextContent ||
-            (Array.isArray(nextContent) && nextContent.length === 0))
-        ) {
-          nextContent = [{ type: 'text', text: 'Error' }]
-        }
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: sanitizeToolId(next.toolCallId),
-          content: nextContent,
-          is_error: next.isError,
-        })
+        appendToolResult(messages[nextIndex] as ToolResultMessage)
         nextIndex += 1
       }
       index = nextIndex - 1
-      result.push({ role: 'user', content: toolResults })
+      if (toolResults.length)
+        result.push({ role: 'user', content: toolResults })
     }
   }
 

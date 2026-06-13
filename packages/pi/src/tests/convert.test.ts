@@ -169,6 +169,65 @@ describe('convertMessages — basic transforms', () => {
     expect(toolContent[0]?.tool_use_id).toBe('call_1')
   })
 
+  test('drops interrupted assistant tool_use without an immediate tool_result', async () => {
+    const messages = await buildMessages([
+      userMsg('run ls'),
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'I will run a command.' },
+          {
+            type: 'toolCall',
+            id: 'toolu_aborted',
+            name: 'Bash',
+            arguments: {},
+          },
+        ],
+        stopReason: 'aborted',
+        timestamp: 0,
+      } as unknown as Message,
+      userMsg('continue'),
+    ])
+
+    expect(messages).toHaveLength(2)
+    expect(messages.map((message) => message.role)).toEqual(['user', 'user'])
+    expect(JSON.stringify(messages)).not.toContain('tool_use')
+    expect(JSON.stringify(messages)).not.toContain('toolu_aborted')
+  })
+
+  test('drops incomplete multi-tool assistant turns and their orphan result', async () => {
+    const messages = await buildMessages([
+      userMsg('run tools'),
+      {
+        role: 'assistant',
+        content: [
+          { type: 'toolCall', id: 'tool_a', name: 'Bash', arguments: {} },
+          { type: 'toolCall', id: 'tool_b', name: 'Bash', arguments: {} },
+        ],
+        timestamp: 0,
+      } as unknown as Message,
+      toolResultMsg('tool_a', 'partial output'),
+      userMsg('continue'),
+    ])
+
+    expect(messages).toHaveLength(2)
+    expect(messages.map((message) => message.role)).toEqual(['user', 'user'])
+    expect(JSON.stringify(messages)).not.toContain('tool_use')
+    expect(JSON.stringify(messages)).not.toContain('tool_result')
+  })
+
+  test('drops orphan tool_result messages', async () => {
+    const messages = await buildMessages([
+      userMsg('hello'),
+      toolResultMsg('tool_without_call', 'orphan output'),
+      userMsg('continue'),
+    ])
+
+    expect(messages).toHaveLength(2)
+    expect(messages.map((message) => message.role)).toEqual(['user', 'user'])
+    expect(JSON.stringify(messages)).not.toContain('tool_result')
+  })
+
   test('sanitizes surrogate pairs in text', async () => {
     const messages = await buildMessages([userMsg('hello \uD800 world')])
     expect(messages[0]).toEqual({
