@@ -874,6 +874,96 @@ describe('rewriteRequestBody', () => {
     expect(result.output_config).toEqual({ effort: 'xhigh' })
   })
 
+  test('strips OpenAI encrypted reasoning blocks before sending to Anthropic', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'first' }] },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'gpt reasoning summary',
+              signature: 'gAAAAABqLPSxOpenAIEncryptedReasoningState',
+            },
+          ],
+        },
+        { role: 'user', content: [{ type: 'text', text: 'continue' }] },
+      ],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(
+      result.messages.map((message: { role: string }) => message.role),
+    ).toEqual(['user', 'user'])
+    expect(JSON.stringify(result.messages)).not.toContain('gAAAAABqLPSx')
+    expect(JSON.stringify(result.messages)).not.toContain(
+      'gpt reasoning summary',
+    )
+  })
+
+  test('preserves Claude signed thinking blocks', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'first' }] },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'claude thinking',
+              signature: 'CAIS5AMKvalid',
+            },
+            { type: 'text', text: 'answer' },
+          ],
+        },
+        { role: 'user', content: [{ type: 'text', text: 'continue' }] },
+      ],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'thinking',
+      thinking: 'claude thinking',
+      signature: 'CAIS5AMKvalid',
+    })
+    expect(result.messages[1].content[1]).toEqual({
+      type: 'text',
+      text: 'answer',
+    })
+  })
+
+  test('removes only OpenAI encrypted thinking from mixed assistant content', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'first' }] },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'gpt reasoning summary',
+              signature: 'gAAAAABqLPSxOpenAIEncryptedReasoningState',
+            },
+            { type: 'text', text: 'visible answer' },
+          ],
+        },
+        { role: 'user', content: [{ type: 'text', text: 'continue' }] },
+      ],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.messages[1].content).toEqual([
+      { type: 'text', text: 'visible answer' },
+    ])
+  })
+
   test('removes existing fast speed when fast mode is disabled', async () => {
     const body = JSON.stringify({
       model: 'claude-opus-4-7',

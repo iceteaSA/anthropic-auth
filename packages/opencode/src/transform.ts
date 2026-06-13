@@ -702,6 +702,33 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
 }
 
+function isOpenAIReasoningEncryptedContent(value: unknown) {
+  return typeof value === 'string' && value.startsWith('gAAAA')
+}
+
+function stripNonAnthropicThinkingBlocks(parsed: Record<string, unknown>) {
+  if (!Array.isArray(parsed.messages)) return 0
+
+  let removed = 0
+  parsed.messages = parsed.messages.filter((message) => {
+    if (!isRecord(message) || !Array.isArray(message.content)) return true
+    if (message.role !== 'assistant') return true
+
+    const filtered = message.content.filter((block) => {
+      if (!isRecord(block) || block.type !== 'thinking') return true
+      if (!isOpenAIReasoningEncryptedContent(block.signature)) return true
+      removed += 1
+      return false
+    })
+
+    if (filtered.length === message.content.length) return true
+    message.content = filtered
+    return filtered.length > 0
+  })
+
+  return removed
+}
+
 function normalizeFableMythosRequest(
   parsed: Record<string, unknown>,
 ): { replacedExisting: boolean } | null {
@@ -835,6 +862,7 @@ export async function rewriteRequestBody(
     })
 
     const modelNormalizeStart = rewriteNowMs()
+    const removedNonAnthropicThinking = stripNonAnthropicThinkingBlocks(parsed)
     const fableMythosThinking = normalizeFableMythosRequest(parsed)
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
@@ -844,6 +872,7 @@ export async function rewriteRequestBody(
         : undefined,
       replacedFableMythosThinking:
         fableMythosThinking?.replacedExisting ?? false,
+      removedNonAnthropicThinking,
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
 
