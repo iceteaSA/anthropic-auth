@@ -885,7 +885,15 @@ describe('rewriteRequestBody', () => {
             {
               type: 'thinking',
               thinking: 'gpt reasoning summary',
-              signature: 'gAAAAABqLPSxOpenAIEncryptedReasoningState',
+              signature: JSON.stringify({
+                id: 'rs_0020061038ec397b016a2aa86b9e9881968a52480521e392de',
+                type: 'reasoning',
+                content: [],
+                encrypted_content: 'gAAAAABqKqhtOpenAIEncryptedReasoningState',
+                summary: [
+                  { type: 'summary_text', text: 'gpt reasoning summary' },
+                ],
+              }),
             },
           ],
         },
@@ -898,7 +906,7 @@ describe('rewriteRequestBody', () => {
     expect(
       result.messages.map((message: { role: string }) => message.role),
     ).toEqual(['user', 'user'])
-    expect(JSON.stringify(result.messages)).not.toContain('gAAAAABqLPSx')
+    expect(JSON.stringify(result.messages)).not.toContain('gAAAAABqKqht')
     expect(JSON.stringify(result.messages)).not.toContain(
       'gpt reasoning summary',
     )
@@ -948,7 +956,15 @@ describe('rewriteRequestBody', () => {
             {
               type: 'thinking',
               thinking: 'gpt reasoning summary',
-              signature: 'gAAAAABqLPSxOpenAIEncryptedReasoningState',
+              signature: JSON.stringify({
+                id: 'rs_0020061038ec397b016a2aa86b9e9881968a52480521e392de',
+                type: 'reasoning',
+                content: [],
+                encrypted_content: 'gAAAAABqKqhtOpenAIEncryptedReasoningState',
+                summary: [
+                  { type: 'summary_text', text: 'gpt reasoning summary' },
+                ],
+              }),
             },
             { type: 'text', text: 'visible answer' },
           ],

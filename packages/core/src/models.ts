@@ -50,6 +50,21 @@ export function isClaudeFableOrMythos5Model(model: unknown) {
   )
 }
 
-export function isOpenAIReasoningEncryptedContent(value: unknown): boolean {
-  return typeof value === 'string' && value.startsWith('gAAAA')
+export function isOpenAIReasoningSignature(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  if (value.startsWith('gAAAA')) return true
+  if (!value.startsWith('{')) return false
+
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>
+    return (
+      parsed.type === 'reasoning' &&
+      typeof parsed.id === 'string' &&
+      parsed.id.startsWith('rs_') &&
+      typeof parsed.encrypted_content === 'string' &&
+      parsed.encrypted_content.startsWith('gAAAA')
+    )
+  } catch {
+    return false
+  }
 }

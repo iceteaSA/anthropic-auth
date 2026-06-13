@@ -10,7 +10,7 @@ import {
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
   isFastModeSupportedModel,
-  isOpenAIReasoningEncryptedContent,
+  isOpenAIReasoningSignature,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
@@ -713,7 +713,7 @@ function stripNonAnthropicThinkingBlocks(parsed: Record<string, unknown>) {
 
     const filtered = message.content.filter((block) => {
       if (!isRecord(block) || block.type !== 'thinking') return true
-      if (!isOpenAIReasoningEncryptedContent(block.signature)) return true
+      if (!isOpenAIReasoningSignature(block.signature)) return true
       removed += 1
       return false
     })

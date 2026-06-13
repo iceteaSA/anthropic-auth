@@ -8,7 +8,7 @@ import {
   type ClaudeCodeIdentity,
   isClaudeFableOrMythos5Model,
   isFastModeSupportedModel,
-  isOpenAIReasoningEncryptedContent,
+  isOpenAIReasoningSignature,
   orderClaudeCodeBody,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
@@ -152,7 +152,7 @@ function convertMessages(
           blocks.push({ type: 'text', text: sanitize(block.text) })
         } else if (block.type === 'thinking' && block.thinking.trim()) {
           const thinking = block as ThinkingContent
-          if (isOpenAIReasoningEncryptedContent(thinking.thinkingSignature)) {
+          if (isOpenAIReasoningSignature(thinking.thinkingSignature)) {
             // OpenAI reasoningEncryptedContent is also opaque encrypted state,
             // but it is not an Anthropic thinking signature. Sending it as
             // `thinking.signature` makes Anthropic reject the request.

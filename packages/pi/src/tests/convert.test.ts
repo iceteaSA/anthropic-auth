@@ -423,7 +423,13 @@ describe('convertMessages — signed thinking blocks', () => {
       userMsg('q1'),
       thinkingToolMsg(
         'gpt reasoning summary',
-        'gAAAAABqLPSxOpenAIEncryptedReasoningState',
+        JSON.stringify({
+          id: 'rs_0020061038ec397b016a2aa86b9e9881968a52480521e392de',
+          type: 'reasoning',
+          content: [],
+          encrypted_content: 'gAAAAABqKqhtOpenAIEncryptedReasoningState',
+          summary: [{ type: 'summary_text', text: 'gpt reasoning summary' }],
+        }),
         'tool_1',
       ),
       toolResultMsg('tool_1', 'out1'),
@@ -436,7 +442,7 @@ describe('convertMessages — signed thinking blocks', () => {
       name: 'Bash',
       input: {},
     })
-    expect(JSON.stringify(messages)).not.toContain('gAAAAABqLPSx')
+    expect(JSON.stringify(messages)).not.toContain('gAAAAABqKqht')
     expect(JSON.stringify(messages)).not.toContain('gpt reasoning summary')
   })
 
