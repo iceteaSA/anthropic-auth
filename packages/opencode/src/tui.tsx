@@ -8,7 +8,14 @@ import type {
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
-import { createSignal, For, type JSX, onCleanup, Show } from 'solid-js'
+import {
+  createEffect,
+  createSignal,
+  For,
+  type JSX,
+  onCleanup,
+  Show,
+} from 'solid-js'
 
 import {
   type AccountQuota,
@@ -18,14 +25,19 @@ import {
   resolveActiveAccount,
   type SidebarState,
 } from './sidebar-state.js'
-
-const POLL_MS = 1500
-const REFRESH_DEBOUNCE_MS = 200
+import {
+  type AnthropicAuthTuiPrefs,
+  type AppearancePrefs,
+  computeEffectiveOrder,
+  DEFAULT_SLOT_ORDER,
+  PLUGIN_KEY,
+  queueTuiPreferenceUpdate,
+  readTuiPreferencesFile,
+  resolveAnthropicAuthPrefs,
+  watchTuiPreferences,
+} from './tui-preferences.js'
 
 const ID = 'cortexkit.anthropic-auth'
-const BAR_WIDTH = 10
-const BAR_FILLED = '\u2588'
-const BAR_EMPTY = '\u2591'
 
 // Plugin version for the header (mirrors the Magic Context / AFT convention).
 // Read at runtime from package.json relative to this module — NOT a TS JSON
@@ -70,18 +82,22 @@ function toneColor(theme: ThemeCurrent, tone: Tone): ThemeColor {
   }
 }
 
-function usageTone(usedPct: number): Tone {
-  if (usedPct < 50) return 'ok'
-  if (usedPct < 80) return 'warn'
+function usageTone(usedPct: number, appearance: AppearancePrefs): Tone {
+  if (usedPct < appearance.warnThreshold) return 'ok'
+  if (usedPct < appearance.errorThreshold) return 'warn'
   return 'err'
 }
 
-function quotaBar(usedPct: number, width = BAR_WIDTH): string {
+function quotaBar(usedPct: number, appearance: AppearancePrefs): string {
+  const width = appearance.barWidth
   const filled = Math.max(
     0,
     Math.min(Math.round((usedPct / 100) * width), width),
   )
-  return BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(width - filled)
+  return (
+    appearance.barFilledChar.repeat(filled) +
+    appearance.barEmptyChar.repeat(width - filled)
+  )
 }
 
 function formatResetIn(resetsAt: string | undefined): string {
@@ -157,6 +173,7 @@ function CollapsedRow(props: {
 // with an optional muted reset suffix.
 function QuotaRow(props: {
   theme: ThemeCurrent
+  appearance: AppearancePrefs
   label: string
   window: { usedPercent: number; resetsAt?: string } | undefined
 }) {
@@ -178,10 +195,14 @@ function QuotaRow(props: {
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <box flexDirection='row'>
           <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
-          <text fg={toneColor(props.theme, usageTone(used()))}>
-            {quotaBar(used())}
+          <text
+            fg={toneColor(props.theme, usageTone(used(), props.appearance))}
+          >
+            {quotaBar(used(), props.appearance)}
           </text>
-          <text fg={toneColor(props.theme, usageTone(used()))}>
+          <text
+            fg={toneColor(props.theme, usageTone(used(), props.appearance))}
+          >
             {` ${String(Math.round(used())).padStart(3)}%`}
           </text>
         </box>
@@ -196,6 +217,7 @@ function QuotaRow(props: {
 // Account block: header row (name + status word) then per-window quota rows.
 function AccountBlock(props: {
   theme: ThemeCurrent
+  appearance: AppearancePrefs
   name: string
   quota: AccountQuota | null
   active: boolean
@@ -219,11 +241,13 @@ function AccountBlock(props: {
       >
         <QuotaRow
           theme={props.theme}
+          appearance={props.appearance}
           label='5h'
           window={props.quota?.five_hour}
         />
         <QuotaRow
           theme={props.theme}
+          appearance={props.appearance}
           label='7d'
           window={props.quota?.seven_day}
         />
@@ -238,9 +262,77 @@ async function readStateFromFile(): Promise<SidebarState> {
   return getSidebarState()
 }
 
-function QuotaSidebar(props: { api: TuiPluginApi }) {
+interface SidebarController {
+  prefs: () => AnthropicAuthTuiPrefs
+  collapsed: () => boolean
+  toggleCollapsed: () => void
+}
+
+// The TUI may unmount and remount sidebar_content when the user switches
+// views (e.g. main -> subagent -> main). A remount re-runs the component
+// body, so any signal created inside the component would reset to its
+// seed. The controller lives in the plugin closure (process lifetime)
+// and owns the durable prefs/collapse signals plus the single shared
+// watcher subscription, so collapse and live pref reloads survive the
+// remount. No effects or memos here — those need a Solid owner, so the
+// poll-interval createEffect stays inside the component.
+function createSidebarController(
+  initialPrefs: AnthropicAuthTuiPrefs,
+): SidebarController {
+  const [prefs, setPrefs] = createSignal<AnthropicAuthTuiPrefs>(initialPrefs)
+  const seedCollapsed =
+    initialPrefs.rememberCollapsed && initialPrefs.collapsed != null
+      ? initialPrefs.collapsed
+      : initialPrefs.startCollapsed
+  const [collapsed, setCollapsed] = createSignal(seedCollapsed)
+  let lastPersistedCollapsed: boolean | null = initialPrefs.collapsed
+  let lastApplied = JSON.stringify(initialPrefs)
+
+  // The watcher lives for the plugin/process lifetime — it is intentionally
+  // never disposed. Collapse guard mirrors the race-fix in toggleCollapsed:
+  // lastPersistedCollapsed is advanced only once our own write lands, so
+  // watcher echoes of the previous persisted value are rejected by the
+  // `!==` check and cannot revert a user click.
+  watchTuiPreferences(() => {
+    void (async () => {
+      const next = resolveAnthropicAuthPrefs(await readTuiPreferencesFile())
+      const serialized = JSON.stringify(next)
+      if (serialized === lastApplied) return
+      lastApplied = serialized
+      setPrefs(next)
+      if (
+        next.rememberCollapsed &&
+        next.collapsed != null &&
+        next.collapsed !== lastPersistedCollapsed
+      ) {
+        lastPersistedCollapsed = next.collapsed
+        setCollapsed(next.collapsed)
+      }
+    })()
+  })
+
+  function toggleCollapsed() {
+    const next = !collapsed()
+    setCollapsed(next)
+    if (prefs().rememberCollapsed) {
+      void queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], next).then(
+        () => {
+          lastPersistedCollapsed = next
+        },
+      )
+    }
+  }
+
+  return { prefs, collapsed, toggleCollapsed }
+}
+
+function QuotaSidebar(props: {
+  api: TuiPluginApi
+  controller: SidebarController
+}) {
+  const prefs = props.controller.prefs
+  const collapsed = props.controller.collapsed
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
-  const [collapsed, setCollapsed] = createSignal(false)
   let lastUpdated = 0
   let debounce: ReturnType<typeof setTimeout> | null = null
 
@@ -257,19 +349,23 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
     debounce = setTimeout(() => {
       debounce = null
       void refresh()
-    }, REFRESH_DEBOUNCE_MS)
+    }, prefs().refreshDebounceMs)
   }
 
   // Background poller (server and TUI run as separate module instances, so we
   // sync through the state file) plus event-driven refreshes for low latency.
-  const timer = setInterval(refresh, POLL_MS)
+  // The interval rebuilds whenever pollMs changes.
+  createEffect(() => {
+    const timer = setInterval(refresh, prefs().pollMs)
+    onCleanup(() => clearInterval(timer))
+  })
   const unsubs = [
     props.api.event.on('session.updated', scheduleRefresh),
     props.api.event.on('message.updated', scheduleRefresh),
   ]
   setTimeout(refresh, 300)
+
   onCleanup(() => {
-    clearInterval(timer)
     if (debounce) clearTimeout(debounce)
     for (const u of unsubs) u()
   })
@@ -279,8 +375,10 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
   const hasData = () =>
     state().main.quota != null || enabledFallbacks().length > 0
 
-  const headerLabel = () =>
-    !hasData() ? 'CLAUDE' : collapsed() ? '\u25b6 CLAUDE' : '\u25bc CLAUDE'
+  const headerLabel = () => {
+    const name = prefs().header.label
+    return !hasData() ? name : collapsed() ? `\u25b6 ${name}` : `\u25bc ${name}`
+  }
   const activeAccount = () => resolveActiveAccount(state())
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota)
@@ -290,7 +388,9 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
       summary.fiveHourUsedPercent,
       summary.sevenDayUsedPercent,
     ].filter((value): value is number => value != null)
-    return values.length > 0 ? usageTone(Math.max(...values)) : 'muted'
+    return values.length > 0
+      ? usageTone(Math.max(...values), prefs().appearance)
+      : 'muted'
   }
 
   const quotaBackedOff = () => state().main.quotaBackedOff === true
@@ -298,7 +398,8 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
   const degraded = () => quotaBackedOff() || refreshBackedOff()
 
   const cacheKeep = () => state().cacheKeep
-  const showCache = () => cacheKeep() != null && cacheKeep()?.window != null
+  const showCache = () =>
+    prefs().sections.cache && cacheKeep() != null && cacheKeep()?.window != null
   const relayValue = () => {
     const r = state().relay
     if (!r) return '\u2014'
@@ -324,7 +425,7 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
         justifyContent='space-between'
         alignItems='center'
         onMouseDown={() => {
-          if (hasData()) setCollapsed((value) => !value)
+          if (hasData()) props.controller.toggleCollapsed()
         }}
       >
         <box paddingLeft={1} paddingRight={1} backgroundColor={theme().accent}>
@@ -335,7 +436,7 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
         <Show
           when={degraded()}
           fallback={
-            <Show when={PLUGIN_VERSION !== ''}>
+            <Show when={prefs().header.showVersion && PLUGIN_VERSION !== ''}>
               <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
             </Show>
           }
@@ -385,46 +486,54 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
           }
         >
           {/* Quota */}
-          <SectionHeader theme={theme()} title='Quota' />
-          <AccountBlock
-            theme={theme()}
-            name='main'
-            quota={state().main.quota}
-            active={state().activeId === 'main'}
-          />
-          <For each={enabledFallbacks()}>
-            {(fb) => (
-              <AccountBlock
-                theme={theme()}
-                name={fb.label ?? fb.id}
-                quota={fb.quota}
-                active={state().activeId === fb.id}
-                marginTop={1}
-              />
-            )}
-          </For>
+          <Show when={prefs().sections.quota}>
+            <SectionHeader theme={theme()} title='Quota' />
+            <AccountBlock
+              theme={theme()}
+              appearance={prefs().appearance}
+              name='main'
+              quota={state().main.quota}
+              active={state().activeId === 'main'}
+            />
+            <Show when={prefs().sections.fallbackAccounts}>
+              <For each={enabledFallbacks()}>
+                {(fb) => (
+                  <AccountBlock
+                    theme={theme()}
+                    appearance={prefs().appearance}
+                    name={fb.label ?? fb.id}
+                    quota={fb.quota}
+                    active={state().activeId === fb.id}
+                    marginTop={1}
+                  />
+                )}
+              </For>
+            </Show>
+          </Show>
         </Show>
 
         {/* Routing */}
-        <SectionHeader theme={theme()} title='Routing' />
-        <StatRow
-          theme={theme()}
-          label='Route'
-          value={state().route}
-          tone='accent'
-        />
-        <StatRow
-          theme={theme()}
-          label='Mode'
-          value={state().fastMode ? 'fast' : 'std'}
-          tone={state().fastMode ? 'accent' : 'muted'}
-        />
-        <StatRow
-          theme={theme()}
-          label='Relay'
-          value={relayValue()}
-          tone={state().relay?.enabled ? 'ok' : 'muted'}
-        />
+        <Show when={prefs().sections.routing}>
+          <SectionHeader theme={theme()} title='Routing' />
+          <StatRow
+            theme={theme()}
+            label='Route'
+            value={state().route}
+            tone='accent'
+          />
+          <StatRow
+            theme={theme()}
+            label='Mode'
+            value={state().fastMode ? 'fast' : 'std'}
+            tone={state().fastMode ? 'accent' : 'muted'}
+          />
+          <StatRow
+            theme={theme()}
+            label='Relay'
+            value={relayValue()}
+            tone={state().relay?.enabled ? 'ok' : 'muted'}
+          />
+        </Show>
 
         {/* Cache */}
         <Show when={showCache()}>
@@ -446,7 +555,7 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
         </Show>
 
         {/* Health — only when something is wrong */}
-        <Show when={degraded()}>
+        <Show when={degraded() && prefs().sections.health}>
           <SectionHeader theme={theme()} title='Health' />
           <Show when={quotaBackedOff()}>
             <StatRow
@@ -471,11 +580,13 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
 }
 
 const tui: TuiPlugin = async (api) => {
+  const root = await readTuiPreferencesFile()
+  const controller = createSidebarController(resolveAnthropicAuthPrefs(root))
   api.slots.register({
-    order: 160,
+    order: computeEffectiveOrder(root, PLUGIN_KEY, DEFAULT_SLOT_ORDER),
     slots: {
       sidebar_content(_ctx: unknown, _props: { session_id: string }) {
-        return <QuotaSidebar api={api} />
+        return <QuotaSidebar api={api} controller={controller} />
       },
     },
   })
