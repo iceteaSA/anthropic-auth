@@ -10,6 +10,7 @@ import {
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
   isFastModeSupportedModel,
+  isOpenAIReasoningEncryptedContent,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
@@ -700,10 +701,6 @@ function applyHybridCache1h(parsed: Record<string, unknown>) {
   }
   if (bridge) setMessageCacheAnchor(parsed.messages[bridge.index])
   if (latest) setMessageCacheAnchor(parsed.messages[latest.index])
-}
-
-function isOpenAIReasoningEncryptedContent(value: unknown) {
-  return typeof value === 'string' && value.startsWith('gAAAA')
 }
 
 function stripNonAnthropicThinkingBlocks(parsed: Record<string, unknown>) {

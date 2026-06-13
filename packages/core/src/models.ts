@@ -49,3 +49,7 @@ export function isClaudeFableOrMythos5Model(model: unknown) {
     )
   )
 }
+
+export function isOpenAIReasoningEncryptedContent(value: unknown): boolean {
+  return typeof value === 'string' && value.startsWith('gAAAA')
+}

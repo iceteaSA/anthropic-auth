@@ -418,6 +418,28 @@ describe('convertMessages — signed thinking blocks', () => {
     expect(current[1]?.type).toBe('tool_use')
   })
 
+  test('drops OpenAI encrypted reasoning before sending to Anthropic', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg(
+        'gpt reasoning summary',
+        'gAAAAABqLPSxOpenAIEncryptedReasoningState',
+        'tool_1',
+      ),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({
+      type: 'tool_use',
+      id: 'tool_1',
+      name: 'Bash',
+      input: {},
+    })
+    expect(JSON.stringify(messages)).not.toContain('gAAAAABqLPSx')
+    expect(JSON.stringify(messages)).not.toContain('gpt reasoning summary')
+  })
+
   test('downgrades a signed thinking block with a lone surrogate to sanitized text', async () => {
     const messages = await buildMessages([
       userMsg('q1'),
