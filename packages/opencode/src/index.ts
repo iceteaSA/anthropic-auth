@@ -502,14 +502,22 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
 
-  let _rpcServer: RpcServerHandle | null = null
+  let rpcServer: RpcServerHandle | null = null
   if (ctx.directory) {
+    const rpcGlobal = globalThis as {
+      __anthropicAuthRpcServer?: RpcServerHandle
+    }
+    if (rpcGlobal.__anthropicAuthRpcServer) {
+      await rpcGlobal.__anthropicAuthRpcServer.stop().catch(() => {})
+      rpcGlobal.__anthropicAuthRpcServer = undefined
+    }
     try {
-      _rpcServer = await startRpcServer({
+      rpcServer = await startRpcServer({
         dir: getRpcDir(ctx.directory),
         drain: drainNotifications,
         apply: applyCommand,
       })
+      rpcGlobal.__anthropicAuthRpcServer = rpcServer
     } catch (error) {
       log('[rpc] failed to start', {
         error: error instanceof Error ? error.message : String(error),
@@ -865,34 +873,34 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
     if (command === 'claude-routing') {
+      const text = await executePersistentRoutingCommand(args)
       const storage = await loadAccounts(accountStoragePath)
-      return {
-        command,
-        text: await executePersistentRoutingCommand(args),
-        knobs: { mode: getRoutingMode(storage) },
-      }
+      return { command, text, knobs: { mode: getRoutingMode(storage) } }
     }
     if (command === 'claude-fast') {
+      const text = await executePersistentFastModeCommand(args)
       const storage = await loadAccounts(accountStoragePath)
       return {
         command,
-        text: await executePersistentFastModeCommand(args),
+        text,
         knobs: { enabled: isFastModePersistentlyEnabled(storage) },
       }
     }
     if (command === 'claude-dump') {
+      const text = await executePersistentDumpCommand(args)
       const storage = await loadAccounts(accountStoragePath)
       return {
         command,
-        text: await executePersistentDumpCommand(args),
+        text,
         knobs: { enabled: isDumpPersistentlyEnabled(storage) },
       }
     }
     if (command === 'claude-cache') {
+      const text = await executePersistentCache1hCommand(args)
       const storage = await loadAccounts(accountStoragePath)
       return {
         command,
-        text: await executePersistentCache1hCommand(args),
+        text,
         knobs: {
           enabled: isCache1hPersistentlyEnabled(storage),
           mode: getCache1hPersistentMode(storage),
@@ -900,12 +908,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     }
     if (command === 'claude-cachekeep') {
+      const text = await executePersistentCacheKeepCommand(args)
       const storage = await loadAccounts(accountStoragePath)
-      return {
-        command,
-        text: await executePersistentCacheKeepCommand(args),
-        knobs: { window: getCacheKeepWindow(storage) },
-      }
+      return { command, text, knobs: { window: getCacheKeepWindow(storage) } }
     }
     const storage = await loadAccounts()
     const config = getKillswitchConfig(storage)
