@@ -60,7 +60,7 @@ describe('cachekeep prewarm body', () => {
       system: [
         {
           type: 'text',
-          text: 'x-anthropic-billing-header: cc_version=2.1.141.67b; cc_entrypoint=sdk-cli; cch=abcde;',
+          text: 'x-anthropic-billing-header: cc_version=2.1.177.3bf; cc_entrypoint=cli; cch=abcde;',
         },
         { type: 'text', text: 'identity' },
         {

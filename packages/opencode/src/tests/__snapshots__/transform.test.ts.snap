@@ -146,11 +146,11 @@ exports[`sanitizeSystemText – realistic prompt rewriteRequestBody output snaps
   ],
   "system": [
     {
-      "text": "x-anthropic-billing-header: cc_version=<daily>; cc_entrypoint=sdk-cli; cch=<signed>;",
+      "text": "x-anthropic-billing-header: cc_version=<daily>; cc_entrypoint=cli; cch=<signed>;",
       "type": "text",
     },
     {
-      "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
       "type": "text",
     },
     {

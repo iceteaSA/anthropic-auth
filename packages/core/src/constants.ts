@@ -54,7 +54,7 @@ export function isFastModeSupportedModel(model: unknown) {
 
 export const OPENCODE_IDENTITY_PREFIX = 'You are OpenCode'
 export const CLAUDE_CODE_IDENTITY =
-  "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+  "You are Claude Code, Anthropic's official CLI for Claude."
 
 export const PARALLEL_TOOL_CALLS_SYSTEM_PROMPT = [
   '<use_parallel_tool_calls>',
@@ -66,13 +66,13 @@ export const PARALLEL_TOOL_CALLS_SYSTEM_PROMPT = [
 
 export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
-export const CLAUDE_CODE_VERSION = '2.1.141'
-export const CLAUDE_CODE_BUILD_HASH = '67b'
-export const CLAUDE_CODE_ENTRYPOINT = 'sdk-cli'
+export const CLAUDE_CODE_VERSION = '2.1.177'
+export const CLAUDE_CODE_BUILD_HASH = '3bf'
+export const CLAUDE_CODE_ENTRYPOINT = 'cli'
 export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.94.0'
 export const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION = 'v24.3.0'
 
-export const USER_AGENT = 'claude-cli/2.1.141 (external, sdk-cli)'
+export const USER_AGENT = 'claude-cli/2.1.177 (external, cli)'
 
 export const CACHE_1H_MODES = ['explicit', 'automatic', 'hybrid'] as const
 export type Cache1hMode = (typeof CACHE_1H_MODES)[number]

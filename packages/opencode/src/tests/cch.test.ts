@@ -30,7 +30,7 @@ describe('billing header helpers', () => {
   })
 
   test('computes the captured Claude Code build suffix for the default version', () => {
-    expect(computeVersionSuffix('2.1.141', new Date('2026-04-29'))).toBe('67b')
+    expect(computeVersionSuffix('2.1.177', new Date('2026-04-29'))).toBe('3bf')
   })
 
   test('keeps custom version suffixes stable across date boundaries', () => {
