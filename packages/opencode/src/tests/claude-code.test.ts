@@ -27,6 +27,13 @@ describe('Claude Code fingerprint helpers', () => {
     expect(selectClaudeCodeBetas(body).split(',')).toEqual([
       ...CLAUDE_CODE_FULL_AGENT_BETAS,
     ])
+    const fullBetas = selectClaudeCodeBetas(body).split(',')
+    expect(fullBetas[0]).toBe('oauth-2025-04-20')
+    expect(fullBetas).toContain('thinking-token-count-2026-05-13')
+    expect(fullBetas).not.toContain('redact-thinking-2026-02-12')
+    expect(fullBetas).toContain('claude-code-20250219')
+    expect(fullBetas).not.toContain('context-1m-2025-08-07')
+    expect(fullBetas).not.toContain('effort-2025-11-24')
   })
 
   test('selects structured-output betas without full-agent private betas', () => {
@@ -40,6 +47,8 @@ describe('Claude Code fingerprint helpers', () => {
     }).split(',')
 
     expect(betas).toContain('structured-outputs-2025-12-15')
+    expect(betas).toContain('thinking-token-count-2026-05-13')
+    expect(betas).not.toContain('redact-thinking-2026-02-12')
     expect(betas).not.toContain('claude-code-20250219')
     expect(betas).not.toContain('advanced-tool-use-2025-11-20')
     expect(betas).not.toContain('context-1m-2025-08-07')
@@ -55,17 +64,23 @@ describe('Claude Code fingerprint helpers', () => {
       stream: true,
     }).split(',')
 
-    expect(betas).not.toContain('advanced-tool-use-2025-11-20')
+    expect(betas).toContain('thinking-token-count-2026-05-13')
+    expect(betas).toContain('advanced-tool-use-2025-11-20')
+    expect(betas).toContain('extended-cache-ttl-2025-04-11')
+    expect(betas).not.toContain('claude-code-20250219')
     expect(betas).not.toContain('context-1m-2025-08-07')
     expect(betas).not.toContain('effort-2025-11-24')
-    expect(betas).not.toContain('extended-cache-ttl-2025-04-11')
+    expect(betas).not.toContain('redact-thinking-2026-02-12')
   })
 
   test('does not add full-agent betas when request shape is unavailable', () => {
     const betas = selectClaudeCodeBetas(null).split(',')
 
     for (const beta of REQUIRED_BETAS) expect(betas).toContain(beta)
-    expect(betas).not.toContain('advanced-tool-use-2025-11-20')
+    expect(betas[0]).toBe('oauth-2025-04-20')
+    expect(betas).toContain('thinking-token-count-2026-05-13')
+    expect(betas).not.toContain('redact-thinking-2026-02-12')
+    expect(betas).not.toContain('claude-code-20250219')
   })
 
   test('applies Claude Code headers and couples session id to metadata', () => {

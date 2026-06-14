@@ -2,13 +2,15 @@ export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 
 export const AUTHORIZE_URLS = {
   console: 'https://platform.claude.com/oauth/authorize',
-  max: 'https://claude.ai/oauth/authorize',
+  max: 'https://claude.com/cai/oauth/authorize',
 } as const
 
 export const CODE_CALLBACK_URL =
   'https://platform.claude.com/oauth/code/callback'
 
 export const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
+
+export const AXIOS_USER_AGENT = 'axios/1.15.2'
 
 export const OAUTH_SCOPES = [
   'org:create_api_key',
@@ -18,6 +20,9 @@ export const OAUTH_SCOPES = [
   'user:mcp_servers',
   'user:file_upload',
 ]
+
+export const REFRESH_SCOPE =
+  'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 
 export const TOOL_PREFIX = 'mcp_'
 

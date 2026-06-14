@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import {
+  AXIOS_USER_AGENT,
   authorize,
   CLIENT_ID,
   ClaudeOAuthRefreshError,
   CODE_CALLBACK_URL,
   exchange,
   OAUTH_SCOPES,
+  REFRESH_SCOPE,
   refreshClaudeOAuthToken,
+  TOKEN_URL,
 } from '@cortexkit/anthropic-auth-core'
 
 const originalSetTimeout = globalThis.setTimeout
@@ -25,8 +28,8 @@ describe('authorize', () => {
     expect(result.verifier).toBeString()
 
     const url = new URL(result.url)
-    expect(url.origin).toBe('https://claude.ai')
-    expect(url.pathname).toBe('/oauth/authorize')
+    expect(url.origin).toBe('https://claude.com')
+    expect(url.pathname).toBe('/cai/oauth/authorize')
     expect(url.searchParams.get('redirect_uri')).toBe(CODE_CALLBACK_URL)
   })
 
@@ -176,12 +179,22 @@ describe('refreshClaudeOAuthToken', () => {
       }) as unknown as typeof fetch,
     })
 
+    expect(capturedUrl).toBe(TOKEN_URL)
     expect(capturedUrl).toBe('https://platform.claude.com/v1/oauth/token')
     expect(capturedHeaders?.get('content-type')).toBe('application/json')
+    expect(capturedHeaders?.get('accept')).toBe(
+      'application/json, text/plain, */*',
+    )
+    expect(capturedHeaders?.get('user-agent')).toBe(AXIOS_USER_AGENT)
+    expect(capturedHeaders?.get('user-agent')).toBe('axios/1.15.2')
     const body = JSON.parse(capturedBody ?? '{}')
     expect(body.grant_type).toBe('refresh_token')
     expect(body.refresh_token).toBe('old-refresh')
     expect(body.client_id).toBe(CLIENT_ID)
+    expect(body.scope).toBe(REFRESH_SCOPE)
+    expect(body.scope).toBe(
+      'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
+    )
     expect(result).toEqual({
       access: 'new-access',
       refresh: 'old-refresh',
