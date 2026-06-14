@@ -24,15 +24,18 @@ export interface RpcServerOptions {
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
-    let data = ''
-    req.on('data', (chunk) => {
-      data += chunk
-      if (data.length > 1_000_000) {
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > 1_000_000) {
         req.destroy()
         reject(new Error('body too large'))
+        return
       }
+      chunks.push(chunk)
     })
-    req.on('end', () => resolve(data))
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
     req.on('error', reject)
   })
 }
