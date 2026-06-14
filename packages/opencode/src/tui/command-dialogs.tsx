@@ -195,7 +195,6 @@ export function openCommandDialog(
     api.ui.dialog.replace(() => (
       <DialogSelect
         title='Claude killswitch'
-        current={enabled ? 'on' : 'off'}
         options={[
           {
             title: enabled ? 'Disable killswitch' : 'Enable killswitch',
