@@ -64,6 +64,7 @@ export interface AnthropicAuthTuiPrefs {
     routing: boolean
     cache: boolean
     health: boolean
+    pacing: boolean
   }
   appearance: {
     barWidth: number
@@ -91,6 +92,7 @@ export const DEFAULT_PREFS: AnthropicAuthTuiPrefs = {
     routing: true,
     cache: true,
     health: true,
+    pacing: true,
   },
   appearance: {
     barWidth: 10,
@@ -176,6 +178,7 @@ export function resolveAnthropicAuthPrefs(
       routing: bool(sections.routing, d.sections.routing),
       cache: bool(sections.cache, d.sections.cache),
       health: bool(sections.health, d.sections.health),
+      pacing: bool(sections.pacing, d.sections.pacing),
     },
     appearance: {
       barWidth: int(appearance.barWidth, d.appearance.barWidth, 4, 40),

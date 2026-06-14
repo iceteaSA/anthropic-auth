@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import {
   type AccountQuota,
+  computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
+  FIVE_HOUR_MS,
   getCollapsedQuotaSummary,
   resolveActiveAccount,
+  SEVEN_DAY_MS,
   type SidebarState,
 } from '../sidebar-state'
 
@@ -105,5 +108,120 @@ describe('getCollapsedQuotaSummary', () => {
   test('returns no collapsed quota text when no windows are available', () => {
     expect(getCollapsedQuotaSummary(null).text).toBeNull()
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
+  })
+})
+
+describe('computeQuotaPacing', () => {
+  const now = Date.UTC(2026, 5, 12, 12, 0, 0)
+
+  function fiveHourWindow(elapsedMs: number, usedPercent: number) {
+    return {
+      window: {
+        usedPercent,
+        remainingPercent: 100 - usedPercent,
+        resetsAt: new Date(now + FIVE_HOUR_MS - elapsedMs).toISOString(),
+      },
+      elapsedMs,
+    }
+  }
+
+  test('reserve: under even-burn pace, lasts until reset', () => {
+    const { window } = fiveHourWindow(FIVE_HOUR_MS / 4, 5)
+    const pacing = computeQuotaPacing(window, FIVE_HOUR_MS, now)
+    expect(pacing).not.toBeNull()
+    expect(pacing?.pacePercent).toBeCloseTo(25, 5)
+    expect(pacing?.deltaPercent).toBeCloseTo(-20, 5)
+    expect(pacing?.state).toBe('reserve')
+    expect(pacing?.runsOutAt).toBeNull()
+  })
+
+  test('deficit: over pace, projects runout before reset', () => {
+    const elapsed = FIVE_HOUR_MS / 4
+    const { window } = fiveHourWindow(elapsed, 50)
+    const pacing = computeQuotaPacing(window, FIVE_HOUR_MS, now)
+    expect(pacing?.pacePercent).toBeCloseTo(25, 5)
+    expect(pacing?.deltaPercent).toBeCloseTo(25, 5)
+    expect(pacing?.state).toBe('deficit')
+    const start = now - elapsed
+    expect(pacing?.runsOutAt).toBe(new Date(start + elapsed * 2).toISOString())
+  })
+
+  test('screenshot case: 7d window, 12h elapsed, 17% used', () => {
+    const elapsed = 12 * 60 * 60 * 1000
+    const window = {
+      usedPercent: 17,
+      remainingPercent: 83,
+      resetsAt: new Date(now + SEVEN_DAY_MS - elapsed).toISOString(),
+    }
+    const pacing = computeQuotaPacing(window, SEVEN_DAY_MS, now)
+    expect(pacing?.deltaPercent).toBeCloseTo(17 - (12 / 168) * 100, 5)
+    expect(pacing?.state).toBe('deficit')
+    expect(pacing?.runsOutAt).not.toBeNull()
+    const runsOutMs = new Date(pacing?.runsOutAt as string).getTime() - now
+    const expectedMs = (elapsed * 100) / 17 - elapsed
+    expect(runsOutMs).toBeCloseTo(expectedMs, -4)
+  })
+
+  test('on-pace when |delta| < 1', () => {
+    const { window } = fiveHourWindow(FIVE_HOUR_MS / 4, 25.5)
+    const pacing = computeQuotaPacing(window, FIVE_HOUR_MS, now)
+    expect(pacing?.state).toBe('on-pace')
+  })
+
+  test('zero usage is reserve and lasts', () => {
+    const { window } = fiveHourWindow(FIVE_HOUR_MS / 2, 0)
+    const pacing = computeQuotaPacing(window, FIVE_HOUR_MS, now)
+    expect(pacing?.state).toBe('reserve')
+    expect(pacing?.deltaPercent).toBeCloseTo(-50, 5)
+    expect(pacing?.runsOutAt).toBeNull()
+  })
+
+  test('projection landing exactly at reset means lasts', () => {
+    const elapsed = FIVE_HOUR_MS / 2
+    const { window } = fiveHourWindow(elapsed, 50)
+    const pacing = computeQuotaPacing(window, FIVE_HOUR_MS, now)
+    expect(pacing?.state).toBe('on-pace')
+    expect(pacing?.runsOutAt).toBeNull()
+  })
+
+  test('null when resetsAt missing or invalid', () => {
+    expect(
+      computeQuotaPacing(
+        { usedPercent: 10, remainingPercent: 90 },
+        FIVE_HOUR_MS,
+        now,
+      ),
+    ).toBeNull()
+    expect(
+      computeQuotaPacing(
+        { usedPercent: 10, remainingPercent: 90, resetsAt: 'garbage' },
+        FIVE_HOUR_MS,
+        now,
+      ),
+    ).toBeNull()
+  })
+
+  test('null in the early-window noise guard', () => {
+    const fourMinutes = 4 * 60 * 1000
+    const { window } = fiveHourWindow(fourMinutes, 3)
+    expect(computeQuotaPacing(window, FIVE_HOUR_MS, now)).toBeNull()
+    const oneHour = 60 * 60 * 1000
+    const sevenDay = {
+      usedPercent: 3,
+      remainingPercent: 97,
+      resetsAt: new Date(now + SEVEN_DAY_MS - oneHour).toISOString(),
+    }
+    expect(computeQuotaPacing(sevenDay, SEVEN_DAY_MS, now)).toBeNull()
+  })
+
+  test('null when elapsed reaches or exceeds the window', () => {
+    const { window } = fiveHourWindow(FIVE_HOUR_MS, 80)
+    expect(computeQuotaPacing(window, FIVE_HOUR_MS, now)).toBeNull()
+    const past = {
+      usedPercent: 80,
+      remainingPercent: 20,
+      resetsAt: new Date(now - 1000).toISOString(),
+    }
+    expect(computeQuotaPacing(past, FIVE_HOUR_MS, now)).toBeNull()
   })
 })
