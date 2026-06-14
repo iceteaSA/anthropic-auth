@@ -726,7 +726,9 @@ const tui: TuiPlugin = async (api) => {
         .then((messages) => {
           for (const message of [...messages].sort((a, b) => a.id - b.id)) {
             lastNotificationId = Math.max(lastNotificationId, message.id)
-            openCommandDialog(api, message.payload)
+            openCommandDialog(api, message.payload, (command, args) =>
+              rpcClient.apply({ command, arguments: args }),
+            )
           }
         })
         .catch(() => {})
