@@ -149,6 +149,82 @@ export function openCommandDialog(
     return
   }
 
-  // fallback for quota, killswitch (interactive versions land later)
+  if (payload.command === 'claude-killswitch') {
+    const config = (payload.knobs.config ?? {}) as {
+      enabled?: boolean
+      main?: Record<string, number>
+      accounts?: Record<string, Record<string, number>>
+    }
+    const accountIds = (payload.knobs.accountIds as string[]) ?? []
+    const enabled = config.enabled === true
+    const readT = (t: Record<string, number> | undefined) => {
+      const fh = t?.five_hour ?? t?.['5h'] ?? 5
+      const sd = t?.seven_day ?? t?.['1w'] ?? 10
+      return { fh, sd }
+    }
+    const mainT = readT(config.main)
+    const seedParts = [`main:${mainT.fh},${mainT.sd}`]
+    for (const id of accountIds) {
+      const t = readT(config.accounts?.[id] ?? config.main)
+      seedParts.push(`${id}:${t.fh},${t.sd}`)
+    }
+    const seed = seedParts.join(' ')
+
+    const openEdit = () => {
+      const DialogPrompt = api.ui.DialogPrompt
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title='Killswitch thresholds'
+          description={() => <text>{payload.text}</text>}
+          placeholder='main:5,10 work-alt:5,10'
+          value={seed}
+          onConfirm={(value: string) => {
+            void apply('claude-killswitch', `set ${value.trim()}`).then((r) => {
+              api.ui.toast({ message: r.text })
+              api.ui.dialog.clear()
+            })
+          }}
+          onCancel={() => api.ui.dialog.clear()}
+        />
+      ))
+    }
+
+    const DialogSelect = api.ui.DialogSelect<string>
+    api.ui.dialog.setSize('xlarge')
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title='Claude killswitch'
+        current={enabled ? 'on' : 'off'}
+        options={[
+          {
+            title: enabled ? 'Disable killswitch' : 'Enable killswitch',
+            value: enabled ? 'off' : 'on',
+            description: enabled
+              ? 'Stop hard-blocking on low quota'
+              : 'Hard-block requests when quota drops below thresholds',
+          },
+          {
+            title: 'Edit thresholds…',
+            value: 'edit',
+            description: 'Set per-account 5h,1w cutoffs',
+          },
+        ]}
+        onSelect={(option) => {
+          if (option.value === 'edit') {
+            openEdit()
+            return
+          }
+          void apply('claude-killswitch', String(option.value)).then((r) => {
+            api.ui.toast({ message: r.text })
+            api.ui.dialog.clear()
+          })
+        }}
+      />
+    ))
+    return
+  }
+
+  // fallback for quota (display-only)
   showText(api, payload.text)
 }
