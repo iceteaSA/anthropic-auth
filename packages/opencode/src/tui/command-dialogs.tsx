@@ -6,8 +6,9 @@ export function openCommandDialog(
   api: TuiPluginApi,
   payload: OpenDialogPayload,
 ) {
+  api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
-    <box flexDirection='column' padding={1}>
+    <box flexDirection='column' padding={1} width='100%'>
       <text>{payload.text}</text>
     </box>
   ))

@@ -44,6 +44,7 @@ import {
 } from './tui-preferences.js'
 
 const RPC_POLL_MS = 500
+let rpcPollStarted = false
 
 const ID = 'cortexkit.anthropic-auth'
 
@@ -706,30 +707,34 @@ const tui: TuiPlugin = async (api) => {
     },
   })
 
-  const rpcClient = createRpcClient(getRpcDir(api.state.path.directory ?? ''))
-  let lastNotificationId = 0
-  let rpcInFlight = false
-  setInterval(() => {
-    if (rpcInFlight) return
-    const current = (api.route as { current?: unknown }).current
-    const resolved =
-      typeof current === 'function' ? (current as () => unknown)() : current
-    const sessionId = (
-      resolved as { params?: { sessionID?: string } } | undefined
-    )?.params?.sessionID
-    rpcInFlight = true
-    void rpcClient
-      .pending(lastNotificationId, sessionId)
-      .then((messages) => {
-        for (const message of [...messages].sort((a, b) => a.id - b.id)) {
-          lastNotificationId = Math.max(lastNotificationId, message.id)
-          openCommandDialog(api, message.payload)
-        }
-      })
-      .finally(() => {
-        rpcInFlight = false
-      })
-  }, RPC_POLL_MS)
+  if (!rpcPollStarted) {
+    rpcPollStarted = true
+    const rpcClient = createRpcClient(getRpcDir(api.state.path.directory ?? ''))
+    let lastNotificationId = 0
+    let rpcInFlight = false
+    setInterval(() => {
+      if (rpcInFlight) return
+      const current = (api.route as { current?: unknown }).current
+      const resolved =
+        typeof current === 'function' ? (current as () => unknown)() : current
+      const sessionId = (
+        resolved as { params?: { sessionID?: string } } | undefined
+      )?.params?.sessionID
+      rpcInFlight = true
+      void rpcClient
+        .pending(lastNotificationId, sessionId)
+        .then((messages) => {
+          for (const message of [...messages].sort((a, b) => a.id - b.id)) {
+            lastNotificationId = Math.max(lastNotificationId, message.id)
+            openCommandDialog(api, message.payload)
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          rpcInFlight = false
+        })
+    }, RPC_POLL_MS)
+  }
 }
 
 const plugin: TuiPluginModule & { id: string } = {
