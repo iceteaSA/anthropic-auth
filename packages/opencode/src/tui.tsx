@@ -350,6 +350,58 @@ function AccountBlock(props: {
   )
 }
 
+// --- Quota dialog content ---------------------------------------------------
+
+// Renders the same rich visualization as the sidebar (account blocks with
+// quota bars + pacing) so the modal matches the sidebar look.
+function QuotaDialogContent(props: {
+  api: TuiPluginApi
+  controller: SidebarController
+}) {
+  const prefs = props.controller.prefs
+  const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
+  let lastUpdated = 0
+  async function refresh() {
+    const next = await readStateFromFile()
+    if (next.lastUpdated !== lastUpdated) {
+      lastUpdated = next.lastUpdated
+      setState(next)
+    }
+  }
+  createEffect(() => {
+    const timer = setInterval(refresh, prefs().pollMs)
+    onCleanup(() => clearInterval(timer))
+  })
+  setTimeout(refresh, 0)
+  const theme = () => props.api.theme.current
+  const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
+  return (
+    <box flexDirection='column' padding={1} width='100%'>
+      <AccountBlock
+        theme={theme()}
+        appearance={prefs().appearance}
+        name='main'
+        quota={state().main.quota}
+        active={state().activeId === 'main'}
+        pacingEnabled={prefs().sections.pacing}
+      />
+      <For each={enabledFallbacks()}>
+        {(fb) => (
+          <AccountBlock
+            theme={theme()}
+            appearance={prefs().appearance}
+            name={fb.label ?? fb.id}
+            quota={fb.quota}
+            active={state().activeId === fb.id}
+            pacingEnabled={prefs().sections.pacing}
+            marginTop={1}
+          />
+        )}
+      </For>
+    </box>
+  )
+}
+
 // --- State plumbing ---------------------------------------------------------
 
 async function readStateFromFile(): Promise<SidebarState> {
@@ -726,6 +778,13 @@ const tui: TuiPlugin = async (api) => {
         .then((messages) => {
           for (const message of [...messages].sort((a, b) => a.id - b.id)) {
             lastNotificationId = Math.max(lastNotificationId, message.id)
+            if (message.payload.command === 'claude-quota') {
+              api.ui.dialog.setSize('xlarge')
+              api.ui.dialog.replace(() => (
+                <QuotaDialogContent api={api} controller={controller} />
+              ))
+              continue
+            }
             openCommandDialog(api, message.payload, (command, args) =>
               rpcClient.apply({ command, arguments: args }),
             )
