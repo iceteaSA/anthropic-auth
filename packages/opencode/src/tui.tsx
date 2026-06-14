@@ -16,7 +16,8 @@ import {
   onCleanup,
   Show,
 } from 'solid-js'
-
+import { createRpcClient } from './rpc/rpc-client.js'
+import { getRpcDir } from './rpc/rpc-dir.js'
 import {
   type AccountQuota,
   computeQuotaPacing,
@@ -29,6 +30,7 @@ import {
   SEVEN_DAY_MS,
   type SidebarState,
 } from './sidebar-state.js'
+import { openCommandDialog } from './tui/command-dialogs.js'
 import {
   type AnthropicAuthTuiPrefs,
   type AppearancePrefs,
@@ -40,6 +42,8 @@ import {
   resolveAnthropicAuthPrefs,
   watchTuiPreferences,
 } from './tui-preferences.js'
+
+const RPC_POLL_MS = 500
 
 const ID = 'cortexkit.anthropic-auth'
 
@@ -701,6 +705,31 @@ const tui: TuiPlugin = async (api) => {
       },
     },
   })
+
+  const rpcClient = createRpcClient(getRpcDir(api.state.path.directory ?? ''))
+  let lastNotificationId = 0
+  let rpcInFlight = false
+  setInterval(() => {
+    if (rpcInFlight) return
+    const current = (api.route as { current?: unknown }).current
+    const resolved =
+      typeof current === 'function' ? (current as () => unknown)() : current
+    const sessionId = (
+      resolved as { params?: { sessionID?: string } } | undefined
+    )?.params?.sessionID
+    rpcInFlight = true
+    void rpcClient
+      .pending(lastNotificationId, sessionId)
+      .then((messages) => {
+        for (const message of [...messages].sort((a, b) => a.id - b.id)) {
+          lastNotificationId = Math.max(lastNotificationId, message.id)
+          openCommandDialog(api, message.payload)
+        }
+      })
+      .finally(() => {
+        rpcInFlight = false
+      })
+  }, RPC_POLL_MS)
 }
 
 const plugin: TuiPluginModule & { id: string } = {

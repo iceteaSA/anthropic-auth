@@ -36,6 +36,7 @@
   "files": [
     "dist",
     "src/tui.tsx",
+    "src/tui/command-dialogs.tsx",
     "src/sidebar-state.ts",
     "src/tui-preferences.ts",
     "src/rpc",
