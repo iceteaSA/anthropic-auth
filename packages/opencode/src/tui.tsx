@@ -377,6 +377,7 @@ function QuotaDialogContent(props: {
   const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
   return (
     <box flexDirection='column' padding={1} width='100%'>
+      <SectionHeader theme={theme()} title='Quota' />
       <AccountBlock
         theme={theme()}
         appearance={prefs().appearance}
@@ -385,19 +386,21 @@ function QuotaDialogContent(props: {
         active={state().activeId === 'main'}
         pacingEnabled={prefs().sections.pacing}
       />
-      <For each={enabledFallbacks()}>
-        {(fb) => (
-          <AccountBlock
-            theme={theme()}
-            appearance={prefs().appearance}
-            name={fb.label ?? fb.id}
-            quota={fb.quota}
-            active={state().activeId === fb.id}
-            pacingEnabled={prefs().sections.pacing}
-            marginTop={1}
-          />
-        )}
-      </For>
+      <Show when={prefs().sections.fallbackAccounts}>
+        <For each={enabledFallbacks()}>
+          {(fb) => (
+            <AccountBlock
+              theme={theme()}
+              appearance={prefs().appearance}
+              name={fb.label ?? fb.id}
+              quota={fb.quota}
+              active={state().activeId === fb.id}
+              pacingEnabled={prefs().sections.pacing}
+              marginTop={1}
+            />
+          )}
+        </For>
+      </Show>
     </box>
   )
 }
