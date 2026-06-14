@@ -376,31 +376,37 @@ function QuotaDialogContent(props: {
   const theme = () => props.api.theme.current
   const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
   return (
-    <box flexDirection='column' padding={1} width='100%'>
-      <SectionHeader theme={theme()} title='Quota' />
-      <AccountBlock
-        theme={theme()}
-        appearance={prefs().appearance}
-        name='main'
-        quota={state().main.quota}
-        active={state().activeId === 'main'}
-        pacingEnabled={prefs().sections.pacing}
-      />
-      <Show when={prefs().sections.fallbackAccounts}>
-        <For each={enabledFallbacks()}>
-          {(fb) => (
-            <AccountBlock
-              theme={theme()}
-              appearance={prefs().appearance}
-              name={fb.label ?? fb.id}
-              quota={fb.quota}
-              active={state().activeId === fb.id}
-              pacingEnabled={prefs().sections.pacing}
-              marginTop={1}
-            />
-          )}
-        </For>
-      </Show>
+    <box flexDirection='column' padding={2} width='100%' alignItems='center'>
+      <box flexDirection='column' width={58}>
+        <box width='100%' justifyContent='center' marginBottom={1}>
+          <text fg={theme().text}>
+            <b>Quota</b>
+          </text>
+        </box>
+        <AccountBlock
+          theme={theme()}
+          appearance={prefs().appearance}
+          name='main'
+          quota={state().main.quota}
+          active={state().activeId === 'main'}
+          pacingEnabled={prefs().sections.pacing}
+        />
+        <Show when={prefs().sections.fallbackAccounts}>
+          <For each={enabledFallbacks()}>
+            {(fb) => (
+              <AccountBlock
+                theme={theme()}
+                appearance={prefs().appearance}
+                name={fb.label ?? fb.id}
+                quota={fb.quota}
+                active={state().activeId === fb.id}
+                pacingEnabled={prefs().sections.pacing}
+                marginTop={1}
+              />
+            )}
+          </For>
+        </Show>
+      </box>
     </box>
   )
 }
