@@ -74,6 +74,81 @@ export function openCommandDialog(
     return
   }
 
-  // fallback for quota, cache, cachekeep, killswitch (interactive versions land later)
+  if (payload.command === 'claude-cache') {
+    const enabled = payload.knobs.enabled === true
+    const mode = (payload.knobs.mode as string) ?? 'hybrid'
+    const currentValue = enabled ? mode : 'off'
+    const DialogSelect = api.ui.DialogSelect<string>
+    api.ui.dialog.setSize('large')
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title='Claude 1h cache'
+        current={currentValue}
+        options={[
+          { title: 'Off', value: 'off', description: 'Disable 1h cache' },
+          {
+            title: 'Explicit',
+            value: 'explicit',
+            description: 'Existing OpenCode breakpoints',
+          },
+          {
+            title: 'Automatic',
+            value: 'automatic',
+            description: 'Top-level cache_control only',
+          },
+          {
+            title: 'Hybrid',
+            value: 'hybrid',
+            description: 'system + messages[0] + top-level',
+          },
+        ]}
+        onSelect={(option) => {
+          if (option.value === 'off') {
+            void apply('claude-cache', 'off').then((r) => {
+              api.ui.toast({ message: r.text })
+              api.ui.dialog.clear()
+            })
+            return
+          }
+          void apply('claude-cache', `mode ${option.value}`)
+            .then(() => apply('claude-cache', 'on'))
+            .then((r) => {
+              api.ui.toast({ message: r.text })
+              api.ui.dialog.clear()
+            })
+        }}
+      />
+    ))
+    return
+  }
+
+  if (payload.command === 'claude-cachekeep') {
+    const window = payload.knobs.window as
+      | { startHour: number; endHour: number }
+      | undefined
+    const seed = window
+      ? `${String(window.startHour).padStart(2, '0')}-${String(window.endHour).padStart(2, '0')}`
+      : ''
+    const DialogPrompt = api.ui.DialogPrompt
+    api.ui.dialog.setSize('large')
+    api.ui.dialog.replace(() => (
+      <DialogPrompt
+        title='Claude cachekeep window'
+        description={() => <text>{payload.text}</text>}
+        placeholder="HH-HH (e.g. 08-20) or 'off'"
+        value={seed}
+        onConfirm={(value: string) => {
+          void apply('claude-cachekeep', value.trim()).then((r) => {
+            api.ui.toast({ message: r.text })
+            api.ui.dialog.clear()
+          })
+        }}
+        onCancel={() => api.ui.dialog.clear()}
+      />
+    ))
+    return
+  }
+
+  // fallback for quota, killswitch (interactive versions land later)
   showText(api, payload.text)
 }
