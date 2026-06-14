@@ -1,0 +1,58 @@
+import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  drainNotifications,
+  pushNotification,
+  resetNotificationsForTest,
+} from '../rpc/notifications'
+import { startRpcServer } from '../rpc/rpc-server'
+
+let stop: (() => Promise<void>) | null = null
+let dir: string
+
+afterEach(async () => {
+  await stop?.()
+  stop = null
+  if (dir) await rm(dir, { recursive: true, force: true })
+  resetNotificationsForTest()
+})
+
+describe('rpc-server', () => {
+  test('health is open; pending-notifications requires bearer and drains', async () => {
+    resetNotificationsForTest()
+    dir = await mkdtemp(join(tmpdir(), 'aa-rpcsrv-'))
+    const server = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    stop = server.stop
+    const base = `http://127.0.0.1:${server.port}`
+
+    expect((await fetch(`${base}/health`)).status).toBe(200)
+
+    const noAuth = await fetch(`${base}/rpc/pending-notifications`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lastReceivedId: 0 }),
+    })
+    expect(noAuth.status).toBe(401)
+
+    pushNotification({ command: 'claude-quota', text: 'x', knobs: {} }, 's1')
+    const ok = await fetch(`${base}/rpc/pending-notifications`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${server.token}`,
+      },
+      body: JSON.stringify({ lastReceivedId: 0, sessionId: 's1' }),
+    })
+    expect(ok.status).toBe(200)
+    const body = (await ok.json()) as {
+      messages: Array<{ payload: { command: string } }>
+    }
+    expect(body.messages[0]?.payload.command).toBe('claude-quota')
+  })
+})
