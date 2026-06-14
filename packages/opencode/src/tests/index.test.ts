@@ -314,6 +314,19 @@ describe('auth.methods', () => {
 })
 
 describe('provider.models', () => {
+  beforeEach(async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+  })
+
+  afterEach(async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { recursive: true, force: true })
+      tempConfigDir = undefined
+    }
+  })
+
   test('zeros out Anthropic model costs for OAuth auth', async () => {
     const plugin = await getPlugin()
     const models = {
