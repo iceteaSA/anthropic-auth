@@ -54,5 +54,23 @@ describe('rpc-server', () => {
       messages: Array<{ payload: { command: string } }>
     }
     expect(body.messages[0]?.payload.command).toBe('claude-quota')
+
+    const applyNoAuth = await fetch(`${base}/rpc/apply`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ command: 'claude-quota', arguments: '' }),
+    })
+    expect(applyNoAuth.status).toBe(401)
+
+    const applyOk = await fetch(`${base}/rpc/apply`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${server.token}`,
+      },
+      body: JSON.stringify({ command: 'claude-quota', arguments: '' }),
+    })
+    expect(applyOk.status).toBe(200)
+    expect(await applyOk.json()).toEqual({ text: 'ok', knobs: {} })
   })
 })

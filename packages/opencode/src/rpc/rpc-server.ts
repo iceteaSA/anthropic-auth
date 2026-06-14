@@ -27,7 +27,10 @@ function readBody(req: IncomingMessage): Promise<string> {
     let data = ''
     req.on('data', (chunk) => {
       data += chunk
-      if (data.length > 1_000_000) reject(new Error('body too large'))
+      if (data.length > 1_000_000) {
+        req.destroy()
+        reject(new Error('body too large'))
+      }
     })
     req.on('end', () => resolve(data))
     req.on('error', reject)
@@ -95,7 +98,12 @@ export async function startRpcServer(
     })
   })
   server.unref()
-  await writePortFile(options.dir, { port, token, pid: process.pid })
+  try {
+    await writePortFile(options.dir, { port, token, pid: process.pid })
+  } catch (error) {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    throw error
+  }
 
   return {
     port,
