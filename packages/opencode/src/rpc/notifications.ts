@@ -28,7 +28,11 @@ export function drainNotifications(
     n.sessionId === undefined ||
     n.sessionId === sessionId
   if (lastReceivedId > 0) {
-    queue = queue.filter((n) => !(n.id <= lastReceivedId && matches(n)))
+    queue = queue.filter((n) => {
+      if (n.id > lastReceivedId) return true
+      if (sessionId === undefined) return false
+      return n.sessionId !== sessionId
+    })
   }
   return queue.filter((n) => n.id > lastReceivedId && matches(n))
 }

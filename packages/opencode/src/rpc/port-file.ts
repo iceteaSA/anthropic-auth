@@ -1,4 +1,11 @@
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { join } from 'node:path'
 
 export interface PortFileEntry {
@@ -46,8 +53,10 @@ export async function discoverPortFile(
       const parsed = JSON.parse(
         await readFile(join(dir, name), 'utf8'),
       ) as PortFileEntry
-      if (Number.isFinite(parsed.port) && pidAlive(parsed.pid))
-        live.push(parsed)
+      if (Number.isFinite(parsed.port)) {
+        if (pidAlive(parsed.pid)) live.push(parsed)
+        else unlink(join(dir, name)).catch(() => {})
+      }
     } catch {}
   }
   if (live.length === 0) return null

@@ -52,4 +52,16 @@ describe('notifications', () => {
     const all = drainNotifications(0, 's1')
     expect(all.length).toBe(100)
   })
+
+  test('a global notification reaches every session and is not pruned by one ack', () => {
+    // push a global (no sessionId) notification
+    pushNotification(payload('claude-quota'))
+    const a = drainNotifications(0, 's1')
+    expect(a.length).toBe(1)
+    // s1 acks it
+    drainNotifications(a[0]?.id as number, 's1')
+    // s2 must STILL receive it
+    const b = drainNotifications(0, 's2')
+    expect(b.length).toBe(1)
+  })
 })
