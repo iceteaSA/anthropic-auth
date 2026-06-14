@@ -1,0 +1,55 @@
+import { discoverPortFile } from './port-file'
+import type { ApplyRequest, ApplyResult, RpcNotification } from './protocol'
+
+export interface RpcClient {
+  pending: (
+    lastReceivedId: number,
+    sessionId?: string,
+  ) => Promise<RpcNotification[]>
+  apply: (request: ApplyRequest) => Promise<ApplyResult>
+}
+
+async function call<T>(
+  dir: string,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<T | null> {
+  const entry = await discoverPortFile(dir)
+  if (!entry) return null
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 2_000)
+  try {
+    const res = await fetch(`http://127.0.0.1:${entry.port}/rpc/${method}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${entry.token}`,
+      },
+      body: JSON.stringify(params),
+      signal: controller.signal,
+    })
+    if (!res.ok) return null
+    return (await res.json()) as T
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export function createRpcClient(dir: string): RpcClient {
+  return {
+    async pending(lastReceivedId, sessionId) {
+      const out = await call<{ messages: RpcNotification[] }>(
+        dir,
+        'pending-notifications',
+        { lastReceivedId, sessionId },
+      )
+      return out?.messages ?? []
+    },
+    async apply(request) {
+      const out = await call<ApplyResult>(dir, 'apply', { ...request })
+      return out ?? { text: 'apply failed', knobs: {} }
+    },
+  }
+}
