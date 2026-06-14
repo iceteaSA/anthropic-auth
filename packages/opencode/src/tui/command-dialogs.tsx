@@ -24,7 +24,7 @@ export function openCommandDialog(
   if (payload.command === 'claude-routing') {
     const current = (payload.knobs.mode as string) ?? 'main-first'
     const DialogSelect = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('large')
+    api.ui.dialog.setSize('xlarge')
     api.ui.dialog.replace(() => (
       <DialogSelect
         title='Claude routing'
@@ -57,7 +57,7 @@ export function openCommandDialog(
     const label =
       payload.command === 'claude-fast' ? 'fast mode' : 'request dump'
     const DialogConfirm = api.ui.DialogConfirm
-    api.ui.dialog.setSize('large')
+    api.ui.dialog.setSize('xlarge')
     api.ui.dialog.replace(() => (
       <DialogConfirm
         title={`Claude ${label}`}
@@ -79,7 +79,7 @@ export function openCommandDialog(
     const mode = (payload.knobs.mode as string) ?? 'hybrid'
     const currentValue = enabled ? mode : 'off'
     const DialogSelect = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('large')
+    api.ui.dialog.setSize('xlarge')
     api.ui.dialog.replace(() => (
       <DialogSelect
         title='Claude 1h cache'
@@ -130,7 +130,7 @@ export function openCommandDialog(
       ? `${String(window.startHour).padStart(2, '0')}-${String(window.endHour).padStart(2, '0')}`
       : ''
     const DialogPrompt = api.ui.DialogPrompt
-    api.ui.dialog.setSize('large')
+    api.ui.dialog.setSize('xlarge')
     api.ui.dialog.replace(() => (
       <DialogPrompt
         title='Claude cachekeep window'
