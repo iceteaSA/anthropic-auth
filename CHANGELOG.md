@@ -2,6 +2,20 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.9.3
+
+### Patch Changes
+
+- Keep OpenCode sidebar quota display stable during concurrent quota refreshes by re-seeding from the latest runtime state and avoiding stale quota writes from older plugin instances.
+- Dump direct Anthropic requests when `/claude-dump on` is enabled, including redacted request metadata for OpenCode and Pi direct/API paths. Relay requests continue to include relay metadata.
+- Harden Pi SSE reader cleanup so preflight parsing cannot cancel the response stream on early abandon.
+- Strip OpenAI encrypted reasoning payloads, including Pi JSON-stringified `encrypted_content` payloads, before converting history to Anthropic `thinking` blocks.
+- Repair Pi replay after interrupted tool calls by dropping incomplete aborted assistant `tool_use` turns and orphan tool results before sending Anthropic history.
+- Add configurable OpenCode TUI preferences via `tui-preferences.jsonc`, persisted sidebar collapse state, shared `forceToTop` ordering helpers, and quota pacing/runout projections in the sidebar.
+- Update OpenCode, Pi, OpenTUI, Miniflare, and related development dependencies.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the TUI preferences and quota pacing contributions.
+
 ## 1.9.2
 
 ### Patch Changes

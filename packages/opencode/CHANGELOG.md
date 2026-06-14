@@ -2,6 +2,18 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.9.3
+
+### Patch Changes
+
+- Keep sidebar quota display stable during concurrent quota refreshes by re-seeding from the latest runtime state and avoiding stale quota writes from older plugin instances.
+- Dump direct Anthropic requests when `/claude-dump on` is enabled, including redacted request metadata. Relay requests continue to include relay metadata.
+- Strip OpenAI encrypted reasoning payloads before converting stored history to Anthropic `thinking` blocks.
+- Add configurable TUI preferences via `tui-preferences.jsonc`, persisted sidebar collapse state, shared `forceToTop` ordering helpers, and quota pacing/runout projections in the sidebar.
+- Update OpenCode, OpenTUI, Miniflare, and related development dependencies.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the TUI preferences and quota pacing contributions.
+
 ## 1.9.2
 
 ### Patch Changes
