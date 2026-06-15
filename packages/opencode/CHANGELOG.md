@@ -2,6 +2,16 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.9.4
+
+### Patch Changes
+
+- Align Claude OAuth request fingerprints with captured Claude Code 2.1.177 interactive CLI traffic, including the CLI identity string, user agent, billing `cc_entrypoint=cli`, and beta header ordering.
+- Remove unavailable `context-1m` and `effort` betas from Claude Code OAuth requests, add the captured thinking token count beta, and keep redacted thinking disabled by design.
+- Match captured OAuth login/refresh details more closely with the updated axios-style user agent, accept header, refresh scope, and Claude Max authorize URL.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the Claude Code MITM capture and fingerprint alignment.
+
 ## 1.9.3
 
 ### Patch Changes
