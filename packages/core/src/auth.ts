@@ -1,8 +1,10 @@
 import {
   AUTHORIZE_URLS,
+  AXIOS_USER_AGENT,
   CLIENT_ID,
   CODE_CALLBACK_URL,
   OAUTH_SCOPES,
+  REFRESH_SCOPE,
   TOKEN_URL,
 } from './constants.ts'
 import { generatePKCE } from './pkce.ts'
@@ -82,13 +84,14 @@ export async function refreshClaudeOAuthToken(input: {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'User-Agent': 'axios/1.13.6',
+          Accept: 'application/json, text/plain, */*',
+          'User-Agent': AXIOS_USER_AGENT,
         },
         body: JSON.stringify({
           grant_type: 'refresh_token',
           refresh_token: input.refreshToken,
           client_id: CLIENT_ID,
+          scope: REFRESH_SCOPE,
         }),
       })
 
@@ -178,7 +181,7 @@ async function exchangeCode(
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/plain, */*',
-      'User-Agent': 'axios/1.13.6',
+      'User-Agent': AXIOS_USER_AGENT,
     },
     body: JSON.stringify({
       code: callback.code,

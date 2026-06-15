@@ -1836,8 +1836,8 @@ describe('sanitizeSystemText – realistic prompt', () => {
     const result = await rewriteRequestBody(body)
     const parsed = JSON.parse(result)
     parsed.system[0].text = parsed.system[0].text.replace(
-      /cc_version=[^;]+; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5};/,
-      'cc_version=<daily>; cc_entrypoint=sdk-cli; cch=<signed>;',
+      /cc_version=[^;]+; cc_entrypoint=cli; cch=[0-9a-f]{5};/,
+      'cc_version=<daily>; cc_entrypoint=cli; cch=<signed>;',
     )
     expect(parsed).toMatchSnapshot()
   })
