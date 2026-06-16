@@ -316,6 +316,22 @@ The sidebar polls plugin state and refreshes on OpenCode session and message eve
 
 Click the `CLAUDE` header to collapse or expand the sidebar. Collapsed, it shows the active account's 5-hour quota usage and a fast-mode row when fast mode is on; the header shows the plugin version (or a `LIMITED` badge when degraded). Collapse state persists across restarts by default via `tui-preferences.jsonc` (`rememberCollapsed`); set `"rememberCollapsed": false` for the old per-session behavior.
 
+### Command modals (OpenCode TUI)
+
+In the OpenCode TUI, the `/claude-*` commands open interactive modal dialogs instead of posting a text reply:
+
+- `/claude-quota` — a read-only view rendering the same per-account quota bars and pacing as the sidebar.
+- `/claude-routing` — select main-first or fallback-first.
+- `/claude-fast` — toggle fast mode on or off.
+- `/claude-dump` — toggle request dump capture on or off.
+- `/claude-cache` — select the 1-hour cache mode (off, explicit, automatic, or hybrid).
+- `/claude-cachekeep` — enter a cache keepalive window (`HH-HH`) or `off`.
+- `/claude-killswitch` — enable or disable the killswitch, or edit per-account `5h,1w` thresholds.
+
+Applying a change in a modal persists it through the same configuration the slash arguments use, so the modal and the typed command (`/claude-routing fallback-first`, etc.) are equivalent. Outside the OpenCode TUI (OpenCode desktop or headless), the commands print their text summary as before; Pi is unaffected.
+
+The modal bridge runs a loopback-only RPC server (bound to `127.0.0.1`, bearer-authenticated) so the OpenCode server process can signal the separate TUI process. Its runtime directory defaults to a per-project path under the OpenCode state directory; override it with `OPENCODE_ANTHROPIC_AUTH_RPC_DIR`.
+
 ## TUI preferences
 
 The TUI sidebar reads `tui-preferences.jsonc` from the opencode config
@@ -584,6 +600,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
+| `OPENCODE_ANTHROPIC_AUTH_RPC_DIR` | Override the directory for the OpenCode TUI command-modal RPC bridge (port file + token). Defaults to a per-project path under the OpenCode state directory. |
 | `PI_ANTHROPIC_AUTH_FILE` | Override the Pi sidecar config path. |
 | `PI_AGENT_DIR` | Override Pi's agent directory when deriving the default sidecar path. |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |

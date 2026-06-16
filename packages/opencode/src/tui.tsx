@@ -16,7 +16,8 @@ import {
   onCleanup,
   Show,
 } from 'solid-js'
-
+import { createRpcClient } from './rpc/rpc-client.js'
+import { getRpcDir } from './rpc/rpc-dir.js'
 import {
   type AccountQuota,
   computeQuotaPacing,
@@ -29,6 +30,7 @@ import {
   SEVEN_DAY_MS,
   type SidebarState,
 } from './sidebar-state.js'
+import { openCommandDialog } from './tui/command-dialogs.js'
 import {
   type AnthropicAuthTuiPrefs,
   type AppearancePrefs,
@@ -40,6 +42,9 @@ import {
   resolveAnthropicAuthPrefs,
   watchTuiPreferences,
 } from './tui-preferences.js'
+
+const RPC_POLL_MS = 500
+let rpcPollStarted = false
 
 const ID = 'cortexkit.anthropic-auth'
 
@@ -341,6 +346,67 @@ function AccountBlock(props: {
           pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
         />
       </Show>
+    </box>
+  )
+}
+
+// --- Quota dialog content ---------------------------------------------------
+
+// Renders the same rich visualization as the sidebar (account blocks with
+// quota bars + pacing) so the modal matches the sidebar look.
+function QuotaDialogContent(props: {
+  api: TuiPluginApi
+  controller: SidebarController
+}) {
+  const prefs = props.controller.prefs
+  const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
+  let lastUpdated = 0
+  async function refresh() {
+    const next = await readStateFromFile()
+    if (next.lastUpdated !== lastUpdated) {
+      lastUpdated = next.lastUpdated
+      setState(next)
+    }
+  }
+  createEffect(() => {
+    const timer = setInterval(refresh, prefs().pollMs)
+    onCleanup(() => clearInterval(timer))
+  })
+  setTimeout(refresh, 0)
+  const theme = () => props.api.theme.current
+  const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
+  return (
+    <box flexDirection='column' padding={2} width='100%' alignItems='center'>
+      <box flexDirection='column' width={58}>
+        <box width='100%' justifyContent='center' marginBottom={1}>
+          <text fg={theme().text}>
+            <b>Quota</b>
+          </text>
+        </box>
+        <AccountBlock
+          theme={theme()}
+          appearance={prefs().appearance}
+          name='main'
+          quota={state().main.quota}
+          active={state().activeId === 'main'}
+          pacingEnabled={prefs().sections.pacing}
+        />
+        <Show when={prefs().sections.fallbackAccounts}>
+          <For each={enabledFallbacks()}>
+            {(fb) => (
+              <AccountBlock
+                theme={theme()}
+                appearance={prefs().appearance}
+                name={fb.label ?? fb.id}
+                quota={fb.quota}
+                active={state().activeId === fb.id}
+                pacingEnabled={prefs().sections.pacing}
+                marginTop={1}
+              />
+            )}
+          </For>
+        </Show>
+      </box>
     </box>
   )
 }
@@ -701,6 +767,44 @@ const tui: TuiPlugin = async (api) => {
       },
     },
   })
+
+  if (!rpcPollStarted) {
+    rpcPollStarted = true
+    const rpcClient = createRpcClient(getRpcDir(api.state.path.directory ?? ''))
+    let lastNotificationId = 0
+    let rpcInFlight = false
+    setInterval(() => {
+      if (rpcInFlight) return
+      const current = (api.route as { current?: unknown }).current
+      const resolved =
+        typeof current === 'function' ? (current as () => unknown)() : current
+      const sessionId = (
+        resolved as { params?: { sessionID?: string } } | undefined
+      )?.params?.sessionID
+      rpcInFlight = true
+      void rpcClient
+        .pending(lastNotificationId, sessionId)
+        .then((messages) => {
+          for (const message of [...messages].sort((a, b) => a.id - b.id)) {
+            lastNotificationId = Math.max(lastNotificationId, message.id)
+            if (message.payload.command === 'claude-quota') {
+              api.ui.dialog.setSize('xlarge')
+              api.ui.dialog.replace(() => (
+                <QuotaDialogContent api={api} controller={controller} />
+              ))
+              continue
+            }
+            openCommandDialog(api, message.payload, (command, args) =>
+              rpcClient.apply({ command, arguments: args }),
+            )
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          rpcInFlight = false
+        })
+    }, RPC_POLL_MS)
+  }
 }
 
 const plugin: TuiPluginModule & { id: string } = {

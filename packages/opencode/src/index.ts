@@ -91,8 +91,20 @@ import {
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
-
 import { resolvePromptContext } from './prompt-context.ts'
+import {
+  drainNotifications,
+  isTuiConnected,
+  pushNotification,
+} from './rpc/notifications.ts'
+import type {
+  ApplyRequest,
+  ApplyResult,
+  CommandModalName,
+  OpenDialogPayload,
+} from './rpc/protocol.ts'
+import { getRpcDir } from './rpc/rpc-dir.ts'
+import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
 import { type SidebarState, setSidebarState } from './sidebar-state.ts'
 import {
   addFastModeBetaHeader,
@@ -278,7 +290,11 @@ async function sendIgnoredMessage(
   )
 }
 
-function throwHandledSentinel(): never {
+function _throwHandledSentinel(): never {
+  throw new Error(HANDLED_SENTINEL)
+}
+
+function cleanAbort(): never {
   throw new Error(HANDLED_SENTINEL)
 }
 
@@ -485,6 +501,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
+
+  let rpcServer: RpcServerHandle | null = null
+  if (ctx.directory) {
+    const rpcGlobal = globalThis as {
+      __anthropicAuthRpcServer?: RpcServerHandle
+    }
+    if (rpcGlobal.__anthropicAuthRpcServer) {
+      await rpcGlobal.__anthropicAuthRpcServer.stop().catch(() => {})
+      rpcGlobal.__anthropicAuthRpcServer = undefined
+    }
+    try {
+      rpcServer = await startRpcServer({
+        dir: getRpcDir(ctx.directory),
+        drain: drainNotifications,
+        apply: applyCommand,
+      })
+      rpcGlobal.__anthropicAuthRpcServer = rpcServer
+    } catch (error) {
+      log('[rpc] failed to start', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
 
   // Remembers the last explicit routing decision so quota-only sidebar refreshes
   // (background main/fallback quota landing) do not reset the active account.
@@ -827,6 +866,76 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
+  async function buildDialogPayload(
+    command: CommandModalName,
+    args: string,
+  ): Promise<OpenDialogPayload> {
+    if (command === 'claude-quota')
+      return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-routing') {
+      const text = await executePersistentRoutingCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      return { command, text, knobs: { mode: getRoutingMode(storage) } }
+    }
+    if (command === 'claude-fast') {
+      const text = await executePersistentFastModeCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      return {
+        command,
+        text,
+        knobs: { enabled: isFastModePersistentlyEnabled(storage) },
+      }
+    }
+    if (command === 'claude-dump') {
+      const text = await executePersistentDumpCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      return {
+        command,
+        text,
+        knobs: { enabled: isDumpPersistentlyEnabled(storage) },
+      }
+    }
+    if (command === 'claude-cache') {
+      const text = await executePersistentCache1hCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      return {
+        command,
+        text,
+        knobs: {
+          enabled: isCache1hPersistentlyEnabled(storage),
+          mode: getCache1hPersistentMode(storage),
+        },
+      }
+    }
+    if (command === 'claude-cachekeep') {
+      const text = await executePersistentCacheKeepCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      return { command, text, knobs: { window: getCacheKeepWindow(storage) } }
+    }
+    const storage = await loadAccounts()
+    const config = getKillswitchConfig(storage)
+    const accountIds = (storage?.accounts ?? [])
+      .filter((a) => a.enabled !== false)
+      .map((a) => a.id)
+    const result = executeKillswitchCommand({
+      argumentsText: args,
+      config,
+      accountIds,
+    })
+    if (result.updatedConfig)
+      await setKillswitchPersistent(result.updatedConfig)
+    return {
+      command,
+      text: result.text,
+      knobs: { config: getKillswitchConfig(await loadAccounts()), accountIds },
+    }
+  }
+
+  async function applyCommand(request: ApplyRequest): Promise<ApplyResult> {
+    const payload = await buildDialogPayload(request.command, request.arguments)
+    return { text: payload.text, knobs: payload.knobs }
+  }
+
   function quotaBar(pct: number, width = 10): string {
     const filled = Math.max(0, Math.min(Math.round((pct / 100) * width), width))
     return '█'.repeat(filled) + '░'.repeat(width - filled)
@@ -1004,30 +1113,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       arguments: string
       sessionID: string
     }) => {
-      if (input.command === CACHE_1H_COMMAND_NAME) {
-        await sendIgnoredMessage(
-          ctx,
-          input.sessionID,
-          await executePersistentCache1hCommand(input.arguments),
-        )
-        throwHandledSentinel()
-      }
-
-      if (input.command === CLAUDE_CACHE_KEEP_COMMAND_NAME) {
-        await sendIgnoredMessage(
-          ctx,
-          input.sessionID,
-          await executePersistentCacheKeepCommand(input.arguments),
-        )
-        throwHandledSentinel()
-      }
-
-      if (input.command === CLAUDE_QUOTAS_COMMAND_NAME) {
-        await sendIgnoredMessage(
-          ctx,
-          input.sessionID,
-          await buildQuotaCommandSummary(),
-        )
+      const modalCommands: CommandModalName[] = [
+        'claude-cache',
+        'claude-cachekeep',
+        'claude-quota',
+        'claude-dump',
+        'claude-fast',
+        'claude-routing',
+        'claude-killswitch',
+      ]
+      if (!modalCommands.includes(input.command as CommandModalName)) return
+      const command = input.command as CommandModalName
+      const payload = await buildDialogPayload(command, input.arguments)
+      if (command === 'claude-quota') {
         const cmdStorage = await loadAccounts()
         const cmdAuth = latestGetAuth
           ? await latestGetAuth().catch(() => undefined)
@@ -1038,53 +1136,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           mainAccessToken: cmdAuth?.access,
           mainRefreshToken: cmdAuth?.refresh,
         })
-        throwHandledSentinel()
       }
-
-      if (input.command === CLAUDE_DUMP_COMMAND_NAME) {
-        await sendIgnoredMessage(
-          ctx,
-          input.sessionID,
-          await executePersistentDumpCommand(input.arguments),
-        )
-        throwHandledSentinel()
+      if (isTuiConnected(input.sessionID)) {
+        pushNotification(payload, input.sessionID)
+      } else {
+        await sendIgnoredMessage(ctx, input.sessionID, payload.text)
       }
-
-      if (input.command === CLAUDE_FAST_COMMAND_NAME) {
-        await sendIgnoredMessage(
-          ctx,
-          input.sessionID,
-          await executePersistentFastModeCommand(input.arguments),
-        )
-        throwHandledSentinel()
-      }
-
-      if (input.command === CLAUDE_ROUTING_COMMAND_NAME) {
-        await sendIgnoredMessage(
-          ctx,
-          input.sessionID,
-          await executePersistentRoutingCommand(input.arguments),
-        )
-        throwHandledSentinel()
-      }
-
-      if (input.command === KILLSWITCH_COMMAND_NAME) {
-        const storage = await loadAccounts()
-        const config = getKillswitchConfig(storage)
-        const accountIds = (storage?.accounts ?? [])
-          .filter((a) => a.enabled !== false)
-          .map((a) => a.id)
-        const result = executeKillswitchCommand({
-          argumentsText: input.arguments,
-          config,
-          accountIds,
-        })
-        if (result.updatedConfig) {
-          await setKillswitchPersistent(result.updatedConfig)
-        }
-        await sendIgnoredMessage(ctx, input.sessionID, result.text)
-        throwHandledSentinel()
-      }
+      cleanAbort()
     },
     auth: {
       provider: 'anthropic',
