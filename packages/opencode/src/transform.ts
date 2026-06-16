@@ -1148,6 +1148,116 @@ function updateSseDiagnostics(state: SseDiagnosticState, text: string) {
   }
 }
 
+type SseErrorState = {
+  pending: string
+}
+
+type RetryableAnthropicStreamError = Error & {
+  code: 'ECONNRESET'
+  syscall: 'anthropic-sse'
+  providerErrorType?: string
+}
+
+function createSseErrorState(): SseErrorState {
+  return { pending: '' }
+}
+
+function isRetryableAnthropicStreamError(
+  errorType: string | undefined,
+  message: string,
+) {
+  const normalizedType = errorType?.toLowerCase()
+  const normalizedMessage = message.toLowerCase()
+  return (
+    normalizedType === 'api_error' ||
+    normalizedType === 'overloaded_error' ||
+    normalizedType === 'server_error' ||
+    normalizedType === 'internal_server_error' ||
+    normalizedMessage.includes('internal server error') ||
+    normalizedMessage.includes('server overloaded')
+  )
+}
+
+function retryableAnthropicStreamError(
+  errorType: string | undefined,
+  message: string,
+): RetryableAnthropicStreamError {
+  const detail = errorType ? `${errorType}: ${message}` : message
+  const error = new Error(
+    `Anthropic stream error: ${detail}`,
+  ) as RetryableAnthropicStreamError
+  error.code = 'ECONNRESET'
+  error.syscall = 'anthropic-sse'
+  if (errorType) error.providerErrorType = errorType
+  return error
+}
+
+function retryableAnthropicStreamErrorFromRawEvent(
+  rawEvent: string,
+): RetryableAnthropicStreamError | null {
+  if (!rawEvent.includes('error')) return null
+
+  let eventName: string | undefined
+  const dataLines: string[] = []
+  for (const line of rawEvent.split(/\r?\n/)) {
+    if (line.startsWith('event:')) {
+      eventName = line.slice('event:'.length).trim()
+      continue
+    }
+    if (line.startsWith('data:')) {
+      const value = line.slice('data:'.length)
+      dataLines.push(value.startsWith(' ') ? value.slice(1) : value)
+    }
+  }
+
+  const dataText = dataLines.join('\n')
+  if (!dataText || dataText === '[DONE]') return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(dataText)
+  } catch {
+    return null
+  }
+
+  const data = asDiagnosticRecord(parsed)
+  if (eventName !== 'error' && stringField(data, 'type') !== 'error') {
+    return null
+  }
+
+  const error = asDiagnosticRecord(data?.error)
+  const errorType =
+    stringField(error, 'type') ?? stringField(error, 'code') ?? undefined
+  const message =
+    stringField(error, 'message') ??
+    stringField(data, 'message') ??
+    errorType ??
+    'Anthropic stream error'
+
+  if (!isRetryableAnthropicStreamError(errorType, message)) return null
+  return retryableAnthropicStreamError(errorType, message)
+}
+
+function updateSseErrorState(
+  state: SseErrorState,
+  text: string,
+): RetryableAnthropicStreamError | null {
+  if (!text) return null
+  state.pending += text
+
+  while (true) {
+    const boundary = findSseBoundary(state.pending)
+    if (!boundary) break
+
+    const rawEvent = state.pending.slice(0, boundary.index)
+    state.pending = state.pending.slice(boundary.index + boundary.length)
+    const error = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
+    if (error) return error
+  }
+
+  return null
+}
+
 function sseDiagnosticStats(state: SseDiagnosticState) {
   return {
     sseEvents: state.events,
@@ -1189,6 +1299,7 @@ export function createStrippedStream(
   let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
   const sseDiagnostics = options.perf ? createSseDiagnosticState() : undefined
+  const sseErrors = createSseErrorState()
 
   const releaseReader = () => {
     if (readerReleased) return
@@ -1230,6 +1341,18 @@ export function createStrippedStream(
         if (done) {
           const finalDecoded = decoder.decode()
           if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, finalDecoded)
+          const retryableStreamError = updateSseErrorState(
+            sseErrors,
+            finalDecoded,
+          )
+          if (retryableStreamError) {
+            logProgress('stream_tool_prefix_retryable_error', {
+              error: retryableStreamError.message,
+              providerErrorType: retryableStreamError.providerErrorType,
+            })
+            releaseReader()
+            throw retryableStreamError
+          }
           const rewriteStart = rewriteNowMs()
           const flushed = splitToolPrefixRewriteBuffer(
             `${pending}${finalDecoded}`,
@@ -1251,6 +1374,17 @@ export function createStrippedStream(
         inputBytes += value.byteLength
         const decoded = decoder.decode(value, { stream: true })
         if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
+        const retryableStreamError = updateSseErrorState(sseErrors, decoded)
+        if (retryableStreamError) {
+          logProgress('stream_tool_prefix_retryable_error', {
+            error: retryableStreamError.message,
+            providerErrorType: retryableStreamError.providerErrorType,
+            readMs,
+            lastChunkBytes: value.byteLength,
+          })
+          releaseReader()
+          throw retryableStreamError
+        }
         const text = pending + decoded
         const rewriteStart = rewriteNowMs()
         const rewritten = splitToolPrefixRewriteBuffer(text)

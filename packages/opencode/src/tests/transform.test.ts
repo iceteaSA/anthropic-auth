@@ -588,6 +588,70 @@ describe('createStrippedStream', () => {
     expect(JSON.stringify(perf)).not.toContain('secret')
   })
 
+  test('marks Anthropic internal stream errors as retryable connection resets', async () => {
+    const encoder = new TextEncoder()
+    const decoder = new TextDecoder()
+    const perf: Array<{ stage: string; data: Record<string, unknown> }> = []
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}\n\n',
+    ]
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+
+    const stripped = createStrippedStream(
+      new Response(stream, { status: 200 }),
+      {
+        perf: (stage, data) => perf.push({ stage, data: data ?? {} }),
+      },
+    )
+    const reader = stripped.body?.getReader()
+    expect(reader).toBeDefined()
+
+    const first = await reader!.read()
+    expect(decoder.decode(first.value)).toContain('message_start')
+
+    let caught: unknown
+    try {
+      await reader!.read()
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as { code?: string }).code).toBe('ECONNRESET')
+    expect((caught as { syscall?: string }).syscall).toBe('anthropic-sse')
+    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
+      'api_error',
+    )
+    expect((caught as Error).message).toContain('Internal server error')
+    expect(
+      perf.some(
+        (entry) => entry.stage === 'stream_tool_prefix_retryable_error',
+      ),
+    ).toBe(true)
+  })
+
+  test('does not mark non-transient Anthropic stream errors retryable', async () => {
+    const encoder = new TextEncoder()
+    const chunks = [
+      'event: error\ndata: {"type":"error","error":{"type":"invalid_request_error","message":"Bad request"}}\n\n',
+    ]
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+
+    const stripped = createStrippedStream(new Response(stream, { status: 200 }))
+    await expect(stripped.text()).resolves.toContain('Bad request')
+  })
+
   test('preserves response status and headers', async () => {
     const stream = new ReadableStream({
       start(controller) {
