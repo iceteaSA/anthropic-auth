@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.10.1
+
+### Patch Changes
+
+- Stabilize `/claude-cache hybrid` system cache anchors when OpenCode leaves plugin-added system instructions split across multiple blocks, preserving the canonical merged tail before placing the Anthropic cache breakpoint.
+
 ## 1.10.0
 
 ### Minor Changes
