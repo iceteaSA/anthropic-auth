@@ -2,6 +2,18 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.10.0
+
+### Minor Changes
+
+- Add interactive OpenCode TUI command dialogs for Anthropic auth commands, backed by a localhost-only authenticated RPC bridge so sidebar actions can configure routing, cache, quota, relay, and related settings without text-only command replies.
+
+### Patch Changes
+
+- Mark transient Anthropic SSE server errors inside HTTP 200 streams as retryable connection-reset-style failures so OpenCode can use its normal auto-retry flow instead of surfacing them as non-retryable unknown errors.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the interactive TUI command modal contribution.
+
 ## 1.9.4
 
 ### Patch Changes
