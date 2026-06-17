@@ -1350,6 +1350,41 @@ describe('rewriteRequestBody', () => {
     expect(result.messages[1].content[0].cache_control).toBeUndefined()
   })
 
+  test('hybrid mode coalesces split plugin system tail before anchoring system cache', async () => {
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'Primary system prompt' },
+        {
+          type: 'text',
+          text: '<use_parallel_tool_calls>parallel</use_parallel_tool_calls>',
+        },
+        { type: 'text', text: '## Magic Context\nmagic' },
+        { type: 'text', text: '## IMPORTANT NOTICE about your tools\ntools' },
+      ],
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    expect(result.system).toHaveLength(4)
+    expect(result.system[0].text).toContain('x-anthropic-billing-header')
+    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[2].text).toBe('Primary system prompt')
+    expect(result.system[2].cache_control).toBeUndefined()
+    expect(result.system[3].text).toBe(
+      '<use_parallel_tool_calls>parallel</use_parallel_tool_calls>\n## Magic Context\nmagic\n## IMPORTANT NOTICE about your tools\ntools',
+    )
+    expect(result.system[3].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
   test('hybrid mode keeps system, messages[0], and messages[1] explicit breakpoints', async () => {
     const body = JSON.stringify({
       system: [

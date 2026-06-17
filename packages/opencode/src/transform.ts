@@ -653,6 +653,46 @@ function selectHybridMessageAnchors(messages: unknown[]) {
   return { latest, bridge }
 }
 
+function systemBlockText(block: unknown) {
+  return isRecord(block) && typeof block.text === 'string' ? block.text : ''
+}
+
+function coalesceHybridSystemTail(parsed: Record<string, unknown>) {
+  if (!Array.isArray(parsed.system)) return
+
+  const system = parsed.system
+  let prefixCount = 0
+  if (
+    systemBlockText(system[prefixCount]).startsWith(
+      'x-anthropic-billing-header:',
+    )
+  ) {
+    prefixCount++
+  }
+  if (systemBlockText(system[prefixCount]) === CLAUDE_CODE_IDENTITY) {
+    prefixCount++
+  }
+
+  // Preserve the primary OpenCode/system prompt block, but canonicalize all
+  // subsequent plugin-added instruction blocks into one block before placing the
+  // hybrid system cache anchor. OpenCode normally does this in request prep, but
+  // skips it if a hook changes the first system entry. Without this downstream
+  // normalization, byte-identical system text can flip between merged/split block
+  // layouts and move the cache_control breakpoint.
+  const tailStart = prefixCount + 1
+  if (tailStart >= system.length - 1) return
+
+  const firstTail = system[tailStart]
+  if (!isRecord(firstTail)) return
+
+  const mergedTail = system.slice(tailStart).map(systemBlockText).join('\n')
+  system.splice(tailStart, system.length - tailStart, {
+    ...firstTail,
+    type: 'text',
+    text: mergedTail,
+  })
+}
+
 function setHybridSystemAnchor(parsed: Record<string, unknown>) {
   if (Array.isArray(parsed.system)) {
     const identityIndex = parsed.system.findIndex(
@@ -671,6 +711,7 @@ function setHybridSystemAnchor(parsed: Record<string, unknown>) {
 
 function applyHybridCache1h(parsed: Record<string, unknown>) {
   removeAllCacheControls(parsed)
+  coalesceHybridSystemTail(parsed)
 
   if (!Array.isArray(parsed.messages)) {
     setHybridSystemAnchor(parsed)
