@@ -94,3 +94,29 @@ describe('pid matching', () => {
     expect(found?.token).toBe('match')
   })
 })
+
+test('pid match wins over newer competing live entry', async () => {
+  const child = Bun.spawn(['sleep', '60'])
+  try {
+    await writePortFile(dir, { port: 100, token: 'older-a', pid: child.pid })
+    await new Promise((r) => setTimeout(r, 5))
+    await writePortFile(dir, {
+      port: 200,
+      token: 'newer-b',
+      pid: process.pid,
+    })
+
+    // process.pid match → returns its entry even though it is newer
+    const byMain = await discoverPortFile(dir, process.pid)
+    expect(byMain?.port).toBe(200)
+    expect(byMain?.token).toBe('newer-b')
+
+    // child.pid match → returns its entry even though it is OLDER
+    // Pre-fix code would return the newer process.pid entry here
+    const byChild = await discoverPortFile(dir, child.pid)
+    expect(byChild?.port).toBe(100)
+    expect(byChild?.token).toBe('older-a')
+  } finally {
+    child.kill()
+  }
+})
