@@ -411,4 +411,18 @@ describe('formatLogLine', () => {
     expect(line).toContain('msg')
     expect(line).toContain('"pid"')
   })
+
+  test('degrades throwing-getter payload to [unserializable] instead of throwing', () => {
+    const payload = {
+      a: 1,
+      get bad() {
+        throw new Error('boom')
+      },
+    }
+    const line = formatLogLine('info', 'test', 'msg', payload)
+    expect(line.length).toBeGreaterThan(0)
+    expect(line).toContain('[unserializable]')
+    expect(line).toContain('msg')
+    expect(line).toContain('"pid"')
+  })
 })

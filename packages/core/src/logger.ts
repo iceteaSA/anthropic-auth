@@ -156,15 +156,15 @@ export function formatLogLine(
   message: string,
   payload?: Record<string, unknown>,
 ): string {
-  const redacted = redactPayload(payload)
-  const withPid = redacted
-    ? { ...redacted, pid: process.pid }
-    : { pid: process.pid }
   const now = new Date().toISOString()
   const levelUpper = level.toUpperCase().padEnd(5)
   const channelSegment = channel ? ` [${channel}]` : ''
   const payloadJson = (() => {
     try {
+      const redacted = redactPayload(payload)
+      const withPid = redacted
+        ? { ...redacted, pid: process.pid }
+        : { pid: process.pid }
       return ` ${JSON.stringify(withPid)}`
     } catch {
       return ` {"pid":${process.pid},"payload":"[unserializable]"}`
