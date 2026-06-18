@@ -839,14 +839,23 @@ export async function acquireRefreshFileLock(options: {
       try {
         const evictStat = await stat(evictPath)
         if (evictStat.mtimeMs + EVICT_TTL > now()) return null
-        await rm(evictPath, { recursive: true, force: true }).catch(() => {})
+        // Atomically claim the stale marker — only one contender can rename it
+        const claimedPath = `${evictPath}.${randomUUID()}`
+        try {
+          await rename(evictPath, claimedPath)
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
+          throw e
+        }
+        await rm(claimedPath, { recursive: true, force: true }).catch(() => {})
       } catch {
         return null
       }
       try {
         await mkdir(evictPath)
-      } catch {
-        return null
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EEXIST') return null
+        throw e
       }
     }
 

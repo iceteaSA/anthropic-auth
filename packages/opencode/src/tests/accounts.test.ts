@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -447,27 +455,32 @@ describe('account storage', () => {
   })
 
   describe('stale-lock eviction race', () => {
-    const N = 8
-    const ROUNDS = 20
+    const N = 16
+    const ROUNDS = 50
 
-    test('concurrent stale-lock reclaim yields exactly one winner', async () => {
+    test('concurrent stale-evictPath crash-recovery yields exactly one winner', async () => {
       for (let round = 0; round < ROUNDS; round++) {
-        const now = round * 100_000 + 1_000
-        const lockPath = `${accountPath}.stale-race.lock`
+        const lockPath = `${accountPath}.stale-crash.lock`
+        const evictPath = `${lockPath}.evicting`
 
+        // Seed a STALE evictPath (simulating crashed evictor)
+        await mkdir(evictPath, { recursive: true })
+        const staleDate = new Date(Date.now() - 60_000)
+        await utimes(evictPath, staleDate, staleDate)
+
+        // Seed a stale lock
         await writeFile(
           lockPath,
-          `${JSON.stringify({ ownerId: 'dead-owner', expiresAt: now - 60_000 })}\n`,
+          `${JSON.stringify({ ownerId: 'dead-owner', expiresAt: Date.now() - 60_000 })}\n`,
           { encoding: 'utf8', mode: 0o600 },
         )
 
         const results = await Promise.all(
           Array.from({ length: N }, () =>
             acquireRefreshFileLock({
-              name: 'stale-race',
+              name: 'stale-crash',
               ttlMs: 60_000,
               path: accountPath,
-              now: () => now,
             }),
           ),
         )
@@ -478,7 +491,8 @@ describe('account storage', () => {
           `Round ${round}: expected 1 winner, got ${winners.length}`,
         ).toBe(1)
 
-        await expect(stat(`${lockPath}.evicting`)).rejects.toThrow()
+        // .evicting marker must be cleaned up
+        await expect(stat(evictPath)).rejects.toThrow()
 
         await winners[0]!.release()
       }
