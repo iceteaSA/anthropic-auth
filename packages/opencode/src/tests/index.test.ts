@@ -657,14 +657,20 @@ describe('auth.loader', () => {
     globalThis.fetch = mock((input: any, init: any) => {
       const url = extractUrl(input)
       if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: { utilization: 0.25 },
-              seven_day: { utilization: 0.3 },
-            }),
-            { status: 200 },
-          ),
+        // Delay the main quota refresh so its setSidebarState writeFile lands
+        // AFTER the fallback-first sidebar write.  Two concurrent async
+        // writeFile calls race on disk — without this delay the main-refresh
+        // write can complete after the fallback write and clobber activeId
+        // back to 'main'.
+        return Bun.sleep(40).then(
+          () =>
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0.25 },
+                seven_day: { utilization: 0.3 },
+              }),
+              { status: 200 },
+            ),
         )
       }
 
@@ -692,8 +698,16 @@ describe('auth.loader', () => {
       }),
     })
 
+    // Absorb the 40ms usage-API delay (above) so the background
+    // refreshSidebarQuota write completes on disk before we poll the sidebar
+    // file.  Without this sleep the delayed write can leak into the next test.
+    await Bun.sleep(60)
+
     const state = await waitForSidebarState(
-      (candidate) => candidate.activeId === 'fallback-1',
+      (candidate) =>
+        candidate.activeId === 'fallback-1' &&
+        candidate.route === 'fallback-first' &&
+        candidate.fallbacks[0]?.quota?.five_hour?.usedPercent === 25,
     )
     expect(state.route).toBe('fallback-first')
     expect(state.fallbacks[0]?.quota?.five_hour?.usedPercent).toBe(25)
@@ -3562,7 +3576,8 @@ describe('auth.loader', () => {
 
     // Fallback served → active id should be the fallback.
     const state = await waitForSidebarState(
-      (candidate) => candidate.activeId === 'fallback-1',
+      (candidate) =>
+        candidate.activeId === 'fallback-1' && candidate.route === 'fallback',
     )
     expect(state.route).toBe('fallback')
 
