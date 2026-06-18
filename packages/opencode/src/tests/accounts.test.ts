@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -444,6 +444,71 @@ describe('account storage', () => {
     await expect(
       readFile(join(lockDir, 'owner.json'), 'utf8'),
     ).rejects.toThrow()
+  })
+
+  describe('stale-lock eviction race', () => {
+    const N = 8
+    const ROUNDS = 20
+
+    test('concurrent stale-lock reclaim yields exactly one winner', async () => {
+      for (let round = 0; round < ROUNDS; round++) {
+        const now = round * 100_000 + 1_000
+        const lockPath = `${accountPath}.stale-race.lock`
+
+        await writeFile(
+          lockPath,
+          `${JSON.stringify({ ownerId: 'dead-owner', expiresAt: now - 60_000 })}\n`,
+          { encoding: 'utf8', mode: 0o600 },
+        )
+
+        const results = await Promise.all(
+          Array.from({ length: N }, () =>
+            acquireRefreshFileLock({
+              name: 'stale-race',
+              ttlMs: 60_000,
+              path: accountPath,
+              now: () => now,
+            }),
+          ),
+        )
+
+        const winners = results.filter((r) => r !== null)
+        expect(
+          winners.length,
+          `Round ${round}: expected 1 winner, got ${winners.length}`,
+        ).toBe(1)
+
+        await expect(stat(`${lockPath}.evicting`)).rejects.toThrow()
+
+        await winners[0]!.release()
+      }
+    })
+
+    test('fresh lock is never stolen by contenders', async () => {
+      const now = 1_000
+      const lockPath = `${accountPath}.fresh-lock.lock`
+
+      await writeFile(
+        lockPath,
+        `${JSON.stringify({ ownerId: 'alive-owner', expiresAt: now + 120_000 })}\n`,
+        { encoding: 'utf8', mode: 0o600 },
+      )
+
+      const results = await Promise.all(
+        Array.from({ length: N }, () =>
+          acquireRefreshFileLock({
+            name: 'fresh-lock',
+            ttlMs: 60_000,
+            path: accountPath,
+            now: () => now,
+          }),
+        ),
+      )
+
+      expect(results.every((r) => r === null)).toBe(true)
+
+      await expect(stat(`${lockPath}.evicting`)).rejects.toThrow()
+    })
   })
 
   test('preserves relay config when saving storage loaded by older code', async () => {

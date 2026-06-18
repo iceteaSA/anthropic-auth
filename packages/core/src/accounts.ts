@@ -828,19 +828,47 @@ export async function acquireRefreshFileLock(options: {
   }
 
   if (!(await tryAcquire())) {
+    const evictPath = `${lockPath}.evicting`
+    const EVICT_TTL = 5_000
+
     try {
-      const owner = await readOwner()
-      if (Number(owner?.expiresAt) > now()) return null
-    } catch {
+      await mkdir(evictPath)
+    } catch (evictError) {
+      const code = (evictError as NodeJS.ErrnoException).code
+      if (code !== 'EEXIST') return null
       try {
-        const current = await stat(lockPath)
-        if (current.mtimeMs + options.ttlMs > Date.now()) return null
+        const evictStat = await stat(evictPath)
+        if (evictStat.mtimeMs + EVICT_TTL > now()) return null
+        await rm(evictPath, { recursive: true, force: true }).catch(() => {})
+      } catch {
+        return null
+      }
+      try {
+        await mkdir(evictPath)
       } catch {
         return null
       }
     }
-    await rm(lockPath, { recursive: true, force: true }).catch(() => {})
-    if (!(await tryAcquire())) return null
+
+    try {
+      let lockStillStale = true
+      try {
+        const currentOwner = await readOwner()
+        if (Number(currentOwner?.expiresAt) > now()) lockStillStale = false
+      } catch {
+        try {
+          const current = await stat(lockPath)
+          if (current.mtimeMs + options.ttlMs > now()) lockStillStale = false
+        } catch {
+          // Lock doesn't exist — safe to acquire
+        }
+      }
+      if (!lockStillStale) return null
+      await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+      if (!(await tryAcquire())) return null
+    } finally {
+      await rm(evictPath, { recursive: true, force: true }).catch(() => {})
+    }
   }
 
   scheduleRenewal()
