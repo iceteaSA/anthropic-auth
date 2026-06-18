@@ -770,7 +770,10 @@ const tui: TuiPlugin = async (api) => {
 
   if (!rpcPollStarted) {
     rpcPollStarted = true
-    const rpcClient = createRpcClient(getRpcDir(api.state.path.directory ?? ''))
+    const rpcClient = createRpcClient(
+      getRpcDir(api.state.path.directory ?? ''),
+      process.pid,
+    )
     let lastNotificationId = 0
     let rpcInFlight = false
     setInterval(() => {

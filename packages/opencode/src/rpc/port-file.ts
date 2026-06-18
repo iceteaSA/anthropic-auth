@@ -39,6 +39,7 @@ export async function writePortFile(
 
 export async function discoverPortFile(
   dir: string,
+  expectedPid?: number,
 ): Promise<PortFileEntry | null> {
   let names: string[]
   try {
@@ -60,5 +61,10 @@ export async function discoverPortFile(
     } catch {}
   }
   if (live.length === 0) return null
-  return live.sort((a, b) => b.startedAt - a.startedAt)[0] ?? null
+  const candidates =
+    expectedPid && expectedPid >= 1
+      ? live.filter((entry) => entry.pid === expectedPid)
+      : []
+  const entries = candidates.length > 0 ? candidates : live
+  return entries.sort((a, b) => b.startedAt - a.startedAt)[0] ?? null
 }

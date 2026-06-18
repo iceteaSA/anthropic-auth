@@ -13,8 +13,9 @@ async function call<T>(
   dir: string,
   method: string,
   params: Record<string, unknown>,
+  expectedPid?: number,
 ): Promise<T | null> {
-  const entry = await discoverPortFile(dir)
+  const entry = await discoverPortFile(dir, expectedPid)
   if (!entry) return null
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 2_000)
@@ -37,18 +38,24 @@ async function call<T>(
   }
 }
 
-export function createRpcClient(dir: string): RpcClient {
+export function createRpcClient(dir: string, expectedPid?: number): RpcClient {
   return {
     async pending(lastReceivedId, sessionId) {
       const out = await call<{ messages: RpcNotification[] }>(
         dir,
         'pending-notifications',
         { lastReceivedId, sessionId },
+        expectedPid,
       )
       return out?.messages ?? []
     },
     async apply(request) {
-      const out = await call<ApplyResult>(dir, 'apply', { ...request })
+      const out = await call<ApplyResult>(
+        dir,
+        'apply',
+        { ...request },
+        expectedPid,
+      )
       return out ?? { text: 'apply failed', knobs: {} }
     },
   }
