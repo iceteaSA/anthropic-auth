@@ -1,6 +1,7 @@
 import type { AccountStorage } from './accounts.ts'
 import { signRequestBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
+import { logger } from './logger.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
 export const CACHE_KEEP_TTL_MS = 60 * 60_000
@@ -276,7 +277,7 @@ export class CacheKeepManager {
     if (this.timer) return
     this.timer = setInterval(() => {
       void this.tick().catch((error) => {
-        this.options.log?.('[cachekeep] tick failed', {
+        logger.warn('cachekeep', 'tick failed', {
           error: error instanceof Error ? error.message : String(error),
         })
       })
@@ -434,7 +435,7 @@ export class CacheKeepManager {
       body: prewarm.bodyText,
     })
     if (!response.ok) {
-      this.options.log?.('[cachekeep] prewarm failed', {
+      logger.warn('cachekeep', 'prewarm failed', {
         session: target.id,
         status: response.status,
         body: await response.text().catch(() => ''),

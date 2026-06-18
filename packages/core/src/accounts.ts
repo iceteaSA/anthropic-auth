@@ -10,7 +10,7 @@ import {
   CLAUDE_CODE_VERSION,
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
-import { log } from './logger.ts'
+import { type LogLevel, log, logger } from './logger.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -145,6 +145,9 @@ export type AccountStorage = {
   }
   dump?: {
     enabled?: boolean
+  }
+  logging?: {
+    level?: LogLevel
   }
   claudeFast?: {
     enabled?: boolean
@@ -1163,6 +1166,12 @@ export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
   return Math.max(1, minutes) * 60_000
 }
 
+export function getPersistedLogLevel(
+  storage: AccountStorage | null,
+): LogLevel | undefined {
+  return storage?.logging?.level
+}
+
 export function getPersistedMainQuota(storage: AccountStorage | null): {
   quota: OAuthQuotaSnapshot
   checkedAt: number
@@ -1741,7 +1750,7 @@ export class FallbackAccountManager {
         await this.refreshAccount(account, storage)
         changed = true
       } catch (error) {
-        log('[refresh] fallback oauth background failed', {
+        logger.warn('refresh', 'fallback oauth background failed', {
           accountId: account.id,
           error: error instanceof Error ? error.message : String(error),
         })

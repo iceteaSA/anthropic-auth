@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
-import { relayLog } from './logger.ts'
+import { isSecretKey, relayLog } from './logger.ts'
 
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
 
@@ -266,7 +266,8 @@ function redactForDump(value: unknown): unknown {
       lower === 'authorization' ||
       lower === 'x-api-key' ||
       lower === 'cookie' ||
-      lower === 'set-cookie'
+      lower === 'set-cookie' ||
+      isSecretKey(key)
     ) {
       redacted[key] = '[redacted]'
       continue

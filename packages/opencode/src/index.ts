@@ -37,6 +37,7 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getKillswitchConfig,
+  getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
   getRelayConfig,
@@ -60,6 +61,7 @@ import {
   killswitchRetryAfterSeconds,
   loadAccounts,
   log,
+  logger,
   mergeAnthropicBetas,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -87,6 +89,7 @@ import {
   setFastModeEnabled,
   setFastModePersistentEnabled,
   setKillswitchPersistent,
+  setLogLevel,
   setRoutingMode,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
@@ -427,7 +430,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         storage.quota.mainLastQuotaApiError = undefined
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (error) {
-        log('[quota] failed to persist main quota', {
+        logger.warn('quota', 'failed to persist main quota', {
           error: error instanceof Error ? error.message : String(error),
         })
       }
@@ -442,7 +445,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         storage.quota.mainLastQuotaApiError = error
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (e) {
-        log('[quota] failed to persist backoff state', {
+        logger.warn('quota', 'failed to persist backoff state', {
           error: e instanceof Error ? e.message : String(e),
         })
       }
@@ -501,6 +504,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
+  if (!process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL) {
+    setLogLevel(getPersistedLogLevel(initialStorage) ?? 'info')
+  }
 
   let rpcServer: RpcServerHandle | null = null
   if (ctx.directory) {
@@ -519,7 +525,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       })
       rpcGlobal.__anthropicAuthRpcServer = rpcServer
     } catch (error) {
-      log('[rpc] failed to start', {
+      logger.warn('rpc', 'failed to start', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -605,7 +611,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       lastUpdated: Date.now(),
     }
     setSidebarState(state).catch((error) =>
-      log('[sidebar] state write failed', {
+      logger.warn('sidebar', 'state write failed', {
         error: error instanceof Error ? error.message : String(error),
       }),
     )
@@ -1532,7 +1538,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     : undefined,
                 })
               } catch (error) {
-                log('[refresh] opencode main oauth refresh failed', {
+                logger.warn('refresh', 'opencode main oauth refresh failed', {
                   message:
                     error instanceof Error ? error.message : String(error),
                 })
