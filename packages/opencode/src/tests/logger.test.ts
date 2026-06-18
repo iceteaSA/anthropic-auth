@@ -306,6 +306,40 @@ describe('redactPayload', () => {
     expect(Array.isArray(items)).toBe(true)
     expect((items as unknown[])[0]).toBe('[Circular]')
   })
+
+  test('diamond object: shared ref in siblings serializes fully (not [Circular])', () => {
+    const shared = { v: 1 }
+    const result = redactPayload({ a: shared, b: shared })
+    expect(result?.a).toEqual({ v: 1 })
+    expect(result?.b).toEqual({ v: 1 })
+    expect(result?.a).not.toBe('[Circular]')
+    expect(result?.b).not.toBe('[Circular]')
+  })
+
+  test('diamond array: shared array in siblings serializes fully', () => {
+    const shared = [1, 2]
+    const result = redactPayload({ a: shared, b: shared })
+    expect(result?.a).toEqual([1, 2])
+    expect(result?.b).toEqual([1, 2])
+    expect(result?.a).not.toBe('[Circular]')
+    expect(result?.b).not.toBe('[Circular]')
+  })
+
+  test('circular still works (regression)', () => {
+    const c: Record<string, unknown> = { x: 1 }
+    c.self = c
+    const result = redactPayload(c)
+    expect(result?.x).toBe(1)
+    expect(result?.self).toBe('[Circular]')
+  })
+
+  test('secret-key precedence over cyclic-or-shared objects', () => {
+    const inner: Record<string, unknown> = {}
+    inner.self = inner
+    const payload = { token: inner }
+    const result = redactPayload(payload)
+    expect(result?.token).toBe('***REDACTED***')
+  })
 })
 
 // -- formatLogLine ---------------------------------------------------------
@@ -366,5 +400,15 @@ describe('formatLogLine', () => {
     expect(line.length).toBeGreaterThan(0)
     expect(line).toContain('[Circular]')
     expect(line).toContain('circular msg')
+  })
+
+  test('degrades BigInt payload to [unserializable] instead of throwing', () => {
+    const line = formatLogLine('info', 'test', 'msg', {
+      n: BigInt(10),
+    } as Record<string, unknown>)
+    expect(line.length).toBeGreaterThan(0)
+    expect(line).toContain('[unserializable]')
+    expect(line).toContain('msg')
+    expect(line).toContain('"pid"')
   })
 })

@@ -127,19 +127,22 @@ export function redactPayload(
     }
     if (seen.has(value)) return '[Circular]'
     seen.add(value)
+    try {
+      if (Array.isArray(value)) return value.map(walk)
 
-    if (Array.isArray(value)) return value.map(walk)
-
-    const obj = value as Record<string, unknown>
-    const result: Record<string, unknown> = {}
-    for (const [key, entry] of Object.entries(obj)) {
-      if (isSecretKey(key)) {
-        result[key] = '***REDACTED***'
-        continue
+      const obj = value as Record<string, unknown>
+      const result: Record<string, unknown> = {}
+      for (const [key, entry] of Object.entries(obj)) {
+        if (isSecretKey(key)) {
+          result[key] = '***REDACTED***'
+          continue
+        }
+        result[key] = walk(entry)
       }
-      result[key] = walk(entry)
+      return result
+    } finally {
+      seen.delete(value)
     }
-    return result
   }
 
   return walk(payload) as Record<string, unknown>
@@ -160,7 +163,13 @@ export function formatLogLine(
   const now = new Date().toISOString()
   const levelUpper = level.toUpperCase().padEnd(5)
   const channelSegment = channel ? ` [${channel}]` : ''
-  const payloadJson = ` ${JSON.stringify(withPid)}`
+  const payloadJson = (() => {
+    try {
+      return ` ${JSON.stringify(withPid)}`
+    } catch {
+      return ` {"pid":${process.pid},"payload":"[unserializable]"}`
+    }
+  })()
 
   return `[${now}] ${levelUpper}${channelSegment} ${message}${payloadJson}`
 }
