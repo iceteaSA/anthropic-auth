@@ -118,12 +118,18 @@ export function redactPayload(
 ): Record<string, unknown> | undefined {
   if (payload == null || Object.keys(payload).length === 0) return undefined
 
+  const seen = new WeakSet<object>()
+
   function walk(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(walk)
     if (value == null || typeof value !== 'object') {
       if (isRedactableValue(value)) return '***REDACTED***'
       return value
     }
+    if (seen.has(value)) return '[Circular]'
+    seen.add(value)
+
+    if (Array.isArray(value)) return value.map(walk)
+
     const obj = value as Record<string, unknown>
     const result: Record<string, unknown> = {}
     for (const [key, entry] of Object.entries(obj)) {
@@ -154,9 +160,7 @@ export function formatLogLine(
   const now = new Date().toISOString()
   const levelUpper = level.toUpperCase().padEnd(5)
   const channelSegment = channel ? ` [${channel}]` : ''
-  const payloadJson = redacted
-    ? ` ${JSON.stringify(withPid)}`
-    : ` ${JSON.stringify(withPid)}`
+  const payloadJson = ` ${JSON.stringify(withPid)}`
 
   return `[${now}] ${levelUpper}${channelSegment} ${message}${payloadJson}`
 }

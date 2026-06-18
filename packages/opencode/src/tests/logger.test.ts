@@ -280,6 +280,32 @@ describe('redactPayload', () => {
     expect(arr[0]!.accessToken).toBe('***REDACTED***')
     expect(arr[1]!.name).toBe('safe')
   })
+
+  test('handles circular objects without throwing', () => {
+    const circular: Record<string, unknown> = { a: 1 }
+    circular.self = circular
+    const result = redactPayload(circular)
+    expect(result).not.toBe(undefined)
+    expect(result?.a).toBe(1)
+    expect(result?.self).toBe('[Circular]')
+  })
+
+  test('secret-key takes precedence over [Circular] marker', () => {
+    const inner: Record<string, unknown> = {}
+    inner.self = inner
+    const payload = { token: inner }
+    const result = redactPayload(payload)
+    expect(result?.token).toBe('***REDACTED***')
+  })
+
+  test('handles array cycles', () => {
+    const arr: unknown[] = []
+    arr.push(arr)
+    const result = redactPayload({ items: arr })
+    const items = result?.items
+    expect(Array.isArray(items)).toBe(true)
+    expect((items as unknown[])[0]).toBe('[Circular]')
+  })
 })
 
 // -- formatLogLine ---------------------------------------------------------
@@ -331,5 +357,14 @@ describe('formatLogLine', () => {
     const line = formatLogLine('info', '', 'no channel')
     // After the level, should go straight to message
     expect(line).toContain('INFO  no channel')
+  })
+
+  test('does not throw on circular payload', () => {
+    const circular: Record<string, unknown> = { a: 1 }
+    circular.self = circular
+    const line = formatLogLine('info', 'test', 'circular msg', circular)
+    expect(line.length).toBeGreaterThan(0)
+    expect(line).toContain('[Circular]')
+    expect(line).toContain('circular msg')
   })
 })
