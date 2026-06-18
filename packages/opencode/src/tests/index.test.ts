@@ -492,8 +492,8 @@ describe('auth.loader', () => {
     globalThis.setInterval = originalSetInterval
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    await drainSidebarWrites()
+    restoreProcessTestFiles()
     if (tempConfigDir) {
       await rm(tempConfigDir, { recursive: true, force: true })
       tempConfigDir = undefined
