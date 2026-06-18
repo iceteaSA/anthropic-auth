@@ -15,7 +15,11 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
-import { getSidebarState } from '../sidebar-state'
+import {
+  drainSidebarWrites,
+  getSidebarState,
+  getSidebarStateFile,
+} from '../sidebar-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -88,6 +92,7 @@ function createFallbackStorage(
 
 async function useTempAccountFile(storage: AccountStorage) {
   if (tempConfigDir) {
+    await drainSidebarWrites()
     await rm(tempConfigDir, { recursive: true, force: true })
   }
   tempConfigDir = await mkdtemp(join(tmpdir(), 'anthropic-plugin-test-'))
@@ -100,6 +105,19 @@ async function useTempAccountFile(storage: AccountStorage) {
     'sidebar-state.json',
   )
   await saveAccounts(storage)
+}
+
+function restoreProcessTestFiles() {
+  const testDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
+  if (!testDir) return
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(
+    testDir,
+    'anthropic-auth.json',
+  )
+  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+    testDir,
+    'sidebar-state.json',
+  )
 }
 
 async function waitForSidebarState(
@@ -313,14 +331,22 @@ describe('auth.methods', () => {
   })
 })
 
+test('test setup keeps sidebar state off the production default path', () => {
+  const testDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
+  expect(typeof testDir).toBe('string')
+  if (!testDir) throw new Error('missing test directory')
+  restoreProcessTestFiles()
+  expect(getSidebarStateFile().startsWith(`${testDir}/`)).toBe(true)
+})
+
 describe('provider.models', () => {
   beforeEach(async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
   afterEach(async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    await drainSidebarWrites()
+    restoreProcessTestFiles()
     if (tempConfigDir) {
       await rm(tempConfigDir, { recursive: true, force: true })
       tempConfigDir = undefined
@@ -657,20 +683,14 @@ describe('auth.loader', () => {
     globalThis.fetch = mock((input: any, init: any) => {
       const url = extractUrl(input)
       if (url.includes('/api/oauth/usage')) {
-        // Delay the main quota refresh so its setSidebarState writeFile lands
-        // AFTER the fallback-first sidebar write.  Two concurrent async
-        // writeFile calls race on disk — without this delay the main-refresh
-        // write can complete after the fallback write and clobber activeId
-        // back to 'main'.
-        return Bun.sleep(40).then(
-          () =>
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0.25 },
-                seven_day: { utilization: 0.3 },
-              }),
-              { status: 200 },
-            ),
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
         )
       }
 
@@ -697,11 +717,7 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
-
-    // Absorb the 40ms usage-API delay (above) so the background
-    // refreshSidebarQuota write completes on disk before we poll the sidebar
-    // file.  Without this sleep the delayed write can leak into the next test.
-    await Bun.sleep(60)
+    await drainSidebarWrites()
 
     const state = await waitForSidebarState(
       (candidate) =>
@@ -3537,17 +3553,14 @@ describe('auth.loader', () => {
     globalThis.fetch = mock((input: any, init: any) => {
       const url = extractUrl(input)
       if (url.includes('/api/oauth/usage')) {
-        // Delay the background main refresh so it settles AFTER the fallback
-        // write — this is the race that causes the clobber in production.
-        return Bun.sleep(40).then(
-          () =>
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0.95 },
-                seven_day: { utilization: 0.1 },
-              }),
-              { status: 200 },
-            ),
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.95 },
+              seven_day: { utilization: 0.1 },
+            }),
+            { status: 200 },
+          ),
         )
       }
       // Anthropic messages call — fallback serves 200, main would not be reached.
@@ -3573,6 +3586,7 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
+    await drainSidebarWrites()
 
     // Fallback served → active id should be the fallback.
     const state = await waitForSidebarState(
@@ -3580,9 +3594,6 @@ describe('auth.loader', () => {
         candidate.activeId === 'fallback-1' && candidate.route === 'fallback',
     )
     expect(state.route).toBe('fallback')
-
-    // Let the fire-and-forget refreshMain().then(...) settle.
-    await Bun.sleep(80)
 
     // REGRESSION: pre-fix the async callback rewrites activeId to 'main'.
     const after = await getSidebarState()

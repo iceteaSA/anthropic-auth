@@ -108,7 +108,11 @@ import type {
 } from './rpc/protocol.ts'
 import { getRpcDir } from './rpc/rpc-dir.ts'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
-import { type SidebarState, setSidebarState } from './sidebar-state.ts'
+import {
+  getSidebarStateFile,
+  type SidebarState,
+  setSidebarState,
+} from './sidebar-state.ts'
 import {
   addFastModeBetaHeader,
   createStrippedStream,
@@ -537,6 +541,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     activeId: 'main',
     route: 'main',
   }
+  const sidebarStateFile = getSidebarStateFile()
 
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -610,7 +615,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       },
       lastUpdated: Date.now(),
     }
-    setSidebarState(state).catch((error) =>
+    setSidebarState(state, sidebarStateFile).catch((error) =>
       logger.warn('sidebar', 'state write failed', {
         error: error instanceof Error ? error.message : String(error),
       }),

@@ -59,6 +59,8 @@ export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   lastUpdated: 0,
 }
 
+let writeChain: Promise<void> = Promise.resolve()
+
 export async function getSidebarState(): Promise<SidebarState> {
   try {
     const raw = await readFile(getSidebarStateFile(), 'utf8')
@@ -68,14 +70,24 @@ export async function getSidebarState(): Promise<SidebarState> {
   }
 }
 
-export async function setSidebarState(state: SidebarState): Promise<void> {
-  try {
-    const stateFile = getSidebarStateFile()
-    await mkdir(dirname(stateFile), { recursive: true })
-    await writeFile(stateFile, JSON.stringify(state), 'utf8')
-  } catch {
-    // Best-effort — sidebar is non-critical
-  }
+export async function setSidebarState(
+  state: SidebarState,
+  stateFile = getSidebarStateFile(),
+): Promise<void> {
+  writeChain = writeChain
+    .then(async () => {
+      await mkdir(dirname(stateFile), { recursive: true })
+      await writeFile(stateFile, JSON.stringify(state), 'utf8')
+    })
+    .catch(() => {
+      // Best-effort — sidebar is non-critical
+    })
+
+  return writeChain
+}
+
+export async function drainSidebarWrites(): Promise<void> {
+  return writeChain
 }
 
 // Resolve the currently-active account from activeId for the collapsed sidebar
