@@ -174,6 +174,23 @@ export function formatLogLine(
   return `[${now}] ${levelUpper}${channelSegment} ${message}${payloadJson}`
 }
 
+// -- Test-capture sink ----------------------------------------------------
+
+export type LogTestRecord = {
+  level: LogLevel
+  channel: string
+  message: string
+  payload?: Record<string, unknown>
+}
+
+let testSink: ((record: LogTestRecord) => void) | null = null
+
+export function __setLogTestSink(
+  sink: ((record: LogTestRecord) => void) | null,
+) {
+  testSink = sink
+}
+
 // -- Leveled API ----------------------------------------------------------
 
 function emit(
@@ -183,6 +200,13 @@ function emit(
   payload?: Record<string, unknown>,
 ): void {
   if (!shouldEmit(level)) return
+  if (testSink) {
+    try {
+      testSink({ level, channel, message, payload: redactPayload(payload) })
+    } catch {
+      // Sink must never throw into production.
+    }
+  }
   if (isTestEnv) return
   try {
     const line = `${formatLogLine(level, channel, message, payload)}\n`
