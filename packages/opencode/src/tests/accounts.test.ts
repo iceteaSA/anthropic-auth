@@ -2031,17 +2031,70 @@ describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
 })
 
 // ---------------------------------------------------------------------------
-// recordQuotaRefreshError duck-typed auth classification
-// (tested through buildQuotaOperationError + status===401 behavior)
+// recordQuotaRefreshError — refresh-backoff arming via isRefreshError
+// (tested through FallbackAccountManager integration path)
 // ---------------------------------------------------------------------------
-describe('recordQuotaRefreshError 401 → auth classification', () => {
-  test('buildQuotaOperationError with duck-typed 401 → non-transient (proves .status is read)', () => {
-    const result = buildQuotaOperationError({
-      error: { status: 401 },
-      now: 1_000_000,
+describe('recordQuotaRefreshError refresh-backoff arming', () => {
+  test('non-401 refresh error (status 500) arms refresh backoff', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-500-refresh',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1, // way in the past → tokenNeedsRefresh
     })
-    // Non-transient quota errors get the fixed 5-min delay
-    expect(result.nextRetryAt).toBe(1_000_000 + 5 * 60_000)
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      return Promise.resolve(new Response('server error', { status: 500 }))
+    }) as unknown as typeof fetch
+
+    const now = 1_000_000
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-500-refresh') as
+      | OAuthAccount
+      | undefined
+    expect(account?.lastRefreshError).toBeDefined()
+    expect(account?.lastRefreshError?.checkedAt).toBe(now)
+  })
+
+  test('401 refresh error arms refresh backoff (ClaudeOAuthRefreshError regression)', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-401-refresh',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      return Promise.resolve(new Response('unauthorized', { status: 401 }))
+    }) as unknown as typeof fetch
+
+    const now = 1_000_000
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-401-refresh') as
+      | OAuthAccount
+      | undefined
+    expect(account?.lastRefreshError).toBeDefined()
+    expect(account?.lastRefreshError?.checkedAt).toBe(now)
   })
 })
 

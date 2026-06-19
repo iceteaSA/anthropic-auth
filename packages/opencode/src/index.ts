@@ -23,7 +23,6 @@ import {
   CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
-  ClaudeOAuthRefreshError,
   dumpDirectRequest,
   exchange,
   executeAccountCommand,
@@ -1819,8 +1818,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     if (
                       attempt < maxRetries &&
                       (isNetworkError ||
-                        (error instanceof ClaudeOAuthRefreshError &&
-                          error.status >= 500))
+                        (() => {
+                          const s = (error as { status?: number }).status
+                          return typeof s === 'number' && s >= 500
+                        })())
                     ) {
                       continue
                     }
@@ -1840,7 +1841,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     const failedRefreshToken = freshAuth?.refresh
                     if (
                       failedRefreshToken &&
-                      error instanceof ClaudeOAuthRefreshError
+                      (error as { isRefreshError?: boolean }).isRefreshError
                     ) {
                       await updateMainRefreshState((storage) => {
                         storage.refresh = storage.refresh ?? {}

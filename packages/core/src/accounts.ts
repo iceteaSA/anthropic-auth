@@ -1822,7 +1822,7 @@ function recordQuotaRefreshError(
     now,
     previous: account.lastQuotaRefreshError,
   })
-  if ((error as { status?: unknown }).status === 401) {
+  if ((error as { isRefreshError?: boolean }).isRefreshError) {
     recordRefreshError(account, error, now)
   }
 }
