@@ -329,7 +329,12 @@ globalThis.fetch = async (input, init) => {
       },
     )
 
-    proc.stdin.write('\n')
+    // Feed stdin for the unconditional worker-name prompt plus the conditional
+    // URL prompt (the latter fires when getWorkersSubdomain returns no subdomain;
+    // Bun's readline.question() hangs on a second call against a closed pipe).
+    proc.stdin.write(
+      '\nhttps://opencode-anthropic-relay.user-subdomain.workers.dev\n',
+    )
     proc.stdin.end()
 
     const [exitCode, stdout, stderr] = await Promise.all([
@@ -353,5 +358,5 @@ globalThis.fetch = async (input, init) => {
 
     const calls = (await readFile(callsPath, 'utf8')).trim().split('\n')
     expect(calls).toHaveLength(4)
-  }, 20000)
+  })
 })
