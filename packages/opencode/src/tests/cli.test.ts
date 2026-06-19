@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { getAccountStatePath } from '@cortexkit/anthropic-auth-core'
 
+import { relaySetup } from '../cli'
+
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 let tempDir: string
@@ -292,60 +294,74 @@ describe('CLI login', () => {
 })
 
 describe('CLI relay setup', () => {
+  // relaySetup is exercised IN-PROCESS with an injected fetch + prompt rather
+  // than via `bun --preload ... src/cli.ts relay setup`. The old subprocess
+  // form hung indefinitely in CI (timed out at 5000ms with proc.exited never
+  // resolving) — the failure lived in the subprocess+--preload+readline/stdin
+  // harness, not in relaySetup's logic, and was unreproducible locally. Calling
+  // relaySetup directly with injected deps removes that entire fragile surface
+  // (no spawn, no preload-stub-application risk, no real network, no stdin/pipe
+  // race) while still exercising the real setup logic: KV create, worker
+  // upload, enable workers.dev, subdomain lookup, token generation, and config
+  // save — the same four Cloudflare calls and the same persisted relay config.
   test('deploys worker resources and saves relay config', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
-    const callsPath = join(tempDir, 'calls.jsonl')
-    const preloadPath = join(tempDir, 'relay-preload.ts')
+    const calls: Array<{ url: string; method?: string }> = []
 
-    await writeFile(
-      preloadPath,
-      `import { appendFileSync } from 'node:fs'
-globalThis.fetch = async (input, init) => {
-  const url = input.toString()
-  appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ url, method: init?.method }) + '\\n')
-  if (url.includes('/storage/kv/namespaces')) return Response.json({ success: true, result: { id: 'kv-id' } })
-  if (url.includes('/workers/scripts/opencode-anthropic-relay/subdomain')) return Response.json({ success: true, result: { enabled: true } })
-  if (url.includes('/workers/subdomain')) return Response.json({ success: true, result: { subdomain: 'user-subdomain' } })
-  if (url.includes('/workers/scripts/opencode-anthropic-relay')) return Response.json({ success: true, result: {} })
-  return Response.json({ success: false, errors: [{ message: 'unexpected ' + url }] }, { status: 500 })
-}
-`,
-      'utf8',
-    )
+    const fetchImpl = async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = input.toString()
+      calls.push({ url, method: init?.method })
+      if (url.includes('/storage/kv/namespaces'))
+        return Response.json({ success: true, result: { id: 'kv-id' } })
+      if (url.includes('/workers/scripts/opencode-anthropic-relay/subdomain'))
+        return Response.json({ success: true, result: { enabled: true } })
+      if (url.includes('/workers/subdomain'))
+        return Response.json({
+          success: true,
+          result: { subdomain: 'user-subdomain' },
+        })
+      if (url.includes('/workers/scripts/opencode-anthropic-relay'))
+        return Response.json({ success: true, result: {} })
+      return Response.json(
+        { success: false, errors: [{ message: `unexpected ${url}` }] },
+        { status: 500 },
+      )
+    }
 
-    const proc = Bun.spawn(
-      ['bun', '--preload', preloadPath, 'src/cli.ts', 'relay', 'setup'],
-      {
-        cwd: packageRoot,
-        env: {
-          ...process.env,
-          OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
-          CLOUDFLARE_API_TOKEN: 'cf-token',
-          CLOUDFLARE_ACCOUNT_ID: 'account-id',
-        },
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    )
+    // The worker-name prompt returns '' (→ default name); no other prompt fires
+    // because the injected fetch returns a workers.dev subdomain.
+    const promptAnswers: Record<string, string> = {
+      'Worker name [opencode-anthropic-relay]: ': '',
+    }
+    const askedPrompts: string[] = []
+    const prompt = async (message: string) => {
+      askedPrompts.push(message)
+      return promptAnswers[message] ?? ''
+    }
 
-    // Feed stdin for the unconditional worker-name prompt plus the conditional
-    // URL prompt (the latter fires when getWorkersSubdomain returns no subdomain;
-    // Bun's readline.question() hangs on a second call against a closed pipe).
-    proc.stdin.write(
-      '\nhttps://opencode-anthropic-relay.user-subdomain.workers.dev\n',
-    )
-    proc.stdin.end()
+    const prevFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    const prevToken = process.env.CLOUDFLARE_API_TOKEN
+    const prevAccount = process.env.CLOUDFLARE_ACCOUNT_ID
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
+    process.env.CLOUDFLARE_API_TOKEN = 'cf-token'
+    process.env.CLOUDFLARE_ACCOUNT_ID = 'account-id'
+    try {
+      await relaySetup({ fetchImpl, prompt })
+    } finally {
+      if (prevFile === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+      else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = prevFile
+      if (prevToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN
+      else process.env.CLOUDFLARE_API_TOKEN = prevToken
+      if (prevAccount === undefined) delete process.env.CLOUDFLARE_ACCOUNT_ID
+      else process.env.CLOUDFLARE_ACCOUNT_ID = prevAccount
+    }
 
-    const [exitCode, stdout, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ])
-
-    expect(stderr).toBe('')
-    expect(exitCode).toBe(0)
-    expect(stdout).toContain('Relay enabled')
+    // Token + account come from env, so the only prompt is the worker name.
+    expect(askedPrompts).toEqual(['Worker name [opencode-anthropic-relay]: '])
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.relay).toMatchObject({
@@ -356,7 +372,12 @@ globalThis.fetch = async (input, init) => {
     })
     expect(storage.relay.token).toBeString()
 
-    const calls = (await readFile(callsPath, 'utf8')).trim().split('\n')
     expect(calls).toHaveLength(4)
+    expect(calls.map((c) => `${c.method ?? 'GET'} ${c.url}`)).toEqual([
+      'POST https://api.cloudflare.com/client/v4/accounts/account-id/storage/kv/namespaces',
+      'PUT https://api.cloudflare.com/client/v4/accounts/account-id/workers/scripts/opencode-anthropic-relay',
+      'POST https://api.cloudflare.com/client/v4/accounts/account-id/workers/scripts/opencode-anthropic-relay/subdomain',
+      'GET https://api.cloudflare.com/client/v4/accounts/account-id/workers/subdomain',
+    ])
   })
 })
