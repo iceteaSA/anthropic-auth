@@ -1,13 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import { getAccountStatePath } from '@cortexkit/anthropic-auth-core'
 
-import { relaySetup } from '../cli'
-
-const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
+import { addApiRoute, login, relaySetup } from '../cli'
 
 let tempDir: string
 
@@ -19,32 +16,57 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true })
 })
 
+// addApiRoute / login are exercised IN-PROCESS with injected deps rather than
+// via `bun [--preload] src/cli.ts ...`. The subprocess form (Bun.spawn +
+// optional --preload fetch stub + stdin pipe) hung indefinitely in CI
+// (proc.exited never resolving, 5000ms timeout) while passing locally — the
+// failure lived in that harness, not in the command logic, and was
+// unreproducible locally. Calling the commands directly with injected prompt
+// (and, for login, authorize/exchange) removes the entire fragile surface
+// (no spawn, no preload, no readline/stdin race, no real network) while still
+// exercising the real logic and asserting the same persisted outcomes.
+
+// Run a command body against a temp account file, restoring any env we touch.
+async function withAccountEnv<T>(
+  accountPath: string,
+  env: Record<string, string | undefined>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const keys = ['OPENCODE_ANTHROPIC_AUTH_FILE', ...Object.keys(env)]
+  const prev = new Map(keys.map((k) => [k, process.env[k]]))
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const [k, v] of prev) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
 describe('CLI api add', () => {
   test('saves API route config and stores API key in runtime state', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
-    const proc = Bun.spawn(['bun', 'src/cli.ts', 'api', 'add', 'kie-opus'], {
-      cwd: packageRoot,
-      env: {
-        ...process.env,
-        OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
+
+    await withAccountEnv(
+      accountPath,
+      {
         OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: 'https://api.kie.ai/claude',
         OPENCODE_ANTHROPIC_AUTH_API_KEY: 'kie-key',
         OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: 'authorization-bearer',
       },
-      stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-
-    const [exitCode, stdout, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ])
-
-    expect(stderr).toBe('')
-    expect(exitCode).toBe(0)
-    expect(stdout).toContain('Saved API fallback route "kie-opus"')
+      () =>
+        addApiRoute('kie-opus', {
+          prompt: async () => {
+            throw new Error('prompt should not be called: all inputs from env')
+          },
+        }),
+    )
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.accounts[0]).toMatchObject({
@@ -65,91 +87,92 @@ describe('CLI api add', () => {
 
   test('rejects invalid API base URL before saving route state', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
-    const proc = Bun.spawn(['bun', 'src/cli.ts', 'api', 'add', 'bad-api'], {
-      cwd: packageRoot,
-      env: {
-        ...process.env,
-        OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
+
+    const promise = withAccountEnv(
+      accountPath,
+      {
         OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: 'https://secret@example.com/v1',
         OPENCODE_ANTHROPIC_AUTH_API_KEY: 'kie-key',
         OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: 'authorization-bearer',
       },
-      stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
+      () =>
+        addApiRoute('bad-api', {
+          prompt: async () => '',
+        }),
+    )
 
-    const [exitCode, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stderr).text(),
-    ])
+    await expect(promise).rejects.toThrow(
+      'API fallback base URL must be an http(s) URL',
+    )
 
-    expect(exitCode).toBe(1)
-    expect(stderr).toContain('API fallback base URL must be an http(s) URL')
+    // Nothing should have been persisted for the rejected route.
+    await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
   })
 })
 
 describe('CLI login', () => {
   test('continues from label prompt to OAuth callback prompt and saves account', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
-    const preloadPath = join(tempDir, 'preload.ts')
 
-    await writeFile(
-      preloadPath,
-      `globalThis.fetch = async () => new Response(JSON.stringify({ access_token: 'cli-access', refresh_token: 'cli-refresh', expires_in: 3600 }), { status: 200 })\n`,
-      'utf8',
-    )
-
-    const proc = Bun.spawn(
-      ['bun', '--preload', preloadPath, 'src/cli.ts', 'login'],
-      {
-        cwd: packageRoot,
-        env: {
-          ...process.env,
-          OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
-        },
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    )
-
-    const reader = proc.stdout.getReader()
-    const decoder = new TextDecoder()
-    let stdout = ''
-    let state: string | undefined
-
-    proc.stdin.write('cli-label\n')
-
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
-      state = stdout.match(/[?&]state=([a-f0-9]+)/)?.[1]
-      if (state) break
+    // Real authorize() (exercises PKCE + state + the printed URL); exchange()
+    // is the network boundary, stubbed to return canned tokens. The prompt
+    // returns the label first, then the pasted callback code.
+    const asked: string[] = []
+    const promptAnswers = [
+      'cli-label',
+      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
+    ]
+    let askIndex = 0
+    const prompt = async (message: string) => {
+      asked.push(message)
+      return promptAnswers[askIndex++] ?? ''
     }
 
-    expect(state).toBeString()
-
-    proc.stdin.write(
-      `https://platform.claude.com/oauth/code/callback?code=cli-code&state=${state}\n`,
-    )
-    proc.stdin.end()
-
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
+    let exchangeArgs: { input: string; verifier: string } | undefined
+    const exchange = async (
+      input: string,
+      verifier: string,
+    ): Promise<{
+      type: 'success'
+      access: string
+      refresh: string
+      expires: number
+    }> => {
+      exchangeArgs = { input, verifier }
+      return {
+        type: 'success',
+        access: 'cli-access',
+        refresh: 'cli-refresh',
+        expires: Date.now() + 3600 * 1000,
+      }
     }
 
-    const [exitCode, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stderr).text(),
+    const logs: string[] = []
+    const origLog = console.log
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(' '))
+    }
+    try {
+      await withAccountEnv(accountPath, {}, () =>
+        login(undefined, { prompt, exchange }),
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    const stdout = logs.join('\n')
+    // The real authorize() URL was printed and carries a generated state.
+    expect(stdout).toMatch(/[?&]state=[a-f0-9]+/)
+    // The callback-code prompt and label prompt both fired, in order.
+    expect(asked).toEqual([
+      'Fallback account label (optional): ',
+      'Paste the full callback URL or authorization code here: ',
     ])
-
-    expect(stderr).toBe('')
-    expect(exitCode).toBe(0)
-    expect(stdout).toContain('Paste the full callback URL')
+    // exchange received the real authorize() verifier and the pasted code.
+    expect(exchangeArgs?.input).toBe(
+      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
+    )
+    expect(exchangeArgs?.verifier).toBeString()
     expect(stdout).toContain('Saved fallback account "cli-label"')
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
@@ -173,7 +196,6 @@ describe('CLI login', () => {
 
   test('re-login with same label clears stale errors and quota', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
-    const preloadPath = join(tempDir, 'preload.ts')
 
     await writeFile(
       accountPath,
@@ -208,59 +230,32 @@ describe('CLI login', () => {
       }),
       'utf8',
     )
-    await writeFile(
-      preloadPath,
-      `globalThis.fetch = async () => new Response(JSON.stringify({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600 }), { status: 200 })\n`,
-      'utf8',
-    )
 
-    const proc = Bun.spawn(
-      ['bun', '--preload', preloadPath, 'src/cli.ts', 'login', 'cli-label'],
-      {
-        cwd: packageRoot,
-        env: {
-          ...process.env,
-          OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
-        },
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    )
-
-    const reader = proc.stdout.getReader()
-    const decoder = new TextDecoder()
-    let stdout = ''
-    let state: string | undefined
-
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
-      state = stdout.match(/[?&]state=([a-f0-9]+)/)?.[1]
-      if (state) break
+    // Label is passed as the arg, so the only prompt is the callback code.
+    const asked: string[] = []
+    const prompt = async (message: string) => {
+      asked.push(message)
+      return 'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
     }
+    const exchange = async (): Promise<{
+      type: 'success'
+      access: string
+      refresh: string
+      expires: number
+    }> => ({
+      type: 'success',
+      access: 'new-access',
+      refresh: 'new-refresh',
+      expires: Date.now() + 3600 * 1000,
+    })
 
-    expect(state).toBeString()
-
-    proc.stdin.write(
-      `https://platform.claude.com/oauth/code/callback?code=cli-code&state=${state}\n`,
+    await withAccountEnv(accountPath, {}, () =>
+      login('cli-label', { prompt, exchange }),
     )
-    proc.stdin.end()
 
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
-    }
-
-    const [exitCode, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stderr).text(),
+    expect(asked).toEqual([
+      'Paste the full callback URL or authorization code here: ',
     ])
-
-    expect(stderr).toBe('')
-    expect(exitCode).toBe(0)
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.accounts).toHaveLength(1)

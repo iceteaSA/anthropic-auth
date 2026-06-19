@@ -280,18 +280,34 @@ function closePromptInterface() {
   promptInterface = null
 }
 
-async function login(labelArg?: string) {
+/**
+ * Dependencies the `login` command talks to the outside world through. All
+ * default to the real implementations (the readline-backed prompt, and the
+ * core authorize/exchange helpers) so the production `login` path is
+ * unchanged; tests inject deterministic stubs to exercise the full login flow
+ * in-process without a subprocess, real network, or stdin.
+ */
+export interface LoginDeps {
+  prompt?: (message: string) => Promise<string>
+  authorize?: typeof authorize
+  exchange?: typeof exchange
+}
+
+export async function login(labelArg?: string, deps: LoginDeps = {}) {
+  const ask = deps.prompt ?? prompt
+  const authorizeImpl = deps.authorize ?? authorize
+  const exchangeImpl = deps.exchange ?? exchange
   const storage = (await loadAccounts()) ?? defaultStorage()
   const label =
-    labelArg?.trim() || (await prompt('Fallback account label (optional): '))
-  const authorization = await authorize('max')
+    labelArg?.trim() || (await ask('Fallback account label (optional): '))
+  const authorization = await authorizeImpl('max')
 
   console.log('\nOpen this URL in your browser and complete Claude sign-in:\n')
   console.log(`${authorization.url}\n`)
-  const code = await prompt(
+  const code = await ask(
     'Paste the full callback URL or authorization code here: ',
   )
-  const result = await exchange(
+  const result = await exchangeImpl(
     code,
     authorization.verifier,
     authorization.redirectUri,
@@ -319,16 +335,25 @@ async function login(labelArg?: string) {
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }
 
-async function addApiRoute(labelArg?: string) {
+/**
+ * Dependencies the `api add` command talks to the outside world through. The
+ * prompt defaults to the real readline-backed prompt so the production
+ * `api add` path is unchanged; tests inject canned answers to exercise the
+ * full route-add flow in-process without a subprocess or stdin.
+ */
+export interface ApiAddDeps {
+  prompt?: (message: string) => Promise<string>
+}
+
+export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
+  const ask = deps.prompt ?? prompt
   const storage = (await loadAccounts()) ?? defaultStorage()
   const label =
-    labelArg?.trim() || (await prompt('API fallback label (optional): '))
+    labelArg?.trim() || (await ask('API fallback label (optional): '))
   const baseURL =
     process.env.OPENCODE_ANTHROPIC_AUTH_API_BASE_URL?.trim() ||
     (
-      await prompt(
-        'Anthropic-compatible base URL [https://api.kie.ai/claude]: ',
-      )
+      await ask('Anthropic-compatible base URL [https://api.kie.ai/claude]: ')
     ).trim() ||
     'https://api.kie.ai/claude'
   if (!isValidApiBaseURL(baseURL)) {
@@ -338,11 +363,11 @@ async function addApiRoute(labelArg?: string) {
   }
   const apiKey =
     process.env.OPENCODE_ANTHROPIC_AUTH_API_KEY?.trim() ||
-    (await prompt('API key: '))
+    (await ask('API key: '))
   if (!apiKey.trim()) throw new Error('API key is required')
   const authHeaderInput = (
     process.env.OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER?.trim() ||
-    (await prompt(
+    (await ask(
       'Auth header [authorization-bearer|x-api-key] (default authorization-bearer): ',
     ))
   )
