@@ -76,6 +76,7 @@ export class QuotaManager {
 
   // --- Inflight deduplication ---
   private inflightMain: Promise<OAuthQuotaSnapshot> | null = null
+  private inflightMainFp: string | null = null
   private inflightFallbacks = new Map<string, Promise<OAuthQuotaSnapshot>>()
 
   // --- Rate-limiting (scoped per route so a fallback 429 never backs off the
@@ -192,8 +193,9 @@ export class QuotaManager {
       this.mainTokenFp = null
     }
 
-    // Deduplicate — return in-flight promise if already fetching
-    if (this.inflightMain) return this.inflightMain
+    // Deduplicate — return in-flight promise only if same token fingerprint
+    if (this.inflightMain && this.inflightMainFp === fp)
+      return this.inflightMain
 
     // Rate-limit — if API recently 429'd, return stale or throw
     if (this.isBackedOff()) {
@@ -201,6 +203,7 @@ export class QuotaManager {
       throw new Error('Quota API rate-limited — try again later')
     }
 
+    this.inflightMainFp = fp
     this.inflightMain = this._fetchMain(accessToken)
     return this.inflightMain
   }
@@ -443,6 +446,7 @@ export class QuotaManager {
   }
 
   private async _fetchMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
+    const thisFetchFp = tokenFingerprint(accessToken)
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — may have been set by
@@ -489,7 +493,10 @@ export class QuotaManager {
           await fileLock.release()
         }
       } finally {
-        this.inflightMain = null
+        if (this.inflightMainFp === thisFetchFp) {
+          this.inflightMain = null
+          this.inflightMainFp = null
+        }
       }
     })
   }

@@ -466,7 +466,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
     onFallbackStorageChanged: () => {
-      void refreshSidebarQuota()
+      void refreshSidebarQuota().catch(() => {})
     },
   })
   fallbackManager.startBackgroundRefresh()
@@ -2494,7 +2494,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       void quotaManager
                         .refreshMain(auth.access)
                         .then(() => {
-                          void refreshSidebarQuota()
+                          void refreshSidebarQuota().catch(() => {})
                           showQuotaToastFromCache()
                         })
                         .catch(() => {})

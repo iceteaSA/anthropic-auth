@@ -663,4 +663,138 @@ describe('QuotaManager', () => {
       expect(errorCallback.nextRetryAt).toBeGreaterThan(now)
     })
   })
+
+  describe('refreshMain dedup (token-keyed)', () => {
+    test('concurrent different-token refreshMain: each gets its own quota', async () => {
+      let callCount = 0
+      const fetchMock = mock(async (_url: string, _init?: unknown) => {
+        callCount++
+        return new Response(
+          JSON.stringify({
+            five_hour: {
+              utilization: callCount * 10,
+              resets_at: new Date(now + 3600_000).toISOString(),
+            },
+            seven_day: {
+              utilization: callCount * 10,
+              resets_at: new Date(now + 86400_000).toISOString(),
+            },
+          }),
+          { status: 200 },
+        )
+      })
+
+      const qm = new QuotaManager({
+        storage: null,
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        now: () => now,
+      })
+
+      const tokenA = 'access-token-aaaaaaaa'
+      const tokenB = 'access-token-bbbbbbbb'
+
+      expect(tokenFingerprint(tokenA)).not.toBe(tokenFingerprint(tokenB))
+
+      const [quotaA, quotaB] = await Promise.all([
+        qm.refreshMain(tokenA),
+        qm.refreshMain(tokenB),
+      ])
+
+      expect(quotaA.five_hour).toBeDefined()
+      expect(quotaB.five_hour).toBeDefined()
+      // Two separate API calls — not deduped across different tokens
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      // Each token got its own distinct quota (callCount 1 vs 2)
+      expect(quotaA.five_hour?.usedPercent).not.toBe(
+        quotaB.five_hour?.usedPercent,
+      )
+    })
+
+    test('same-token concurrent refreshMain deduplicates (one API call)', async () => {
+      const fetchMock = mock(async () => {
+        return new Response(
+          JSON.stringify({
+            five_hour: {
+              utilization: 42,
+              resets_at: new Date(now + 3600_000).toISOString(),
+            },
+            seven_day: {
+              utilization: 42,
+              resets_at: new Date(now + 86400_000).toISOString(),
+            },
+          }),
+          { status: 200 },
+        )
+      })
+
+      const qm = new QuotaManager({
+        storage: null,
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        now: () => now,
+      })
+
+      const token = 'access-token-same'
+
+      const [quota1, quota2] = await Promise.all([
+        qm.refreshMain(token),
+        qm.refreshMain(token),
+      ])
+
+      expect(quota1).toEqual(quota2)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    })
+
+    test('pre-fix failure proof: different tokens each trigger own fetch with correct quota', async () => {
+      const fetchedTokens: string[] = []
+      let callCount = 0
+      const fetchMock = mock(
+        async (_url: string, init?: { headers?: Record<string, string> }) => {
+          callCount++
+          const headers = (init?.headers ?? {}) as Record<string, string>
+          const auth = headers.Authorization ?? ''
+          const token = auth.replace('Bearer ', '')
+          fetchedTokens.push(token)
+          return new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: callCount * 10,
+                resets_at: new Date(now + 3600_000).toISOString(),
+              },
+              seven_day: {
+                utilization: callCount * 10,
+                resets_at: new Date(now + 86400_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          )
+        },
+      )
+
+      const qm = new QuotaManager({
+        storage: null,
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        now: () => now,
+      })
+
+      const tokenA = 'token-aaaa'
+      const tokenB = 'token-bbbb'
+      expect(tokenFingerprint(tokenA)).not.toBe(tokenFingerprint(tokenB))
+
+      const [quotaA, quotaB] = await Promise.all([
+        qm.refreshMain(tokenA),
+        qm.refreshMain(tokenB),
+      ])
+
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(fetchedTokens.length).toBe(2)
+      expect(fetchedTokens).toContain(tokenA)
+      expect(fetchedTokens).toContain(tokenB)
+
+      expect(quotaA.five_hour).toBeDefined()
+      expect(quotaB.five_hour).toBeDefined()
+      expect(quotaA.five_hour?.usedPercent).not.toBe(
+        quotaB.five_hour?.usedPercent,
+      )
+    })
+  })
 })

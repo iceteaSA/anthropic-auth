@@ -138,4 +138,40 @@ describe('rpc-server', () => {
     }
     expect(rejected).toBe(true)
   })
+
+  test('oversized body does not trigger unhandled error when writing error response', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'aa-rpcsrv-'))
+    const server = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    stop = server.stop
+    const base = `http://127.0.0.1:${server.port}`
+
+    let unhandledError: unknown = null
+    const onUnhandled = (err: unknown) => {
+      unhandledError = err
+    }
+    process.on('uncaughtException', onUnhandled)
+
+    const huge = 'x'.repeat(1_000_001)
+    try {
+      await fetch(`${base}/rpc/apply`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${server.token}`,
+        },
+        body: JSON.stringify({ command: 'test', arguments: huge }),
+      })
+    } catch {
+      // Expected — socket destroyed
+    }
+
+    // Yield to allow any unhandled error events to fire
+    await new Promise((r) => setTimeout(r, 50))
+    process.removeListener('uncaughtException', onUnhandled)
+    expect(unhandledError).toBeNull()
+  })
 })
