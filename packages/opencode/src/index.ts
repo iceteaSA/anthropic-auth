@@ -12,6 +12,7 @@ import {
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
+  CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
@@ -1451,11 +1452,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           description:
             'Show or toggle 1-hour Anthropic ephemeral prompt cache TTL.',
         },
+        [CLAUDE_ACCOUNT_COMMAND_NAME]: {
+          template: CLAUDE_ACCOUNT_COMMAND_NAME,
+          description:
+            'Manage fallback accounts — list, enable/disable, reorder, remove, or add (API key or OAuth).',
+        },
         [CLAUDE_CACHE_KEEP_COMMAND_NAME]: {
           template: CLAUDE_CACHE_KEEP_COMMAND_NAME,
           description:
             'Keep hybrid Claude cache warm for recently used sessions during a local time window.',
         },
+
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
           template: CLAUDE_QUOTAS_COMMAND_NAME,
           description:

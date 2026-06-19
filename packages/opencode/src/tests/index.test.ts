@@ -1652,6 +1652,39 @@ describe('auth.loader', () => {
     expect(saved.claudeCache).toEqual({ enabled: true, mode: 'explicit' })
   })
 
+  test('config hook registers every modal command so they appear in the command palette', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const plugin = await getPlugin()
+
+    const result: { command?: Record<string, unknown> } = {}
+    await plugin.config(result)
+
+    const registered = Object.keys(result.command ?? {})
+
+    // Every modal command must be registered — if one is missing it won't appear
+    // in the slash-command palette and users will get "No matching items".
+    const required = [
+      'claude-account',
+      'claude-cache',
+      'claude-cachekeep',
+      'claude-quota',
+      'claude-dump',
+      'claude-fast',
+      'claude-routing',
+      'claude-killswitch',
+      'claude-logging',
+    ]
+    for (const name of required) {
+      expect(registered).toContain(name)
+    }
+
+    // The config hook must not register extra commands beyond the modalCommands
+    // set (drift in either direction is a bug).  The CommandModalName type in
+    // protocol.ts and the modalCommands list in index.ts define exactly 9 names
+    // — no more, no less.
+    expect(registered).toHaveLength(9)
+  })
+
   test('handles /claude-cachekeep command and persists window', async () => {
     await useTempAccountFile(
       createFallbackStorage({
