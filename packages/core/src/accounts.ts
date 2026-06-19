@@ -630,27 +630,20 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
-function stateFromStorage(storage: AccountStorage): AccountRuntimeState {
-  const accounts = Object.fromEntries(
-    storage.accounts.map((account) => [
-      account.id,
-      accountRuntimeState(account),
-    ]),
-  )
-  return {
-    version: 1,
-    main: objectWithDefinedEntries({
-      quota: storage.quota?.mainQuota,
-      quotaCheckedAt: storage.quota?.mainQuotaCheckedAt,
-      quotaToken: storage.quota?.mainQuotaToken,
-      lastQuotaApiError: storage.quota?.mainLastQuotaApiError,
-      lastRefreshError: storage.refresh?.mainLastRefreshError,
-      refreshLeaseId: storage.refresh?.mainRefreshLeaseId,
-      refreshLeaseUntil: storage.refresh?.mainRefreshLeaseUntil,
-      refreshLeaseTokenHash: storage.refresh?.mainRefreshLeaseTokenHash,
-    }),
-    accounts,
-  }
+// ---------------------------------------------------------------------------
+// In-process save mutex — serializes all account-store writes so concurrent
+// read-modify-write callers (background timers that call saveAccountState with
+// different section flags) don't lose each other's updates (#9).
+// ---------------------------------------------------------------------------
+let saveChain: Promise<void> = Promise.resolve()
+
+function enqueueSave<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    saveChain = saveChain.then(
+      () => fn().then(resolve, reject),
+      () => fn().then(resolve, reject),
+    )
+  })
 }
 
 async function writeJsonAtomic(path: string, value: unknown) {
@@ -668,14 +661,23 @@ async function writeJsonAtomic(path: string, value: unknown) {
   }
 }
 
-export async function saveAccounts(
+export function saveAccounts(
   storage: AccountStorage,
   path = getAccountStoragePath(),
-) {
+): Promise<void> {
+  const resolvedPath = path
+  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath))
+}
+
+async function saveAccountsLocked(storage: AccountStorage, path: string) {
   const existing = await loadExistingTopLevelFields(path)
   const nextConfig = { ...existing, ...configFromStorage(storage) }
   await writeJsonAtomic(path, nextConfig)
-  await writeJsonAtomic(getAccountStatePath(path), stateFromStorage(storage))
+  await saveAccountStateUnlocked(storage, path, {
+    mainQuota: true,
+    mainRefresh: true,
+    accounts: true,
+  })
 }
 
 function applyMainQuotaStatePatch(
@@ -720,7 +722,7 @@ function pruneUndefined(value: unknown): unknown {
   )
 }
 
-export async function saveAccountState(
+export function saveAccountState(
   storage: AccountStorage,
   path = getAccountStoragePath(),
   scope: AccountStateSaveScope = {
@@ -728,6 +730,17 @@ export async function saveAccountState(
     mainRefresh: true,
     accounts: true,
   },
+): Promise<void> {
+  const resolvedPath = path
+  return enqueueSave(() =>
+    saveAccountStateUnlocked(storage, resolvedPath, scope),
+  )
+}
+
+async function saveAccountStateUnlocked(
+  storage: AccountStorage,
+  path: string,
+  scope: AccountStateSaveScope,
 ) {
   const statePath = getAccountStatePath(path)
   const existing = (await readJsonIfPresent(statePath)).value

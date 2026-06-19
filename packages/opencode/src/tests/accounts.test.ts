@@ -1967,3 +1967,94 @@ describe('NaN quota utilization guards', () => {
     expect(killswitchPassesPolicy(quota, storage)).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Fix #9: saveAccountState lost-update race — concurrent saves with different
+// section flags must not overwrite each other's sections.
+// ---------------------------------------------------------------------------
+describe('saveAccountState lost-update race (#9)', () => {
+  test('concurrent saves with different scopes persist both sections', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 100 },
+      },
+      mainQuotaCheckedAt: 100,
+      mainQuotaToken: 'token-initial',
+    }
+    storage.refresh = {
+      ...storage.refresh,
+      mainLastRefreshError: {
+        message: 'initial error',
+        checkedAt: 100,
+      },
+      mainRefreshLeaseId: 'lease-initial',
+    }
+    await saveAccounts(storage)
+
+    const ROUNDS = 50
+    const failures: number[] = []
+
+    for (let round = 0; round < ROUNDS; round++) {
+      const quotaStorage = baseStorage()
+      quotaStorage.quota = {
+        ...quotaStorage.quota,
+        mainQuota: {
+          five_hour: {
+            usedPercent: 20 + round,
+            remainingPercent: 80 - round,
+            checkedAt: 200 + round,
+          },
+        },
+        mainQuotaCheckedAt: 200 + round,
+        mainQuotaToken: `token-quota-${round}`,
+      }
+
+      const refreshStorage = baseStorage()
+      refreshStorage.refresh = {
+        ...refreshStorage.refresh,
+        mainLastRefreshError: {
+          message: `refresh error ${round}`,
+          checkedAt: 300 + round,
+        },
+        mainRefreshLeaseId: `lease-${round}`,
+        mainRefreshLeaseUntil: 400 + round,
+      }
+
+      await Promise.all([
+        saveAccountState(quotaStorage, accountPath, { mainQuota: true }),
+        saveAccountState(refreshStorage, accountPath, { mainRefresh: true }),
+      ])
+
+      const loaded = await loadAccounts()
+      const quotaOk = loaded?.quota?.mainQuotaToken === `token-quota-${round}`
+      const refreshOk = loaded?.refresh?.mainRefreshLeaseId === `lease-${round}`
+
+      if (!quotaOk || !refreshOk) {
+        failures.push(round)
+        // Don't break — collect all failures for diagnostics
+      }
+    }
+
+    if (failures.length) {
+      const loaded = await loadAccounts()
+      // Load state file directly for diagnostic detail
+      const statePath = getAccountStatePath(accountPath)
+      const stateRaw = await readFile(statePath, 'utf8').catch(() => 'MISSING')
+      throw new Error(
+        `Lost update in ${failures.length}/${ROUNDS} rounds (rounds: ${failures.slice(0, 10).join(', ')}). ` +
+          `Last loaded mainQuotaToken=${loaded?.quota?.mainQuotaToken}, ` +
+          `mainRefreshLeaseId=${loaded?.refresh?.mainRefreshLeaseId}. ` +
+          `State file: ${stateRaw.slice(0, 300)}`,
+      )
+    }
+
+    // Final verification: both sections have the last round's values
+    const final = await loadAccounts()
+    expect(final?.quota?.mainQuotaToken).toBe(`token-quota-${ROUNDS - 1}`)
+    expect(final?.quota?.mainQuotaCheckedAt).toBe(200 + ROUNDS - 1)
+    expect(final?.refresh?.mainRefreshLeaseId).toBe(`lease-${ROUNDS - 1}`)
+    expect(final?.refresh?.mainRefreshLeaseUntil).toBe(400 + ROUNDS - 1)
+  })
+})
