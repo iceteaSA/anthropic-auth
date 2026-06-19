@@ -433,7 +433,9 @@ export function openCommandDialog(
             onConfirm={(value: string) => {
               const trimmed = value.trim()
               collected.label = trimmed || undefined
-              let args = `add-apikey ${collected.apiKey!}`
+              const apiKey = collected.apiKey
+              if (!apiKey) return
+              let args = `add-apikey ${apiKey}`
               if (
                 collected.baseURL &&
                 collected.baseURL !== 'https://api.kie.ai/claude'
