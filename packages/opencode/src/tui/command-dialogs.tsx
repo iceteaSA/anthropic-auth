@@ -335,45 +335,141 @@ export function openCommandDialog(
       ))
     }
 
-    // -- Add API key -------------------------------------------------------
+    // -- Add API key (multi-step: key → baseURL → authHeader → label) ------
     const openAddApiKey = () => {
-      const DialogPrompt = api.ui.DialogPrompt
-      api.ui.dialog.setSize('xlarge')
-      api.ui.dialog.replace(() => (
-        <DialogPrompt
-          title='Add API key account'
-          description={() => (
-            <text>
-              Paste your API key below. Optionally add a label after a space
-              (e.g. sk-ant-... my-label).
-            </text>
-          )}
-          placeholder='sk-ant-... my-label'
-          value=''
-          onConfirm={(value: string) => {
-            const trimmed = value.trim()
-            if (!trimmed) {
-              buildL1()
-              return
-            }
-            void apply('claude-account', `add-apikey ${trimmed}`).then((r) => {
-              api.ui.toast({ message: r.text })
-              updateAccounts(r)
-              buildL1()
-            })
-          }}
-          onCancel={() => openAddType()}
-        />
-      ))
+      const collected: {
+        apiKey?: string
+        baseURL?: string
+        authHeader?: string
+        label?: string
+      } = {}
+
+      const openApiKeyPrompt = () => {
+        const DialogPrompt = api.ui.DialogPrompt
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogPrompt
+            title='Add API key account \u2014 API key'
+            description={() => <text>Paste your API key (required).</text>}
+            placeholder='sk-ant-...'
+            value=''
+            onConfirm={(value: string) => {
+              const trimmed = value.trim()
+              if (!trimmed) {
+                openAddType()
+                return
+              }
+              collected.apiKey = trimmed
+              openBaseURLPrompt()
+            }}
+            onCancel={() => openAddType()}
+          />
+        ))
+      }
+
+      const openBaseURLPrompt = () => {
+        const DialogPrompt = api.ui.DialogPrompt
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogPrompt
+            title='Add API key account \u2014 base URL'
+            description={() => (
+              <text>
+                Anthropic-compatible API base URL. Default:
+                https://api.kie.ai/claude
+              </text>
+            )}
+            placeholder='https://api.kie.ai/claude'
+            value=''
+            onConfirm={(value: string) => {
+              const trimmed = value.trim()
+              collected.baseURL = trimmed || 'https://api.kie.ai/claude'
+              openAuthHeaderSelect()
+            }}
+            onCancel={() => openApiKeyPrompt()}
+          />
+        ))
+      }
+
+      const openAuthHeaderSelect = () => {
+        const DialogSelect = api.ui.DialogSelect<string>
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogSelect
+            title='Add API key account \u2014 auth header'
+            options={[
+              {
+                title: 'Authorization: Bearer (default)',
+                value: 'authorization-bearer',
+                description: 'Standard bearer token authentication',
+              },
+              {
+                title: 'X-API-Key',
+                value: 'x-api-key',
+                description: 'Custom header-based API key',
+              },
+            ]}
+            onSelect={(option) => {
+              collected.authHeader = option.value as
+                | 'authorization-bearer'
+                | 'x-api-key'
+              openLabelPrompt()
+            }}
+          />
+        ))
+      }
+
+      const openLabelPrompt = () => {
+        const DialogPrompt = api.ui.DialogPrompt
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogPrompt
+            title='Add API key account \u2014 label'
+            description={() => (
+              <text>A short name for this account (optional).</text>
+            )}
+            placeholder='e.g. Work API'
+            value=''
+            onConfirm={(value: string) => {
+              const trimmed = value.trim()
+              collected.label = trimmed || undefined
+              let args = `add-apikey ${collected.apiKey!}`
+              if (
+                collected.baseURL &&
+                collected.baseURL !== 'https://api.kie.ai/claude'
+              ) {
+                args += ` --base-url ${collected.baseURL}`
+              }
+              if (
+                collected.authHeader &&
+                collected.authHeader !== 'authorization-bearer'
+              ) {
+                args += ` --auth-header ${collected.authHeader}`
+              }
+              if (collected.label) {
+                args += ` --label ${collected.label}`
+              }
+              void apply('claude-account', args).then((r) => {
+                api.ui.toast({ message: r.text })
+                updateAccounts(r)
+                buildL1()
+              })
+            }}
+            onCancel={() => openAuthHeaderSelect()}
+          />
+        ))
+      }
+
+      openApiKeyPrompt()
     }
 
-    // -- Add OAuth ---------------------------------------------------------
+    // -- Add OAuth (OSC-52 copy + code entry) ------------------------------
     const openAddOAuthStart = () => {
       void apply('claude-account', 'add-oauth-start').then((r) => {
         const oauthUrl = r.knobs.oauthUrl as string | undefined
         updateAccounts(r)
         if (oauthUrl) {
-          openAddOAuthCode(oauthUrl)
+          openOAuthUrlScreen(oauthUrl)
         } else {
           api.ui.toast({ message: r.text })
           buildL1()
@@ -381,21 +477,61 @@ export function openCommandDialog(
       })
     }
 
-    const openAddOAuthCode = (oauthUrl: string) => {
+    const openOAuthUrlScreen = (oauthUrl: string) => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='OAuth sign-in'
+          options={[
+            {
+              title: 'Copy URL to clipboard',
+              value: 'copy',
+              description: oauthUrl,
+            },
+            {
+              title: 'Enter sign-in code',
+              value: 'code',
+              description:
+                'Open the URL in your browser, sign in, then paste the callback URL or code',
+            },
+            { title: 'Cancel', value: 'cancel' },
+          ]}
+          onSelect={(option) => {
+            if (option.value === 'cancel') {
+              buildL1()
+              return
+            }
+            if (option.value === 'copy') {
+              const ok = api.renderer.copyToClipboardOSC52(oauthUrl)
+              if (ok) {
+                api.ui.toast({ message: 'URL copied to clipboard' })
+              } else {
+                api.ui.toast({
+                  message:
+                    'Copy unavailable \u2014 select the URL text above to copy',
+                })
+              }
+              openOAuthUrlScreen(oauthUrl)
+              return
+            }
+            openOAuthCodePrompt()
+          }}
+        />
+      ))
+    }
+
+    const openOAuthCodePrompt = () => {
       const DialogPrompt = api.ui.DialogPrompt
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
         <DialogPrompt
-          title='OAuth sign-in'
+          title='OAuth sign-in \u2014 enter code'
           description={() => (
-            <box flexDirection='column' gap={1}>
-              <text>Open this URL in your browser and sign in to Claude:</text>
-              <text>{oauthUrl}</text>
-              <text>
-                After sign-in you will be redirected. Paste the full callback
-                URL or authorization code below.
-              </text>
-            </box>
+            <text>
+              After signing in you will be redirected. Paste the full callback
+              URL or authorization code below.
+            </text>
           )}
           placeholder='Paste callback URL or code here'
           value=''

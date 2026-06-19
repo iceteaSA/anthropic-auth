@@ -1010,13 +1010,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
       const label = action.label?.trim() || undefined
       const now = Date.now()
+      const resolvedBaseURL =
+        action.baseURL?.trim() || 'https://api.kie.ai/claude'
+      if (!isValidApiBaseURL(resolvedBaseURL)) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return {
+          text: 'Invalid base URL. Must be an http(s) URL without embedded credentials.',
+          accounts,
+        }
+      }
+      const resolvedAuthHeader = action.authHeader ?? 'authorization-bearer'
+
       const account: ApiKeyAccount = {
         id: label || randomUUID(),
         label: label || undefined,
         type: 'api' as const,
         apiKey: action.apiKey,
-        baseURL: 'https://api.kie.ai/claude',
-        authHeader: 'authorization-bearer' as const,
+        baseURL: resolvedBaseURL,
+        authHeader: resolvedAuthHeader,
         enabled: true,
         addedAt: now,
         lastUsed: now,
@@ -1079,15 +1095,52 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         }
       }
 
-      const result = await exchange(
-        action.code,
-        pending.verifier,
-        pending.redirectUri,
-        pending.state,
-      )
+      try {
+        const result = await exchange(
+          action.code,
+          pending.verifier,
+          pending.redirectUri,
+          pending.state,
+        )
 
-      if (result.type === 'failed') {
-        oauthPending.delete(key)
+        if (result.type === 'failed') {
+          const accounts = buildAccountList(
+            (await loadAccounts(accountStoragePath)) ?? {
+              version: 1,
+              accounts: [],
+            },
+          )
+          return {
+            text: 'OAuth authentication failed. Please check the code and try again.',
+            accounts,
+          }
+        }
+
+        const now = Date.now()
+        const account: OAuthAccount = {
+          id: randomUUID(),
+          type: 'oauth' as const,
+          access: result.access,
+          refresh: result.refresh,
+          expires: result.expires,
+          enabled: true,
+          addedAt: now,
+          lastUsed: now,
+        }
+        await addAccountPersistent(account, accountStoragePath)
+        logger.info('commands', 'account added', {
+          id: account.id,
+          label: account.label,
+          type: 'oauth',
+        })
+
+        const updatedStorage = await loadAccounts(accountStoragePath)
+        await refreshSidebarAfterMutation(updatedStorage)
+        const accounts = buildAccountList(
+          updatedStorage ?? { version: 1, accounts: [] },
+        )
+        return { text: `OAuth account added.`, accounts }
+      } catch {
         const accounts = buildAccountList(
           (await loadAccounts(accountStoragePath)) ?? {
             version: 1,
@@ -1095,36 +1148,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           },
         )
         return {
-          text: 'OAuth authentication failed. Please check the code and try again.',
+          text: 'OAuth exchange failed due to a network error. Please try again.',
           accounts,
         }
+      } finally {
+        oauthPending.delete(key)
       }
-
-      const now = Date.now()
-      const account: OAuthAccount = {
-        id: randomUUID(),
-        type: 'oauth' as const,
-        access: result.access,
-        refresh: result.refresh,
-        expires: result.expires,
-        enabled: true,
-        addedAt: now,
-        lastUsed: now,
-      }
-      await addAccountPersistent(account, accountStoragePath)
-      oauthPending.delete(key)
-      logger.info('commands', 'account added', {
-        id: account.id,
-        label: account.label,
-        type: 'oauth',
-      })
-
-      const updatedStorage = await loadAccounts(accountStoragePath)
-      await refreshSidebarAfterMutation(updatedStorage)
-      const accounts = buildAccountList(
-        updatedStorage ?? { version: 1, accounts: [] },
-      )
-      return { text: `OAuth account added.`, accounts }
     }
 
     // -- existing flows ----------------------------------------------------

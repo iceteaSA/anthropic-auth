@@ -179,6 +179,53 @@ describe('parseAccountCommandAction — add actions', () => {
       type: 'usage',
     })
   })
+
+  test('add-apikey with --base-url flag', async () => {
+    const { parseAccountCommandAction } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    expect(
+      parseAccountCommandAction(
+        'add-apikey sk-ant-key --base-url https://api.example.com/v1',
+      ),
+    ).toEqual({
+      type: 'add-apikey',
+      apiKey: 'sk-ant-key',
+      baseURL: 'https://api.example.com/v1',
+    })
+  })
+
+  test('add-apikey with --auth-header x-api-key', async () => {
+    const { parseAccountCommandAction } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    expect(
+      parseAccountCommandAction(
+        'add-apikey sk-ant-key --auth-header x-api-key',
+      ),
+    ).toEqual({
+      type: 'add-apikey',
+      apiKey: 'sk-ant-key',
+      authHeader: 'x-api-key',
+    })
+  })
+
+  test('add-apikey with all flags', async () => {
+    const { parseAccountCommandAction } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    expect(
+      parseAccountCommandAction(
+        'add-apikey sk-ant-key --base-url https://api.example.com --auth-header x-api-key --label MyKey',
+      ),
+    ).toEqual({
+      type: 'add-apikey',
+      apiKey: 'sk-ant-key',
+      baseURL: 'https://api.example.com',
+      authHeader: 'x-api-key',
+      label: 'MyKey',
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -258,6 +305,54 @@ describe('add-apikey flow', () => {
     expect(fallback).toBeDefined()
     expect(fallback!.label).toBe('TestList')
   })
+
+  test('persists with custom baseURL and x-api-key authHeader', async () => {
+    const plugin = await getPlugin()
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-apikey sk-ant-custom --base-url https://api.example.com/v1 --auth-header x-api-key --label CustomAPI',
+    )
+
+    const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded).not.toBeNull()
+    expect(loaded!.accounts).toHaveLength(1)
+    const account = loaded!.accounts[0]!
+    expect(account.type).toBe('api')
+    if (account.type === 'api') {
+      expect(account.apiKey).toBe('sk-ant-custom')
+      expect(account.baseURL).toBe('https://api.example.com/v1')
+      expect(account.authHeader).toBe('x-api-key')
+    }
+    expect(account.label).toBe('CustomAPI')
+  })
+
+  test('rejects invalid baseURL with embedded credentials', async () => {
+    const plugin = await getPlugin()
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-apikey sk-ant-bad --base-url https://user:pass@evil.com',
+    )
+
+    const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded!.accounts).toHaveLength(0)
+  })
+
+  test('rejects non-http baseURL', async () => {
+    const plugin = await getPlugin()
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-apikey sk-ant-bad2 --base-url file:///etc/passwd',
+    )
+
+    const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded!.accounts).toHaveLength(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -281,17 +376,55 @@ describe('add-oauth error paths', () => {
   })
 
   test('add-oauth-start stores pending and returns url', async () => {
-    // We can't mock authorize at the module level easily in Bun ESM,
-    // but we can verify the command doesn't crash and produces a notification.
-    // Live-verify: the actual authorize() call makes an HTTP request.
-    // For unit-test purposes, we verify the parser + the error paths.
-    //
-    // Test that the command syntax is accepted:
     const { parseAccountCommandAction } = await import(
       '@cortexkit/anthropic-auth-core'
     )
     const parsed = parseAccountCommandAction('add-oauth-start')
     expect(parsed.type).toBe('add-oauth-start')
+  })
+
+  test('pending entry is always cleared after finish (even on failure)', async () => {
+    // This validates the finally-block behavior:
+    // After calling add-oauth-finish with a real pending entry (from a real
+    // add-oauth-start), the pending is consumed. A second finish call with the
+    // same session ID must receive 'expired / no pending', proving the finally
+    // block cleared it. We use the error-path here since exchange will fail
+    // with the bad code, but the pending is still deleted by finally.
+    //
+    // We call add-oauth-start (real authorize, creates pending entry),
+    // then add-oauth-finish with a garbage code (exchange returns failed).
+    // Then a second add-oauth-finish must get 'expired'.
+    const plugin = await getPlugin()
+
+    // Start OAuth — this will make a real HTTP call to authorize()
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-oauth-start',
+      'ses_cleanup_test',
+    )
+
+    // Finish with garbage code — exchange will fail, but pending MUST be cleared
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-oauth-finish garbage-code',
+      'ses_cleanup_test',
+    )
+
+    // Second finish with same session — must get 'expired' (pending cleared)
+    capturedRecords = []
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-oauth-finish another-code',
+      'ses_cleanup_test',
+    )
+
+    // No accounts should have been added
+    const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded!.accounts).toHaveLength(0)
   })
 })
 

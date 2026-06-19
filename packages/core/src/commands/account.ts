@@ -9,7 +9,13 @@ export type AccountCommandAction =
   | { type: 'remove'; id: string }
   | { type: 'move-up'; id: string }
   | { type: 'move-down'; id: string }
-  | { type: 'add-apikey'; apiKey: string; label?: string }
+  | {
+      type: 'add-apikey'
+      apiKey: string
+      label?: string
+      baseURL?: string
+      authHeader?: 'authorization-bearer' | 'x-api-key'
+    }
   | { type: 'add-oauth-start' }
   | { type: 'add-oauth-finish'; code: string }
   | { type: 'usage' }
@@ -30,14 +36,54 @@ export function parseAccountCommandAction(
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
 
   if (action === 'add-apikey' && rest) {
-    const firstSpace = rest.indexOf(' ')
-    if (firstSpace === -1) {
-      return { type: 'add-apikey', apiKey: rest }
+    let remaining = rest
+    let baseURL: string | undefined
+    let authHeader: 'authorization-bearer' | 'x-api-key' | undefined
+
+    // Parse --base-url flag
+    const baseUrlMatch = remaining.match(/--base-url\s+(\S+)/)
+    if (baseUrlMatch) {
+      baseURL = baseUrlMatch[1]
+      remaining = remaining.replace(baseUrlMatch[0], '').trim()
     }
+
+    // Parse --auth-header flag
+    const authMatch = remaining.match(
+      /--auth-header\s+(authorization-bearer|x-api-key)/,
+    )
+    if (authMatch) {
+      authHeader = authMatch[1] as 'authorization-bearer' | 'x-api-key'
+      remaining = remaining.replace(authMatch[0], '').trim()
+    }
+
+    // Parse --label flag
+    let label: string | undefined
+    const labelMatch = remaining.match(/--label\s+(.+)/)
+    if (labelMatch) {
+      label = labelMatch[1]?.trim() || undefined
+      remaining = remaining.replace(labelMatch[0], '').trim()
+    }
+
+    // First remaining token is the API key; rest (if any) is label
+    const firstSpace = remaining.indexOf(' ')
+    if (firstSpace === -1) {
+      if (!remaining) return { type: 'usage' }
+      return {
+        type: 'add-apikey',
+        apiKey: remaining,
+        baseURL,
+        authHeader,
+        label,
+      }
+    }
+    const apiKey = remaining.slice(0, firstSpace)
+    const tail = remaining.slice(firstSpace + 1).trim()
     return {
       type: 'add-apikey',
-      apiKey: rest.slice(0, firstSpace),
-      label: rest.slice(firstSpace + 1).trim() || undefined,
+      apiKey,
+      label: label ?? (tail || undefined),
+      baseURL,
+      authHeader,
     }
   }
 
