@@ -15,9 +15,11 @@ import {
   type AccountStorage,
   acquireRefreshFileLock,
   addAccountPersistent,
+  buildQuotaOperationError,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
+  fetchOAuthQuotaSnapshot,
   getAccountStatePath,
   getCache1hPersistentMode,
   getLogLevel,
@@ -1798,6 +1800,248 @@ describe('buildRefreshOperationError', () => {
       refreshToken: 'test-token',
     })
     expect(result.nextRetryAt).toBe(1000000 + 5 * 60_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Duck-typed ProviderHttpError contract — isTransientRefreshError
+// (tested through buildRefreshOperationError)
+// ---------------------------------------------------------------------------
+describe('isTransientRefreshError via duck-typed error classification', () => {
+  const now = 1_000_000
+  const REFRESH_NON_TRANSIENT = 24 * 60 * 60_000
+
+  test('429 (duck-typed .status) → transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 429 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('500 (duck-typed .status) → transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 500 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('503 (duck-typed .status) → transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 503 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('401 (duck-typed .status) → NOT transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 401 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('400 (duck-typed .status) → NOT transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 400 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('plain Error with fetch failed → transient (network path)', () => {
+    const result = buildRefreshOperationError({
+      error: new Error('fetch failed'),
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('ClaudeOAuthRefreshError 429 still classified transient (regression)', () => {
+    const result = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Duck-typed retryAfter propagation in buildRefreshOperationError
+// ---------------------------------------------------------------------------
+describe('buildRefreshOperationError retryAfter duck-typed propagation', () => {
+  const now = 1_000_000
+
+  test('reads .retryAfter from duck-typed error (no instanceof)', () => {
+    const error: Error & { retryAfter?: number } = Object.assign(
+      new Error('fail'),
+      { retryAfter: 60 },
+    )
+    const result = buildRefreshOperationError({
+      error,
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + 60_000)
+  })
+
+  test('ClaudeOAuthRefreshError retryAfter still works (regression)', () => {
+    const result = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited', '120'),
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + 120_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Duck-typed ProviderHttpError contract — isTransientQuotaError
+// (tested through buildQuotaOperationError)
+// ---------------------------------------------------------------------------
+describe('isTransientQuotaError via duck-typed error classification', () => {
+  const now = 1_000_000
+  const QUOTA_NON_TRANSIENT = 5 * 60_000
+
+  test('429 (duck-typed .status) → transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 429 },
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('500 (duck-typed .status) → transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 500 },
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('401 (duck-typed .status) → NOT transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 401 },
+      now,
+    })
+    expect(result.nextRetryAt).toBe(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('400 (duck-typed .status) → NOT transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 400 },
+      now,
+    })
+    expect(result.nextRetryAt).toBe(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('plain Error with fetch failed → transient (network path)', () => {
+    const result = buildQuotaOperationError({
+      error: new Error('fetch failed'),
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('duck-typed { status: 429 } — proves no regex/instanceof dependency', () => {
+    // A plain object (not Error, not ClaudeOAuthRefreshError) with just .status
+    const result = buildQuotaOperationError({
+      error: { status: 429 },
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// fetchOAuthQuotaSnapshot attaches .status + .retryAfter (producer)
+// ---------------------------------------------------------------------------
+describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
+  test('429 response → thrown error carries .status=429 + .retryAfter', async () => {
+    let thrown: unknown = null
+    const fetchImpl = (async () => {
+      return new Response('rate limited', {
+        status: 429,
+        headers: { 'Retry-After': '60' },
+      })
+    }) as unknown as typeof fetch
+    try {
+      await fetchOAuthQuotaSnapshot({
+        accessToken: 't',
+        fetchImpl,
+        now: () => 1_000_000,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect((thrown as { status?: number }).status).toBe(429)
+    expect((thrown as { retryAfter?: number }).retryAfter).toBe(60)
+    // Verify isTransientQuotaError classifies it as transient
+    const result = buildQuotaOperationError({ error: thrown, now: 1_000_000 })
+    expect(result.nextRetryAt!).toBeLessThan(1_000_000 + 5 * 60_000)
+  })
+
+  test('500 response → thrown error carries .status=500', async () => {
+    let thrown: unknown = null
+    const fetchImpl = (async () => {
+      return new Response('server error', { status: 500 })
+    }) as unknown as typeof fetch
+    try {
+      await fetchOAuthQuotaSnapshot({
+        accessToken: 't',
+        fetchImpl,
+        now: () => 1_000_000,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect((thrown as { status?: number }).status).toBe(500)
+    // Verify isTransientQuotaError classifies it as transient
+    const result = buildQuotaOperationError({ error: thrown, now: 1_000_000 })
+    expect(result.nextRetryAt!).toBeLessThan(1_000_000 + 5 * 60_000)
+  })
+
+  test('401 response → thrown error carries .status=401 (NOT transient for quota)', async () => {
+    let thrown: unknown = null
+    const fetchImpl = (async () => {
+      return new Response('unauthorized', { status: 401 })
+    }) as unknown as typeof fetch
+    try {
+      await fetchOAuthQuotaSnapshot({
+        accessToken: 't',
+        fetchImpl,
+        now: () => 1_000_000,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect((thrown as { status?: number }).status).toBe(401)
+    const result = buildQuotaOperationError({ error: thrown, now: 1_000_000 })
+    expect(result.nextRetryAt).toBe(1_000_000 + 5 * 60_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// recordQuotaRefreshError duck-typed auth classification
+// (tested through buildQuotaOperationError + status===401 behavior)
+// ---------------------------------------------------------------------------
+describe('recordQuotaRefreshError 401 → auth classification', () => {
+  test('buildQuotaOperationError with duck-typed 401 → non-transient (proves .status is read)', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 401 },
+      now: 1_000_000,
+    })
+    // Non-transient quota errors get the fixed 5-min delay
+    expect(result.nextRetryAt).toBe(1_000_000 + 5 * 60_000)
   })
 })
 

@@ -14,7 +14,7 @@ type CallbackParams = {
   state: string
 }
 
-function parseRetryAfterHeader(
+export function parseRetryAfterHeader(
   value: string | undefined | null,
 ): number | undefined {
   if (!value) return undefined

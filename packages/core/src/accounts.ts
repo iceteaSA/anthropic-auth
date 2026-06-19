@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from './auth.ts'
+import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
@@ -1213,8 +1213,9 @@ export function hashRefreshToken(refreshToken: string) {
 }
 
 function isTransientRefreshError(error: unknown) {
-  if (error instanceof ClaudeOAuthRefreshError) {
-    return error.status === 429 || error.status >= 500
+  const status = (error as { status?: unknown }).status
+  if (typeof status === 'number' && Number.isFinite(status)) {
+    return status === 429 || status >= 500
   }
   if (!(error instanceof Error)) return false
   return (
@@ -1239,12 +1240,11 @@ export function buildRefreshOperationError(input: {
       ? (input.previous.retryCount ?? 0)
       : 0
   const retryCount = previousRetryCount + 1
+  const retryAfterFromError = (input.error as { retryAfter?: unknown })
+    .retryAfter
   let delay: number
-  if (
-    input.error instanceof ClaudeOAuthRefreshError &&
-    input.error.retryAfter
-  ) {
-    delay = input.error.retryAfter * 1000
+  if (typeof retryAfterFromError === 'number' && retryAfterFromError > 0) {
+    delay = retryAfterFromError * 1000
   } else if (isTransientRefreshError(input.error)) {
     delay = Math.min(
       MAX_REFRESH_RETRY_DELAY_MS,
@@ -1645,9 +1645,12 @@ function cachedQuotaSnapshotStillRelevant(
 }
 
 function isTransientQuotaError(error: unknown) {
-  const message = formatErrorMessage(error)
-  if (/Claude quota check failed: (429|5\d\d)\b/.test(message)) return true
+  const status = (error as { status?: unknown }).status
+  if (typeof status === 'number' && Number.isFinite(status)) {
+    return status === 429 || status >= 500
+  }
   if (!(error instanceof Error)) return false
+  const message = error.message
   const code = (error as Error & { code?: unknown }).code
   return (
     message.includes('fetch failed') ||
@@ -1712,7 +1715,14 @@ export async function fetchOAuthQuotaSnapshot(input: {
 
   if (!response.ok) {
     const body = await response.text().catch(() => '')
-    throw new Error(`Claude quota check failed: ${response.status} — ${body}`)
+    const error = Object.assign(
+      new Error(`Claude quota check failed: ${response.status} — ${body}`),
+      {
+        status: response.status,
+        retryAfter: parseRetryAfterHeader(response.headers.get('Retry-After')),
+      },
+    )
+    throw error
   }
 
   const checkedAt = input.now?.() ?? Date.now()
@@ -1812,7 +1822,7 @@ function recordQuotaRefreshError(
     now,
     previous: account.lastQuotaRefreshError,
   })
-  if (error instanceof ClaudeOAuthRefreshError) {
+  if ((error as { status?: unknown }).status === 401) {
     recordRefreshError(account, error, now)
   }
 }
