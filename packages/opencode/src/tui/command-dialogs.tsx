@@ -255,7 +255,14 @@ export function openCommandDialog(
             const account = accounts.find((a) => a.id === option.value)
             if (!account) return
             if (account.role === 'main') {
-              openManage(account, true)
+              const pct =
+                account.quotaPercent != null
+                  ? ` ${Math.round(account.quotaPercent)}%`
+                  : ' \u2013%'
+              showText(
+                api,
+                `${account.label}\nRole: main (read-only)\nQuota:${pct}`,
+              )
               return
             }
             openManage(account, false)
@@ -360,6 +367,30 @@ export function openCommandDialog(
     }
 
     buildL1()
+    return
+  }
+
+  if (payload.command === 'claude-logging') {
+    const current = (payload.knobs.level as string) ?? 'info'
+    const levels = ['error', 'warn', 'info', 'debug', 'trace']
+    const DialogSelect = api.ui.DialogSelect<string>
+    api.ui.dialog.setSize('xlarge')
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title='Claude log level'
+        current={current}
+        options={levels.map((level) => ({
+          title: level === current ? `\u2022 ${level}` : level,
+          value: level,
+        }))}
+        onSelect={(option) => {
+          void apply('claude-logging', String(option.value)).then((r) => {
+            api.ui.toast({ message: r.text })
+            api.ui.dialog.clear()
+          })
+        }}
+      />
+    ))
     return
   }
 

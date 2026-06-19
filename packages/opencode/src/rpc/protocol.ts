@@ -7,6 +7,7 @@ export type CommandModalName =
   | 'claude-fast'
   | 'claude-routing'
   | 'claude-killswitch'
+  | 'claude-logging'
 
 export interface OpenDialogPayload {
   command: CommandModalName

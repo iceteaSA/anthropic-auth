@@ -242,4 +242,19 @@ export function registerCommands(pi: ExtensionAPI) {
       notify(ctx, result.text)
     },
   })
+
+  pi.registerCommand('claude-logging', {
+    description: 'Show or set the plugin log level',
+    handler: async (args, ctx) => {
+      const path = getPiAccountStoragePath()
+      const storage = await loadAccounts(path)
+      // Mutations not wired for Pi — display-only like claude-account.
+      // The persisted level still applies on next loader boot.
+      const { executeLoggingCommand, getPersistedLogLevel } = await import(
+        '@cortexkit/anthropic-auth-core'
+      )
+      const level = getPersistedLogLevel(storage) ?? 'info'
+      notify(ctx, executeLoggingCommand({ argumentsText: args ?? '', level }))
+    },
+  })
 }

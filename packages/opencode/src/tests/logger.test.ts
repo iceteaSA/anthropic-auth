@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  buildLoggingStatusSummary,
+  executeLoggingCommand,
   formatLogLine,
   getLogLevel,
   isSecretKey,
   type LogLevel,
+  parseLoggingCommandAction,
   parseLogLevel,
   redactPayload,
   setLogLevel,
@@ -424,5 +427,100 @@ describe('formatLogLine', () => {
     expect(line).toContain('[unserializable]')
     expect(line).toContain('msg')
     expect(line).toContain('"pid"')
+  })
+})
+
+// -- parseLoggingCommandAction ----------------------------------------------
+
+describe('parseLoggingCommandAction', () => {
+  test('empty args returns status', () => {
+    expect(parseLoggingCommandAction('')).toEqual({ type: 'status' })
+    expect(parseLoggingCommandAction('  ')).toEqual({ type: 'status' })
+  })
+
+  test('valid levels', () => {
+    expect(parseLoggingCommandAction('error')).toEqual({
+      type: 'level',
+      level: 'error',
+    })
+    expect(parseLoggingCommandAction('warn')).toEqual({
+      type: 'level',
+      level: 'warn',
+    })
+    expect(parseLoggingCommandAction('info')).toEqual({
+      type: 'level',
+      level: 'info',
+    })
+    expect(parseLoggingCommandAction('debug')).toEqual({
+      type: 'level',
+      level: 'debug',
+    })
+    expect(parseLoggingCommandAction('trace')).toEqual({
+      type: 'level',
+      level: 'trace',
+    })
+  })
+
+  test('case insensitive', () => {
+    expect(parseLoggingCommandAction('ERROR')).toEqual({
+      type: 'level',
+      level: 'error',
+    })
+    expect(parseLoggingCommandAction('Debug')).toEqual({
+      type: 'level',
+      level: 'debug',
+    })
+  })
+
+  test('extra tokens return usage', () => {
+    expect(parseLoggingCommandAction('error now')).toEqual({ type: 'usage' })
+    expect(parseLoggingCommandAction('info please')).toEqual({ type: 'usage' })
+  })
+
+  test('unknown level returns usage', () => {
+    expect(parseLoggingCommandAction('verbose')).toEqual({ type: 'usage' })
+    expect(parseLoggingCommandAction('silent')).toEqual({ type: 'usage' })
+  })
+})
+
+// -- executeLoggingCommand --------------------------------------------------
+
+describe('executeLoggingCommand', () => {
+  test('status shows current level', () => {
+    const text = executeLoggingCommand({ argumentsText: '', level: 'debug' })
+    expect(text).toContain('Claude Log Level')
+    expect(text).toContain('debug')
+  })
+
+  test('set level returns updated text', () => {
+    const text = executeLoggingCommand({
+      argumentsText: 'trace',
+      level: 'info',
+    })
+    expect(text).toContain('Claude Log Level Updated')
+    expect(text).toContain('trace')
+  })
+
+  test('usage returns usage text', () => {
+    const text = executeLoggingCommand({
+      argumentsText: 'verbose',
+      level: 'info',
+    })
+    expect(text).toContain('Usage')
+  })
+})
+
+// -- buildLoggingStatusSummary ----------------------------------------------
+
+describe('buildLoggingStatusSummary', () => {
+  test('has status title and current level', () => {
+    const text = buildLoggingStatusSummary({ level: 'warn' })
+    expect(text).toContain('Claude Log Level')
+    expect(text).toContain('warn')
+  })
+
+  test('defaults to info', () => {
+    const text = buildLoggingStatusSummary()
+    expect(text).toContain('info')
   })
 })

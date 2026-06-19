@@ -312,6 +312,49 @@ describe('setting-change INFO logs', () => {
     expect(rec!.payload).toEqual({ subagents: true })
   })
 
+  // -- logging --------------------------------------------------------------
+
+  test('logging level change emits info log and persists', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-logging', 'debug')
+    expect(
+      capturedRecords.filter((r) => r.channel === 'commands'),
+    ).toHaveLength(1)
+    const rec = findCommandsLog('log level changed')
+    expect(rec).toBeDefined()
+    expect(rec!.payload).toEqual({ level: 'debug' })
+    const raw = await readConfigFile()
+    expect(raw.logging?.level).toBe('debug')
+  })
+
+  test('logging status emits no setting-change info log', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-logging', '')
+    expect(
+      capturedRecords.filter((r) => r.channel === 'commands'),
+    ).toHaveLength(0)
+  })
+
+  test('logging trace level persists', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-logging', 'trace')
+    const raw = await readConfigFile()
+    expect(raw.logging?.level).toBe('trace')
+  })
+
+  test('logging getLogLevel reflects persisted level after command', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-logging', 'warn')
+    const { getLogLevel: _getLogLevel } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    expect(_getLogLevel()).toBe('warn')
+  })
+
   // -- payload hygiene -----------------------------------------------------
 
   test('INFO log payload does not contain tokens or bearer strings', async () => {

@@ -19,6 +19,7 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
+  CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   ClaudeOAuthRefreshError,
@@ -30,6 +31,7 @@ import {
   executeDumpCommand,
   executeFastModeCommand,
   executeKillswitchCommand,
+  executeLoggingCommand,
   executeRoutingCommand,
   FallbackAccountManager,
   formatQuotaBackoffMessage,
@@ -73,6 +75,7 @@ import {
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseLoggingCommandAction,
   parseRoutingCommandAction,
   type QuotaAccountSummary,
   QuotaManager,
@@ -97,6 +100,7 @@ import {
   setFastModePersistentEnabled,
   setKillswitchPersistent,
   setLogLevel,
+  setLogLevelPersistent,
   setRoutingMode,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
@@ -903,6 +907,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
+  async function executePersistentLoggingCommand(argumentsText: string) {
+    const action = parseLoggingCommandAction(argumentsText)
+    if (action.type === 'level') {
+      await setLogLevelPersistent(action.level)
+      logger.info('commands', 'log level changed', { level: action.level })
+      return executeLoggingCommand({ argumentsText, level: action.level })
+    }
+
+    const storage = await loadAccounts(accountStoragePath)
+    const level = getPersistedLogLevel(storage) ?? 'info'
+    return executeLoggingCommand({ argumentsText, level })
+  }
+
   async function executePersistentAccountCommand(argumentsText: string) {
     const storage = await loadAccounts(accountStoragePath)
     const result = executeAccountCommand({
@@ -978,6 +995,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-logging') {
+      const text = await executePersistentLoggingCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      return {
+        command,
+        text,
+        knobs: { level: getPersistedLogLevel(storage) ?? 'info' },
+      }
+    }
     if (command === 'claude-account') {
       const result = await executePersistentAccountCommand(args)
       return {
@@ -1199,6 +1225,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           description:
             'Show or toggle Anthropic fast mode for supported Opus models.',
         },
+        [CLAUDE_LOGGING_COMMAND_NAME]: {
+          template: CLAUDE_LOGGING_COMMAND_NAME,
+          description:
+            'Show or set the plugin log level (error, warn, info, debug, trace).',
+        },
         [CLAUDE_ROUTING_COMMAND_NAME]: {
           template: CLAUDE_ROUTING_COMMAND_NAME,
           description:
@@ -1253,6 +1284,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         'claude-fast',
         'claude-routing',
         'claude-killswitch',
+        'claude-logging',
       ]
       if (!modalCommands.includes(input.command as CommandModalName)) return
       const command = input.command as CommandModalName
