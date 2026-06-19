@@ -175,7 +175,7 @@ export function resolveActiveAccount(state: SidebarState): {
     // accounts out of state.fallbacks, so in normal operation every entry is
     // enabled. Kept so this pure helper stays correct for any caller and is
     // exercised directly by the unit tests.
-    const fallback = state.fallbacks.find(
+    const fallback = state.fallbacks?.find(
       (account) => account.enabled && account.id === activeId,
     )
     if (fallback) {
@@ -186,7 +186,7 @@ export function resolveActiveAccount(state: SidebarState): {
       }
     }
   }
-  return { id: 'main', name: 'main', quota: state.main.quota }
+  return { id: 'main', name: 'main', quota: state.main?.quota ?? null }
 }
 
 export function getCollapsedQuotaSummary(quota: AccountQuota | null): {

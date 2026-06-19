@@ -86,6 +86,41 @@ describe('resolveActiveAccount', () => {
     expect(active.id).toBe('main')
     expect(active.quota).toBeNull()
   })
+
+  test('does not throw on partial main with undefined quota', () => {
+    const state = { main: {} } as unknown as SidebarState
+    expect(() => resolveActiveAccount(state)).not.toThrow()
+    const active = resolveActiveAccount(state)
+    expect(active.id).toBe('main')
+    expect(active.quota).toBeNull()
+  })
+
+  test('does not throw when fallbacks is undefined', () => {
+    const state = {
+      main: { quota: null },
+      fallbacks: undefined,
+    } as unknown as SidebarState
+    expect(() => resolveActiveAccount(state)).not.toThrow()
+    const active = resolveActiveAccount(state)
+    expect(active.id).toBe('main')
+  })
+
+  test('does not throw on empty object', () => {
+    const state = {} as unknown as SidebarState
+    expect(() => resolveActiveAccount(state)).not.toThrow()
+    const active = resolveActiveAccount(state)
+    expect(active.id).toBe('main')
+    expect(active.name).toBe('main')
+    expect(active.quota).toBeNull()
+  })
+
+  test('does not throw when main is null', () => {
+    const state = { main: null, fallbacks: [] } as unknown as SidebarState
+    expect(() => resolveActiveAccount(state)).not.toThrow()
+    const active = resolveActiveAccount(state)
+    expect(active.id).toBe('main')
+    expect(active.quota).toBeNull()
+  })
 })
 
 describe('getCollapsedQuotaSummary', () => {
