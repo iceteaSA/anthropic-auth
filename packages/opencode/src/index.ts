@@ -403,7 +403,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
   const accountStoragePath = getAccountStoragePath()
-  const initialStorage = await loadAccounts(accountStoragePath)
+  let initialStorage: AccountStorage | null
+  try {
+    initialStorage = await loadAccounts(accountStoragePath)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Failed to load account store: ${message}`, {
+      cause: error instanceof Error ? error : undefined,
+    })
+  }
   const quotaManager = new QuotaManager({
     storage: initialStorage,
     onMainQuotaFetched: async (

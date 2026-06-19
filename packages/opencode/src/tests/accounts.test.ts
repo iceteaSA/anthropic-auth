@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
@@ -20,9 +21,13 @@ import {
   getCache1hPersistentMode,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  type KillswitchThresholds,
+  killswitchPassesPolicy,
   loadAccounts,
   type OAuthAccount,
+  type OAuthQuotaSnapshot,
   QuotaManager,
+  quotaSnapshotPassesPolicy,
   saveAccountState,
   saveAccounts,
   setCache1hPersistentEnabled,
@@ -357,9 +362,9 @@ describe('account storage', () => {
     expect(account.quota?.five_hour?.usedPercent).toBe(20)
   })
 
-  test('malformed sidecar file is ignored', async () => {
+  test('malformed config file throws a clear error', async () => {
     await writeFile(accountPath, '{nope', 'utf8')
-    await expect(loadAccounts()).resolves.toBeNull()
+    await expect(loadAccounts()).rejects.toThrow('corrupt or unreadable')
   })
 
   test('refresh file lock allows only one holder', async () => {
@@ -1619,5 +1624,198 @@ describe('buildRefreshOperationError', () => {
       refreshToken: 'test-token',
     })
     expect(result.nextRetryAt).toBe(1000000 + 5 * 60_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix #2: writeJsonAtomic removes orphaned temp file on rename failure
+// ---------------------------------------------------------------------------
+describe('writeJsonAtomic temp cleanup', () => {
+  test('removes temp file on rename failure', async () => {
+    const renameMock = mock(async () => {
+      throw new Error('forced rename failure')
+    })
+    mock.module('node:fs/promises', () => {
+      const actual = require('node:fs/promises')
+      return { ...actual, rename: renameMock }
+    })
+
+    try {
+      const storage = baseStorage()
+      const err = await saveAccounts(storage, accountPath).catch(
+        (e: unknown) => e,
+      )
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toContain('forced rename failure')
+
+      const files = await readdir(tempDir)
+      const tmpFiles = files.filter((f) => f.endsWith('.tmp'))
+      expect(tmpFiles).toEqual([])
+    } finally {
+      // Restore original module — Bun mock.restore() does not undo mock.module
+      mock.module('node:fs/promises', () => require('node:fs/promises'))
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix #3: readJsonIfPresent throws on corrupt store instead of swallowing
+// ---------------------------------------------------------------------------
+describe('readJsonIfPresent corrupt-store handling', () => {
+  test('throws a clear error on malformed JSON', async () => {
+    await writeFile(accountPath, '{broken json', 'utf8')
+    const err = await loadAccounts(accountPath).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toContain('corrupt or unreadable')
+    expect((err as Error).message).toContain(accountPath)
+  })
+
+  test('throws on unreadable file (EACCES-like, not ENOENT)', async () => {
+    // Save valid accounts first so both config and state files exist
+    const validStorage = baseStorage()
+    await saveAccounts(validStorage, accountPath)
+    // Replace the state file with a directory — readFile on a directory
+    // returns EISDIR, which is not ENOENT, so readJsonIfPresent must throw
+    const statePath = getAccountStatePath(accountPath)
+    await rm(statePath)
+    await mkdir(statePath)
+    const err = await loadAccounts(accountPath).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toContain('corrupt or unreadable')
+  })
+
+  test('returns not-present for genuinely missing file (ENOENT)', async () => {
+    // accountPath doesn't exist yet
+    const result = await loadAccounts(accountPath)
+    expect(result).toBeNull()
+  })
+
+  test('loads valid JSON normally', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'test-account',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: Date.now() + 3600_000,
+    })
+    await saveAccounts(storage, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded).not.toBeNull()
+    expect(loaded!.accounts[0]?.id).toBe('test-account')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix #10: NaN quota utilization → unknown (fail-closed) instead of 0%→bypass
+// ---------------------------------------------------------------------------
+describe('NaN quota utilization guards', () => {
+  test('NaN remainingPercent blocks killswitch (fail-closed)', () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10 },
+    }
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: Number.NaN,
+        remainingPercent: Number.NaN,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 50,
+        remainingPercent: 50,
+        checkedAt: Date.now(),
+      },
+    }
+    // Pre-fix: NaN < 5 → false, NaN < 10 → false, so passes (returns true — bypass)
+    // Post-fix: the guard in mapUsageWindow prevents NaN from entering the system;
+    // but if NaN somehow arrives, killswitchPassesPolicy blocks because
+    // failClosedOnUnknownQuota defaults to true and the bogus data indicates
+    // an unknown/corrupt state. We test that NaN values in remainingPercent
+    // cause the policy to block.
+    expect(killswitchPassesPolicy(quota, storage)).toBe(false)
+  })
+
+  test('NaN remainingPercent blocks quota policy (fail-closed)', () => {
+    const storage = baseStorage()
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: Number.NaN,
+        remainingPercent: Number.NaN,
+        checkedAt: Date.now(),
+      },
+    }
+    expect(quotaSnapshotPassesPolicy(quota, storage)).toBe(false)
+  })
+
+  test('NaN threshold falls back to default', async () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: Number.NaN } as unknown as KillswitchThresholds,
+    }
+    // Save and reload so the threshold flows through normalizeKillswitchThresholds
+    await saveAccounts(storage, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    // The NaN should be normalized away — loadAccounts normalizes, so the
+    // loaded storage should have the default thresholds
+    // Test that killswitch works with default thresholds (not NaN)
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+    }
+    // remainingPercent 4 < DEFAULT_KILLSWITCH_THRESHOLDS.five_hour (5) → blocked
+    expect(killswitchPassesPolicy(quota, loaded)).toBe(false)
+  })
+
+  test('finite threshold is respected', async () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 3, seven_day: 5 },
+    }
+    await saveAccounts(storage, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    const quotaBoth: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 80,
+        remainingPercent: 20,
+        checkedAt: Date.now(),
+      },
+    }
+    // remainingPercent 4 >= threshold 3 (pass), remainingPercent 20 >= 5 (pass)
+    expect(killswitchPassesPolicy(quotaBoth, loaded)).toBe(true)
+  })
+
+  test('mapUsageWindow returns undefined for NaN utilization', () => {
+    // mapUsageWindow is internal, but we test the observable behaviour:
+    // a quota snapshot fetched with NaN utilization would produce an
+    // undefined window, which killswitchPassesPolicy treats as unknown
+    // (fail-closed blocking when failClosedOnUnknownQuota is true).
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10 },
+    }
+    // Simulate the result of mapUsageWindow returning undefined for both windows
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: undefined,
+      seven_day: undefined,
+    }
+    // Both windows unknown → failClosedOnUnknownQuota=true → blocked
+    expect(killswitchPassesPolicy(quota, storage)).toBe(false)
+
+    // When failClosedOnUnknownQuota=false, unknown windows pass
+    storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
+    expect(killswitchPassesPolicy(quota, storage)).toBe(true)
   })
 })

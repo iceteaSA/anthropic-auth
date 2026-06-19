@@ -435,7 +435,10 @@ async function readJsonIfPresent(path: string): Promise<{
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { exists: false, value: null }
     }
-    return { exists: false, value: null }
+    const cause = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `account store at ${path} is corrupt or unreadable (${cause}) — fix or remove it`,
+    )
   }
 }
 
@@ -657,7 +660,12 @@ async function writeJsonAtomic(path: string, value: unknown) {
     encoding: 'utf8',
     mode: 0o600,
   })
-  await rename(tempPath, path)
+  try {
+    await rename(tempPath, path)
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {})
+    throw error
+  }
 }
 
 export async function saveAccounts(
@@ -1252,6 +1260,9 @@ export function quotaSnapshotPassesPolicy(
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
     if (!window) return !failClosedOnUnknownQuota(storage)
+    if (!Number.isFinite(window.remainingPercent)) {
+      return !failClosedOnUnknownQuota(storage)
+    }
     if (window.remainingPercent < thresholds[key]) return false
   }
   return true
@@ -1270,15 +1281,17 @@ export const DEFAULT_KILLSWITCH_THRESHOLDS: Record<QuotaWindowName, number> = {
 function normalizeKillswitchThresholds(
   thresholds: KillswitchThresholds | undefined,
 ): Record<QuotaWindowName, number> {
+  const fiveHour = thresholds?.five_hour ?? thresholds?.['5h']
+  const sevenDay = thresholds?.seven_day ?? thresholds?.['1w']
   return {
     five_hour:
-      thresholds?.five_hour ??
-      thresholds?.['5h'] ??
-      DEFAULT_KILLSWITCH_THRESHOLDS.five_hour,
+      typeof fiveHour === 'number' && Number.isFinite(fiveHour)
+        ? fiveHour
+        : DEFAULT_KILLSWITCH_THRESHOLDS.five_hour,
     seven_day:
-      thresholds?.seven_day ??
-      thresholds?.['1w'] ??
-      DEFAULT_KILLSWITCH_THRESHOLDS.seven_day,
+      typeof sevenDay === 'number' && Number.isFinite(sevenDay)
+        ? sevenDay
+        : DEFAULT_KILLSWITCH_THRESHOLDS.seven_day,
   }
 }
 
@@ -1315,6 +1328,10 @@ export function killswitchPassesPolicy(
     // only one window, and a present window below its threshold must still
     // block even if the other window is missing.
     if (!window) {
+      sawUnknownWindow = true
+      continue
+    }
+    if (!Number.isFinite(window.remainingPercent)) {
       sawUnknownWindow = true
       continue
     }
@@ -1484,6 +1501,7 @@ function mapUsageWindow(
   checkedAt: number,
 ): AccountQuotaWindow | undefined {
   if (typeof window?.utilization !== 'number') return undefined
+  if (!Number.isFinite(window.utilization)) return undefined
   const usedPercent = clampPercent(window.utilization)
   return {
     usedPercent,
