@@ -14,11 +14,14 @@ import { join } from 'node:path'
 import {
   type AccountStorage,
   acquireRefreshFileLock,
+  addAccountPersistent,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
   getAccountStatePath,
   getCache1hPersistentMode,
+  getLogLevel,
+  getPersistedLogLevel,
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
@@ -29,15 +32,24 @@ import {
   type OAuthQuotaSnapshot,
   QuotaManager,
   quotaSnapshotPassesPolicy,
+  removeAccount,
+  removeAccountPersistent,
+  reorderAccounts,
+  reorderAccountsPersistent,
   saveAccountState,
   saveAccounts,
+  setAccountEnabled,
+  setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
   setFastModePersistentEnabled,
+  setLogLevel,
+  setLogLevelPersistent,
   shouldFallbackStatus,
+  upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
 
 let tempDir: string
@@ -2070,5 +2082,250 @@ describe('saveAccountState lost-update race (#9)', () => {
     expect(final?.quota?.mainQuotaCheckedAt).toBe(200 + ROUNDS - 1)
     expect(final?.refresh?.mainRefreshLeaseId).toBe(`lease-${ROUNDS - 1}`)
     expect(final?.refresh?.mainRefreshLeaseUntil).toBe(400 + ROUNDS - 1)
+  })
+})
+
+// -- Account-mutation helpers --------------------------------------------------
+
+describe('upsertAccount', () => {
+  test('inserts a new account when no id or label match exists', () => {
+    const storage = baseStorage()
+    const account: OAuthAccount = {
+      id: 'new-id',
+      type: 'oauth',
+      refresh: 'refresh-token',
+      label: 'new-label',
+    }
+    upsertAccount(storage, account)
+    expect(storage.accounts).toHaveLength(1)
+    expect(storage.accounts[0]!.id).toBe('new-id')
+  })
+
+  test('updates by id match, preserving addedAt', () => {
+    const storage = baseStorage()
+    const original: OAuthAccount = {
+      id: 'existing',
+      type: 'oauth',
+      refresh: 'original-refresh',
+      access: 'original-access',
+      addedAt: 100,
+    }
+    storage.accounts.push(original)
+    upsertAccount(storage, {
+      id: 'existing',
+      type: 'oauth',
+      refresh: 'new-refresh',
+      access: 'new-access',
+    })
+    expect(storage.accounts).toHaveLength(1)
+    const updated = storage.accounts[0] as OAuthAccount
+    expect(updated.access).toBe('new-access')
+    expect(updated.refresh).toBe('new-refresh')
+    expect(updated.addedAt).toBe(100)
+  })
+
+  test('updates by label match', () => {
+    const storage = baseStorage()
+    const original: OAuthAccount = {
+      id: 'id-a',
+      type: 'oauth',
+      refresh: 'refresh-a',
+      label: 'shared-label',
+    }
+    storage.accounts.push(original)
+    upsertAccount(storage, {
+      id: 'id-b',
+      type: 'oauth',
+      refresh: 'refresh-b',
+      label: 'shared-label',
+    })
+    expect(storage.accounts).toHaveLength(1)
+    expect(storage.accounts[0]!.id).toBe('id-b') // overwritten by incoming account
+    expect((storage.accounts[0] as OAuthAccount).refresh).toBe('refresh-b') // updated
+  })
+
+  test('merges oauth-specific fields on update', () => {
+    const storage = baseStorage()
+    const original: OAuthAccount = {
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'r1',
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1 },
+      },
+      lastRefreshedAt: 50,
+      lastRefreshError: { message: 'old', checkedAt: 10 },
+      lastQuotaRefreshError: { message: 'old-quota', checkedAt: 10 },
+    }
+    storage.accounts.push(original)
+    upsertAccount(storage, {
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'r2',
+      quota: {
+        five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: 2 },
+      },
+      lastRefreshedAt: 60,
+      lastRefreshError: { message: 'new', checkedAt: 20 },
+      lastQuotaRefreshError: { message: 'new-quota', checkedAt: 20 },
+    })
+    const merged = storage.accounts[0] as OAuthAccount
+    expect(merged.quota).toBeDefined()
+    expect(merged.lastRefreshedAt).toBe(60)
+    expect(merged.lastRefreshError?.message).toBe('new')
+    expect(merged.lastQuotaRefreshError?.message).toBe('new-quota')
+  })
+})
+
+describe('removeAccount', () => {
+  test('removes an existing account by id and returns true', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    expect(removeAccount(storage, 'a')).toBe(true)
+    expect(storage.accounts.map((c) => c.id)).toEqual(['b'])
+  })
+
+  test('returns false when id not found', () => {
+    const storage = baseStorage()
+    expect(removeAccount(storage, 'nonexistent')).toBe(false)
+  })
+})
+
+describe('reorderAccounts', () => {
+  test('reorders to match orderedIds', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    reorderAccounts(storage, ['b', 'a', 'c'])
+    expect(storage.accounts.map((c) => c.id)).toEqual(['b', 'a', 'c'])
+  })
+
+  test('unknown ids keep relative order at the end', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    reorderAccounts(storage, ['x']) // x unknown
+    expect(storage.accounts.map((c) => c.id)).toEqual(['a', 'b'])
+  })
+
+  test('partial list puts known first, unknowns after preserving order', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    reorderAccounts(storage, ['a']) // only 'a' specified
+    expect(storage.accounts.map((c) => c.id)).toEqual(['a', 'c', 'b'])
+  })
+})
+
+describe('setAccountEnabled', () => {
+  test('sets enabled flag on matching account', () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'a',
+      type: 'oauth',
+      refresh: 'r',
+      enabled: true,
+    })
+    storage.accounts.push({
+      id: 'b',
+      type: 'oauth',
+      refresh: 'r',
+      enabled: true,
+    })
+    expect(setAccountEnabled(storage, 'a', false)).toBe(true)
+    expect(storage.accounts[0]!.enabled).toBe(false)
+    expect(storage.accounts[1]!.enabled).toBe(true)
+  })
+
+  test('returns false when id not found', () => {
+    const storage = baseStorage()
+    expect(setAccountEnabled(storage, 'nonexistent', false)).toBe(false)
+  })
+})
+
+// -- Persistent round-trip tests -----------------------------------------------
+
+describe('removeAccountPersistent', () => {
+  test('persists removal across load', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    await saveAccounts(storage)
+    expect(await removeAccountPersistent('a', accountPath)).toBe(true)
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts).toHaveLength(0)
+  })
+
+  test('returns false for unknown id', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage)
+    expect(await removeAccountPersistent('nonexistent', accountPath)).toBe(
+      false,
+    )
+  })
+})
+
+describe('reorderAccountsPersistent', () => {
+  test('persists reorder across load', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    await saveAccounts(storage)
+    await reorderAccountsPersistent(['b', 'a', 'c'], accountPath)
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts.map((c) => c.id)).toEqual(['b', 'a', 'c'])
+  })
+})
+
+describe('setAccountEnabledPersistent', () => {
+  test('persists enabled flag across load', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'a',
+      type: 'oauth',
+      refresh: 'r',
+      enabled: true,
+    })
+    await saveAccounts(storage)
+    expect(await setAccountEnabledPersistent('a', false, accountPath)).toBe(
+      true,
+    )
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts[0]?.enabled).toBe(false)
+  })
+})
+
+describe('addAccountPersistent', () => {
+  test('adds a new account and persists', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage)
+    await addAccountPersistent(
+      { id: 'new-acc', type: 'oauth', refresh: 'r' },
+      accountPath,
+    )
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts).toHaveLength(1)
+    expect(loaded?.accounts[0]?.id).toBe('new-acc')
+  })
+})
+
+// -- setLogLevelPersistent -----------------------------------------------------
+
+describe('setLogLevelPersistent', () => {
+  test('persists storage.logging.level and sets runtime log level', async () => {
+    const originalLevel = getLogLevel()
+    try {
+      const storage = baseStorage()
+      await saveAccounts(storage)
+      await setLogLevelPersistent('debug', accountPath)
+      const loaded = await loadAccounts()
+      expect(getPersistedLogLevel(loaded)).toBe('debug')
+      expect(getLogLevel()).toBe('debug')
+    } finally {
+      setLogLevel(originalLevel)
+    }
   })
 })

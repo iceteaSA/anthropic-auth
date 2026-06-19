@@ -6,13 +6,13 @@ import {
   type AccountStorage,
   authorize,
   exchange,
-  type FallbackAccount,
   generateRelayToken,
   getAccountStoragePath,
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
   saveAccounts,
+  upsertAccount,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -235,29 +235,6 @@ async function prompt(message: string) {
 function closePromptInterface() {
   promptInterface?.close()
   promptInterface = null
-}
-
-function upsertAccount(storage: AccountStorage, account: FallbackAccount) {
-  const index = storage.accounts.findIndex(
-    (candidate) =>
-      candidate.id === account.id ||
-      (account.label && candidate.label === account.label),
-  )
-  if (index >= 0) {
-    storage.accounts[index] = {
-      ...storage.accounts[index],
-      ...account,
-      addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
-      ...(account.type === 'oauth' && {
-        quota: account.quota,
-        lastRefreshedAt: account.lastRefreshedAt,
-        lastRefreshError: account.lastRefreshError,
-        lastQuotaRefreshError: account.lastQuotaRefreshError,
-      }),
-    }
-    return
-  }
-  storage.accounts.push(account)
 }
 
 async function login(labelArg?: string) {

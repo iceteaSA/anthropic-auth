@@ -419,6 +419,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
+    logging: isRecord(value.logging) ? value.logging : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
     accounts: value.accounts
       .map(normalizeAccount)
@@ -622,6 +623,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     quota,
     claudeCache: storage.claudeCache,
     dump: storage.dump,
+    logging: storage.logging,
     claudeFast: storage.claudeFast,
     costZeroing: storage.costZeroing,
     cacheKeep: storage.cacheKeep,
@@ -1333,6 +1335,24 @@ export function getPersistedLogLevel(
   return storage?.logging?.level
 }
 
+export async function setLogLevelPersistent(
+  level: LogLevel,
+  path = getAccountStoragePath(),
+) {
+  const { setLogLevel } = await import('./logger.ts')
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.logging = {
+    ...(storage.logging ?? {}),
+    level,
+  }
+  await saveAccounts(storage, path)
+  setLogLevel(level)
+}
+
 export function getPersistedMainQuota(storage: AccountStorage | null): {
   quota: OAuthQuotaSnapshot
   checkedAt: number
@@ -1502,6 +1522,52 @@ export async function setKillswitchPersistent(
   return storage
 }
 
+export async function removeAccountPersistent(
+  id: string,
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  const storage = await loadAccounts(path)
+  if (!storage) return false
+  const existed = removeAccount(storage, id)
+  if (existed) await saveAccounts(storage, path)
+  return existed
+}
+
+export async function reorderAccountsPersistent(
+  orderedIds: string[],
+  path = getAccountStoragePath(),
+) {
+  const storage = await loadAccounts(path)
+  if (!storage) return
+  reorderAccounts(storage, orderedIds)
+  await saveAccounts(storage, path)
+}
+
+export async function setAccountEnabledPersistent(
+  id: string,
+  enabled: boolean,
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  const storage = await loadAccounts(path)
+  if (!storage) return false
+  const found = setAccountEnabled(storage, id, enabled)
+  if (found) await saveAccounts(storage, path)
+  return found
+}
+
+export async function addAccountPersistent(
+  account: FallbackAccount,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  upsertAccount(storage, account)
+  await saveAccounts(storage, path)
+}
+
 export function getQuotaNextRefreshAt(
   quota: OAuthQuotaSnapshot | undefined,
   storage: AccountStorage | null,
@@ -1665,6 +1731,58 @@ function updateStoredAccount(
     (candidate) => candidate.id === account.id,
   )
   if (index >= 0) storage.accounts[index] = account
+}
+
+export function upsertAccount(
+  storage: AccountStorage,
+  account: FallbackAccount,
+) {
+  const index = storage.accounts.findIndex(
+    (candidate) =>
+      candidate.id === account.id ||
+      (account.label && candidate.label === account.label),
+  )
+  if (index >= 0) {
+    storage.accounts[index] = {
+      ...storage.accounts[index],
+      ...account,
+      addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
+      ...(account.type === 'oauth' && {
+        quota: account.quota,
+        lastRefreshedAt: account.lastRefreshedAt,
+        lastRefreshError: account.lastRefreshError,
+        lastQuotaRefreshError: account.lastQuotaRefreshError,
+      }),
+    }
+    return
+  }
+  storage.accounts.push(account)
+}
+
+export function removeAccount(storage: AccountStorage, id: string): boolean {
+  const index = storage.accounts.findIndex((c) => c.id === id)
+  if (index < 0) return false
+  storage.accounts.splice(index, 1)
+  return true
+}
+
+export function reorderAccounts(storage: AccountStorage, orderedIds: string[]) {
+  const orderMap = new Map(orderedIds.map((id, i) => [id, i]))
+  const known = storage.accounts.filter((a) => orderMap.has(a.id))
+  const unknown = storage.accounts.filter((a) => !orderMap.has(a.id))
+  known.sort((a, b) => (orderMap.get(a.id) ?? 0) - (orderMap.get(b.id) ?? 0))
+  storage.accounts = [...known, ...unknown]
+}
+
+export function setAccountEnabled(
+  storage: AccountStorage,
+  id: string,
+  enabled: boolean,
+): boolean {
+  const account = storage.accounts.find((c) => c.id === id)
+  if (!account) return false
+  account.enabled = enabled
+  return true
 }
 
 function formatErrorMessage(error: unknown) {

@@ -797,6 +797,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const storage = await setCache1hPersistentEnabled(enabled)
       const mode = getCache1hPersistentMode(storage)
       setCache1hState({ enabled, mode })
+      logger.info('commands', 'cache enabled changed', { enabled })
       return executeCache1hCommand({ argumentsText, enabled, mode })
     }
 
@@ -804,6 +805,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const storage = await setCache1hPersistentMode(action.mode)
       const enabled = isCache1hPersistentlyEnabled(storage)
       setCache1hState({ enabled, mode: action.mode })
+      logger.info('commands', 'cache mode changed', { mode: action.mode })
       return executeCache1hCommand({
         argumentsText,
         enabled,
@@ -855,6 +857,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const enabled = action.type === 'enable'
       await setDumpPersistentEnabled(enabled)
       setDumpEnabled(enabled)
+      logger.info('commands', 'dump changed', { enabled })
       return executeDumpCommand({ argumentsText, enabled })
     }
 
@@ -870,6 +873,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const enabled = action.type === 'enable'
       await setFastModePersistentEnabled(enabled)
       setFastModeEnabled(enabled)
+      logger.info('commands', 'fast mode changed', { enabled })
       return executeFastModeCommand({ argumentsText, enabled })
     }
 
@@ -883,6 +887,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const action = parseRoutingCommandAction(argumentsText)
     if (action.type === 'mode') {
       await setRoutingMode(action.mode)
+      logger.info('commands', 'routing mode changed', { mode: action.mode })
       return executeRoutingCommand({ argumentsText, mode: action.mode })
     }
 
@@ -949,8 +954,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       config,
       accountIds,
     })
-    if (result.updatedConfig)
+    if (result.updatedConfig) {
       await setKillswitchPersistent(result.updatedConfig)
+      if (config.enabled !== result.updatedConfig.enabled) {
+        logger.info('commands', 'killswitch changed', {
+          enabled: result.updatedConfig.enabled === true,
+        })
+      }
+      if (
+        JSON.stringify(config.main) !==
+          JSON.stringify(result.updatedConfig.main) ||
+        JSON.stringify(config.accounts) !==
+          JSON.stringify(result.updatedConfig.accounts)
+      ) {
+        logger.info('commands', 'killswitch thresholds changed', {
+          thresholds:
+            result.updatedConfig.main ?? result.updatedConfig.accounts,
+        })
+      }
+    }
     return {
       command,
       text: result.text,
