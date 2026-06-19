@@ -48,6 +48,56 @@ function expectOAuthAccount(
   return account as OAuthAccount
 }
 
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((next) => {
+    resolve = next
+  })
+  return { promise, resolve }
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out after ${ms}ms`)),
+          ms,
+        )
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function seedStaleRefreshLock(name: string, now: number, ttlMs: number) {
+  const lockPath = `${accountPath}.${name}.lock`
+  const evictPath = `${lockPath}.evicting`
+  await rm(lockPath, { recursive: true, force: true })
+  await rm(evictPath, { recursive: true, force: true })
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({ ownerId: 'stale-owner', expiresAt: now - ttlMs })}\n`,
+    'utf8',
+  )
+  await mkdir(evictPath)
+  const staleTime = new Date(now - 10_000)
+  await utimes(evictPath, staleTime, staleTime)
+  return { lockPath, evictPath }
+}
+
+async function countRefreshLockLeaks(name: string) {
+  const entries = await readdir(tempDir)
+  return entries.filter(
+    (entry) =>
+      entry.startsWith(`anthropic-auth.json.${name}.lock.evicting`) ||
+      entry.startsWith(`anthropic-auth.json.${name}.lock.evicting.`),
+  ).length
+}
+
 const baseStorage = (): AccountStorage => ({
   version: 1,
   main: { type: 'opencode', provider: 'anthropic' },
@@ -413,6 +463,104 @@ describe('account storage', () => {
     expect(afterStale).not.toBeNull()
     await afterStale?.release()
   })
+
+  test('refresh file lock stale-marker steal has a single winner under forced recreate race', async () => {
+    const name = 'test-refresh-forced-stale-steal'
+    const now = 100_000
+    const ttlMs = 1_000
+    await seedStaleRefreshLock(name, now, ttlMs)
+
+    const cSawStaleMarker = deferred()
+    const releaseCFromStaleMarker = deferred()
+    const cClaimedMarker = deferred()
+    const releaseCFromClaim = deferred()
+    const cConfirmedStaleLock = deferred()
+    const releaseCFromStaleLock = deferred()
+    const aAcquiredMarker = deferred()
+    const releaseAFromMarker = deferred()
+
+    const contenderC = acquireRefreshFileLock({
+      name,
+      ttlMs,
+      path: accountPath,
+      now: () => now,
+      onStep: async (step) => {
+        if (step === 'stale-marker-stat') {
+          cSawStaleMarker.resolve()
+          await releaseCFromStaleMarker.promise
+        }
+        if (step === 'stale-marker-claimed') {
+          cClaimedMarker.resolve()
+          await releaseCFromClaim.promise
+        }
+        if (step === 'stale-lock-confirmed') {
+          cConfirmedStaleLock.resolve()
+          await releaseCFromStaleLock.promise
+        }
+      },
+    })
+
+    await withTimeout(cSawStaleMarker.promise, 1_000)
+
+    const contenderA = acquireRefreshFileLock({
+      name,
+      ttlMs,
+      path: accountPath,
+      now: () => now,
+      onStep: (step) => {
+        if (step === 'eviction-marker-acquired') {
+          aAcquiredMarker.resolve()
+          return releaseAFromMarker.promise
+        }
+      },
+    })
+
+    await withTimeout(aAcquiredMarker.promise, 1_000)
+    releaseCFromStaleMarker.resolve()
+    await withTimeout(cClaimedMarker.promise, 1_000)
+    releaseCFromClaim.resolve()
+    await withTimeout(cConfirmedStaleLock.promise, 1_000)
+
+    releaseAFromMarker.resolve()
+    const aLock = await withTimeout(contenderA, 1_000)
+    releaseCFromStaleLock.resolve()
+    const cLock = await withTimeout(contenderC, 1_000)
+    const winners = [aLock, cLock].filter(Boolean)
+
+    await Promise.all(winners.map((lock) => lock?.release()))
+
+    expect(winners).toHaveLength(1)
+    expect(await countRefreshLockLeaks(name)).toBe(0)
+  })
+
+  test('refresh file lock stale-marker steal has a single winner across high-volume contention', async () => {
+    const name = 'test-refresh-high-volume-stale-steal'
+    const ttlMs = 1_000
+    const contenders = 16
+    const rounds = 1_000
+
+    for (let round = 0; round < rounds; round++) {
+      const now = 1_000_000 + round * 20_000
+      await seedStaleRefreshLock(name, now, ttlMs)
+
+      const locks = await Promise.all(
+        Array.from({ length: contenders }, () =>
+          acquireRefreshFileLock({
+            name,
+            ttlMs,
+            path: accountPath,
+            now: () => now,
+          }),
+        ),
+      )
+      const winners = locks.filter(Boolean)
+
+      await Promise.all(winners.map((lock) => lock?.release()))
+
+      expect(winners, `round ${round}`).toHaveLength(1)
+      expect(await countRefreshLockLeaks(name), `round ${round}`).toBe(0)
+    }
+  }, 30_000)
 
   test('refresh file lock renews while the holder is alive', async () => {
     const first = await acquireRefreshFileLock({

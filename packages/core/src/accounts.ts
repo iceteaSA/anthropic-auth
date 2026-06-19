@@ -767,6 +767,13 @@ export async function acquireRefreshFileLock(options: {
   now?: () => number
   renew?: boolean
   renewIntervalMs?: number
+  onStep?: (
+    step:
+      | 'stale-marker-stat'
+      | 'stale-marker-claimed'
+      | 'stale-lock-confirmed'
+      | 'eviction-marker-acquired',
+  ) => void | Promise<void>
 }): Promise<{ release: () => Promise<void> } | null> {
   const accountPath = options.path ?? getAccountStoragePath()
   const lockPath = `${accountPath}.${options.name}.lock`
@@ -835,58 +842,132 @@ export async function acquireRefreshFileLock(options: {
     if ('unref' in renewTimer) renewTimer.unref()
   }
 
-  if (!(await tryAcquire())) {
+  let acquired = await tryAcquire()
+  if (!acquired) {
     const evictPath = `${lockPath}.evicting`
+    const evictOwnerPath = join(evictPath, 'owner.json')
+    const evictOwnerId = randomUUID()
     const EVICT_TTL = 5_000
+    const MAX_STEAL_ATTEMPTS = 8
 
-    try {
-      await mkdir(evictPath)
-    } catch (evictError) {
-      const code = (evictError as NodeJS.ErrnoException).code
-      if (code !== 'EEXIST') return null
-      try {
-        const evictStat = await stat(evictPath)
-        if (evictStat.mtimeMs + EVICT_TTL > now()) return null
-        // Atomically claim the stale marker — only one contender can rename it
-        const claimedPath = `${evictPath}.${randomUUID()}`
-        try {
-          await rename(evictPath, claimedPath)
-        } catch (e) {
-          if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
-          throw e
-        }
-        await rm(claimedPath, { recursive: true, force: true }).catch(() => {})
-      } catch {
-        return null
-      }
-      try {
-        await mkdir(evictPath)
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === 'EEXIST') return null
-        throw e
-      }
+    async function backoff() {
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.floor(Math.random() * 4)),
+      )
     }
 
-    try {
-      let lockStillStale = true
+    async function lockIsLive() {
       try {
         const currentOwner = await readOwner()
-        if (Number(currentOwner?.expiresAt) > now()) lockStillStale = false
+        return Number(currentOwner?.expiresAt) > now()
       } catch {
         try {
           const current = await stat(lockPath)
-          if (current.mtimeMs + options.ttlMs > now()) lockStillStale = false
+          return current.mtimeMs + options.ttlMs > now()
         } catch {
-          // Lock doesn't exist — safe to acquire
+          // Lock doesn't exist — safe to acquire.
+          return false
         }
       }
-      if (!lockStillStale) return null
-      await rm(lockPath, { recursive: true, force: true }).catch(() => {})
-      if (!(await tryAcquire())) return null
-    } finally {
-      await rm(evictPath, { recursive: true, force: true }).catch(() => {})
+    }
+
+    async function ownsEvictionMarker() {
+      try {
+        const owner = JSON.parse(await readFile(evictOwnerPath, 'utf8'))
+        return owner?.ownerId === evictOwnerId
+      } catch {
+        return false
+      }
+    }
+
+    async function tryAcquireEvictionMarker() {
+      await mkdir(evictPath)
+      try {
+        await writeFile(
+          evictOwnerPath,
+          `${JSON.stringify({ ownerId: evictOwnerId, createdAt: now() })}\n`,
+          { encoding: 'utf8', mode: 0o600, flag: 'wx' },
+        )
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        await releaseEvictionMarker()
+        throw error
+      }
+      await options.onStep?.('eviction-marker-acquired')
+      return true
+    }
+
+    async function releaseEvictionMarker() {
+      if (await ownsEvictionMarker()) {
+        await rm(evictPath, { recursive: true, force: true }).catch(() => {})
+      }
+    }
+
+    for (let attempt = 0; attempt < MAX_STEAL_ATTEMPTS; attempt++) {
+      acquired = await tryAcquire()
+      if (acquired) break
+      if (await lockIsLive()) return null
+
+      try {
+        if (!(await tryAcquireEvictionMarker())) {
+          await backoff()
+          continue
+        }
+      } catch (evictError) {
+        const code = (evictError as NodeJS.ErrnoException).code
+        if (code !== 'EEXIST') throw evictError
+
+        let evictStat: Awaited<ReturnType<typeof stat>>
+        try {
+          evictStat = await stat(evictPath)
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === 'ENOENT') {
+            await backoff()
+            continue
+          }
+          throw statError
+        }
+        if (evictStat.mtimeMs + EVICT_TTL > now()) return null
+
+        await options.onStep?.('stale-marker-stat')
+        const claimedPath = `${evictPath}.${randomUUID()}`
+        try {
+          await rename(evictPath, claimedPath)
+        } catch (renameError) {
+          if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
+            await backoff()
+            continue
+          }
+          throw renameError
+        }
+        await options.onStep?.('stale-marker-claimed')
+        await rm(claimedPath, { recursive: true, force: true }).catch(() => {})
+        await backoff()
+        continue
+      }
+
+      try {
+        if (await lockIsLive()) return null
+        if (!(await ownsEvictionMarker())) return null
+        await options.onStep?.('stale-lock-confirmed')
+        if (!(await ownsEvictionMarker())) return null
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+        if (!(await ownsEvictionMarker())) return null
+        acquired = await tryAcquire()
+        if (!acquired) return null
+        if (!(await ownsEvictionMarker())) {
+          await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+          acquired = false
+          return null
+        }
+        break
+      } finally {
+        await releaseEvictionMarker()
+      }
     }
   }
+
+  if (!acquired) return null
 
   scheduleRenewal()
 
