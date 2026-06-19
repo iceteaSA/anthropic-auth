@@ -9,9 +9,11 @@ import {
   executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
+  executeLoggingCommand,
   executeRoutingCommand,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getPersistedLogLevel,
   getRoutingMode,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
@@ -23,7 +25,11 @@ import {
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseLoggingCommandAction,
   parseRoutingCommandAction,
+  removeAccountPersistent,
+  reorderAccountsPersistent,
+  setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
@@ -32,6 +38,7 @@ import {
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModePersistentEnabled,
+  setLogLevelPersistent,
   setRoutingMode,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -238,7 +245,26 @@ export function registerCommands(pi: ExtensionAPI) {
         return
       }
 
-      // Mutations not wired for Pi — display-only
+      // Wire persistent mutations via core helpers
+      const { id, action: mutationAction } = result.updated
+
+      if (mutationAction === 'enable') {
+        await setAccountEnabledPersistent(id, true, path)
+      } else if (mutationAction === 'disable') {
+        await setAccountEnabledPersistent(id, false, path)
+      } else if (mutationAction === 'remove') {
+        const existed = await removeAccountPersistent(id, path)
+        if (!existed) {
+          notify(ctx, `Account "${id}" not found.`, 'warning')
+          return
+        }
+      } else if (mutationAction === 'reorder') {
+        const newOrder = result.updated.newOrder
+        if (newOrder) {
+          await reorderAccountsPersistent(newOrder, path)
+        }
+      }
+
       notify(ctx, result.text)
     },
   })
@@ -248,12 +274,16 @@ export function registerCommands(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const path = getPiAccountStoragePath()
       const storage = await loadAccounts(path)
-      // Mutations not wired for Pi — display-only like claude-account.
-      // The persisted level still applies on next loader boot.
-      const { executeLoggingCommand, getPersistedLogLevel } = await import(
-        '@cortexkit/anthropic-auth-core'
-      )
-      const level = getPersistedLogLevel(storage) ?? 'info'
+      const action = parseLoggingCommandAction(args ?? '')
+      const currentLevel = getPersistedLogLevel(storage) ?? 'info'
+
+      // Wire persistent log-level mutation
+      let level = currentLevel
+      if (action.type === 'level') {
+        await setLogLevelPersistent(action.level, path)
+        level = action.level
+      }
+
       notify(ctx, executeLoggingCommand({ argumentsText: args ?? '', level }))
     },
   })
