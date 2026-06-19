@@ -1,0 +1,125 @@
+# Codebase Structure
+
+## Directory Layout
+
+```
+anthropic-auth/
+├── packages/
+│   ├── core/                   # Shared core library
+│   │   └── src/                # Reusable OAuth, quota, cache, relay, signing
+│   ├── opencode/               # OpenCode plugin + CLI
+│   │   ├── src/
+│   │   │   ├── rpc/            # Loopback RPC server/client for TUI IPC
+│   │   │   ├── tests/          # Comprehensive test suite per module
+│   │   │   │   ├── fixtures/   # Test fixtures (realistic system prompts)
+│   │   │   │   └── __snapshots__/
+│   │   │   └── tui/            # Command modal dialog components
+│   │   └── dist/               # Built output (git-ignored)
+│   ├── pi/                     # Pi provider extension
+│   │   ├── src/
+│   │   │   └── tests/
+│   │   └── dist/
+│   └── e2e-tests/              # End-to-end integration tests
+│       ├── src/                # Test harness + mock servers
+│       └── tests/              # Test files
+├── scripts/                    # Dev, release, and analysis scripts
+├── captures/                   # System-prompt capture artifacts (git-ignored)
+├── docs/                       # Documentation (superpowers plans/specs/perf)
+├── images/                     # Images for README
+└── .github/                    # CI workflows + issue templates
+```
+
+## Directory Purposes
+
+**`packages/core/src/`:**
+- Purpose: All reusable OAuth, account management, quota, cache, relay, dump, signing, routing, and command execution logic
+- Contains: TypeScript modules, each focused on one concern
+- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers)
+
+**`packages/opencode/src/`:**
+- Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
+- Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), RPC server for TUI IPC, preferences management
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar widget), `tui-preferences.ts` (JSONC preferences file)
+
+**`packages/opencode/src/rpc/`:**
+- Purpose: Loopback HTTP RPC between OpenCode server and TUI process
+- Contains: `rpc-server.ts`, `rpc-client.ts`, `rpc-dir.ts`, `port-file.ts`, `protocol.ts`, `notifications.ts`
+
+**`packages/pi/src/`:**
+- Purpose: Pi extension — registers CortexKit Anthropic provider override
+- Contains: Extension entry point, command registration, request building, streaming provider
+- Key files: `index.ts` (provider registration), `stream.ts` (streaming request handling), `commands.ts` (slash command registration), `convert.ts` (request body conversion), `paths.ts` (Pi-specific path resolution)
+
+**`packages/e2e-tests/`:**
+- Purpose: Integration tests with mock Anthropic and relay servers
+- Contains: Test harness, mock server implementations, tool prefix tests
+
+**`scripts/`:**
+- Purpose: Development, release, and analysis utilities
+- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` (cross-package version alignment)
+
+## Key File Locations
+
+**Entry Points:**
+- `packages/opencode/src/index.ts`: OpenCode plugin factory (exported as `AnthropicAuthPlugin`)
+- `packages/opencode/src/cli.ts`: CLI binary entry (`opencode-anthropic-auth`)
+- `packages/pi/src/index.ts`: Pi extension entry (default export function)
+- `packages/opencode/src/tui.tsx`: TUI sidebar widget entry (SolidJS component)
+- `packages/core/src/index.ts`: Shared core library entry (re-exports all modules)
+
+**Configuration:**
+- `package.json` (root): Bun workspace root — workspace config, shared dev dependencies, root scripts
+- `packages/core/package.json`: Core package — depends only on `xxhash-wasm`
+- `packages/opencode/package.json`: OpenCode package — depends on core + OpenCode SDK + SolidJS + OpenTUI
+- `packages/pi/package.json`: Pi package — depends on core + Pi SDKs (peer dependencies)
+- `biome.json`: Biome linter and formatter config
+- `mise.toml`: Runtime version management (Bun, Node.js)
+- `lefthook.yml`: Git hooks configuration
+- `tsconfig.*.json`: TypeScript configs (root + per-package build configs)
+
+**Core Logic:**
+- `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → refresh
+- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, file locking
+- `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness
+- `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
+- `packages/core/src/cch.ts`: XXH64-based request body signing
+- `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager
+- `packages/core/src/routing.ts`: Main-first / fallback-first routing mode
+- `packages/core/src/killswitch.ts`: Per-account hard-block thresholds
+- `packages/opencode/src/transform.ts`: Request rewriting, system sanitization, cache strategy, tool prefix, SSE stripping
+- `packages/pi/src/stream.ts`: Pi provider streaming implementation
+
+**Tests:**
+- `packages/opencode/src/tests/`: One test file per module (30+ test files covering core + opencode)
+- `packages/pi/src/tests/`: Pi-specific tests (convert, stream)
+- `packages/e2e-tests/tests/`: Integration tests
+
+## Naming Conventions
+
+**Files:** PascalCase for all TypeScript source files (`auth.ts`, `quota-manager.ts`, `FallbackAccountManager`, `rewriteRequestBody`). Each module file exports a focused set of related functions/types.
+
+**Directories:** Lowercase with hyphens for feature directories (`rpc/`, `tui/`, `e2e-tests/`). Tests are co-located in `tests/` subdirectories.
+
+**Packages:** `@cortexkit/anthropic-auth-core`, `@cortexkit/opencode-anthropic-auth`, `@cortexkit/pi-anthropic-auth` — follows the `@scope/package` + `-core`/`-opencode`/`-pi` suffix convention for the monorepo packages.
+
+**Exports:** Core library re-exports all modules through a barrel (`packages/core/src/index.ts`). OpenCode and Pi packages import from core by name, not path.
+
+## Where to Add New Code
+
+**New shared feature (used by both OpenCode and Pi):** `packages/core/src/[feature].ts` — add the implementation, export it from `packages/core/src/index.ts`, then import it in the OpenCode plugin and/or Pi extension as needed.
+
+**New OpenCode hook or fetch transform:** `packages/opencode/src/` — follow the pattern in `index.ts` for hook registration or `transform.ts` for pipeline steps. Add tests in `packages/opencode/src/tests/`.
+
+**New slash command:** Register the command name in `packages/core/src/constants.ts` (or a dedicated module), implement execution logic in core (shared) or per-package (if platform-specific), add the command hook in `packages/opencode/src/index.ts` (config hook) or `packages/pi/src/commands.ts`.
+
+**New TUI feature:** `packages/opencode/src/tui/` — add components as `.tsx` files using SolidJS + OpenTUI. Add RPC protocol types in `packages/opencode/src/rpc/protocol.ts` if the feature needs server-to-TUI IPC.
+
+**New test:** Co-locate with source as `*.test.ts` — `packages/opencode/src/tests/` for unit tests covering opencode and core modules, `packages/pi/src/tests/` for Pi-specific tests, `packages/e2e-tests/tests/` for integration tests.
+
+**New script:** `scripts/` — use TypeScript (run with `bun`) or plain JavaScript for analysis tools. Reference `tsconfig.scripts.json` for TypeScript compilation options.
+
+**New CLI command:** `packages/opencode/src/cli.ts` — add the subcommand handler following the `login`/`list`/`api add`/`relay setup` pattern.
+
+**New model spec:** `packages/core/src/models.ts` — add model ID, pricing, context window, and max output tokens constants. If it needs special request handling, update `packages/opencode/src/transform.ts` (e.g., Fable/Mythos thinking normalization).
+
+**Shared utilities used across packages:** Extend `packages/core/src/` rather than duplicating between opencode and pi packages.

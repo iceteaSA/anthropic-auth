@@ -1,10 +1,15 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, test } from 'bun:test'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   type AccountQuota,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
   getCollapsedQuotaSummary,
+  getSidebarState,
+  normalizeSidebarState,
   resolveActiveAccount,
   SEVEN_DAY_MS,
   type SidebarState,
@@ -223,5 +228,282 @@ describe('computeQuotaPacing', () => {
       resetsAt: new Date(now - 1000).toISOString(),
     }
     expect(computeQuotaPacing(past, FIVE_HOUR_MS, now)).toBeNull()
+  })
+})
+
+function isValidSidebarState(s: unknown): s is SidebarState {
+  if (!s || typeof s !== 'object') return false
+  const st = s as Record<string, unknown>
+  return (
+    typeof st.route === 'string' &&
+    st.main !== null &&
+    typeof st.main === 'object' &&
+    'quota' in (st.main as Record<string, unknown>) &&
+    Array.isArray(st.fallbacks) &&
+    typeof st.lastUpdated === 'number' &&
+    typeof st.fastMode === 'boolean'
+  )
+}
+
+describe('normalizeSidebarState', () => {
+  test('returns DEFAULT for null', () => {
+    const out = normalizeSidebarState(null)
+    expect(out).toEqual(DEFAULT_SIDEBAR_STATE)
+    expect(out.main.quota).toBeNull()
+    expect(out.fallbacks).toEqual([])
+  })
+
+  test('returns DEFAULT for a non-object (number)', () => {
+    const out = normalizeSidebarState(42)
+    expect(out).toEqual(DEFAULT_SIDEBAR_STATE)
+  })
+
+  test('returns DEFAULT for an array', () => {
+    const out = normalizeSidebarState([])
+    expect(out).toEqual(DEFAULT_SIDEBAR_STATE)
+  })
+
+  test('returns DEFAULT for undefined', () => {
+    const out = normalizeSidebarState(undefined)
+    expect(out).toEqual(DEFAULT_SIDEBAR_STATE)
+  })
+
+  test('fills defaults for an empty object', () => {
+    const out = normalizeSidebarState({})
+    expect(isValidSidebarState(out)).toBe(true)
+    expect(out.main).toEqual({ quota: null })
+    expect(out.fallbacks).toEqual([])
+    expect(out.route).toBe(DEFAULT_SIDEBAR_STATE.route)
+    expect(out.lastUpdated).toBe(0)
+    expect(out.fastMode).toBe(false)
+    expect(out.relay).toBeNull()
+    expect(out.cacheKeep).toBeUndefined()
+  })
+
+  test('fills defaults for a sentinel-only object', () => {
+    const out = normalizeSidebarState({ SENTINEL: true })
+    expect(isValidSidebarState(out)).toBe(true)
+    expect(out.main).toEqual({ quota: null })
+    expect(out.fallbacks).toEqual([])
+  })
+
+  test('empty main object gets quota:null', () => {
+    const out = normalizeSidebarState({ main: {} })
+    expect(out.main).toEqual({ quota: null })
+  })
+
+  test('main: null is replaced with {quota:null}', () => {
+    const out = normalizeSidebarState({ main: null })
+    expect(out.main).toEqual({ quota: null })
+  })
+
+  test('main: non-object is replaced with {quota:null}', () => {
+    const out = normalizeSidebarState({ main: 42 })
+    expect(out.main).toEqual({ quota: null })
+  })
+
+  test('fallbacks: string is replaced with []', () => {
+    const out = normalizeSidebarState({ fallbacks: 'x' })
+    expect(out.fallbacks).toEqual([])
+  })
+
+  test('fallbacks: null is replaced with []', () => {
+    const out = normalizeSidebarState({ main: null, fallbacks: null })
+    expect(out.fallbacks).toEqual([])
+  })
+
+  test('fallbacks: filters out entries missing id', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [
+        { label: 'no-id', quota: null, enabled: true },
+        { id: 'ok', label: 'ok', quota: null, enabled: true },
+        null,
+        'string',
+        42,
+      ],
+    })
+    expect(out.fallbacks).toHaveLength(1)
+    expect(out.fallbacks[0]!.id).toBe('ok')
+  })
+
+  test('fallbacks: quota defaults to null when missing', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: true }],
+    })
+    expect(out.fallbacks[0]!.quota).toBeNull()
+  })
+
+  test('fallbacks: quota defaults to null when non-object', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', quota: 'bad', enabled: true }],
+    })
+    expect(out.fallbacks[0]!.quota).toBeNull()
+  })
+
+  test('fallbacks: enabled defaults to false when non-boolean', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: 'yes' }],
+    })
+    expect(out.fallbacks[0]!.enabled).toBe(false)
+  })
+
+  test('relay defaults to null when missing transport', () => {
+    const out = normalizeSidebarState({ relay: { enabled: true } })
+    expect(out.relay).toBeNull()
+  })
+
+  test('relay defaults to null when non-object', () => {
+    const out = normalizeSidebarState({ relay: 'bad' })
+    expect(out.relay).toBeNull()
+  })
+
+  test('cacheKeep defaults to undefined when missing enabled', () => {
+    const out = normalizeSidebarState({ cacheKeep: { window: '1h' } })
+    expect(out.cacheKeep).toBeUndefined()
+  })
+
+  test('cacheKeep defaults to undefined when non-object', () => {
+    const out = normalizeSidebarState({ cacheKeep: 'bad' })
+    expect(out.cacheKeep).toBeUndefined()
+  })
+
+  test('route defaults when non-string', () => {
+    const out = normalizeSidebarState({ route: 42 })
+    expect(out.route).toBe(DEFAULT_SIDEBAR_STATE.route)
+  })
+
+  test('fastMode defaults when non-boolean', () => {
+    const out = normalizeSidebarState({ fastMode: 'yes' })
+    expect(out.fastMode).toBe(false)
+  })
+
+  test('lastUpdated defaults when non-number', () => {
+    const out = normalizeSidebarState({ lastUpdated: 'now' })
+    expect(out.lastUpdated).toBe(0)
+  })
+
+  test('never throws for any malformed input', () => {
+    const malformed = [
+      null,
+      undefined,
+      42,
+      [],
+      {},
+      { SENTINEL: true },
+      { main: {} },
+      { main: null, fallbacks: null },
+      { fallbacks: 'x' },
+      { main: { quota: 'bad' }, fallbacks: [{}], relay: {} },
+    ]
+    for (const input of malformed) {
+      expect(() => normalizeSidebarState(input)).not.toThrow()
+      const out = normalizeSidebarState(input)
+      expect(isValidSidebarState(out)).toBe(true)
+    }
+  })
+
+  test('valid state round-trips unchanged (idempotent)', () => {
+    const valid: SidebarState = {
+      main: {
+        quota: {
+          five_hour: {
+            usedPercent: 13,
+            remainingPercent: 87,
+            resetsAt: '2026-01-01T00:00:00Z',
+          },
+          seven_day: { usedPercent: 7, remainingPercent: 93 },
+        },
+        quotaBackedOff: false,
+        quotaBackoffUntil: 1719000000000,
+        refreshBackedOff: true,
+        refreshBackoffUntil: 1719100000000,
+      },
+      fallbacks: [
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: {
+            five_hour: { usedPercent: 40, remainingPercent: 60 },
+          },
+          enabled: true,
+        },
+      ],
+      activeId: 'fb1',
+      route: 'fallback',
+      relay: { enabled: true, transport: 'stdio' },
+      fastMode: true,
+      cacheKeep: {
+        enabled: true,
+        window: '1h',
+        trackedSessions: 5,
+      },
+      lastUpdated: 1719000000000,
+    }
+    const out = normalizeSidebarState(valid)
+    expect(out).toEqual(valid)
+    // Idempotent: normalizing again yields the same result
+    expect(normalizeSidebarState(out)).toEqual(out)
+  })
+})
+
+describe('getSidebarState malformed file round-trip', () => {
+  const testDir = join(tmpdir(), 'opencode-auth-sidebar-test')
+  const testFile = join(testDir, 'sidebar-state.json')
+  const prevEnv = process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+
+  afterAll(async () => {
+    if (prevEnv) {
+      process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = prevEnv
+    } else {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    }
+    await rm(testDir, { recursive: true, force: true })
+  })
+
+  test('reads malformed JSON file without throwing', async () => {
+    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = testFile
+    await mkdir(testDir, { recursive: true })
+
+    // Write a malformed shape to disk — valid JSON, wrong shape
+    await writeFile(
+      testFile,
+      JSON.stringify({ main: null, fallbacks: 'bad', lastUpdated: 'nope' }),
+    )
+    const state = await getSidebarState()
+    expect(state.main).toEqual({ quota: null })
+    expect(state.fallbacks).toEqual([])
+    expect(state.lastUpdated).toBe(0)
+  })
+
+  test('reads unparseable file without throwing', async () => {
+    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = testFile
+    await mkdir(testDir, { recursive: true })
+    await writeFile(testFile, 'not json at all {{{')
+    const state = await getSidebarState()
+    expect(state).toEqual(DEFAULT_SIDEBAR_STATE)
+  })
+
+  test('valid state round-trips through file', async () => {
+    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = testFile
+    await mkdir(testDir, { recursive: true })
+    const valid: SidebarState = {
+      main: {
+        quota: {
+          five_hour: { usedPercent: 13, remainingPercent: 87 },
+          seven_day: { usedPercent: 7, remainingPercent: 93 },
+        },
+        quotaBackedOff: false,
+        refreshBackedOff: true,
+      },
+      fallbacks: [{ id: 'fb1', label: 'work', quota: null, enabled: true }],
+      activeId: 'fb1',
+      route: 'fallback',
+      relay: { enabled: false, transport: 'sse' },
+      fastMode: true,
+      lastUpdated: 1719000000000,
+    }
+    await writeFile(testFile, JSON.stringify(valid))
+    const state = await getSidebarState()
+    expect(state).toEqual(valid)
   })
 })

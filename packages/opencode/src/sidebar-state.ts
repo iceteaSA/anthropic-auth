@@ -58,13 +58,84 @@ export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   fastMode: false,
   lastUpdated: 0,
 }
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
+export function normalizeSidebarState(raw: unknown): SidebarState {
+  if (!isRecord(raw)) return { ...DEFAULT_SIDEBAR_STATE }
+
+  const main: SidebarState['main'] = { quota: null }
+  if (isRecord(raw.main)) {
+    const m = raw.main
+    main.quota = isRecord(m.quota) ? (m.quota as AccountQuota) : null
+    if (typeof m.quotaBackedOff === 'boolean')
+      main.quotaBackedOff = m.quotaBackedOff
+    if (typeof m.quotaBackoffUntil === 'number')
+      main.quotaBackoffUntil = m.quotaBackoffUntil
+    if (typeof m.refreshBackedOff === 'boolean')
+      main.refreshBackedOff = m.refreshBackedOff
+    if (typeof m.refreshBackoffUntil === 'number')
+      main.refreshBackoffUntil = m.refreshBackoffUntil
+  }
+
+  const fallbacks: SidebarAccountState[] = Array.isArray(raw.fallbacks)
+    ? raw.fallbacks
+        .filter(isRecord)
+        .filter((entry) => typeof entry.id === 'string')
+        .map((entry) => ({
+          id: entry.id as string,
+          label: typeof entry.label === 'string' ? entry.label : undefined,
+          quota: isRecord(entry.quota) ? (entry.quota as AccountQuota) : null,
+          enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
+        }))
+    : []
+
+  let relay: SidebarState['relay'] = null
+  if (isRecord(raw.relay)) {
+    const r = raw.relay
+    if (typeof r.enabled === 'boolean' && typeof r.transport === 'string') {
+      relay = { enabled: r.enabled, transport: r.transport }
+    }
+  }
+
+  let cacheKeep: SidebarState['cacheKeep']
+  if (isRecord(raw.cacheKeep)) {
+    const ck = raw.cacheKeep
+    if (typeof ck.enabled === 'boolean') {
+      cacheKeep = {
+        enabled: ck.enabled,
+        window: typeof ck.window === 'string' ? ck.window : undefined,
+        trackedSessions:
+          typeof ck.trackedSessions === 'number'
+            ? ck.trackedSessions
+            : undefined,
+      }
+    }
+  }
+
+  return {
+    main,
+    fallbacks,
+    activeId: typeof raw.activeId === 'string' ? raw.activeId : undefined,
+    route:
+      typeof raw.route === 'string' ? raw.route : DEFAULT_SIDEBAR_STATE.route,
+    relay,
+    fastMode:
+      typeof raw.fastMode === 'boolean'
+        ? raw.fastMode
+        : DEFAULT_SIDEBAR_STATE.fastMode,
+    cacheKeep,
+    lastUpdated: typeof raw.lastUpdated === 'number' ? raw.lastUpdated : 0,
+  }
+}
 
 let writeChain: Promise<void> = Promise.resolve()
 
 export async function getSidebarState(): Promise<SidebarState> {
   try {
     const raw = await readFile(getSidebarStateFile(), 'utf8')
-    return JSON.parse(raw) as SidebarState
+    return normalizeSidebarState(JSON.parse(raw))
   } catch {
     return DEFAULT_SIDEBAR_STATE
   }
