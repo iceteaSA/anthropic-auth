@@ -26,6 +26,7 @@ import {
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
+  setCacheKeepSubagentsEnabled,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModePersistentEnabled,
@@ -101,6 +102,8 @@ export function registerCommands(pi: ExtensionAPI) {
         )
       } else if (action.type === 'disable') {
         storage = await setCacheKeepPersistentEnabled(false, path)
+      } else if (action.type === 'subagents') {
+        storage = await setCacheKeepSubagentsEnabled(action.enabled, path)
       }
 
       notify(

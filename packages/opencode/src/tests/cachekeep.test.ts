@@ -35,6 +35,17 @@ describe('claude-cachekeep command', () => {
     expect(parseCacheKeepCommandAction('9-9')).toEqual({ type: 'usage' })
   })
 
+  test('parses subagents on/off', () => {
+    expect(parseCacheKeepCommandAction('subagents on')).toEqual({
+      type: 'subagents',
+      enabled: true,
+    })
+    expect(parseCacheKeepCommandAction('subagents off')).toEqual({
+      type: 'subagents',
+      enabled: false,
+    })
+  })
+
   test('renders hybrid requirement and tracked sessions', () => {
     const summary = executeCacheKeepCommand({
       argumentsText: '09-23',
@@ -267,6 +278,155 @@ describe('CacheKeepManager', () => {
       tracked: false,
       reason: 'body exceeds cachekeep memory budget',
     })
+    manager.stop()
+  })
+
+  test('reads usage from prewarm response and logs cost', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const fetchImpl = mock(
+      (_input: string | URL | Request, _init?: RequestInit) => {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              usage: {
+                input_tokens: 5000,
+                cache_creation_input_tokens: 3000,
+                cache_read_input_tokens: 0,
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+    })
+
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await manager.track({
+      sessionId: 'ses_cost',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: body,
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    manager.stop()
+  })
+
+  test('handles prewarm response without usage gracefully', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const fetchImpl = mock(
+      (_input: string | URL | Request, _init?: RequestInit) => {
+        return Promise.resolve(
+          new Response(JSON.stringify({ id: 'msg_1' }), { status: 200 }),
+        )
+      },
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+    })
+
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await manager.track({
+      sessionId: 'ses_no_usage',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: body,
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    manager.stop()
+  })
+
+  test('handles prewarm json parse failure gracefully', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const fetchImpl = mock(
+      (_input: string | URL | Request, _init?: RequestInit) => {
+        return Promise.resolve(new Response('not json', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+    })
+
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await manager.track({
+      sessionId: 'ses_bad_json',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: body,
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    manager.stop()
+  })
+
+  test('failed prewarm reschedules with backoff', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const fetchImpl = mock(
+      (_input: string | URL | Request, _init?: RequestInit) => {
+        return Promise.resolve(new Response('rate limited', { status: 429 }))
+      },
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+    })
+
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await manager.track({
+      sessionId: 'ses_fail',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: body,
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
     manager.stop()
   })
 })

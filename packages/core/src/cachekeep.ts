@@ -29,6 +29,7 @@ export type CacheKeepCommandAction =
   | { type: 'disable' }
   | { type: 'window'; startHour: number; endHour: number }
   | { type: 'usage' }
+  | { type: 'subagents'; enabled: boolean }
 
 export type CacheKeepStatus = {
   enabled: boolean
@@ -48,6 +49,8 @@ export function parseCacheKeepCommandAction(
   const trimmed = input.trim()
   if (!trimmed) return { type: 'status' }
   if (trimmed === 'off') return { type: 'disable' }
+  if (trimmed === 'subagents on') return { type: 'subagents', enabled: true }
+  if (trimmed === 'subagents off') return { type: 'subagents', enabled: false }
 
   const match = /^(\d{1,2})-(\d{1,2})$/.exec(trimmed)
   if (!match) return { type: 'usage' }
@@ -192,6 +195,16 @@ export function executeCacheKeepCommand(input: {
     ].join('\n')
   }
 
+  if (action.type === 'subagents') {
+    return [
+      STATUS_TITLE,
+      '',
+      buildCacheKeepStatusSummary(status),
+      '',
+      `Subagent tracking: ${action.enabled ? 'enabled' : 'disabled'}`,
+    ].join('\n')
+  }
+
   return [USAGE_TITLE, '', USAGE, '', buildCacheKeepStatusSummary(status)].join(
     '\n',
   )
@@ -269,12 +282,12 @@ export class CacheKeepManager {
         headers: Headers,
         target: CacheKeepTarget,
       ) => Promise<Headers> | Headers
-      log?: (message: string, data?: Record<string, unknown>) => void
     },
   ) {}
 
   start() {
     if (this.timer) return
+    logger.debug('cachekeep', 'started')
     this.timer = setInterval(() => {
       void this.tick().catch((error) => {
         logger.warn('cachekeep', 'tick failed', {
@@ -286,7 +299,9 @@ export class CacheKeepManager {
   }
 
   stop() {
-    if (this.timer) clearInterval(this.timer)
+    if (!this.timer) return
+    logger.debug('cachekeep', 'stopped')
+    clearInterval(this.timer)
     this.timer = null
   }
 
@@ -401,6 +416,7 @@ export class CacheKeepManager {
     if (!isCacheKeepHybridActive(storage)) return
     if (!isWithinCacheKeepWindow(window, new Date(now))) return
 
+    logger.debug('cachekeep', 'fired', { targets: this.targets.size })
     const dueAt = now + CACHE_KEEP_PREWARM_LEAD_MS
     for (const target of this.targets.values()) {
       if (target.cacheExpiresAt > dueAt) continue
@@ -411,7 +427,7 @@ export class CacheKeepManager {
   private async prewarm(target: CacheKeepTarget, now: number) {
     const prewarm = await buildCacheKeepPrewarmBody(target.bodyText)
     if (!prewarm.ok) {
-      this.options.log?.('[cachekeep] prewarm skipped', {
+      logger.debug('cachekeep', 'prewarm skipped', {
         session: target.id,
         reason: prewarm.reason,
       })
@@ -443,8 +459,25 @@ export class CacheKeepManager {
       target.cacheExpiresAt = now + CACHE_KEEP_PREWARM_LEAD_MS + 5 * 60_000
       return
     }
-    await response.body?.cancel().catch(() => {})
+    const data = (await response.json().catch(() => null)) as Record<
+      string,
+      unknown
+    > | null
+    const usage = data?.usage as
+      | {
+          input_tokens?: number
+          cache_creation_input_tokens?: number
+          cache_read_input_tokens?: number
+        }
+      | undefined
     target.cacheExpiresAt = now + CACHE_KEEP_TTL_MS
-    this.options.log?.('[cachekeep] prewarm succeeded', { session: target.id })
+    if (usage) {
+      logger.debug('cachekeep', 'prewarm succeeded', {
+        session: target.id,
+        usage,
+      })
+    } else {
+      logger.debug('cachekeep', 'prewarm succeeded', { session: target.id })
+    }
   }
 }

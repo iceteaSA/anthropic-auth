@@ -164,6 +164,7 @@ export type AccountStorage = {
     enabled?: boolean
     startHour?: number
     endHour?: number
+    subagents?: boolean
   }
   relay?: {
     enabled?: boolean
@@ -1129,6 +1130,27 @@ export async function setCacheKeepPersistentEnabled(
   storage.cacheKeep = {
     ...(storage.cacheKeep ?? {}),
     enabled,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export function isCacheKeepSubagentsEnabled(storage: AccountStorage | null) {
+  return storage?.cacheKeep?.subagents === true
+}
+
+export async function setCacheKeepSubagentsEnabled(
+  enabled: boolean,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
+    subagents: enabled,
   }
   await saveAccounts(storage, path)
   return storage

@@ -48,6 +48,7 @@ import {
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
+  isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
   isFastModeEnabled,
@@ -84,6 +85,7 @@ import {
   setCache1hState,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
+  setCacheKeepSubagentsEnabled,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModeEnabled,
@@ -508,7 +510,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
       return headers
     },
-    log,
   })
   setCache1hState({
     enabled: isCache1hPersistentlyEnabled(initialStorage),
@@ -825,8 +826,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         action.startHour,
         action.endHour,
       )
+      logger.info('commands', 'cachekeep enabled changed', { enabled: true })
     } else if (action.type === 'disable') {
       storage = await setCacheKeepPersistentEnabled(false)
+      logger.info('commands', 'cachekeep enabled changed', { enabled: false })
+    } else if (action.type === 'subagents') {
+      storage = await setCacheKeepSubagentsEnabled(action.enabled)
+      logger.info('commands', 'cachekeep subagents changed', {
+        subagents: action.enabled,
+      })
     }
 
     const window = getCacheKeepWindow(storage)
@@ -1907,27 +1915,28 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             if (
               route === 'main' &&
               typeof body === 'string' &&
-              !subagentRequest &&
               isCache1hEnabled() &&
               getCache1hMode() === 'hybrid'
             ) {
               const storage = await getRequestStorage()
-              const cacheKeepStart = nowMs()
-              const tracked = cacheKeepManager.track({
-                sessionId: relayAffinity,
-                url: rewritten.url?.toString() ?? rewritten.input.toString(),
-                headers: requestHeaders,
-                bodyText: body,
-                storage,
-                cacheMode: 'hybrid',
-              })
-              trace?.mark('cachekeep_track', {
-                session: relayAffinity,
-                ms: roundMs(nowMs() - cacheKeepStart),
-                tracked: tracked.tracked,
-                reason: tracked.tracked ? undefined : tracked.reason,
-                bodyBytes: body.length,
-              })
+              if (!subagentRequest || isCacheKeepSubagentsEnabled(storage)) {
+                const cacheKeepStart = nowMs()
+                const tracked = cacheKeepManager.track({
+                  sessionId: relayAffinity,
+                  url: rewritten.url?.toString() ?? rewritten.input.toString(),
+                  headers: requestHeaders,
+                  bodyText: body,
+                  storage,
+                  cacheMode: 'hybrid',
+                })
+                trace?.mark('cachekeep_track', {
+                  session: relayAffinity,
+                  ms: roundMs(nowMs() - cacheKeepStart),
+                  tracked: tracked.tracked,
+                  reason: tracked.tracked ? undefined : tracked.reason,
+                  bodyBytes: body.length,
+                })
+              }
             }
 
             const directFetch = async () => {

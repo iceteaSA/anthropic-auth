@@ -19,6 +19,7 @@ import {
   FallbackAccountManager,
   getAccountStatePath,
   getCache1hPersistentMode,
+  isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
   type KillswitchThresholds,
@@ -34,6 +35,7 @@ import {
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
+  setCacheKeepSubagentsEnabled,
   setFastModePersistentEnabled,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
@@ -757,6 +759,18 @@ describe('account storage', () => {
       startHour: 9,
       endHour: 23,
     })
+  })
+
+  test('persists and reads cacheKeep subagents toggle', async () => {
+    const storage = await setCacheKeepSubagentsEnabled(true)
+    expect(storage.cacheKeep?.subagents).toBe(true)
+    expect(isCacheKeepSubagentsEnabled(storage)).toBe(true)
+
+    const disabled = await setCacheKeepSubagentsEnabled(false)
+    expect(disabled.cacheKeep?.subagents).toBe(false)
+    expect(isCacheKeepSubagentsEnabled(disabled)).toBe(false)
+
+    expect(isCacheKeepSubagentsEnabled(null)).toBe(false)
   })
 
   test('persists claudeFast enabled state', async () => {
