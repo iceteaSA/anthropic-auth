@@ -234,24 +234,51 @@ export function openCommandDialog(
         quotaPercent: number | null
       }>) ?? []
 
+    const updateAccounts = (r: {
+      text: string
+      knobs: Record<string, unknown>
+    }) => {
+      const updated = r.knobs.accounts as typeof accounts
+      if (updated && updated.length > 0) {
+        accounts.length = 0
+        accounts.push(...updated)
+      }
+    }
+
     const buildL1 = () => {
       const DialogSelect = api.ui.DialogSelect<string>
+      const l1Options: Array<{
+        title: string
+        value: string
+        description?: string
+      }> = [
+        {
+          title: 'Add account\u2026',
+          value: '__add__',
+          description: 'Add an API key or OAuth fallback account',
+        },
+        ...accounts.map((a) => {
+          const pct =
+            a.quotaPercent != null
+              ? ` ${Math.round(a.quotaPercent)}%`
+              : ' \u2013%'
+          const status = !a.enabled ? ' (disabled)' : ''
+          return {
+            title: `${a.label} [${a.role}]${status}${pct}`,
+            value: a.id,
+          }
+        }),
+      ]
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
         <DialogSelect
           title='Claude accounts'
-          options={accounts.map((a) => {
-            const pct =
-              a.quotaPercent != null
-                ? ` ${Math.round(a.quotaPercent)}%`
-                : ' \u2013%'
-            const status = !a.enabled ? ' (disabled)' : ''
-            return {
-              title: `${a.label} [${a.role}]${status}${pct}`,
-              value: a.id,
-            }
-          })}
+          options={l1Options}
           onSelect={(option) => {
+            if (option.value === '__add__') {
+              openAddType()
+              return
+            }
             const account = accounts.find((a) => a.id === option.value)
             if (!account) return
             if (account.role === 'main') {
@@ -271,6 +298,127 @@ export function openCommandDialog(
       ))
     }
 
+    // -- Add type selection (OAuth vs API key) ------------------------------
+    const openAddType = () => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='Add account'
+          options={[
+            {
+              title: 'OAuth (login)',
+              value: 'oauth',
+              description:
+                'Sign in to Claude via browser — works with Pro, Max, and Team plans',
+            },
+            {
+              title: 'API key',
+              value: 'apikey',
+              description:
+                'Provide an API key for an Anthropic-compatible endpoint',
+            },
+            { title: 'Back', value: 'back' },
+          ]}
+          onSelect={(option) => {
+            if (option.value === 'back') {
+              buildL1()
+              return
+            }
+            if (option.value === 'apikey') {
+              openAddApiKey()
+              return
+            }
+            openAddOAuthStart()
+          }}
+        />
+      ))
+    }
+
+    // -- Add API key -------------------------------------------------------
+    const openAddApiKey = () => {
+      const DialogPrompt = api.ui.DialogPrompt
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title='Add API key account'
+          description={() => (
+            <text>
+              Paste your API key below. Optionally add a label after a space
+              (e.g. sk-ant-... my-label).
+            </text>
+          )}
+          placeholder='sk-ant-... my-label'
+          value=''
+          onConfirm={(value: string) => {
+            const trimmed = value.trim()
+            if (!trimmed) {
+              buildL1()
+              return
+            }
+            void apply('claude-account', `add-apikey ${trimmed}`).then((r) => {
+              api.ui.toast({ message: r.text })
+              updateAccounts(r)
+              buildL1()
+            })
+          }}
+          onCancel={() => openAddType()}
+        />
+      ))
+    }
+
+    // -- Add OAuth ---------------------------------------------------------
+    const openAddOAuthStart = () => {
+      void apply('claude-account', 'add-oauth-start').then((r) => {
+        const oauthUrl = r.knobs.oauthUrl as string | undefined
+        updateAccounts(r)
+        if (oauthUrl) {
+          openAddOAuthCode(oauthUrl)
+        } else {
+          api.ui.toast({ message: r.text })
+          buildL1()
+        }
+      })
+    }
+
+    const openAddOAuthCode = (oauthUrl: string) => {
+      const DialogPrompt = api.ui.DialogPrompt
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title='OAuth sign-in'
+          description={() => (
+            <box flexDirection='column' gap={1}>
+              <text>Open this URL in your browser and sign in to Claude:</text>
+              <text>{oauthUrl}</text>
+              <text>
+                After sign-in you will be redirected. Paste the full callback
+                URL or authorization code below.
+              </text>
+            </box>
+          )}
+          placeholder='Paste callback URL or code here'
+          value=''
+          onConfirm={(value: string) => {
+            const trimmed = value.trim()
+            if (!trimmed) {
+              buildL1()
+              return
+            }
+            void apply('claude-account', `add-oauth-finish ${trimmed}`).then(
+              (r) => {
+                api.ui.toast({ message: r.text })
+                updateAccounts(r)
+                buildL1()
+              },
+            )
+          }}
+          onCancel={() => buildL1()}
+        />
+      ))
+    }
+
+    // -- Manage existing account -------------------------------------------
     const openManage = (
       account: (typeof accounts)[number],
       isMain: boolean,
@@ -329,12 +477,8 @@ export function openCommandDialog(
                   onConfirm={() => {
                     void apply('claude-account', `remove ${account.id}`).then(
                       (r) => {
-                        const updated = r.knobs.accounts as typeof accounts
                         api.ui.toast({ message: r.text })
-                        if (updated && updated.length > 0) {
-                          accounts.length = 0
-                          accounts.push(...updated)
-                        }
+                        updateAccounts(r)
                         buildL1()
                       },
                     )
@@ -347,18 +491,14 @@ export function openCommandDialog(
 
             void apply('claude-account', `${option.value} ${account.id}`).then(
               (r) => {
-                const updated = r.knobs.accounts as typeof accounts
                 api.ui.toast({ message: r.text })
-                if (updated && updated.length > 0) {
-                  accounts.length = 0
-                  accounts.push(...updated)
-                  openManage(
-                    updated.find((a) => a.id === account.id) ?? account,
-                    isMain,
-                  )
-                } else {
-                  openManage(account, isMain)
-                }
+                updateAccounts(r)
+                const updatedList = r.knobs.accounts as typeof accounts
+                const refreshed =
+                  (updatedList && updatedList.length > 0
+                    ? updatedList.find((a) => a.id === account.id)
+                    : undefined) ?? account
+                openManage(refreshed, isMain)
               },
             )
           }}

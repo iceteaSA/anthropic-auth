@@ -3,6 +3,7 @@ import {
   type AccountStorage,
   type ApiKeyAccount,
   acquireRefreshFileLock,
+  addAccountPersistent,
   authorize,
   buildAccountList,
   buildClaudeQuotaSummary,
@@ -71,6 +72,7 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
@@ -414,6 +416,57 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
   const accountStoragePath = getAccountStoragePath()
+
+  // -- OAuth add-flow pending state (Add account modal) --------------------
+  interface OAuthPendingEntry {
+    state: string
+    verifier: string
+    redirectUri: string
+    createdAt: number
+  }
+  const OAUTH_PENDING_TTL_MS = 10 * 60 * 1000 // 10 minutes
+  const OAUTH_PENDING_CAP = 50
+  const oauthPending = new Map<string, OAuthPendingEntry>()
+
+  function cleanupExpiredOAuthPending() {
+    const now = Date.now()
+    for (const [sessionId, entry] of oauthPending) {
+      if (now - entry.createdAt > OAUTH_PENDING_TTL_MS) {
+        oauthPending.delete(sessionId)
+      }
+    }
+  }
+
+  function storeOAuthPending(
+    sessionId: string,
+    entry: OAuthPendingEntry,
+  ): void {
+    cleanupExpiredOAuthPending()
+    if (oauthPending.size >= OAUTH_PENDING_CAP) {
+      let oldestSession = ''
+      let oldestTime = Infinity
+      for (const [sid, e] of oauthPending) {
+        if (e.createdAt < oldestTime) {
+          oldestTime = e.createdAt
+          oldestSession = sid
+        }
+      }
+      if (oldestSession) oauthPending.delete(oldestSession)
+    }
+    oauthPending.set(sessionId, entry)
+  }
+
+  function takeOAuthPending(sessionId: string): OAuthPendingEntry | undefined {
+    cleanupExpiredOAuthPending()
+    const entry = oauthPending.get(sessionId)
+    if (!entry) return undefined
+    if (Date.now() - entry.createdAt > OAUTH_PENDING_TTL_MS) {
+      oauthPending.delete(sessionId)
+      return undefined
+    }
+    return entry
+  }
+
   let initialStorage: AccountStorage | null
   try {
     initialStorage = await loadAccounts(accountStoragePath)
@@ -799,6 +852,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return buildClaudeQuotaSummary({ accounts, refreshedAt: Date.now() })
   }
 
+  async function refreshSidebarAfterMutation(
+    updatedStorage: AccountStorage | null,
+  ) {
+    if (latestGetAuth) {
+      try {
+        const auth = await latestGetAuth()
+        writeSidebarState(updatedStorage, {
+          activeId: lastSidebarRouting.activeId,
+          route: lastSidebarRouting.route,
+          mainAccessToken: auth.access,
+          mainRefreshToken: auth.refresh,
+        })
+      } catch {
+        // auth not yet available — sidebar will refresh on next request
+      }
+    }
+  }
+
   async function executePersistentCache1hCommand(argumentsText: string) {
     const action = parseCache1hCommandAction(argumentsText)
     if (action.type === 'enable' || action.type === 'disable') {
@@ -920,7 +991,143 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return executeLoggingCommand({ argumentsText, level })
   }
 
-  async function executePersistentAccountCommand(argumentsText: string) {
+  async function executePersistentAccountCommand(
+    argumentsText: string,
+    sessionId?: string,
+  ) {
+    const action = parseAccountCommandAction(argumentsText)
+
+    // -- add-apikey --------------------------------------------------------
+    if (action.type === 'add-apikey') {
+      if (!action.apiKey) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return { text: 'API key is required', accounts }
+      }
+      const label = action.label?.trim() || undefined
+      const now = Date.now()
+      const account: ApiKeyAccount = {
+        id: label || randomUUID(),
+        label: label || undefined,
+        type: 'api' as const,
+        apiKey: action.apiKey,
+        baseURL: 'https://api.kie.ai/claude',
+        authHeader: 'authorization-bearer' as const,
+        enabled: true,
+        addedAt: now,
+        lastUsed: now,
+      }
+      await addAccountPersistent(account, accountStoragePath)
+      logger.info('commands', 'account added', {
+        id: account.id,
+        label: account.label,
+        type: 'apikey',
+      })
+
+      const updatedStorage = await loadAccounts(accountStoragePath)
+      await refreshSidebarAfterMutation(updatedStorage)
+      const accounts = buildAccountList(
+        updatedStorage ?? { version: 1, accounts: [] },
+      )
+      return {
+        text: `API key account "${account.label ?? account.id}" added.`,
+        accounts,
+      }
+    }
+
+    // -- add-oauth-start ---------------------------------------------------
+    if (action.type === 'add-oauth-start') {
+      const authResult = await authorize('max')
+      const entry: OAuthPendingEntry = {
+        state: authResult.state,
+        verifier: authResult.verifier,
+        redirectUri: authResult.redirectUri,
+        createdAt: Date.now(),
+      }
+      const key = sessionId ?? 'default'
+      storeOAuthPending(key, entry)
+      return {
+        text: `Open this URL in your browser:\n${authResult.url}`,
+        knobs: { oauthUrl: authResult.url },
+        accounts: buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        ),
+      }
+    }
+
+    // -- add-oauth-finish --------------------------------------------------
+    if (action.type === 'add-oauth-finish') {
+      const key = sessionId ?? 'default'
+      const pending = takeOAuthPending(key)
+      if (!pending) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return {
+          text: 'OAuth session expired. Please start again.',
+          accounts,
+        }
+      }
+
+      const result = await exchange(
+        action.code,
+        pending.verifier,
+        pending.redirectUri,
+        pending.state,
+      )
+
+      if (result.type === 'failed') {
+        oauthPending.delete(key)
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return {
+          text: 'OAuth authentication failed. Please check the code and try again.',
+          accounts,
+        }
+      }
+
+      const now = Date.now()
+      const account: OAuthAccount = {
+        id: randomUUID(),
+        type: 'oauth' as const,
+        access: result.access,
+        refresh: result.refresh,
+        expires: result.expires,
+        enabled: true,
+        addedAt: now,
+        lastUsed: now,
+      }
+      await addAccountPersistent(account, accountStoragePath)
+      oauthPending.delete(key)
+      logger.info('commands', 'account added', {
+        id: account.id,
+        label: account.label,
+        type: 'oauth',
+      })
+
+      const updatedStorage = await loadAccounts(accountStoragePath)
+      await refreshSidebarAfterMutation(updatedStorage)
+      const accounts = buildAccountList(
+        updatedStorage ?? { version: 1, accounts: [] },
+      )
+      return { text: `OAuth account added.`, accounts }
+    }
+
+    // -- existing flows ----------------------------------------------------
     const storage = await loadAccounts(accountStoragePath)
     const result = executeAccountCommand({
       argumentsText,
@@ -992,6 +1199,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   async function buildDialogPayload(
     command: CommandModalName,
     args: string,
+    sessionId?: string,
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
@@ -1005,11 +1213,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     }
     if (command === 'claude-account') {
-      const result = await executePersistentAccountCommand(args)
+      const result = await executePersistentAccountCommand(args, sessionId)
+      const knobs: Record<string, unknown> = {
+        accounts: result.accounts,
+      }
+      if ('knobs' in result && result.knobs) {
+        Object.assign(knobs, result.knobs)
+      }
       return {
         command,
         text: result.text,
-        knobs: { accounts: result.accounts },
+        knobs,
       }
     }
     if (command === 'claude-routing') {
@@ -1089,7 +1303,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   }
 
   async function applyCommand(request: ApplyRequest): Promise<ApplyResult> {
-    const payload = await buildDialogPayload(request.command, request.arguments)
+    const payload = await buildDialogPayload(
+      request.command,
+      request.arguments,
+      request.sessionId,
+    )
     return { text: payload.text, knobs: payload.knobs }
   }
 
@@ -1288,7 +1506,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       ]
       if (!modalCommands.includes(input.command as CommandModalName)) return
       const command = input.command as CommandModalName
-      const payload = await buildDialogPayload(command, input.arguments)
+      const payload = await buildDialogPayload(
+        command,
+        input.arguments,
+        input.sessionID,
+      )
       if (command === 'claude-quota') {
         const cmdStorage = await loadAccounts()
         const cmdAuth = latestGetAuth

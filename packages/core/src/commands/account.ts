@@ -9,6 +9,9 @@ export type AccountCommandAction =
   | { type: 'remove'; id: string }
   | { type: 'move-up'; id: string }
   | { type: 'move-down'; id: string }
+  | { type: 'add-apikey'; apiKey: string; label?: string }
+  | { type: 'add-oauth-start' }
+  | { type: 'add-oauth-finish'; code: string }
   | { type: 'usage' }
 
 export function parseAccountCommandAction(
@@ -18,13 +21,30 @@ export function parseAccountCommandAction(
   if (parts.length === 0) return { type: 'status' }
 
   const action = parts[0]
-  const id = parts.slice(1).join(' ')
+  const rest = parts.slice(1).join(' ')
 
-  if (action === 'enable' && id) return { type: 'enable', id }
-  if (action === 'disable' && id) return { type: 'disable', id }
-  if (action === 'remove' && id) return { type: 'remove', id }
-  if (action === 'move-up' && id) return { type: 'move-up', id }
-  if (action === 'move-down' && id) return { type: 'move-down', id }
+  if (action === 'enable' && rest) return { type: 'enable', id: rest }
+  if (action === 'disable' && rest) return { type: 'disable', id: rest }
+  if (action === 'remove' && rest) return { type: 'remove', id: rest }
+  if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
+  if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
+
+  if (action === 'add-apikey' && rest) {
+    const firstSpace = rest.indexOf(' ')
+    if (firstSpace === -1) {
+      return { type: 'add-apikey', apiKey: rest }
+    }
+    return {
+      type: 'add-apikey',
+      apiKey: rest.slice(0, firstSpace),
+      label: rest.slice(firstSpace + 1).trim() || undefined,
+    }
+  }
+
+  if (action === 'add-oauth-start') return { type: 'add-oauth-start' }
+
+  if (action === 'add-oauth-finish' && rest)
+    return { type: 'add-oauth-finish', code: rest }
 
   return { type: 'usage' }
 }
@@ -68,12 +88,15 @@ export function buildAccountList(storage: AccountStorage): AccountListItem[] {
 
 const USAGE_TEXT = [
   'Usage:',
-  '  /claude-account                  Show account list',
-  '  /claude-account enable <id>      Enable a fallback account',
-  '  /claude-account disable <id>     Disable a fallback account',
-  '  /claude-account remove <id>      Remove a fallback account',
-  '  /claude-account move-up <id>     Move a fallback account up',
-  '  /claude-account move-down <id>   Move a fallback account down',
+  '  /claude-account                       Show account list',
+  '  /claude-account enable <id>           Enable a fallback account',
+  '  /claude-account disable <id>          Disable a fallback account',
+  '  /claude-account remove <id>           Remove a fallback account',
+  '  /claude-account move-up <id>          Move a fallback account up',
+  '  /claude-account move-down <id>        Move a fallback account down',
+  '  /claude-account add-apikey <key>      Add an API key fallback account',
+  '  /claude-account add-oauth-start       Start OAuth device flow',
+  '  /claude-account add-oauth-finish <code>  Complete OAuth flow',
 ].join('\n')
 
 export function executeAccountCommand(input: {
@@ -108,6 +131,16 @@ export function executeAccountCommand(input: {
 
   if (action.type === 'usage') {
     return { text: USAGE_TEXT }
+  }
+
+  if (action.type === 'add-apikey') {
+    return { text: 'add-apikey' }
+  }
+  if (action.type === 'add-oauth-start') {
+    return { text: 'add-oauth-start' }
+  }
+  if (action.type === 'add-oauth-finish') {
+    return { text: 'add-oauth-finish' }
   }
 
   const id = action.id

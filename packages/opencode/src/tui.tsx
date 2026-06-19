@@ -800,7 +800,7 @@ const tui: TuiPlugin = async (api) => {
               continue
             }
             openCommandDialog(api, message.payload, (command, args) =>
-              rpcClient.apply({ command, arguments: args }),
+              rpcClient.apply({ command, arguments: args, sessionId }),
             )
           }
         })
