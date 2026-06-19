@@ -22,12 +22,12 @@ describe('getRpcDir', () => {
     expect(isAbsolute(dir)).toBe(true)
   })
 
-  test('resolves relative override to absolute', () => {
+  test('resolves relative override anchored to projectDirectory (not cwd)', () => {
     process.env[RPC_DIR_ENV] = 'relative/path/to/rpc'
     const dir = getRpcDir('/home/user/project')
     expect(isAbsolute(dir)).toBe(true)
-    // Must NOT just return the literal relative string
-    expect(dir).not.toBe('relative/path/to/rpc')
+    // Must be anchored to projectDirectory, not just cwd
+    expect(dir).toBe('/home/user/project/relative/path/to/rpc')
   })
 
   test('returns absolute override unchanged (still absolute)', () => {
