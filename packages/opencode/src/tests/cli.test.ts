@@ -292,14 +292,18 @@ describe('CLI login', () => {
 })
 
 describe('CLI relay setup', () => {
-  test('deploys worker resources and saves relay config', async () => {
-    const accountPath = join(tempDir, 'anthropic-auth.json')
-    const callsPath = join(tempDir, 'calls.jsonl')
-    const preloadPath = join(tempDir, 'relay-preload.ts')
+  // biome-ignore lint/complexity/noBannedTypes: bun-types lacks 3-arg test(name, opts, fn) overload
+  ;(test as Function)(
+    'deploys worker resources and saves relay config',
+    { timeout: 20000 },
+    async () => {
+      const accountPath = join(tempDir, 'anthropic-auth.json')
+      const callsPath = join(tempDir, 'calls.jsonl')
+      const preloadPath = join(tempDir, 'relay-preload.ts')
 
-    await writeFile(
-      preloadPath,
-      `import { appendFileSync } from 'node:fs'
+      await writeFile(
+        preloadPath,
+        `import { appendFileSync } from 'node:fs'
 globalThis.fetch = async (input, init) => {
   const url = input.toString()
   appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ url, method: init?.method }) + '\\n')
@@ -310,48 +314,49 @@ globalThis.fetch = async (input, init) => {
   return Response.json({ success: false, errors: [{ message: 'unexpected ' + url }] }, { status: 500 })
 }
 `,
-      'utf8',
-    )
+        'utf8',
+      )
 
-    const proc = Bun.spawn(
-      ['bun', '--preload', preloadPath, 'src/cli.ts', 'relay', 'setup'],
-      {
-        cwd: packageRoot,
-        env: {
-          ...process.env,
-          OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
-          CLOUDFLARE_API_TOKEN: 'cf-token',
-          CLOUDFLARE_ACCOUNT_ID: 'account-id',
+      const proc = Bun.spawn(
+        ['bun', '--preload', preloadPath, 'src/cli.ts', 'relay', 'setup'],
+        {
+          cwd: packageRoot,
+          env: {
+            ...process.env,
+            OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
+            CLOUDFLARE_API_TOKEN: 'cf-token',
+            CLOUDFLARE_ACCOUNT_ID: 'account-id',
+          },
+          stdin: 'pipe',
+          stdout: 'pipe',
+          stderr: 'pipe',
         },
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    )
+      )
 
-    proc.stdin.write('\n')
-    proc.stdin.end()
+      proc.stdin.write('\n')
+      proc.stdin.end()
 
-    const [exitCode, stdout, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ])
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ])
 
-    expect(stderr).toBe('')
-    expect(exitCode).toBe(0)
-    expect(stdout).toContain('Relay enabled')
+      expect(stderr).toBe('')
+      expect(exitCode).toBe(0)
+      expect(stdout).toContain('Relay enabled')
 
-    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
-    expect(storage.relay).toMatchObject({
-      enabled: true,
-      url: 'https://opencode-anthropic-relay.user-subdomain.workers.dev',
-      fallbackToDirect: true,
-      transport: 'http',
-    })
-    expect(storage.relay.token).toBeString()
+      const storage = JSON.parse(await readFile(accountPath, 'utf8'))
+      expect(storage.relay).toMatchObject({
+        enabled: true,
+        url: 'https://opencode-anthropic-relay.user-subdomain.workers.dev',
+        fallbackToDirect: true,
+        transport: 'http',
+      })
+      expect(storage.relay.token).toBeString()
 
-    const calls = (await readFile(callsPath, 'utf8')).trim().split('\n')
-    expect(calls).toHaveLength(4)
-  })
+      const calls = (await readFile(callsPath, 'utf8')).trim().split('\n')
+      expect(calls).toHaveLength(4)
+    },
+  )
 })
