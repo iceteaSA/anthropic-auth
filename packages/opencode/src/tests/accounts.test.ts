@@ -2096,6 +2096,64 @@ describe('recordQuotaRefreshError refresh-backoff arming', () => {
     expect(account?.lastRefreshError).toBeDefined()
     expect(account?.lastRefreshError?.checkedAt).toBe(now)
   })
+
+  test('quota-endpoint 401 does NOT arm refresh backoff (isRefreshError boundary)', async () => {
+    const now = 1_000_000
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-quota-401',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      // Token is fresh → tokenNeedsRefresh returns false, skipping
+      // the initial refresh step. This ensures the only error is from
+      // the quota endpoint, not from a token refresh.
+      expires: now + 24 * 60 * 60_000,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      // Quota endpoint returns 401
+      return Promise.resolve(
+        new Response('quota unauthorized', { status: 401 }),
+      )
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-quota-401') as
+      | OAuthAccount
+      | undefined
+    // Quota-401 must NOT arm the refresh backoff — only isRefreshError does.
+    expect(account?.lastRefreshError).toBeUndefined()
+    // Quota-401 DOES arm the quota backoff.
+    expect(account?.lastQuotaRefreshError).toBeDefined()
+    expect(account?.lastQuotaRefreshError?.checkedAt).toBe(now)
+  })
 })
 
 // ---------------------------------------------------------------------------

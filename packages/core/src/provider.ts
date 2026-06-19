@@ -10,4 +10,11 @@ export type ProviderHttpError = {
   status?: number
   /** Parsed Retry-After header value in seconds, if the server provided one. */
   retryAfter?: number
+
+  /**
+   * Provider-agnostic marker that the error originated from a token-REFRESH
+   * step (as opposed to a quota-endpoint or other non-refresh error). Consumers
+   * use this flag to arm the refresh backoff without instanceof checks.
+   */
+  isRefreshError?: boolean
 }
