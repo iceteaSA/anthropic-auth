@@ -1656,10 +1656,20 @@ describe('auth.loader', () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const plugin = await getPlugin()
 
-    const result: { command?: Record<string, unknown> } = {}
+    // Seed a pre-existing command from another plugin / opencode itself — the
+    // config hook must MERGE into config.command, never clobber it.
+    const preExisting = { template: 'other-plugin-cmd', description: 'foreign' }
+    const result: { command?: Record<string, unknown> } = {
+      command: { 'other-plugin-cmd': preExisting },
+    }
     await plugin.config(result)
 
     const registered = Object.keys(result.command ?? {})
+
+    // Passthrough-survival: the foreign command must still be present (the hook
+    // spreads ...(config.command ?? {}) — dropping that spread would silently
+    // wipe every other plugin's commands).
+    expect(result.command?.['other-plugin-cmd']).toEqual(preExisting)
 
     // Every modal command must be registered — if one is missing it won't appear
     // in the slash-command palette and users will get "No matching items".
@@ -1678,11 +1688,15 @@ describe('auth.loader', () => {
       expect(registered).toContain(name)
     }
 
-    // The config hook must not register extra commands beyond the modalCommands
-    // set (drift in either direction is a bug).  The CommandModalName type in
-    // protocol.ts and the modalCommands list in index.ts define exactly 9 names
-    // — no more, no less.
-    expect(registered).toHaveLength(9)
+    // The config hook must not register extra claude-* commands beyond the
+    // modalCommands set (drift in either direction is a bug). Exactly the 9
+    // required names should be claude-* keys — no more, no less. (The foreign
+    // 'other-plugin-cmd' is excluded from this count via the claude- prefix.)
+    const claudeRegistered = registered.filter((name) =>
+      name.startsWith('claude-'),
+    )
+    expect(claudeRegistered).toHaveLength(required.length)
+    expect([...claudeRegistered].sort()).toEqual([...required].sort())
   })
 
   test('handles /claude-cachekeep command and persists window', async () => {
