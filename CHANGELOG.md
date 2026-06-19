@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.10.2
+
+### Patch Changes
+
+- Fix OpenCode `ReadableStream is locked` failures after detecting Anthropic streaming rate-limit errors when no fallback route can serve the request, returning a replayable inspected response instead of reusing the consumed stream.
+
 ## 1.10.1
 
 ### Patch Changes

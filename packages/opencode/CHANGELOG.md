@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.10.2
+
+### Patch Changes
+
+- Fix `ReadableStream is locked` failures after detecting Anthropic streaming rate-limit errors when no fallback route can serve the request, returning a replayable inspected response instead of reusing the consumed stream.
+
 ## 1.10.1
 
 ### Patch Changes
