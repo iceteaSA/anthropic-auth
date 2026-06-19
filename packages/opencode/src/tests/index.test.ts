@@ -3627,6 +3627,74 @@ describe('auth.loader', () => {
     ])
   })
 
+  test('fetch wrapper returns inspected streaming rate limit response when fallbacks are unavailable', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'fallback-low',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 95,
+                remainingPercent: 5,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 10,
+                remainingPercent: 90,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      authorizations.push(init?.headers?.get('authorization'))
+      return Promise.resolve(
+        new Response(
+          'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account rate limit"}}\n\n',
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('rate_limit_error')
+    expect(authorizations).toEqual(['Bearer main-access'])
+  })
+
   test('fetch wrapper does not use fallback accounts below quota thresholds', async () => {
     await useTempAccountFile(
       createFallbackStorage({

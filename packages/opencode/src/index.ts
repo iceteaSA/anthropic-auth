@@ -1620,12 +1620,28 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
             if (isStreamingRateLimitText(text)) {
               await reader.cancel().catch(() => {})
+              try {
+                reader.releaseLock()
+              } catch {}
+              const stream = new ReadableStream({
+                start(controller) {
+                  for (const chunk of chunks) controller.enqueue(chunk)
+                  controller.close()
+                },
+              })
               trace?.mark('inspect_stream_first_event', {
                 ms: roundMs(nowMs() - start),
                 bytes,
                 rateLimited: true,
               })
-              return { response, rateLimited: true }
+              return {
+                response: new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers,
+                }),
+                rateLimited: true,
+              }
             }
 
             const stream = new ReadableStream({
