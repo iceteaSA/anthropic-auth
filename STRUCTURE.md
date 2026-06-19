@@ -96,7 +96,7 @@ anthropic-auth/
 
 ## Naming Conventions
 
-**Files:** PascalCase for all TypeScript source files (`auth.ts`, `quota-manager.ts`, `FallbackAccountManager`, `rewriteRequestBody`). Each module file exports a focused set of related functions/types.
+**Files:** Lowercase with hyphens for all TypeScript source files (`auth.ts`, `quota-manager.ts`, `fallback-account.ts`). Each module file exports a focused set of related functions/types.
 
 **Directories:** Lowercase with hyphens for feature directories (`rpc/`, `tui/`, `e2e-tests/`). Tests are co-located in `tests/` subdirectories.
 
