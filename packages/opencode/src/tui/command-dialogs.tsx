@@ -5,7 +5,7 @@ import type { OpenDialogPayload } from '../rpc/protocol.js'
 type ApplyFn = (
   command: OpenDialogPayload['command'],
   args: string,
-) => Promise<{ text: string }>
+) => Promise<{ text: string; knobs: Record<string, unknown> }>
 
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
@@ -221,6 +221,145 @@ export function openCommandDialog(
         }}
       />
     ))
+    return
+  }
+
+  if (payload.command === 'claude-account') {
+    const accounts =
+      (payload.knobs.accounts as Array<{
+        id: string
+        label: string
+        role: string
+        enabled: boolean
+        quotaPercent: number | null
+      }>) ?? []
+
+    const buildL1 = () => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='Claude accounts'
+          options={accounts.map((a) => {
+            const pct =
+              a.quotaPercent != null
+                ? ` ${Math.round(a.quotaPercent)}%`
+                : ' \u2013%'
+            const status = !a.enabled ? ' (disabled)' : ''
+            return {
+              title: `${a.label} [${a.role}]${status}${pct}`,
+              value: a.id,
+            }
+          })}
+          onSelect={(option) => {
+            const account = accounts.find((a) => a.id === option.value)
+            if (!account) return
+            if (account.role === 'main') {
+              openManage(account, true)
+              return
+            }
+            openManage(account, false)
+          }}
+        />
+      ))
+    }
+
+    const openManage = (
+      account: (typeof accounts)[number],
+      isMain: boolean,
+    ) => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      const DialogConfirm = api.ui.DialogConfirm
+      api.ui.dialog.setSize('xlarge')
+
+      const options: Array<{
+        title: string
+        value: string
+        description?: string
+      }> = []
+      if (!isMain) {
+        const toggleLabel = account.enabled ? 'Disable' : 'Enable'
+        options.push({
+          title: toggleLabel,
+          value: account.enabled ? 'disable' : 'enable',
+          description: account.enabled
+            ? 'Stop using this fallback account'
+            : 'Allow this fallback account to be used',
+        })
+        options.push({
+          title: 'Move up',
+          value: 'move-up',
+          description: 'Higher priority in fallback order',
+        })
+        options.push({
+          title: 'Move down',
+          value: 'move-down',
+          description: 'Lower priority in fallback order',
+        })
+        options.push({
+          title: 'Remove\u2026',
+          value: 'remove',
+          description: 'Delete this account permanently',
+        })
+      }
+      options.push({ title: 'Back', value: 'back' })
+
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title={`Manage ${account.label}`}
+          options={options}
+          onSelect={(option) => {
+            if (option.value === 'back') {
+              buildL1()
+              return
+            }
+
+            if (option.value === 'remove') {
+              api.ui.dialog.replace(() => (
+                <DialogConfirm
+                  title={`Remove ${account.label}?`}
+                  message={`Are you sure you want to remove the fallback account "${account.label}"?`}
+                  onConfirm={() => {
+                    void apply('claude-account', `remove ${account.id}`).then(
+                      (r) => {
+                        const updated = r.knobs.accounts as typeof accounts
+                        api.ui.toast({ message: r.text })
+                        if (updated && updated.length > 0) {
+                          accounts.length = 0
+                          accounts.push(...updated)
+                        }
+                        buildL1()
+                      },
+                    )
+                  }}
+                  onCancel={() => openManage(account, isMain)}
+                />
+              ))
+              return
+            }
+
+            void apply('claude-account', `${option.value} ${account.id}`).then(
+              (r) => {
+                const updated = r.knobs.accounts as typeof accounts
+                api.ui.toast({ message: r.text })
+                if (updated && updated.length > 0) {
+                  accounts.length = 0
+                  accounts.push(...updated)
+                  openManage(
+                    updated.find((a) => a.id === account.id) ?? account,
+                    isMain,
+                  )
+                } else {
+                  openManage(account, isMain)
+                }
+              },
+            )
+          }}
+        />
+      ))
+    }
+
+    buildL1()
     return
   }
 

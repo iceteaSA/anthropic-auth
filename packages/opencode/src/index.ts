@@ -4,6 +4,7 @@ import {
   type ApiKeyAccount,
   acquireRefreshFileLock,
   authorize,
+  buildAccountList,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
   buildRefreshOperationError,
@@ -23,6 +24,7 @@ import {
   ClaudeOAuthRefreshError,
   dumpDirectRequest,
   exchange,
+  executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
   executeDumpCommand,
@@ -77,9 +79,12 @@ import {
   quotaSnapshotPassesPolicy,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
+  removeAccountPersistent,
+  reorderAccountsPersistent,
   resolveClaudeCodeIdentity,
   saveAccountState,
   sendViaRelay,
+  setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCache1hState,
@@ -898,12 +903,89 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
+  async function executePersistentAccountCommand(argumentsText: string) {
+    const storage = await loadAccounts(accountStoragePath)
+    const result = executeAccountCommand({
+      argumentsText,
+      storage: storage ?? { version: 1, accounts: [] },
+    })
+
+    if (result.updated) {
+      if (
+        result.updated.action === 'enable' ||
+        result.updated.action === 'disable'
+      ) {
+        const enabled = result.updated.action === 'enable'
+        await setAccountEnabledPersistent(
+          result.updated.id,
+          enabled,
+          accountStoragePath,
+        )
+        const updatedId = result.updated.id
+        const account = storage?.accounts.find((a) => a.id === updatedId)
+        logger.info('commands', `account ${result.updated.action}d`, {
+          id: updatedId,
+          label: account?.label,
+          enabled,
+        })
+      } else if (result.updated.action === 'remove') {
+        await removeAccountPersistent(result.updated.id, accountStoragePath)
+        const updatedId = result.updated.id
+        const account = storage?.accounts.find((a) => a.id === updatedId)
+        logger.info('commands', 'account removed', {
+          id: updatedId,
+          label: account?.label,
+        })
+      } else if (result.updated.action === 'reorder') {
+        await reorderAccountsPersistent(
+          result.updated.newOrder ?? result.updated.previousOrder ?? [],
+          accountStoragePath,
+        )
+        const updatedId = result.updated.id
+        const account = storage?.accounts.find((a) => a.id === updatedId)
+        logger.info('commands', 'account reordered', {
+          id: updatedId,
+          label: account?.label,
+        })
+      }
+
+      const updatedStorage = await loadAccounts(accountStoragePath)
+      if (latestGetAuth) {
+        try {
+          const auth = await latestGetAuth()
+          writeSidebarState(updatedStorage, {
+            activeId: lastSidebarRouting.activeId,
+            route: lastSidebarRouting.route,
+            mainAccessToken: auth.access,
+            mainRefreshToken: auth.refresh,
+          })
+        } catch {
+          // auth not yet available — sidebar will refresh on next request
+        }
+      }
+    }
+
+    const updatedStorage = await loadAccounts(accountStoragePath)
+    const accounts = buildAccountList(
+      updatedStorage ?? { version: 1, accounts: [] },
+    )
+    return { text: result.text, accounts }
+  }
+
   async function buildDialogPayload(
     command: CommandModalName,
     args: string,
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-account') {
+      const result = await executePersistentAccountCommand(args)
+      return {
+        command,
+        text: result.text,
+        knobs: { accounts: result.accounts },
+      }
+    }
     if (command === 'claude-routing') {
       const text = await executePersistentRoutingCommand(args)
       const storage = await loadAccounts(accountStoragePath)
@@ -1163,6 +1245,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       sessionID: string
     }) => {
       const modalCommands: CommandModalName[] = [
+        'claude-account',
         'claude-cache',
         'claude-cachekeep',
         'claude-quota',

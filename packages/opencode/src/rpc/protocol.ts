@@ -1,4 +1,5 @@
 export type CommandModalName =
+  | 'claude-account'
   | 'claude-cache'
   | 'claude-cachekeep'
   | 'claude-quota'

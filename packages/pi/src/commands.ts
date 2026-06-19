@@ -1,8 +1,10 @@
 import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
   executeDumpCommand,
@@ -218,6 +220,26 @@ export function registerCommands(pi: ExtensionAPI) {
           now: Date.now(),
         }),
       )
+    },
+  })
+
+  pi.registerCommand(CLAUDE_ACCOUNT_COMMAND_NAME, {
+    description: 'List, enable/disable, reorder, or remove fallback accounts',
+    handler: async (args, ctx) => {
+      const path = getPiAccountStoragePath()
+      const storage = await loadAccounts(path)
+      const result = executeAccountCommand({
+        argumentsText: args ?? '',
+        storage: storage ?? { version: 1, accounts: [] },
+      })
+
+      if (!result.updated) {
+        notify(ctx, result.text)
+        return
+      }
+
+      // Mutations not wired for Pi — display-only
+      notify(ctx, result.text)
     },
   })
 }
