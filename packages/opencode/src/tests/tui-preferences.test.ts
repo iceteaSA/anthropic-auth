@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as sleep } from 'node:timers/promises'
 import {
   computeEffectiveOrder,
   DEFAULT_PREFS,
@@ -361,9 +362,9 @@ describe('watchTuiPreferences', () => {
       fired += 1
     })
     try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
+      await sleep(50)
       await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-      await new Promise((resolve) => setTimeout(resolve, 400))
+      await sleep(400)
       expect(fired).toBeGreaterThanOrEqual(1)
     } finally {
       dispose()
@@ -377,11 +378,11 @@ describe('watchTuiPreferences', () => {
       fired += 1
     })
     try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
+      await sleep(50)
       for (let i = 0; i < 5; i++) {
         await queueTuiPreferenceUpdate(PLUGIN_KEY, ['pollMs'], 1000 + i)
       }
-      await new Promise((resolve) => setTimeout(resolve, 400))
+      await sleep(400)
       expect(fired).toBeGreaterThanOrEqual(1)
       expect(fired).toBeLessThan(5)
     } finally {
@@ -402,10 +403,10 @@ describe('watchTuiPreferences', () => {
     const dispose = watchTuiPreferences(() => {
       fired += 1
     })
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    await sleep(50)
     dispose()
     await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await sleep(300)
     expect(fired).toBe(0)
   })
 
@@ -416,16 +417,16 @@ describe('watchTuiPreferences', () => {
       fired += 1
     })
     try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
+      await sleep(50)
       await writeFile(
         join(dir, 'tui-preferences.jsonc.backup'),
         'noise',
         'utf8',
       )
-      await new Promise((resolve) => setTimeout(resolve, 300))
+      await sleep(300)
       expect(fired).toBe(0)
       await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-      await new Promise((resolve) => setTimeout(resolve, 400))
+      await sleep(400)
       expect(fired).toBeGreaterThanOrEqual(1)
     } finally {
       dispose()
@@ -439,9 +440,9 @@ describe('watchTuiPreferences', () => {
       fired += 1
     })
     try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
+      await sleep(50)
       await writeFile(file, '{}', 'utf8')
-      await new Promise((resolve) => setTimeout(resolve, 400))
+      await sleep(400)
       expect(fired).toBe(0)
     } finally {
       dispose()

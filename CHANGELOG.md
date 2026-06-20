@@ -7,6 +7,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ### Patch Changes
 
 - Keep OpenCode `fallback-first` routing on usable fallback accounts when another process is already refreshing fallback quota, preventing a broken primary OAuth refresh backoff from aborting requests while fallback quota is still passing.
+- Keep the OpenCode TUI preferences watcher stable even when unrelated tests or integrations temporarily override global timers.
+- Update Biome to 2.5.0.
 
 ## 1.10.2
 

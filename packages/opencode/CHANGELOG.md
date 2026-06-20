@@ -7,6 +7,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 ### Patch Changes
 
 - Keep `fallback-first` routing on usable fallback accounts when another process is already refreshing fallback quota, preventing a broken primary OAuth refresh backoff from aborting requests while fallback quota is still passing.
+- Keep the TUI preferences watcher stable even when unrelated tests or integrations temporarily override global timers.
 
 ## 1.10.2
 

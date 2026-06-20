@@ -2,6 +2,10 @@ import { watch } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import {
+  clearTimeout as nativeClearTimeout,
+  setTimeout as nativeSetTimeout,
+} from 'node:timers'
 import { applyEdits, modify, type ParseError, parse } from 'jsonc-parser'
 
 export const TUI_PREFS_FILE_ENV = 'OPENCODE_TUI_PREFERENCES_FILE'
@@ -290,7 +294,7 @@ const WATCH_DEBOUNCE_MS = 150
 export function watchTuiPreferences(onChange: () => void): () => void {
   const file = getTuiPreferencesFile()
   const name = basename(file)
-  let timer: ReturnType<typeof setTimeout> | null = null
+  let timer: ReturnType<typeof nativeSetTimeout> | null = null
   let lastSeen: string | null = null
   // Seed asynchronously; a real change that fires before the seed resolves
   // still wins because the debounce re-reads the file fresh and compares
@@ -308,8 +312,8 @@ export function watchTuiPreferences(onChange: () => void): () => void {
         filename === name ||
         (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
       if (filename != null && !isOurs) return
-      if (timer) clearTimeout(timer)
-      timer = setTimeout(() => {
+      if (timer) nativeClearTimeout(timer)
+      timer = nativeSetTimeout(() => {
         timer = null
         void readFile(file, 'utf8')
           .catch(() => null)
@@ -322,7 +326,7 @@ export function watchTuiPreferences(onChange: () => void): () => void {
       }, WATCH_DEBOUNCE_MS)
     })
     return () => {
-      if (timer) clearTimeout(timer)
+      if (timer) nativeClearTimeout(timer)
       watcher.close()
     }
   } catch {
