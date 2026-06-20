@@ -3,13 +3,16 @@ import {
   type AccountStorage,
   type ApiKeyAccount,
   acquireRefreshFileLock,
+  addAccountPersistent,
   authorize,
+  buildAccountList,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
   buildRefreshOperationError,
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
+  CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
@@ -18,16 +21,18 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
+  CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
-  ClaudeOAuthRefreshError,
   dumpDirectRequest,
   exchange,
+  executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
   executeKillswitchCommand,
+  executeLoggingCommand,
   executeRoutingCommand,
   FallbackAccountManager,
   formatQuotaBackoffMessage,
@@ -37,6 +42,7 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getKillswitchConfig,
+  getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
   getRelayConfig,
@@ -47,6 +53,7 @@ import {
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
+  isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
   isFastModeEnabled,
@@ -60,33 +67,42 @@ import {
   killswitchRetryAfterSeconds,
   loadAccounts,
   log,
+  logger,
   mergeAnthropicBetas,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseLoggingCommandAction,
   parseRoutingCommandAction,
   type QuotaAccountSummary,
   QuotaManager,
   quotaSnapshotPassesPolicy,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
+  removeAccountPersistent,
+  reorderAccountsPersistent,
   resolveClaudeCodeIdentity,
   saveAccountState,
   sendViaRelay,
+  setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCache1hState,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
+  setCacheKeepSubagentsEnabled,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModeEnabled,
   setFastModePersistentEnabled,
   setKillswitchPersistent,
+  setLogLevel,
+  setLogLevelPersistent,
   setRoutingMode,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
@@ -105,7 +121,11 @@ import type {
 } from './rpc/protocol.ts'
 import { getRpcDir } from './rpc/rpc-dir.ts'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
-import { type SidebarState, setSidebarState } from './sidebar-state.ts'
+import {
+  getSidebarStateFile,
+  type SidebarState,
+  setSidebarState,
+} from './sidebar-state.ts'
 import {
   addFastModeBetaHeader,
   createStrippedStream,
@@ -396,7 +416,66 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
   const accountStoragePath = getAccountStoragePath()
-  const initialStorage = await loadAccounts(accountStoragePath)
+
+  // -- OAuth add-flow pending state (Add account modal) --------------------
+  interface OAuthPendingEntry {
+    state: string
+    verifier: string
+    redirectUri: string
+    createdAt: number
+  }
+  const OAUTH_PENDING_TTL_MS = 10 * 60 * 1000 // 10 minutes
+  const OAUTH_PENDING_CAP = 50
+  const oauthPending = new Map<string, OAuthPendingEntry>()
+
+  function cleanupExpiredOAuthPending() {
+    const now = Date.now()
+    for (const [sessionId, entry] of oauthPending) {
+      if (now - entry.createdAt > OAUTH_PENDING_TTL_MS) {
+        oauthPending.delete(sessionId)
+      }
+    }
+  }
+
+  function storeOAuthPending(
+    sessionId: string,
+    entry: OAuthPendingEntry,
+  ): void {
+    cleanupExpiredOAuthPending()
+    if (oauthPending.size >= OAUTH_PENDING_CAP) {
+      let oldestSession = ''
+      let oldestTime = Infinity
+      for (const [sid, e] of oauthPending) {
+        if (e.createdAt < oldestTime) {
+          oldestTime = e.createdAt
+          oldestSession = sid
+        }
+      }
+      if (oldestSession) oauthPending.delete(oldestSession)
+    }
+    oauthPending.set(sessionId, entry)
+  }
+
+  function takeOAuthPending(sessionId: string): OAuthPendingEntry | undefined {
+    cleanupExpiredOAuthPending()
+    const entry = oauthPending.get(sessionId)
+    if (!entry) return undefined
+    if (Date.now() - entry.createdAt > OAUTH_PENDING_TTL_MS) {
+      oauthPending.delete(sessionId)
+      return undefined
+    }
+    return entry
+  }
+
+  let initialStorage: AccountStorage | null
+  try {
+    initialStorage = await loadAccounts(accountStoragePath)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Failed to load account store: ${message}`, {
+      cause: error instanceof Error ? error : undefined,
+    })
+  }
   const quotaManager = new QuotaManager({
     storage: initialStorage,
     onMainQuotaFetched: async (
@@ -427,7 +506,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         storage.quota.mainLastQuotaApiError = undefined
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (error) {
-        log('[quota] failed to persist main quota', {
+        logger.warn('quota', 'failed to persist main quota', {
           error: error instanceof Error ? error.message : String(error),
         })
       }
@@ -442,7 +521,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         storage.quota.mainLastQuotaApiError = error
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (e) {
-        log('[quota] failed to persist backoff state', {
+        logger.warn('quota', 'failed to persist backoff state', {
           error: e instanceof Error ? e.message : String(e),
         })
       }
@@ -451,7 +530,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
     onFallbackStorageChanged: () => {
-      void refreshSidebarQuota()
+      void refreshSidebarQuota().catch(() => {})
     },
   })
   fallbackManager.startBackgroundRefresh()
@@ -493,7 +572,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
       return headers
     },
-    log,
   })
   setCache1hState({
     enabled: isCache1hPersistentlyEnabled(initialStorage),
@@ -501,6 +579,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
+  if (!process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL) {
+    setLogLevel(getPersistedLogLevel(initialStorage) ?? 'info')
+  }
 
   let rpcServer: RpcServerHandle | null = null
   if (ctx.directory) {
@@ -519,7 +600,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       })
       rpcGlobal.__anthropicAuthRpcServer = rpcServer
     } catch (error) {
-      log('[rpc] failed to start', {
+      logger.warn('rpc', 'failed to start', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -531,6 +612,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     activeId: 'main',
     route: 'main',
   }
+  const sidebarStateFile = getSidebarStateFile()
 
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -604,8 +686,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       },
       lastUpdated: Date.now(),
     }
-    return setSidebarState(state).catch((error) =>
-      log('[sidebar] state write failed', {
+    return setSidebarState(state, sidebarStateFile).catch((error) =>
+      logger.warn('sidebar', 'state write failed', {
         error: error instanceof Error ? error.message : String(error),
       }),
     )
@@ -770,6 +852,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return buildClaudeQuotaSummary({ accounts, refreshedAt: Date.now() })
   }
 
+  async function refreshSidebarAfterMutation(
+    updatedStorage: AccountStorage | null,
+  ) {
+    if (latestGetAuth) {
+      try {
+        const auth = await latestGetAuth()
+        writeSidebarState(updatedStorage, {
+          activeId: lastSidebarRouting.activeId,
+          route: lastSidebarRouting.route,
+          mainAccessToken: auth.access,
+          mainRefreshToken: auth.refresh,
+        })
+      } catch {
+        // auth not yet available — sidebar will refresh on next request
+      }
+    }
+  }
+
   async function executePersistentCache1hCommand(argumentsText: string) {
     const action = parseCache1hCommandAction(argumentsText)
     if (action.type === 'enable' || action.type === 'disable') {
@@ -777,6 +877,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const storage = await setCache1hPersistentEnabled(enabled)
       const mode = getCache1hPersistentMode(storage)
       setCache1hState({ enabled, mode })
+      logger.info('commands', 'cache enabled changed', { enabled })
       return executeCache1hCommand({ argumentsText, enabled, mode })
     }
 
@@ -784,6 +885,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const storage = await setCache1hPersistentMode(action.mode)
       const enabled = isCache1hPersistentlyEnabled(storage)
       setCache1hState({ enabled, mode: action.mode })
+      logger.info('commands', 'cache mode changed', { mode: action.mode })
       return executeCache1hCommand({
         argumentsText,
         enabled,
@@ -806,8 +908,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         action.startHour,
         action.endHour,
       )
+      logger.info('commands', 'cachekeep enabled changed', { enabled: true })
     } else if (action.type === 'disable') {
       storage = await setCacheKeepPersistentEnabled(false)
+      logger.info('commands', 'cachekeep enabled changed', { enabled: false })
+    } else if (action.type === 'subagents') {
+      storage = await setCacheKeepSubagentsEnabled(action.enabled)
+      logger.info('commands', 'cachekeep subagents changed', {
+        subagents: action.enabled,
+      })
     }
 
     const window = getCacheKeepWindow(storage)
@@ -828,6 +937,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const enabled = action.type === 'enable'
       await setDumpPersistentEnabled(enabled)
       setDumpEnabled(enabled)
+      logger.info('commands', 'dump changed', { enabled })
       return executeDumpCommand({ argumentsText, enabled })
     }
 
@@ -843,6 +953,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const enabled = action.type === 'enable'
       await setFastModePersistentEnabled(enabled)
       setFastModeEnabled(enabled)
+      logger.info('commands', 'fast mode changed', { enabled })
       return executeFastModeCommand({ argumentsText, enabled })
     }
 
@@ -856,6 +967,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const action = parseRoutingCommandAction(argumentsText)
     if (action.type === 'mode') {
       await setRoutingMode(action.mode)
+      logger.info('commands', 'routing mode changed', { mode: action.mode })
       return executeRoutingCommand({ argumentsText, mode: action.mode })
     }
 
@@ -866,12 +978,283 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
+  async function executePersistentLoggingCommand(argumentsText: string) {
+    const action = parseLoggingCommandAction(argumentsText)
+    if (action.type === 'level') {
+      await setLogLevelPersistent(action.level)
+      logger.info('commands', 'log level changed', { level: action.level })
+      return executeLoggingCommand({ argumentsText, level: action.level })
+    }
+
+    const storage = await loadAccounts(accountStoragePath)
+    const level = getPersistedLogLevel(storage) ?? 'info'
+    return executeLoggingCommand({ argumentsText, level })
+  }
+
+  async function executePersistentAccountCommand(
+    argumentsText: string,
+    sessionId?: string,
+  ) {
+    const action = parseAccountCommandAction(argumentsText)
+
+    // -- add-apikey --------------------------------------------------------
+    if (action.type === 'add-apikey') {
+      if (!action.apiKey) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return { text: 'API key is required', accounts }
+      }
+      const label = action.label?.trim() || undefined
+      const now = Date.now()
+      const resolvedBaseURL =
+        action.baseURL?.trim() || 'https://api.kie.ai/claude'
+      if (!isValidApiBaseURL(resolvedBaseURL)) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return {
+          text: 'Invalid base URL. Must be an http(s) URL without embedded credentials.',
+          accounts,
+        }
+      }
+      const resolvedAuthHeader = action.authHeader ?? 'authorization-bearer'
+
+      const account: ApiKeyAccount = {
+        id: label || randomUUID(),
+        label: label || undefined,
+        type: 'api' as const,
+        apiKey: action.apiKey,
+        baseURL: resolvedBaseURL,
+        authHeader: resolvedAuthHeader,
+        enabled: true,
+        addedAt: now,
+        lastUsed: now,
+      }
+      await addAccountPersistent(account, accountStoragePath)
+      logger.info('commands', 'account added', {
+        id: account.id,
+        label: account.label,
+        type: 'apikey',
+      })
+
+      const updatedStorage = await loadAccounts(accountStoragePath)
+      await refreshSidebarAfterMutation(updatedStorage)
+      const accounts = buildAccountList(
+        updatedStorage ?? { version: 1, accounts: [] },
+      )
+      return {
+        text: `API key account "${account.label ?? account.id}" added.`,
+        accounts,
+      }
+    }
+
+    // -- add-oauth-start ---------------------------------------------------
+    if (action.type === 'add-oauth-start') {
+      const authResult = await authorize('max')
+      const entry: OAuthPendingEntry = {
+        state: authResult.state,
+        verifier: authResult.verifier,
+        redirectUri: authResult.redirectUri,
+        createdAt: Date.now(),
+      }
+      const key = sessionId ?? 'default'
+      storeOAuthPending(key, entry)
+      return {
+        text: `Open this URL in your browser:\n${authResult.url}`,
+        knobs: { oauthUrl: authResult.url },
+        accounts: buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        ),
+      }
+    }
+
+    // -- add-oauth-finish --------------------------------------------------
+    if (action.type === 'add-oauth-finish') {
+      const key = sessionId ?? 'default'
+      const pending = takeOAuthPending(key)
+      if (!pending) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return {
+          text: 'OAuth session expired. Please start again.',
+          accounts,
+        }
+      }
+
+      try {
+        const result = await exchange(
+          action.code,
+          pending.verifier,
+          pending.redirectUri,
+          pending.state,
+        )
+
+        if (result.type === 'failed') {
+          const accounts = buildAccountList(
+            (await loadAccounts(accountStoragePath)) ?? {
+              version: 1,
+              accounts: [],
+            },
+          )
+          return {
+            text: 'OAuth authentication failed. Please check the code and try again.',
+            accounts,
+          }
+        }
+
+        const now = Date.now()
+        const account: OAuthAccount = {
+          id: randomUUID(),
+          type: 'oauth' as const,
+          access: result.access,
+          refresh: result.refresh,
+          expires: result.expires,
+          enabled: true,
+          addedAt: now,
+          lastUsed: now,
+        }
+        await addAccountPersistent(account, accountStoragePath)
+        logger.info('commands', 'account added', {
+          id: account.id,
+          label: account.label,
+          type: 'oauth',
+        })
+
+        const updatedStorage = await loadAccounts(accountStoragePath)
+        await refreshSidebarAfterMutation(updatedStorage)
+        const accounts = buildAccountList(
+          updatedStorage ?? { version: 1, accounts: [] },
+        )
+        return { text: `OAuth account added.`, accounts }
+      } catch {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? {
+            version: 1,
+            accounts: [],
+          },
+        )
+        return {
+          text: 'OAuth exchange failed due to a network error. Please try again.',
+          accounts,
+        }
+      } finally {
+        oauthPending.delete(key)
+      }
+    }
+
+    // -- existing flows ----------------------------------------------------
+    const storage = await loadAccounts(accountStoragePath)
+    const result = executeAccountCommand({
+      argumentsText,
+      storage: storage ?? { version: 1, accounts: [] },
+    })
+
+    if (result.updated) {
+      if (
+        result.updated.action === 'enable' ||
+        result.updated.action === 'disable'
+      ) {
+        const enabled = result.updated.action === 'enable'
+        await setAccountEnabledPersistent(
+          result.updated.id,
+          enabled,
+          accountStoragePath,
+        )
+        const updatedId = result.updated.id
+        const account = storage?.accounts.find((a) => a.id === updatedId)
+        logger.info('commands', `account ${result.updated.action}d`, {
+          id: updatedId,
+          label: account?.label,
+          enabled,
+        })
+      } else if (result.updated.action === 'remove') {
+        await removeAccountPersistent(result.updated.id, accountStoragePath)
+        const updatedId = result.updated.id
+        const account = storage?.accounts.find((a) => a.id === updatedId)
+        logger.info('commands', 'account removed', {
+          id: updatedId,
+          label: account?.label,
+        })
+      } else if (result.updated.action === 'reorder') {
+        await reorderAccountsPersistent(
+          result.updated.newOrder ?? result.updated.previousOrder ?? [],
+          accountStoragePath,
+        )
+        const updatedId = result.updated.id
+        const account = storage?.accounts.find((a) => a.id === updatedId)
+        logger.info('commands', 'account reordered', {
+          id: updatedId,
+          label: account?.label,
+        })
+      }
+
+      const updatedStorage = await loadAccounts(accountStoragePath)
+      if (latestGetAuth) {
+        try {
+          const auth = await latestGetAuth()
+          writeSidebarState(updatedStorage, {
+            activeId: lastSidebarRouting.activeId,
+            route: lastSidebarRouting.route,
+            mainAccessToken: auth.access,
+            mainRefreshToken: auth.refresh,
+          })
+        } catch {
+          // auth not yet available — sidebar will refresh on next request
+        }
+      }
+    }
+
+    const updatedStorage = await loadAccounts(accountStoragePath)
+    const accounts = buildAccountList(
+      updatedStorage ?? { version: 1, accounts: [] },
+    )
+    return { text: result.text, accounts }
+  }
+
   async function buildDialogPayload(
     command: CommandModalName,
     args: string,
+    sessionId?: string,
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-logging') {
+      const text = await executePersistentLoggingCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      return {
+        command,
+        text,
+        knobs: { level: getPersistedLogLevel(storage) ?? 'info' },
+      }
+    }
+    if (command === 'claude-account') {
+      const result = await executePersistentAccountCommand(args, sessionId)
+      const knobs: Record<string, unknown> = {
+        accounts: result.accounts,
+      }
+      if ('knobs' in result && result.knobs) {
+        Object.assign(knobs, result.knobs)
+      }
+      return {
+        command,
+        text: result.text,
+        knobs,
+      }
+    }
     if (command === 'claude-routing') {
       const text = await executePersistentRoutingCommand(args)
       const storage = await loadAccounts(accountStoragePath)
@@ -922,8 +1305,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       config,
       accountIds,
     })
-    if (result.updatedConfig)
+    if (result.updatedConfig) {
       await setKillswitchPersistent(result.updatedConfig)
+      if (config.enabled !== result.updatedConfig.enabled) {
+        logger.info('commands', 'killswitch changed', {
+          enabled: result.updatedConfig.enabled === true,
+        })
+      }
+      if (
+        JSON.stringify(config.main) !==
+          JSON.stringify(result.updatedConfig.main) ||
+        JSON.stringify(config.accounts) !==
+          JSON.stringify(result.updatedConfig.accounts)
+      ) {
+        logger.info('commands', 'killswitch thresholds changed', {
+          thresholds:
+            result.updatedConfig.main ?? result.updatedConfig.accounts,
+        })
+      }
+    }
     return {
       command,
       text: result.text,
@@ -932,7 +1332,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   }
 
   async function applyCommand(request: ApplyRequest): Promise<ApplyResult> {
-    const payload = await buildDialogPayload(request.command, request.arguments)
+    const payload = await buildDialogPayload(
+      request.command,
+      request.arguments,
+      request.sessionId,
+    )
     return { text: payload.text, knobs: payload.knobs }
   }
 
@@ -1048,11 +1452,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           description:
             'Show or toggle 1-hour Anthropic ephemeral prompt cache TTL.',
         },
+        [CLAUDE_ACCOUNT_COMMAND_NAME]: {
+          template: CLAUDE_ACCOUNT_COMMAND_NAME,
+          description:
+            'Manage fallback accounts — list, enable/disable, reorder, remove, or add (API key or OAuth).',
+        },
         [CLAUDE_CACHE_KEEP_COMMAND_NAME]: {
           template: CLAUDE_CACHE_KEEP_COMMAND_NAME,
           description:
             'Keep hybrid Claude cache warm for recently used sessions during a local time window.',
         },
+
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
           template: CLAUDE_QUOTAS_COMMAND_NAME,
           description:
@@ -1067,6 +1477,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           template: CLAUDE_FAST_COMMAND_NAME,
           description:
             'Show or toggle Anthropic fast mode for supported Opus models.',
+        },
+        [CLAUDE_LOGGING_COMMAND_NAME]: {
+          template: CLAUDE_LOGGING_COMMAND_NAME,
+          description:
+            'Show or set the plugin log level (error, warn, info, debug, trace).',
         },
         [CLAUDE_ROUTING_COMMAND_NAME]: {
           template: CLAUDE_ROUTING_COMMAND_NAME,
@@ -1114,6 +1529,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       sessionID: string
     }) => {
       const modalCommands: CommandModalName[] = [
+        'claude-account',
         'claude-cache',
         'claude-cachekeep',
         'claude-quota',
@@ -1121,10 +1537,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         'claude-fast',
         'claude-routing',
         'claude-killswitch',
+        'claude-logging',
       ]
       if (!modalCommands.includes(input.command as CommandModalName)) return
       const command = input.command as CommandModalName
-      const payload = await buildDialogPayload(command, input.arguments)
+      const payload = await buildDialogPayload(
+        command,
+        input.arguments,
+        input.sessionID,
+      )
       if (command === 'claude-quota') {
         const cmdStorage = await loadAccounts()
         const cmdAuth = latestGetAuth
@@ -1404,8 +1825,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     if (
                       attempt < maxRetries &&
                       (isNetworkError ||
-                        (error instanceof ClaudeOAuthRefreshError &&
-                          error.status >= 500))
+                        (() => {
+                          const s = (error as { status?: number }).status
+                          return typeof s === 'number' && s >= 500
+                        })())
                     ) {
                       continue
                     }
@@ -1425,7 +1848,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     const failedRefreshToken = freshAuth?.refresh
                     if (
                       failedRefreshToken &&
-                      error instanceof ClaudeOAuthRefreshError
+                      (error as { isRefreshError?: boolean }).isRefreshError
                     ) {
                       await updateMainRefreshState((storage) => {
                         storage.refresh = storage.refresh ?? {}
@@ -1532,7 +1955,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     : undefined,
                 })
               } catch (error) {
-                log('[refresh] opencode main oauth refresh failed', {
+                logger.warn('refresh', 'opencode main oauth refresh failed', {
                   message:
                     error instanceof Error ? error.message : String(error),
                 })
@@ -1904,27 +2327,28 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             if (
               route === 'main' &&
               typeof body === 'string' &&
-              !subagentRequest &&
               isCache1hEnabled() &&
               getCache1hMode() === 'hybrid'
             ) {
               const storage = await getRequestStorage()
-              const cacheKeepStart = nowMs()
-              const tracked = cacheKeepManager.track({
-                sessionId: relayAffinity,
-                url: rewritten.url?.toString() ?? rewritten.input.toString(),
-                headers: requestHeaders,
-                bodyText: body,
-                storage,
-                cacheMode: 'hybrid',
-              })
-              trace?.mark('cachekeep_track', {
-                session: relayAffinity,
-                ms: roundMs(nowMs() - cacheKeepStart),
-                tracked: tracked.tracked,
-                reason: tracked.tracked ? undefined : tracked.reason,
-                bodyBytes: body.length,
-              })
+              if (!subagentRequest || isCacheKeepSubagentsEnabled(storage)) {
+                const cacheKeepStart = nowMs()
+                const tracked = cacheKeepManager.track({
+                  sessionId: relayAffinity,
+                  url: rewritten.url?.toString() ?? rewritten.input.toString(),
+                  headers: requestHeaders,
+                  bodyText: body,
+                  storage,
+                  cacheMode: 'hybrid',
+                })
+                trace?.mark('cachekeep_track', {
+                  session: relayAffinity,
+                  ms: roundMs(nowMs() - cacheKeepStart),
+                  tracked: tracked.tracked,
+                  reason: tracked.tracked ? undefined : tracked.reason,
+                  bodyBytes: body.length,
+                })
+              }
             }
 
             const directFetch = async () => {
@@ -2494,7 +2918,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       void quotaManager
                         .refreshMain(auth.access)
                         .then(() => {
-                          void refreshSidebarQuota()
+                          void refreshSidebarQuota().catch(() => {})
                           showQuotaToastFromCache()
                         })
                         .catch(() => {})

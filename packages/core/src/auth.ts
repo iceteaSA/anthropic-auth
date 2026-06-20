@@ -14,7 +14,7 @@ type CallbackParams = {
   state: string
 }
 
-function parseRetryAfterHeader(
+export function parseRetryAfterHeader(
   value: string | undefined | null,
 ): number | undefined {
   if (!value) return undefined
@@ -31,6 +31,14 @@ function parseRetryAfterHeader(
 export class ClaudeOAuthRefreshError extends Error {
   /** Parsed Retry-After value in seconds, if the server provided one. */
   public readonly retryAfter: number | undefined
+
+  /**
+   * Duck-typed marker: any error carrying `isRefreshError: true` arms the
+   * refresh backoff in consumers that receive it (recordQuotaRefreshError).
+   * Provider-agnostic — shared-core extraction of anthropic-auth and
+   * openai-auth relies on this field instead of instanceof.
+   */
+  public readonly isRefreshError = true
 
   constructor(
     public readonly status: number,

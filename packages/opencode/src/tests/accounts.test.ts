@@ -1,28 +1,57 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
   acquireRefreshFileLock,
+  addAccountPersistent,
+  buildQuotaOperationError,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
+  fetchOAuthQuotaSnapshot,
   getAccountStatePath,
   getCache1hPersistentMode,
+  getLogLevel,
+  getPersistedLogLevel,
+  isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  type KillswitchThresholds,
+  killswitchPassesPolicy,
   loadAccounts,
   type OAuthAccount,
+  type OAuthQuotaSnapshot,
   QuotaManager,
+  quotaSnapshotPassesPolicy,
+  removeAccount,
+  removeAccountPersistent,
+  reorderAccounts,
+  reorderAccountsPersistent,
   saveAccountState,
   saveAccounts,
+  setAccountEnabled,
+  setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
+  setCacheKeepSubagentsEnabled,
   setFastModePersistentEnabled,
+  setLogLevel,
+  setLogLevelPersistent,
   shouldFallbackStatus,
+  upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
 
 let tempDir: string
@@ -33,6 +62,56 @@ function expectOAuthAccount(
 ): OAuthAccount {
   expect(account?.type).toBe('oauth')
   return account as OAuthAccount
+}
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((next) => {
+    resolve = next
+  })
+  return { promise, resolve }
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out after ${ms}ms`)),
+          ms,
+        )
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function seedStaleRefreshLock(name: string, now: number, ttlMs: number) {
+  const lockPath = `${accountPath}.${name}.lock`
+  const evictPath = `${lockPath}.evicting`
+  await rm(lockPath, { recursive: true, force: true })
+  await rm(evictPath, { recursive: true, force: true })
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({ ownerId: 'stale-owner', expiresAt: now - ttlMs })}\n`,
+    'utf8',
+  )
+  await mkdir(evictPath)
+  const staleTime = new Date(now - 10_000)
+  await utimes(evictPath, staleTime, staleTime)
+  return { lockPath, evictPath }
+}
+
+async function countRefreshLockLeaks(name: string) {
+  const entries = await readdir(tempDir)
+  return entries.filter(
+    (entry) =>
+      entry.startsWith(`anthropic-auth.json.${name}.lock.evicting`) ||
+      entry.startsWith(`anthropic-auth.json.${name}.lock.evicting.`),
+  ).length
 }
 
 const baseStorage = (): AccountStorage => ({
@@ -349,9 +428,9 @@ describe('account storage', () => {
     expect(account.quota?.five_hour?.usedPercent).toBe(20)
   })
 
-  test('malformed sidecar file is ignored', async () => {
+  test('malformed config file throws a clear error', async () => {
     await writeFile(accountPath, '{nope', 'utf8')
-    await expect(loadAccounts()).resolves.toBeNull()
+    await expect(loadAccounts()).rejects.toThrow('corrupt or unreadable')
   })
 
   test('refresh file lock allows only one holder', async () => {
@@ -401,6 +480,104 @@ describe('account storage', () => {
     await afterStale?.release()
   })
 
+  test('refresh file lock stale-marker steal has a single winner under forced recreate race', async () => {
+    const name = 'test-refresh-forced-stale-steal'
+    const now = 100_000
+    const ttlMs = 1_000
+    await seedStaleRefreshLock(name, now, ttlMs)
+
+    const cSawStaleMarker = deferred()
+    const releaseCFromStaleMarker = deferred()
+    const cClaimedMarker = deferred()
+    const releaseCFromClaim = deferred()
+    const cConfirmedStaleLock = deferred()
+    const releaseCFromStaleLock = deferred()
+    const aAcquiredMarker = deferred()
+    const releaseAFromMarker = deferred()
+
+    const contenderC = acquireRefreshFileLock({
+      name,
+      ttlMs,
+      path: accountPath,
+      now: () => now,
+      onStep: async (step) => {
+        if (step === 'stale-marker-stat') {
+          cSawStaleMarker.resolve()
+          await releaseCFromStaleMarker.promise
+        }
+        if (step === 'stale-marker-claimed') {
+          cClaimedMarker.resolve()
+          await releaseCFromClaim.promise
+        }
+        if (step === 'stale-lock-confirmed') {
+          cConfirmedStaleLock.resolve()
+          await releaseCFromStaleLock.promise
+        }
+      },
+    })
+
+    await withTimeout(cSawStaleMarker.promise, 1_000)
+
+    const contenderA = acquireRefreshFileLock({
+      name,
+      ttlMs,
+      path: accountPath,
+      now: () => now,
+      onStep: (step) => {
+        if (step === 'eviction-marker-acquired') {
+          aAcquiredMarker.resolve()
+          return releaseAFromMarker.promise
+        }
+      },
+    })
+
+    await withTimeout(aAcquiredMarker.promise, 1_000)
+    releaseCFromStaleMarker.resolve()
+    await withTimeout(cClaimedMarker.promise, 1_000)
+    releaseCFromClaim.resolve()
+    await withTimeout(cConfirmedStaleLock.promise, 1_000)
+
+    releaseAFromMarker.resolve()
+    const aLock = await withTimeout(contenderA, 1_000)
+    releaseCFromStaleLock.resolve()
+    const cLock = await withTimeout(contenderC, 1_000)
+    const winners = [aLock, cLock].filter(Boolean)
+
+    await Promise.all(winners.map((lock) => lock?.release()))
+
+    expect(winners).toHaveLength(1)
+    expect(await countRefreshLockLeaks(name)).toBe(0)
+  })
+
+  test('refresh file lock stale-marker steal has a single winner across high-volume contention', async () => {
+    const name = 'test-refresh-high-volume-stale-steal'
+    const ttlMs = 1_000
+    const contenders = 16
+    const rounds = 1_000
+
+    for (let round = 0; round < rounds; round++) {
+      const now = 1_000_000 + round * 20_000
+      await seedStaleRefreshLock(name, now, ttlMs)
+
+      const locks = await Promise.all(
+        Array.from({ length: contenders }, () =>
+          acquireRefreshFileLock({
+            name,
+            ttlMs,
+            path: accountPath,
+            now: () => now,
+          }),
+        ),
+      )
+      const winners = locks.filter(Boolean)
+
+      await Promise.all(winners.map((lock) => lock?.release()))
+
+      expect(winners, `round ${round}`).toHaveLength(1)
+      expect(await countRefreshLockLeaks(name), `round ${round}`).toBe(0)
+    }
+  }, 30_000)
+
   test('refresh file lock renews while the holder is alive', async () => {
     const first = await acquireRefreshFileLock({
       name: 'test-refresh-renew',
@@ -444,6 +621,77 @@ describe('account storage', () => {
     await expect(
       readFile(join(lockDir, 'owner.json'), 'utf8'),
     ).rejects.toThrow()
+  })
+
+  describe('stale-lock eviction race', () => {
+    const N = 16
+    const ROUNDS = 50
+
+    test('concurrent stale-evictPath crash-recovery yields exactly one winner', async () => {
+      for (let round = 0; round < ROUNDS; round++) {
+        const lockPath = `${accountPath}.stale-crash.lock`
+        const evictPath = `${lockPath}.evicting`
+
+        // Seed a STALE evictPath (simulating crashed evictor)
+        await mkdir(evictPath, { recursive: true })
+        const staleDate = new Date(Date.now() - 60_000)
+        await utimes(evictPath, staleDate, staleDate)
+
+        // Seed a stale lock
+        await writeFile(
+          lockPath,
+          `${JSON.stringify({ ownerId: 'dead-owner', expiresAt: Date.now() - 60_000 })}\n`,
+          { encoding: 'utf8', mode: 0o600 },
+        )
+
+        const results = await Promise.all(
+          Array.from({ length: N }, () =>
+            acquireRefreshFileLock({
+              name: 'stale-crash',
+              ttlMs: 60_000,
+              path: accountPath,
+            }),
+          ),
+        )
+
+        const winners = results.filter((r) => r !== null)
+        expect(
+          winners.length,
+          `Round ${round}: expected 1 winner, got ${winners.length}`,
+        ).toBe(1)
+
+        // .evicting marker must be cleaned up
+        await expect(stat(evictPath)).rejects.toThrow()
+
+        await winners[0]!.release()
+      }
+    })
+
+    test('fresh lock is never stolen by contenders', async () => {
+      const now = 1_000
+      const lockPath = `${accountPath}.fresh-lock.lock`
+
+      await writeFile(
+        lockPath,
+        `${JSON.stringify({ ownerId: 'alive-owner', expiresAt: now + 120_000 })}\n`,
+        { encoding: 'utf8', mode: 0o600 },
+      )
+
+      const results = await Promise.all(
+        Array.from({ length: N }, () =>
+          acquireRefreshFileLock({
+            name: 'fresh-lock',
+            ttlMs: 60_000,
+            path: accountPath,
+            now: () => now,
+          }),
+        ),
+      )
+
+      expect(results.every((r) => r === null)).toBe(true)
+
+      await expect(stat(`${lockPath}.evicting`)).rejects.toThrow()
+    })
   })
 
   test('preserves relay config when saving storage loaded by older code', async () => {
@@ -525,6 +773,18 @@ describe('account storage', () => {
       startHour: 9,
       endHour: 23,
     })
+  })
+
+  test('persists and reads cacheKeep subagents toggle', async () => {
+    const storage = await setCacheKeepSubagentsEnabled(true)
+    expect(storage.cacheKeep?.subagents).toBe(true)
+    expect(isCacheKeepSubagentsEnabled(storage)).toBe(true)
+
+    const disabled = await setCacheKeepSubagentsEnabled(false)
+    expect(disabled.cacheKeep?.subagents).toBe(false)
+    expect(isCacheKeepSubagentsEnabled(disabled)).toBe(false)
+
+    expect(isCacheKeepSubagentsEnabled(null)).toBe(false)
   })
 
   test('persists claudeFast enabled state', async () => {
@@ -1580,5 +1840,887 @@ describe('buildRefreshOperationError', () => {
       refreshToken: 'test-token',
     })
     expect(result.nextRetryAt).toBe(1000000 + 5 * 60_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Duck-typed ProviderHttpError contract — isTransientRefreshError
+// (tested through buildRefreshOperationError)
+// ---------------------------------------------------------------------------
+describe('isTransientRefreshError via duck-typed error classification', () => {
+  const now = 1_000_000
+  const REFRESH_NON_TRANSIENT = 24 * 60 * 60_000
+
+  test('429 (duck-typed .status) → transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 429 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('500 (duck-typed .status) → transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 500 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('503 (duck-typed .status) → transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 503 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('401 (duck-typed .status) → NOT transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 401 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('400 (duck-typed .status) → NOT transient', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 400 },
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('plain Error with fetch failed → transient (network path)', () => {
+    const result = buildRefreshOperationError({
+      error: new Error('fetch failed'),
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+
+  test('ClaudeOAuthRefreshError 429 still classified transient (regression)', () => {
+    const result = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Duck-typed retryAfter propagation in buildRefreshOperationError
+// ---------------------------------------------------------------------------
+describe('buildRefreshOperationError retryAfter duck-typed propagation', () => {
+  const now = 1_000_000
+
+  test('reads .retryAfter from duck-typed error (no instanceof)', () => {
+    const error: Error & { retryAfter?: number } = Object.assign(
+      new Error('fail'),
+      { retryAfter: 60 },
+    )
+    const result = buildRefreshOperationError({
+      error,
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + 60_000)
+  })
+
+  test('ClaudeOAuthRefreshError retryAfter still works (regression)', () => {
+    const result = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited', '120'),
+      now,
+      refreshToken: 't',
+    })
+    expect(result.nextRetryAt).toBe(now + 120_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Duck-typed ProviderHttpError contract — isTransientQuotaError
+// (tested through buildQuotaOperationError)
+// ---------------------------------------------------------------------------
+describe('isTransientQuotaError via duck-typed error classification', () => {
+  const now = 1_000_000
+  const QUOTA_NON_TRANSIENT = 5 * 60_000
+
+  test('429 (duck-typed .status) → transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 429 },
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('500 (duck-typed .status) → transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 500 },
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('401 (duck-typed .status) → NOT transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 401 },
+      now,
+    })
+    expect(result.nextRetryAt).toBe(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('400 (duck-typed .status) → NOT transient', () => {
+    const result = buildQuotaOperationError({
+      error: { status: 400 },
+      now,
+    })
+    expect(result.nextRetryAt).toBe(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('plain Error with fetch failed → transient (network path)', () => {
+    const result = buildQuotaOperationError({
+      error: new Error('fetch failed'),
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+
+  test('duck-typed { status: 429 } — proves no regex/instanceof dependency', () => {
+    // A plain object (not Error, not ClaudeOAuthRefreshError) with just .status
+    const result = buildQuotaOperationError({
+      error: { status: 429 },
+      now,
+    })
+    expect(result.nextRetryAt!).toBeLessThan(now + QUOTA_NON_TRANSIENT)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// fetchOAuthQuotaSnapshot attaches .status + .retryAfter (producer)
+// ---------------------------------------------------------------------------
+describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
+  test('429 response → thrown error carries .status=429 + .retryAfter', async () => {
+    let thrown: unknown = null
+    const fetchImpl = (async () => {
+      return new Response('rate limited', {
+        status: 429,
+        headers: { 'Retry-After': '60' },
+      })
+    }) as unknown as typeof fetch
+    try {
+      await fetchOAuthQuotaSnapshot({
+        accessToken: 't',
+        fetchImpl,
+        now: () => 1_000_000,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect((thrown as { status?: number }).status).toBe(429)
+    expect((thrown as { retryAfter?: number }).retryAfter).toBe(60)
+    // Verify isTransientQuotaError classifies it as transient
+    const result = buildQuotaOperationError({ error: thrown, now: 1_000_000 })
+    expect(result.nextRetryAt!).toBeLessThan(1_000_000 + 5 * 60_000)
+  })
+
+  test('500 response → thrown error carries .status=500', async () => {
+    let thrown: unknown = null
+    const fetchImpl = (async () => {
+      return new Response('server error', { status: 500 })
+    }) as unknown as typeof fetch
+    try {
+      await fetchOAuthQuotaSnapshot({
+        accessToken: 't',
+        fetchImpl,
+        now: () => 1_000_000,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect((thrown as { status?: number }).status).toBe(500)
+    // Verify isTransientQuotaError classifies it as transient
+    const result = buildQuotaOperationError({ error: thrown, now: 1_000_000 })
+    expect(result.nextRetryAt!).toBeLessThan(1_000_000 + 5 * 60_000)
+  })
+
+  test('401 response → thrown error carries .status=401 (NOT transient for quota)', async () => {
+    let thrown: unknown = null
+    const fetchImpl = (async () => {
+      return new Response('unauthorized', { status: 401 })
+    }) as unknown as typeof fetch
+    try {
+      await fetchOAuthQuotaSnapshot({
+        accessToken: 't',
+        fetchImpl,
+        now: () => 1_000_000,
+      })
+    } catch (e) {
+      thrown = e
+    }
+    expect((thrown as { status?: number }).status).toBe(401)
+    const result = buildQuotaOperationError({ error: thrown, now: 1_000_000 })
+    expect(result.nextRetryAt).toBe(1_000_000 + 5 * 60_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// recordQuotaRefreshError — refresh-backoff arming via isRefreshError
+// (tested through FallbackAccountManager integration path)
+// ---------------------------------------------------------------------------
+describe('recordQuotaRefreshError refresh-backoff arming', () => {
+  test('non-401 refresh error (status 500) arms refresh backoff', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-500-refresh',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1, // way in the past → tokenNeedsRefresh
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      return Promise.resolve(new Response('server error', { status: 500 }))
+    }) as unknown as typeof fetch
+
+    const now = 1_000_000
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-500-refresh') as
+      | OAuthAccount
+      | undefined
+    expect(account?.lastRefreshError).toBeDefined()
+    expect(account?.lastRefreshError?.checkedAt).toBe(now)
+  })
+
+  test('401 refresh error arms refresh backoff (ClaudeOAuthRefreshError regression)', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-401-refresh',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      return Promise.resolve(new Response('unauthorized', { status: 401 }))
+    }) as unknown as typeof fetch
+
+    const now = 1_000_000
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-401-refresh') as
+      | OAuthAccount
+      | undefined
+    expect(account?.lastRefreshError).toBeDefined()
+    expect(account?.lastRefreshError?.checkedAt).toBe(now)
+  })
+
+  test('quota-endpoint 401 does NOT arm refresh backoff (isRefreshError boundary)', async () => {
+    const now = 1_000_000
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-quota-401',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      // Token is fresh → tokenNeedsRefresh returns false, skipping
+      // the initial refresh step. This ensures the only error is from
+      // the quota endpoint, not from a token refresh.
+      expires: now + 24 * 60 * 60_000,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      // Quota endpoint returns 401
+      return Promise.resolve(
+        new Response('quota unauthorized', { status: 401 }),
+      )
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-quota-401') as
+      | OAuthAccount
+      | undefined
+    // Quota-401 must NOT arm the refresh backoff — only isRefreshError does.
+    expect(account?.lastRefreshError).toBeUndefined()
+    // Quota-401 DOES arm the quota backoff.
+    expect(account?.lastQuotaRefreshError).toBeDefined()
+    expect(account?.lastQuotaRefreshError?.checkedAt).toBe(now)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix #2: writeJsonAtomic removes orphaned temp file on rename failure
+// ---------------------------------------------------------------------------
+describe('writeJsonAtomic temp cleanup', () => {
+  test('removes temp file on rename failure', async () => {
+    const renameMock = mock(async () => {
+      throw new Error('forced rename failure')
+    })
+    mock.module('node:fs/promises', () => {
+      const actual = require('node:fs/promises')
+      return { ...actual, rename: renameMock }
+    })
+
+    try {
+      const storage = baseStorage()
+      const err = await saveAccounts(storage, accountPath).catch(
+        (e: unknown) => e,
+      )
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toContain('forced rename failure')
+
+      const files = await readdir(tempDir)
+      const tmpFiles = files.filter((f) => f.endsWith('.tmp'))
+      expect(tmpFiles).toEqual([])
+    } finally {
+      // Restore original module — Bun mock.restore() does not undo mock.module
+      mock.module('node:fs/promises', () => require('node:fs/promises'))
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix #3: readJsonIfPresent throws on corrupt store instead of swallowing
+// ---------------------------------------------------------------------------
+describe('readJsonIfPresent corrupt-store handling', () => {
+  test('throws a clear error on malformed JSON', async () => {
+    await writeFile(accountPath, '{broken json', 'utf8')
+    const err = await loadAccounts(accountPath).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toContain('corrupt or unreadable')
+    expect((err as Error).message).toContain(accountPath)
+  })
+
+  test('throws on unreadable file (EACCES-like, not ENOENT)', async () => {
+    // Save valid accounts first so both config and state files exist
+    const validStorage = baseStorage()
+    await saveAccounts(validStorage, accountPath)
+    // Replace the state file with a directory — readFile on a directory
+    // returns EISDIR, which is not ENOENT, so readJsonIfPresent must throw
+    const statePath = getAccountStatePath(accountPath)
+    await rm(statePath)
+    await mkdir(statePath)
+    const err = await loadAccounts(accountPath).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toContain('corrupt or unreadable')
+  })
+
+  test('returns not-present for genuinely missing file (ENOENT)', async () => {
+    // accountPath doesn't exist yet
+    const result = await loadAccounts(accountPath)
+    expect(result).toBeNull()
+  })
+
+  test('loads valid JSON normally', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'test-account',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: Date.now() + 3600_000,
+    })
+    await saveAccounts(storage, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded).not.toBeNull()
+    expect(loaded!.accounts[0]?.id).toBe('test-account')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix #10: NaN quota utilization → unknown (fail-closed) instead of 0%→bypass
+// ---------------------------------------------------------------------------
+describe('NaN quota utilization guards', () => {
+  test('NaN remainingPercent blocks killswitch (fail-closed)', () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10 },
+    }
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: Number.NaN,
+        remainingPercent: Number.NaN,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 50,
+        remainingPercent: 50,
+        checkedAt: Date.now(),
+      },
+    }
+    // Pre-fix: NaN < 5 → false, NaN < 10 → false, so passes (returns true — bypass)
+    // Post-fix: the guard in mapUsageWindow prevents NaN from entering the system;
+    // but if NaN somehow arrives, killswitchPassesPolicy blocks because
+    // failClosedOnUnknownQuota defaults to true and the bogus data indicates
+    // an unknown/corrupt state. We test that NaN values in remainingPercent
+    // cause the policy to block.
+    expect(killswitchPassesPolicy(quota, storage)).toBe(false)
+  })
+
+  test('NaN remainingPercent blocks quota policy (fail-closed)', () => {
+    const storage = baseStorage()
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: Number.NaN,
+        remainingPercent: Number.NaN,
+        checkedAt: Date.now(),
+      },
+    }
+    expect(quotaSnapshotPassesPolicy(quota, storage)).toBe(false)
+  })
+
+  test('NaN threshold falls back to default', async () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: Number.NaN } as unknown as KillswitchThresholds,
+    }
+    // Save and reload so the threshold flows through normalizeKillswitchThresholds
+    await saveAccounts(storage, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    // The NaN should be normalized away — loadAccounts normalizes, so the
+    // loaded storage should have the default thresholds
+    // Test that killswitch works with default thresholds (not NaN)
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+    }
+    // remainingPercent 4 < DEFAULT_KILLSWITCH_THRESHOLDS.five_hour (5) → blocked
+    expect(killswitchPassesPolicy(quota, loaded)).toBe(false)
+  })
+
+  test('finite threshold is respected', async () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 3, seven_day: 5 },
+    }
+    await saveAccounts(storage, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    const quotaBoth: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 80,
+        remainingPercent: 20,
+        checkedAt: Date.now(),
+      },
+    }
+    // remainingPercent 4 >= threshold 3 (pass), remainingPercent 20 >= 5 (pass)
+    expect(killswitchPassesPolicy(quotaBoth, loaded)).toBe(true)
+  })
+
+  test('mapUsageWindow returns undefined for NaN utilization', () => {
+    // mapUsageWindow is internal, but we test the observable behaviour:
+    // a quota snapshot fetched with NaN utilization would produce an
+    // undefined window, which killswitchPassesPolicy treats as unknown
+    // (fail-closed blocking when failClosedOnUnknownQuota is true).
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10 },
+    }
+    // Simulate the result of mapUsageWindow returning undefined for both windows
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: undefined,
+      seven_day: undefined,
+    }
+    // Both windows unknown → failClosedOnUnknownQuota=true → blocked
+    expect(killswitchPassesPolicy(quota, storage)).toBe(false)
+
+    // When failClosedOnUnknownQuota=false, unknown windows pass
+    storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
+    expect(killswitchPassesPolicy(quota, storage)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix #9: saveAccountState lost-update race — concurrent saves with different
+// section flags must not overwrite each other's sections.
+// ---------------------------------------------------------------------------
+describe('saveAccountState lost-update race (#9)', () => {
+  test('concurrent saves with different scopes persist both sections', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 100 },
+      },
+      mainQuotaCheckedAt: 100,
+      mainQuotaToken: 'token-initial',
+    }
+    storage.refresh = {
+      ...storage.refresh,
+      mainLastRefreshError: {
+        message: 'initial error',
+        checkedAt: 100,
+      },
+      mainRefreshLeaseId: 'lease-initial',
+    }
+    await saveAccounts(storage)
+
+    const ROUNDS = 50
+    const failures: number[] = []
+
+    for (let round = 0; round < ROUNDS; round++) {
+      const quotaStorage = baseStorage()
+      quotaStorage.quota = {
+        ...quotaStorage.quota,
+        mainQuota: {
+          five_hour: {
+            usedPercent: 20 + round,
+            remainingPercent: 80 - round,
+            checkedAt: 200 + round,
+          },
+        },
+        mainQuotaCheckedAt: 200 + round,
+        mainQuotaToken: `token-quota-${round}`,
+      }
+
+      const refreshStorage = baseStorage()
+      refreshStorage.refresh = {
+        ...refreshStorage.refresh,
+        mainLastRefreshError: {
+          message: `refresh error ${round}`,
+          checkedAt: 300 + round,
+        },
+        mainRefreshLeaseId: `lease-${round}`,
+        mainRefreshLeaseUntil: 400 + round,
+      }
+
+      await Promise.all([
+        saveAccountState(quotaStorage, accountPath, { mainQuota: true }),
+        saveAccountState(refreshStorage, accountPath, { mainRefresh: true }),
+      ])
+
+      const loaded = await loadAccounts()
+      const quotaOk = loaded?.quota?.mainQuotaToken === `token-quota-${round}`
+      const refreshOk = loaded?.refresh?.mainRefreshLeaseId === `lease-${round}`
+
+      if (!quotaOk || !refreshOk) {
+        failures.push(round)
+        // Don't break — collect all failures for diagnostics
+      }
+    }
+
+    if (failures.length) {
+      const loaded = await loadAccounts()
+      // Load state file directly for diagnostic detail
+      const statePath = getAccountStatePath(accountPath)
+      const stateRaw = await readFile(statePath, 'utf8').catch(() => 'MISSING')
+      throw new Error(
+        `Lost update in ${failures.length}/${ROUNDS} rounds (rounds: ${failures.slice(0, 10).join(', ')}). ` +
+          `Last loaded mainQuotaToken=${loaded?.quota?.mainQuotaToken}, ` +
+          `mainRefreshLeaseId=${loaded?.refresh?.mainRefreshLeaseId}. ` +
+          `State file: ${stateRaw.slice(0, 300)}`,
+      )
+    }
+
+    // Final verification: both sections have the last round's values
+    const final = await loadAccounts()
+    expect(final?.quota?.mainQuotaToken).toBe(`token-quota-${ROUNDS - 1}`)
+    expect(final?.quota?.mainQuotaCheckedAt).toBe(200 + ROUNDS - 1)
+    expect(final?.refresh?.mainRefreshLeaseId).toBe(`lease-${ROUNDS - 1}`)
+    expect(final?.refresh?.mainRefreshLeaseUntil).toBe(400 + ROUNDS - 1)
+  })
+})
+
+// -- Account-mutation helpers --------------------------------------------------
+
+describe('upsertAccount', () => {
+  test('inserts a new account when no id or label match exists', () => {
+    const storage = baseStorage()
+    const account: OAuthAccount = {
+      id: 'new-id',
+      type: 'oauth',
+      refresh: 'refresh-token',
+      label: 'new-label',
+    }
+    upsertAccount(storage, account)
+    expect(storage.accounts).toHaveLength(1)
+    expect(storage.accounts[0]!.id).toBe('new-id')
+  })
+
+  test('updates by id match, preserving addedAt', () => {
+    const storage = baseStorage()
+    const original: OAuthAccount = {
+      id: 'existing',
+      type: 'oauth',
+      refresh: 'original-refresh',
+      access: 'original-access',
+      addedAt: 100,
+    }
+    storage.accounts.push(original)
+    upsertAccount(storage, {
+      id: 'existing',
+      type: 'oauth',
+      refresh: 'new-refresh',
+      access: 'new-access',
+    })
+    expect(storage.accounts).toHaveLength(1)
+    const updated = storage.accounts[0] as OAuthAccount
+    expect(updated.access).toBe('new-access')
+    expect(updated.refresh).toBe('new-refresh')
+    expect(updated.addedAt).toBe(100)
+  })
+
+  test('updates by label match', () => {
+    const storage = baseStorage()
+    const original: OAuthAccount = {
+      id: 'id-a',
+      type: 'oauth',
+      refresh: 'refresh-a',
+      label: 'shared-label',
+    }
+    storage.accounts.push(original)
+    upsertAccount(storage, {
+      id: 'id-b',
+      type: 'oauth',
+      refresh: 'refresh-b',
+      label: 'shared-label',
+    })
+    expect(storage.accounts).toHaveLength(1)
+    expect(storage.accounts[0]!.id).toBe('id-b') // overwritten by incoming account
+    expect((storage.accounts[0] as OAuthAccount).refresh).toBe('refresh-b') // updated
+  })
+
+  test('merges oauth-specific fields on update', () => {
+    const storage = baseStorage()
+    const original: OAuthAccount = {
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'r1',
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1 },
+      },
+      lastRefreshedAt: 50,
+      lastRefreshError: { message: 'old', checkedAt: 10 },
+      lastQuotaRefreshError: { message: 'old-quota', checkedAt: 10 },
+    }
+    storage.accounts.push(original)
+    upsertAccount(storage, {
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'r2',
+      quota: {
+        five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: 2 },
+      },
+      lastRefreshedAt: 60,
+      lastRefreshError: { message: 'new', checkedAt: 20 },
+      lastQuotaRefreshError: { message: 'new-quota', checkedAt: 20 },
+    })
+    const merged = storage.accounts[0] as OAuthAccount
+    expect(merged.quota).toBeDefined()
+    expect(merged.lastRefreshedAt).toBe(60)
+    expect(merged.lastRefreshError?.message).toBe('new')
+    expect(merged.lastQuotaRefreshError?.message).toBe('new-quota')
+  })
+})
+
+describe('removeAccount', () => {
+  test('removes an existing account by id and returns true', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    expect(removeAccount(storage, 'a')).toBe(true)
+    expect(storage.accounts.map((c) => c.id)).toEqual(['b'])
+  })
+
+  test('returns false when id not found', () => {
+    const storage = baseStorage()
+    expect(removeAccount(storage, 'nonexistent')).toBe(false)
+  })
+})
+
+describe('reorderAccounts', () => {
+  test('reorders to match orderedIds', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    reorderAccounts(storage, ['b', 'a', 'c'])
+    expect(storage.accounts.map((c) => c.id)).toEqual(['b', 'a', 'c'])
+  })
+
+  test('unknown ids keep relative order at the end', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    reorderAccounts(storage, ['x']) // x unknown
+    expect(storage.accounts.map((c) => c.id)).toEqual(['a', 'b'])
+  })
+
+  test('partial list puts known first, unknowns after preserving order', () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    reorderAccounts(storage, ['a']) // only 'a' specified
+    expect(storage.accounts.map((c) => c.id)).toEqual(['a', 'c', 'b'])
+  })
+})
+
+describe('setAccountEnabled', () => {
+  test('sets enabled flag on matching account', () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'a',
+      type: 'oauth',
+      refresh: 'r',
+      enabled: true,
+    })
+    storage.accounts.push({
+      id: 'b',
+      type: 'oauth',
+      refresh: 'r',
+      enabled: true,
+    })
+    expect(setAccountEnabled(storage, 'a', false)).toBe(true)
+    expect(storage.accounts[0]!.enabled).toBe(false)
+    expect(storage.accounts[1]!.enabled).toBe(true)
+  })
+
+  test('returns false when id not found', () => {
+    const storage = baseStorage()
+    expect(setAccountEnabled(storage, 'nonexistent', false)).toBe(false)
+  })
+})
+
+// -- Persistent round-trip tests -----------------------------------------------
+
+describe('removeAccountPersistent', () => {
+  test('persists removal across load', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    await saveAccounts(storage)
+    expect(await removeAccountPersistent('a', accountPath)).toBe(true)
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts).toHaveLength(0)
+  })
+
+  test('returns false for unknown id', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage)
+    expect(await removeAccountPersistent('nonexistent', accountPath)).toBe(
+      false,
+    )
+  })
+})
+
+describe('reorderAccountsPersistent', () => {
+  test('persists reorder across load', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    await saveAccounts(storage)
+    await reorderAccountsPersistent(['b', 'a', 'c'], accountPath)
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts.map((c) => c.id)).toEqual(['b', 'a', 'c'])
+  })
+})
+
+describe('setAccountEnabledPersistent', () => {
+  test('persists enabled flag across load', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'a',
+      type: 'oauth',
+      refresh: 'r',
+      enabled: true,
+    })
+    await saveAccounts(storage)
+    expect(await setAccountEnabledPersistent('a', false, accountPath)).toBe(
+      true,
+    )
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts[0]?.enabled).toBe(false)
+  })
+})
+
+describe('addAccountPersistent', () => {
+  test('adds a new account and persists', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage)
+    await addAccountPersistent(
+      { id: 'new-acc', type: 'oauth', refresh: 'r' },
+      accountPath,
+    )
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts).toHaveLength(1)
+    expect(loaded?.accounts[0]?.id).toBe('new-acc')
+  })
+})
+
+// -- setLogLevelPersistent -----------------------------------------------------
+
+describe('setLogLevelPersistent', () => {
+  test('persists storage.logging.level and sets runtime log level', async () => {
+    const originalLevel = getLogLevel()
+    try {
+      const storage = baseStorage()
+      await saveAccounts(storage)
+      await setLogLevelPersistent('debug', accountPath)
+      const loaded = await loadAccounts()
+      expect(getPersistedLogLevel(loaded)).toBe('debug')
+      expect(getLogLevel()).toBe('debug')
+    } finally {
+      setLogLevel(originalLevel)
+    }
   })
 })

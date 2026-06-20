@@ -86,9 +86,11 @@ export async function startRpcServer(
       }
       return json(404, { error: 'unknown method' })
     } catch (error) {
-      json(500, {
-        error: error instanceof Error ? error.message : String(error),
-      })
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        json(500, {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
     }
   }
 

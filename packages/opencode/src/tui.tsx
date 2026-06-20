@@ -374,7 +374,8 @@ function QuotaDialogContent(props: {
   })
   setTimeout(refresh, 0)
   const theme = () => props.api.theme.current
-  const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
+  const enabledFallbacks = () =>
+    (state().fallbacks ?? []).filter((f) => f.enabled)
   return (
     <box flexDirection='column' padding={2} width='100%' alignItems='center'>
       <box flexDirection='column' width={58}>
@@ -387,7 +388,7 @@ function QuotaDialogContent(props: {
           theme={theme()}
           appearance={prefs().appearance}
           name='main'
-          quota={state().main.quota}
+          quota={state().main?.quota}
           active={state().activeId === 'main'}
           pacingEnabled={prefs().sections.pacing}
         />
@@ -526,9 +527,10 @@ function QuotaSidebar(props: {
   })
 
   const theme = () => props.api.theme.current
-  const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
+  const enabledFallbacks = () =>
+    (state().fallbacks ?? []).filter((f) => f.enabled)
   const hasData = () =>
-    state().main.quota != null || enabledFallbacks().length > 0
+    state().main?.quota != null || enabledFallbacks().length > 0
 
   const headerLabel = () => {
     const name = prefs().header.label
@@ -568,8 +570,8 @@ function QuotaSidebar(props: {
     return base === 'ok' || base === 'muted' ? 'warn' : base
   }
 
-  const quotaBackedOff = () => state().main.quotaBackedOff === true
-  const refreshBackedOff = () => state().main.refreshBackedOff === true
+  const quotaBackedOff = () => state().main?.quotaBackedOff === true
+  const refreshBackedOff = () => state().main?.refreshBackedOff === true
   const degraded = () => quotaBackedOff() || refreshBackedOff()
 
   const cacheKeep = () => state().cacheKeep
@@ -667,7 +669,7 @@ function QuotaSidebar(props: {
               theme={theme()}
               appearance={prefs().appearance}
               name='main'
-              quota={state().main.quota}
+              quota={state().main?.quota}
               active={state().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
             />
@@ -738,7 +740,7 @@ function QuotaSidebar(props: {
             <StatRow
               theme={theme()}
               label='Quota API'
-              value={`backoff ${formatUntil(state().main.quotaBackoffUntil)}`}
+              value={`backoff ${formatUntil(state().main?.quotaBackoffUntil)}`}
               tone='warn'
             />
           </Show>
@@ -746,7 +748,7 @@ function QuotaSidebar(props: {
             <StatRow
               theme={theme()}
               label='Token refresh'
-              value={`backoff ${formatUntil(state().main.refreshBackoffUntil)}`}
+              value={`backoff ${formatUntil(state().main?.refreshBackoffUntil)}`}
               tone='warn'
             />
           </Show>
@@ -770,7 +772,10 @@ const tui: TuiPlugin = async (api) => {
 
   if (!rpcPollStarted) {
     rpcPollStarted = true
-    const rpcClient = createRpcClient(getRpcDir(api.state.path.directory ?? ''))
+    const rpcClient = createRpcClient(
+      getRpcDir(api.state.path.directory ?? ''),
+      process.pid,
+    )
     let lastNotificationId = 0
     let rpcInFlight = false
     setInterval(() => {
@@ -795,7 +800,7 @@ const tui: TuiPlugin = async (api) => {
               continue
             }
             openCommandDialog(api, message.payload, (command, args) =>
-              rpcClient.apply({ command, arguments: args }),
+              rpcClient.apply({ command, arguments: args, sessionId }),
             )
           }
         })

@@ -6,13 +6,13 @@ import {
   type AccountStorage,
   authorize,
   exchange,
-  type FallbackAccount,
   generateRelayToken,
   getAccountStoragePath,
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
   saveAccounts,
+  upsertAccount,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -62,8 +62,10 @@ async function cloudflareRequest<T>(options: {
   path: string
   body?: RequestInit['body']
   headers?: Record<string, string>
+  fetchImpl?: FetchLike
 }) {
-  const response = await fetch(
+  const fetchImpl = options.fetchImpl ?? fetch
+  const response = await fetchImpl(
     `https://api.cloudflare.com/client/v4${options.path}`,
     {
       method: options.method,
@@ -102,12 +104,14 @@ async function createKvNamespace(
   token: string,
   accountId: string,
   title: string,
+  fetchImpl?: FetchLike,
 ) {
   return cloudflareRequest<{ id: string }>({
     token,
     method: 'POST',
     path: `/accounts/${accountId}/storage/kv/namespaces`,
     body: JSON.stringify({ title }),
+    fetchImpl,
   })
 }
 
@@ -117,6 +121,7 @@ async function uploadRelayWorker(options: {
   scriptName: string
   kvNamespaceId: string
   relayToken: string
+  fetchImpl?: FetchLike
 }) {
   const metadata = {
     main_module: 'worker.js',
@@ -146,6 +151,7 @@ async function uploadRelayWorker(options: {
     method: 'PUT',
     path: `/accounts/${options.accountId}/workers/scripts/${options.scriptName}`,
     body: form,
+    fetchImpl: options.fetchImpl,
   })
 }
 
@@ -153,43 +159,77 @@ async function enableWorkersDev(
   token: string,
   accountId: string,
   scriptName: string,
+  fetchImpl?: FetchLike,
 ) {
   await cloudflareRequest<unknown>({
     token,
     method: 'POST',
     path: `/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`,
     body: JSON.stringify({ enabled: true, previews_enabled: false }),
+    fetchImpl,
   })
 }
 
-async function getWorkersSubdomain(token: string, accountId: string) {
+async function getWorkersSubdomain(
+  token: string,
+  accountId: string,
+  fetchImpl?: FetchLike,
+) {
   return cloudflareRequest<{ subdomain?: string }>({
     token,
     method: 'GET',
     path: `/accounts/${accountId}/workers/subdomain`,
+    fetchImpl,
   }).catch(() => null)
 }
 
-async function relaySetup() {
+/**
+ * Minimal fetch shape relaySetup needs. Narrower than `typeof fetch` (no
+ * `preconnect`) so test stubs and the global `fetch` are both assignable
+ * without a cast. The global `fetch` satisfies this structurally.
+ */
+type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>
+
+/**
+ * Dependencies relaySetup talks to the outside world through. Both default to
+ * the real implementations (global fetch, the readline-backed prompt) so the
+ * production `relay setup` path is unchanged; tests inject deterministic stubs
+ * to exercise the full setup logic in-process without a subprocess.
+ */
+export interface RelaySetupDeps {
+  fetchImpl?: FetchLike
+  prompt?: (message: string) => Promise<string>
+}
+
+export async function relaySetup(deps: RelaySetupDeps = {}) {
+  const fetchImpl = deps.fetchImpl ?? fetch
+  const ask = deps.prompt ?? prompt
   const storage = (await loadAccounts()) ?? defaultStorage()
   const token = requireText(
     process.env.CLOUDFLARE_API_TOKEN?.trim() ||
-      (await prompt('Cloudflare API token: ')),
+      (await ask('Cloudflare API token: ')),
     'Cloudflare API token',
   )
   const accountId = requireText(
-    process.env.CLOUDFLARE_ACCOUNT_ID ||
-      (await prompt('Cloudflare account ID: ')),
+    process.env.CLOUDFLARE_ACCOUNT_ID || (await ask('Cloudflare account ID: ')),
     'Cloudflare account ID',
   )
   const scriptName =
-    (await prompt('Worker name [opencode-anthropic-relay]: ')) ||
+    (await ask('Worker name [opencode-anthropic-relay]: ')) ||
     'opencode-anthropic-relay'
   const kvTitle = `${scriptName}-state`
   const relayToken = generateRelayToken()
 
   console.log('Creating Cloudflare KV namespace...')
-  const namespace = await createKvNamespace(token, accountId, kvTitle)
+  const namespace = await createKvNamespace(
+    token,
+    accountId,
+    kvTitle,
+    fetchImpl,
+  )
   console.log('Uploading relay Worker...')
   await uploadRelayWorker({
     token,
@@ -197,14 +237,17 @@ async function relaySetup() {
     scriptName,
     kvNamespaceId: namespace.id,
     relayToken,
+    fetchImpl,
   })
-  await enableWorkersDev(token, accountId, scriptName).catch((error) => {
-    console.warn(
-      `Could not enable workers.dev automatically: ${error instanceof Error ? error.message : String(error)}`,
-    )
-  })
+  await enableWorkersDev(token, accountId, scriptName, fetchImpl).catch(
+    (error) => {
+      console.warn(
+        `Could not enable workers.dev automatically: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    },
+  )
 
-  const subdomain = await getWorkersSubdomain(token, accountId)
+  const subdomain = await getWorkersSubdomain(token, accountId, fetchImpl)
   const defaultUrl = subdomain?.subdomain
     ? `https://${scriptName}.${subdomain.subdomain}.workers.dev`
     : ''
@@ -237,41 +280,34 @@ function closePromptInterface() {
   promptInterface = null
 }
 
-function upsertAccount(storage: AccountStorage, account: FallbackAccount) {
-  const index = storage.accounts.findIndex(
-    (candidate) =>
-      candidate.id === account.id ||
-      (account.label && candidate.label === account.label),
-  )
-  if (index >= 0) {
-    storage.accounts[index] = {
-      ...storage.accounts[index],
-      ...account,
-      addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
-      ...(account.type === 'oauth' && {
-        quota: account.quota,
-        lastRefreshedAt: account.lastRefreshedAt,
-        lastRefreshError: account.lastRefreshError,
-        lastQuotaRefreshError: account.lastQuotaRefreshError,
-      }),
-    }
-    return
-  }
-  storage.accounts.push(account)
+/**
+ * Dependencies the `login` command talks to the outside world through. All
+ * default to the real implementations (the readline-backed prompt, and the
+ * core authorize/exchange helpers) so the production `login` path is
+ * unchanged; tests inject deterministic stubs to exercise the full login flow
+ * in-process without a subprocess, real network, or stdin.
+ */
+export interface LoginDeps {
+  prompt?: (message: string) => Promise<string>
+  authorize?: typeof authorize
+  exchange?: typeof exchange
 }
 
-async function login(labelArg?: string) {
+export async function login(labelArg?: string, deps: LoginDeps = {}) {
+  const ask = deps.prompt ?? prompt
+  const authorizeImpl = deps.authorize ?? authorize
+  const exchangeImpl = deps.exchange ?? exchange
   const storage = (await loadAccounts()) ?? defaultStorage()
   const label =
-    labelArg?.trim() || (await prompt('Fallback account label (optional): '))
-  const authorization = await authorize('max')
+    labelArg?.trim() || (await ask('Fallback account label (optional): '))
+  const authorization = await authorizeImpl('max')
 
   console.log('\nOpen this URL in your browser and complete Claude sign-in:\n')
   console.log(`${authorization.url}\n`)
-  const code = await prompt(
+  const code = await ask(
     'Paste the full callback URL or authorization code here: ',
   )
-  const result = await exchange(
+  const result = await exchangeImpl(
     code,
     authorization.verifier,
     authorization.redirectUri,
@@ -299,16 +335,25 @@ async function login(labelArg?: string) {
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }
 
-async function addApiRoute(labelArg?: string) {
+/**
+ * Dependencies the `api add` command talks to the outside world through. The
+ * prompt defaults to the real readline-backed prompt so the production
+ * `api add` path is unchanged; tests inject canned answers to exercise the
+ * full route-add flow in-process without a subprocess or stdin.
+ */
+export interface ApiAddDeps {
+  prompt?: (message: string) => Promise<string>
+}
+
+export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
+  const ask = deps.prompt ?? prompt
   const storage = (await loadAccounts()) ?? defaultStorage()
   const label =
-    labelArg?.trim() || (await prompt('API fallback label (optional): '))
+    labelArg?.trim() || (await ask('API fallback label (optional): '))
   const baseURL =
     process.env.OPENCODE_ANTHROPIC_AUTH_API_BASE_URL?.trim() ||
     (
-      await prompt(
-        'Anthropic-compatible base URL [https://api.kie.ai/claude]: ',
-      )
+      await ask('Anthropic-compatible base URL [https://api.kie.ai/claude]: ')
     ).trim() ||
     'https://api.kie.ai/claude'
   if (!isValidApiBaseURL(baseURL)) {
@@ -318,11 +363,11 @@ async function addApiRoute(labelArg?: string) {
   }
   const apiKey =
     process.env.OPENCODE_ANTHROPIC_AUTH_API_KEY?.trim() ||
-    (await prompt('API key: '))
+    (await ask('API key: '))
   if (!apiKey.trim()) throw new Error('API key is required')
   const authHeaderInput = (
     process.env.OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER?.trim() ||
-    (await prompt(
+    (await ask(
       'Auth header [authorization-bearer|x-api-key] (default authorization-bearer): ',
     ))
   )
@@ -412,11 +457,15 @@ async function main() {
   process.exitCode = 1
 }
 
-try {
-  await main()
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error))
-  process.exitCode = 1
-} finally {
-  closePromptInterface()
+// Only run the CLI when executed directly (e.g. `bun src/cli.ts ...`), not when
+// imported by tests that exercise individual commands (relaySetup) in-process.
+if (import.meta.main) {
+  try {
+    await main()
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = 1
+  } finally {
+    closePromptInterface()
+  }
 }

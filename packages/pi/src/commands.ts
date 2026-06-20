@@ -1,15 +1,19 @@
 import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
+  executeLoggingCommand,
   executeRoutingCommand,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getPersistedLogLevel,
   getRoutingMode,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
@@ -21,14 +25,20 @@ import {
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseLoggingCommandAction,
   parseRoutingCommandAction,
+  removeAccountPersistent,
+  reorderAccountsPersistent,
+  setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
+  setCacheKeepSubagentsEnabled,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModePersistentEnabled,
+  setLogLevelPersistent,
   setRoutingMode,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -101,6 +111,8 @@ export function registerCommands(pi: ExtensionAPI) {
         )
       } else if (action.type === 'disable') {
         storage = await setCacheKeepPersistentEnabled(false, path)
+      } else if (action.type === 'subagents') {
+        storage = await setCacheKeepSubagentsEnabled(action.enabled, path)
       }
 
       notify(
@@ -215,6 +227,64 @@ export function registerCommands(pi: ExtensionAPI) {
           now: Date.now(),
         }),
       )
+    },
+  })
+
+  pi.registerCommand(CLAUDE_ACCOUNT_COMMAND_NAME, {
+    description: 'List, enable/disable, reorder, or remove fallback accounts',
+    handler: async (args, ctx) => {
+      const path = getPiAccountStoragePath()
+      const storage = await loadAccounts(path)
+      const result = executeAccountCommand({
+        argumentsText: args ?? '',
+        storage: storage ?? { version: 1, accounts: [] },
+      })
+
+      if (!result.updated) {
+        notify(ctx, result.text)
+        return
+      }
+
+      // Wire persistent mutations via core helpers
+      const { id, action: mutationAction } = result.updated
+
+      if (mutationAction === 'enable') {
+        await setAccountEnabledPersistent(id, true, path)
+      } else if (mutationAction === 'disable') {
+        await setAccountEnabledPersistent(id, false, path)
+      } else if (mutationAction === 'remove') {
+        const existed = await removeAccountPersistent(id, path)
+        if (!existed) {
+          notify(ctx, `Account "${id}" not found.`, 'warning')
+          return
+        }
+      } else if (mutationAction === 'reorder') {
+        const newOrder = result.updated.newOrder
+        if (newOrder) {
+          await reorderAccountsPersistent(newOrder, path)
+        }
+      }
+
+      notify(ctx, result.text)
+    },
+  })
+
+  pi.registerCommand('claude-logging', {
+    description: 'Show or set the plugin log level',
+    handler: async (args, ctx) => {
+      const path = getPiAccountStoragePath()
+      const storage = await loadAccounts(path)
+      const action = parseLoggingCommandAction(args ?? '')
+      const currentLevel = getPersistedLogLevel(storage) ?? 'info'
+
+      // Wire persistent log-level mutation
+      let level = currentLevel
+      if (action.type === 'level') {
+        await setLogLevelPersistent(action.level, path)
+        level = action.level
+      }
+
+      notify(ctx, executeLoggingCommand({ argumentsText: args ?? '', level }))
     },
   })
 }

@@ -5,7 +5,7 @@ import type { OpenDialogPayload } from '../rpc/protocol.js'
 type ApplyFn = (
   command: OpenDialogPayload['command'],
   args: string,
-) => Promise<{ text: string }>
+) => Promise<{ text: string; knobs: Record<string, unknown> }>
 
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
@@ -215,6 +215,454 @@ export function openCommandDialog(
             return
           }
           void apply('claude-killswitch', String(option.value)).then((r) => {
+            api.ui.toast({ message: r.text })
+            api.ui.dialog.clear()
+          })
+        }}
+      />
+    ))
+    return
+  }
+
+  if (payload.command === 'claude-account') {
+    const accounts =
+      (payload.knobs.accounts as Array<{
+        id: string
+        label: string
+        role: string
+        enabled: boolean
+        quotaPercent: number | null
+      }>) ?? []
+
+    const updateAccounts = (r: {
+      text: string
+      knobs: Record<string, unknown>
+    }) => {
+      const updated = r.knobs.accounts as typeof accounts
+      if (updated && updated.length > 0) {
+        accounts.length = 0
+        accounts.push(...updated)
+      }
+    }
+
+    const buildL1 = () => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      const l1Options: Array<{
+        title: string
+        value: string
+        description?: string
+      }> = [
+        {
+          title: 'Add account\u2026',
+          value: '__add__',
+          description: 'Add an API key or OAuth fallback account',
+        },
+        ...accounts.map((a) => {
+          const pct =
+            a.quotaPercent != null
+              ? ` ${Math.round(a.quotaPercent)}%`
+              : ' \u2013%'
+          const status = !a.enabled ? ' (disabled)' : ''
+          return {
+            title: `${a.label} [${a.role}]${status}${pct}`,
+            value: a.id,
+          }
+        }),
+      ]
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='Claude accounts'
+          options={l1Options}
+          onSelect={(option) => {
+            if (option.value === '__add__') {
+              openAddType()
+              return
+            }
+            const account = accounts.find((a) => a.id === option.value)
+            if (!account) return
+            if (account.role === 'main') {
+              const pct =
+                account.quotaPercent != null
+                  ? ` ${Math.round(account.quotaPercent)}%`
+                  : ' \u2013%'
+              showText(
+                api,
+                `${account.label}\nRole: main (read-only)\nQuota:${pct}`,
+              )
+              return
+            }
+            openManage(account, false)
+          }}
+        />
+      ))
+    }
+
+    // -- Add type selection (OAuth vs API key) ------------------------------
+    const openAddType = () => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='Add account'
+          options={[
+            {
+              title: 'OAuth (login)',
+              value: 'oauth',
+              description:
+                'Sign in to Claude via browser — works with Pro, Max, and Team plans',
+            },
+            {
+              title: 'API key',
+              value: 'apikey',
+              description:
+                'Provide an API key for an Anthropic-compatible endpoint',
+            },
+            { title: 'Back', value: 'back' },
+          ]}
+          onSelect={(option) => {
+            if (option.value === 'back') {
+              buildL1()
+              return
+            }
+            if (option.value === 'apikey') {
+              openAddApiKey()
+              return
+            }
+            openAddOAuthStart()
+          }}
+        />
+      ))
+    }
+
+    // -- Add API key (multi-step: key → baseURL → authHeader → label) ------
+    const openAddApiKey = () => {
+      const collected: {
+        apiKey?: string
+        baseURL?: string
+        authHeader?: string
+        label?: string
+      } = {}
+
+      const openApiKeyPrompt = () => {
+        const DialogPrompt = api.ui.DialogPrompt
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogPrompt
+            title='Add API key account \u2014 API key'
+            description={() => <text>Paste your API key (required).</text>}
+            placeholder='sk-ant-...'
+            value=''
+            onConfirm={(value: string) => {
+              const trimmed = value.trim()
+              if (!trimmed) {
+                openAddType()
+                return
+              }
+              collected.apiKey = trimmed
+              openBaseURLPrompt()
+            }}
+            onCancel={() => openAddType()}
+          />
+        ))
+      }
+
+      const openBaseURLPrompt = () => {
+        const DialogPrompt = api.ui.DialogPrompt
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogPrompt
+            title='Add API key account \u2014 base URL'
+            description={() => (
+              <text>
+                Anthropic-compatible API base URL. Default:
+                https://api.kie.ai/claude
+              </text>
+            )}
+            placeholder='https://api.kie.ai/claude'
+            value=''
+            onConfirm={(value: string) => {
+              const trimmed = value.trim()
+              collected.baseURL = trimmed || 'https://api.kie.ai/claude'
+              openAuthHeaderSelect()
+            }}
+            onCancel={() => openApiKeyPrompt()}
+          />
+        ))
+      }
+
+      const openAuthHeaderSelect = () => {
+        const DialogSelect = api.ui.DialogSelect<string>
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogSelect
+            title='Add API key account \u2014 auth header'
+            options={[
+              {
+                title: 'Authorization: Bearer (default)',
+                value: 'authorization-bearer',
+                description: 'Standard bearer token authentication',
+              },
+              {
+                title: 'X-API-Key',
+                value: 'x-api-key',
+                description: 'Custom header-based API key',
+              },
+            ]}
+            onSelect={(option) => {
+              collected.authHeader = option.value as
+                | 'authorization-bearer'
+                | 'x-api-key'
+              openLabelPrompt()
+            }}
+          />
+        ))
+      }
+
+      const openLabelPrompt = () => {
+        const DialogPrompt = api.ui.DialogPrompt
+        api.ui.dialog.setSize('xlarge')
+        api.ui.dialog.replace(() => (
+          <DialogPrompt
+            title='Add API key account \u2014 label'
+            description={() => (
+              <text>A short name for this account (optional).</text>
+            )}
+            placeholder='e.g. Work API'
+            value=''
+            onConfirm={(value: string) => {
+              const trimmed = value.trim()
+              collected.label = trimmed || undefined
+              const apiKey = collected.apiKey
+              if (!apiKey) return
+              let args = `add-apikey ${apiKey}`
+              if (
+                collected.baseURL &&
+                collected.baseURL !== 'https://api.kie.ai/claude'
+              ) {
+                args += ` --base-url ${collected.baseURL}`
+              }
+              if (
+                collected.authHeader &&
+                collected.authHeader !== 'authorization-bearer'
+              ) {
+                args += ` --auth-header ${collected.authHeader}`
+              }
+              if (collected.label) {
+                args += ` --label ${collected.label}`
+              }
+              void apply('claude-account', args).then((r) => {
+                api.ui.toast({ message: r.text })
+                updateAccounts(r)
+                buildL1()
+              })
+            }}
+            onCancel={() => openAuthHeaderSelect()}
+          />
+        ))
+      }
+
+      openApiKeyPrompt()
+    }
+
+    // -- Add OAuth (OSC-52 copy + code entry) ------------------------------
+    const openAddOAuthStart = () => {
+      void apply('claude-account', 'add-oauth-start').then((r) => {
+        const oauthUrl = r.knobs.oauthUrl as string | undefined
+        updateAccounts(r)
+        if (oauthUrl) {
+          openOAuthUrlScreen(oauthUrl)
+        } else {
+          api.ui.toast({ message: r.text })
+          buildL1()
+        }
+      })
+    }
+
+    const openOAuthUrlScreen = (oauthUrl: string) => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='OAuth sign-in'
+          options={[
+            {
+              title: 'Copy URL to clipboard',
+              value: 'copy',
+              description: oauthUrl,
+            },
+            {
+              title: 'Enter sign-in code',
+              value: 'code',
+              description:
+                'Open the URL in your browser, sign in, then paste the callback URL or code',
+            },
+            { title: 'Cancel', value: 'cancel' },
+          ]}
+          onSelect={(option) => {
+            if (option.value === 'cancel') {
+              buildL1()
+              return
+            }
+            if (option.value === 'copy') {
+              const ok = api.renderer.copyToClipboardOSC52(oauthUrl)
+              if (ok) {
+                api.ui.toast({ message: 'URL copied to clipboard' })
+              } else {
+                api.ui.toast({
+                  message:
+                    'Copy unavailable \u2014 select the URL text above to copy',
+                })
+              }
+              openOAuthUrlScreen(oauthUrl)
+              return
+            }
+            openOAuthCodePrompt()
+          }}
+        />
+      ))
+    }
+
+    const openOAuthCodePrompt = () => {
+      const DialogPrompt = api.ui.DialogPrompt
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title='OAuth sign-in \u2014 enter code'
+          description={() => (
+            <text>
+              After signing in you will be redirected. Paste the full callback
+              URL or authorization code below.
+            </text>
+          )}
+          placeholder='Paste callback URL or code here'
+          value=''
+          onConfirm={(value: string) => {
+            const trimmed = value.trim()
+            if (!trimmed) {
+              buildL1()
+              return
+            }
+            void apply('claude-account', `add-oauth-finish ${trimmed}`).then(
+              (r) => {
+                api.ui.toast({ message: r.text })
+                updateAccounts(r)
+                buildL1()
+              },
+            )
+          }}
+          onCancel={() => buildL1()}
+        />
+      ))
+    }
+
+    // -- Manage existing account -------------------------------------------
+    const openManage = (
+      account: (typeof accounts)[number],
+      isMain: boolean,
+    ) => {
+      const DialogSelect = api.ui.DialogSelect<string>
+      const DialogConfirm = api.ui.DialogConfirm
+      api.ui.dialog.setSize('xlarge')
+
+      const options: Array<{
+        title: string
+        value: string
+        description?: string
+      }> = []
+      if (!isMain) {
+        const toggleLabel = account.enabled ? 'Disable' : 'Enable'
+        options.push({
+          title: toggleLabel,
+          value: account.enabled ? 'disable' : 'enable',
+          description: account.enabled
+            ? 'Stop using this fallback account'
+            : 'Allow this fallback account to be used',
+        })
+        options.push({
+          title: 'Move up',
+          value: 'move-up',
+          description: 'Higher priority in fallback order',
+        })
+        options.push({
+          title: 'Move down',
+          value: 'move-down',
+          description: 'Lower priority in fallback order',
+        })
+        options.push({
+          title: 'Remove\u2026',
+          value: 'remove',
+          description: 'Delete this account permanently',
+        })
+      }
+      options.push({ title: 'Back', value: 'back' })
+
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title={`Manage ${account.label}`}
+          options={options}
+          onSelect={(option) => {
+            if (option.value === 'back') {
+              buildL1()
+              return
+            }
+
+            if (option.value === 'remove') {
+              api.ui.dialog.replace(() => (
+                <DialogConfirm
+                  title={`Remove ${account.label}?`}
+                  message={`Are you sure you want to remove the fallback account "${account.label}"?`}
+                  onConfirm={() => {
+                    void apply('claude-account', `remove ${account.id}`).then(
+                      (r) => {
+                        api.ui.toast({ message: r.text })
+                        updateAccounts(r)
+                        buildL1()
+                      },
+                    )
+                  }}
+                  onCancel={() => openManage(account, isMain)}
+                />
+              ))
+              return
+            }
+
+            void apply('claude-account', `${option.value} ${account.id}`).then(
+              (r) => {
+                api.ui.toast({ message: r.text })
+                updateAccounts(r)
+                const updatedList = r.knobs.accounts as typeof accounts
+                const refreshed =
+                  (updatedList && updatedList.length > 0
+                    ? updatedList.find((a) => a.id === account.id)
+                    : undefined) ?? account
+                openManage(refreshed, isMain)
+              },
+            )
+          }}
+        />
+      ))
+    }
+
+    buildL1()
+    return
+  }
+
+  if (payload.command === 'claude-logging') {
+    const current = (payload.knobs.level as string) ?? 'info'
+    const levels = ['error', 'warn', 'info', 'debug', 'trace']
+    const DialogSelect = api.ui.DialogSelect<string>
+    api.ui.dialog.setSize('xlarge')
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title='Claude log level'
+        current={current}
+        options={levels.map((level) => ({
+          title: level === current ? `\u2022 ${level}` : level,
+          value: level,
+        }))}
+        onSelect={(option) => {
+          void apply('claude-logging', String(option.value)).then((r) => {
             api.ui.toast({ message: r.text })
             api.ui.dialog.clear()
           })

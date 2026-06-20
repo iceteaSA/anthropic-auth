@@ -3,14 +3,14 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from './auth.ts'
+import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
   CLAUDE_CODE_VERSION,
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
-import { log } from './logger.ts'
+import { type LogLevel, log, logger } from './logger.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -146,6 +146,9 @@ export type AccountStorage = {
   dump?: {
     enabled?: boolean
   }
+  logging?: {
+    level?: LogLevel
+  }
   claudeFast?: {
     enabled?: boolean
   }
@@ -161,6 +164,7 @@ export type AccountStorage = {
     enabled?: boolean
     startHour?: number
     endHour?: number
+    subagents?: boolean
   }
   relay?: {
     enabled?: boolean
@@ -415,6 +419,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
+    logging: isRecord(value.logging) ? value.logging : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
     accounts: value.accounts
       .map(normalizeAccount)
@@ -432,7 +437,10 @@ async function readJsonIfPresent(path: string): Promise<{
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { exists: false, value: null }
     }
-    return { exists: false, value: null }
+    const cause = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `account store at ${path} is corrupt or unreadable (${cause}) — fix or remove it`,
+    )
   }
 }
 
@@ -615,6 +623,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     quota,
     claudeCache: storage.claudeCache,
     dump: storage.dump,
+    logging: storage.logging,
     claudeFast: storage.claudeFast,
     costZeroing: storage.costZeroing,
     cacheKeep: storage.cacheKeep,
@@ -624,27 +633,20 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
-function stateFromStorage(storage: AccountStorage): AccountRuntimeState {
-  const accounts = Object.fromEntries(
-    storage.accounts.map((account) => [
-      account.id,
-      accountRuntimeState(account),
-    ]),
-  )
-  return {
-    version: 1,
-    main: objectWithDefinedEntries({
-      quota: storage.quota?.mainQuota,
-      quotaCheckedAt: storage.quota?.mainQuotaCheckedAt,
-      quotaToken: storage.quota?.mainQuotaToken,
-      lastQuotaApiError: storage.quota?.mainLastQuotaApiError,
-      lastRefreshError: storage.refresh?.mainLastRefreshError,
-      refreshLeaseId: storage.refresh?.mainRefreshLeaseId,
-      refreshLeaseUntil: storage.refresh?.mainRefreshLeaseUntil,
-      refreshLeaseTokenHash: storage.refresh?.mainRefreshLeaseTokenHash,
-    }),
-    accounts,
-  }
+// ---------------------------------------------------------------------------
+// In-process save mutex — serializes all account-store writes so concurrent
+// read-modify-write callers (background timers that call saveAccountState with
+// different section flags) don't lose each other's updates (#9).
+// ---------------------------------------------------------------------------
+let saveChain: Promise<void> = Promise.resolve()
+
+function enqueueSave<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    saveChain = saveChain.then(
+      () => fn().then(resolve, reject),
+      () => fn().then(resolve, reject),
+    )
+  })
 }
 
 async function writeJsonAtomic(path: string, value: unknown) {
@@ -654,17 +656,31 @@ async function writeJsonAtomic(path: string, value: unknown) {
     encoding: 'utf8',
     mode: 0o600,
   })
-  await rename(tempPath, path)
+  try {
+    await rename(tempPath, path)
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {})
+    throw error
+  }
 }
 
-export async function saveAccounts(
+export function saveAccounts(
   storage: AccountStorage,
   path = getAccountStoragePath(),
-) {
+): Promise<void> {
+  const resolvedPath = path
+  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath))
+}
+
+async function saveAccountsLocked(storage: AccountStorage, path: string) {
   const existing = await loadExistingTopLevelFields(path)
   const nextConfig = { ...existing, ...configFromStorage(storage) }
   await writeJsonAtomic(path, nextConfig)
-  await writeJsonAtomic(getAccountStatePath(path), stateFromStorage(storage))
+  await saveAccountStateUnlocked(storage, path, {
+    mainQuota: true,
+    mainRefresh: true,
+    accounts: true,
+  })
 }
 
 function applyMainQuotaStatePatch(
@@ -709,7 +725,7 @@ function pruneUndefined(value: unknown): unknown {
   )
 }
 
-export async function saveAccountState(
+export function saveAccountState(
   storage: AccountStorage,
   path = getAccountStoragePath(),
   scope: AccountStateSaveScope = {
@@ -717,6 +733,17 @@ export async function saveAccountState(
     mainRefresh: true,
     accounts: true,
   },
+): Promise<void> {
+  const resolvedPath = path
+  return enqueueSave(() =>
+    saveAccountStateUnlocked(storage, resolvedPath, scope),
+  )
+}
+
+async function saveAccountStateUnlocked(
+  storage: AccountStorage,
+  path: string,
+  scope: AccountStateSaveScope,
 ) {
   const statePath = getAccountStatePath(path)
   const existing = (await readJsonIfPresent(statePath)).value
@@ -756,6 +783,13 @@ export async function acquireRefreshFileLock(options: {
   now?: () => number
   renew?: boolean
   renewIntervalMs?: number
+  onStep?: (
+    step:
+      | 'stale-marker-stat'
+      | 'stale-marker-claimed'
+      | 'stale-lock-confirmed'
+      | 'eviction-marker-acquired',
+  ) => void | Promise<void>
 }): Promise<{ release: () => Promise<void> } | null> {
   const accountPath = options.path ?? getAccountStoragePath()
   const lockPath = `${accountPath}.${options.name}.lock`
@@ -824,21 +858,132 @@ export async function acquireRefreshFileLock(options: {
     if ('unref' in renewTimer) renewTimer.unref()
   }
 
-  if (!(await tryAcquire())) {
-    try {
-      const owner = await readOwner()
-      if (Number(owner?.expiresAt) > now()) return null
-    } catch {
+  let acquired = await tryAcquire()
+  if (!acquired) {
+    const evictPath = `${lockPath}.evicting`
+    const evictOwnerPath = join(evictPath, 'owner.json')
+    const evictOwnerId = randomUUID()
+    const EVICT_TTL = 5_000
+    const MAX_STEAL_ATTEMPTS = 8
+
+    async function backoff() {
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.floor(Math.random() * 4)),
+      )
+    }
+
+    async function lockIsLive() {
       try {
-        const current = await stat(lockPath)
-        if (current.mtimeMs + options.ttlMs > Date.now()) return null
+        const currentOwner = await readOwner()
+        return Number(currentOwner?.expiresAt) > now()
       } catch {
-        return null
+        try {
+          const current = await stat(lockPath)
+          return current.mtimeMs + options.ttlMs > now()
+        } catch {
+          // Lock doesn't exist — safe to acquire.
+          return false
+        }
       }
     }
-    await rm(lockPath, { recursive: true, force: true }).catch(() => {})
-    if (!(await tryAcquire())) return null
+
+    async function ownsEvictionMarker() {
+      try {
+        const owner = JSON.parse(await readFile(evictOwnerPath, 'utf8'))
+        return owner?.ownerId === evictOwnerId
+      } catch {
+        return false
+      }
+    }
+
+    async function tryAcquireEvictionMarker() {
+      await mkdir(evictPath)
+      try {
+        await writeFile(
+          evictOwnerPath,
+          `${JSON.stringify({ ownerId: evictOwnerId, createdAt: now() })}\n`,
+          { encoding: 'utf8', mode: 0o600, flag: 'wx' },
+        )
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        await releaseEvictionMarker()
+        throw error
+      }
+      await options.onStep?.('eviction-marker-acquired')
+      return true
+    }
+
+    async function releaseEvictionMarker() {
+      if (await ownsEvictionMarker()) {
+        await rm(evictPath, { recursive: true, force: true }).catch(() => {})
+      }
+    }
+
+    for (let attempt = 0; attempt < MAX_STEAL_ATTEMPTS; attempt++) {
+      acquired = await tryAcquire()
+      if (acquired) break
+      if (await lockIsLive()) return null
+
+      try {
+        if (!(await tryAcquireEvictionMarker())) {
+          await backoff()
+          continue
+        }
+      } catch (evictError) {
+        const code = (evictError as NodeJS.ErrnoException).code
+        if (code !== 'EEXIST') throw evictError
+
+        let evictStat: Awaited<ReturnType<typeof stat>>
+        try {
+          evictStat = await stat(evictPath)
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === 'ENOENT') {
+            await backoff()
+            continue
+          }
+          throw statError
+        }
+        if (evictStat.mtimeMs + EVICT_TTL > now()) return null
+
+        await options.onStep?.('stale-marker-stat')
+        const claimedPath = `${evictPath}.${randomUUID()}`
+        try {
+          await rename(evictPath, claimedPath)
+        } catch (renameError) {
+          if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
+            await backoff()
+            continue
+          }
+          throw renameError
+        }
+        await options.onStep?.('stale-marker-claimed')
+        await rm(claimedPath, { recursive: true, force: true }).catch(() => {})
+        await backoff()
+        continue
+      }
+
+      try {
+        if (await lockIsLive()) return null
+        if (!(await ownsEvictionMarker())) return null
+        await options.onStep?.('stale-lock-confirmed')
+        if (!(await ownsEvictionMarker())) return null
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+        if (!(await ownsEvictionMarker())) return null
+        acquired = await tryAcquire()
+        if (!acquired) return null
+        if (!(await ownsEvictionMarker())) {
+          await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+          acquired = false
+          return null
+        }
+        break
+      } finally {
+        await releaseEvictionMarker()
+      }
+    }
   }
+
+  if (!acquired) return null
 
   scheduleRenewal()
 
@@ -992,6 +1137,27 @@ export async function setCacheKeepPersistentEnabled(
   return storage
 }
 
+export function isCacheKeepSubagentsEnabled(storage: AccountStorage | null) {
+  return storage?.cacheKeep?.subagents === true
+}
+
+export async function setCacheKeepSubagentsEnabled(
+  enabled: boolean,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
+    subagents: enabled,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
 function getFallbackStatuses(storage: AccountStorage | null) {
   return storage?.fallbackOn?.length ? storage.fallbackOn : DEFAULT_FALLBACK_ON
 }
@@ -1047,8 +1213,9 @@ export function hashRefreshToken(refreshToken: string) {
 }
 
 function isTransientRefreshError(error: unknown) {
-  if (error instanceof ClaudeOAuthRefreshError) {
-    return error.status === 429 || error.status >= 500
+  const status = (error as { status?: unknown }).status
+  if (typeof status === 'number' && Number.isFinite(status)) {
+    return status === 429 || status >= 500
   }
   if (!(error instanceof Error)) return false
   return (
@@ -1073,12 +1240,11 @@ export function buildRefreshOperationError(input: {
       ? (input.previous.retryCount ?? 0)
       : 0
   const retryCount = previousRetryCount + 1
+  const retryAfterFromError = (input.error as { retryAfter?: unknown })
+    .retryAfter
   let delay: number
-  if (
-    input.error instanceof ClaudeOAuthRefreshError &&
-    input.error.retryAfter
-  ) {
-    delay = input.error.retryAfter * 1000
+  if (typeof retryAfterFromError === 'number' && retryAfterFromError > 0) {
+    delay = retryAfterFromError * 1000
   } else if (isTransientRefreshError(input.error)) {
     delay = Math.min(
       MAX_REFRESH_RETRY_DELAY_MS,
@@ -1163,6 +1329,30 @@ export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
   return Math.max(1, minutes) * 60_000
 }
 
+export function getPersistedLogLevel(
+  storage: AccountStorage | null,
+): LogLevel | undefined {
+  return storage?.logging?.level
+}
+
+export async function setLogLevelPersistent(
+  level: LogLevel,
+  path = getAccountStoragePath(),
+) {
+  const { setLogLevel } = await import('./logger.ts')
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.logging = {
+    ...(storage.logging ?? {}),
+    level,
+  }
+  await saveAccounts(storage, path)
+  setLogLevel(level)
+}
+
 export function getPersistedMainQuota(storage: AccountStorage | null): {
   quota: OAuthQuotaSnapshot
   checkedAt: number
@@ -1206,6 +1396,9 @@ export function quotaSnapshotPassesPolicy(
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
     if (!window) return !failClosedOnUnknownQuota(storage)
+    if (!Number.isFinite(window.remainingPercent)) {
+      return !failClosedOnUnknownQuota(storage)
+    }
     if (window.remainingPercent < thresholds[key]) return false
   }
   return true
@@ -1224,15 +1417,17 @@ export const DEFAULT_KILLSWITCH_THRESHOLDS: Record<QuotaWindowName, number> = {
 function normalizeKillswitchThresholds(
   thresholds: KillswitchThresholds | undefined,
 ): Record<QuotaWindowName, number> {
+  const fiveHour = thresholds?.five_hour ?? thresholds?.['5h']
+  const sevenDay = thresholds?.seven_day ?? thresholds?.['1w']
   return {
     five_hour:
-      thresholds?.five_hour ??
-      thresholds?.['5h'] ??
-      DEFAULT_KILLSWITCH_THRESHOLDS.five_hour,
+      typeof fiveHour === 'number' && Number.isFinite(fiveHour)
+        ? fiveHour
+        : DEFAULT_KILLSWITCH_THRESHOLDS.five_hour,
     seven_day:
-      thresholds?.seven_day ??
-      thresholds?.['1w'] ??
-      DEFAULT_KILLSWITCH_THRESHOLDS.seven_day,
+      typeof sevenDay === 'number' && Number.isFinite(sevenDay)
+        ? sevenDay
+        : DEFAULT_KILLSWITCH_THRESHOLDS.seven_day,
   }
 }
 
@@ -1269,6 +1464,10 @@ export function killswitchPassesPolicy(
     // only one window, and a present window below its threshold must still
     // block even if the other window is missing.
     if (!window) {
+      sawUnknownWindow = true
+      continue
+    }
+    if (!Number.isFinite(window.remainingPercent)) {
       sawUnknownWindow = true
       continue
     }
@@ -1321,6 +1520,52 @@ export async function setKillswitchPersistent(
   storage.killswitch = config
   await saveAccounts(storage, path)
   return storage
+}
+
+export async function removeAccountPersistent(
+  id: string,
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  const storage = await loadAccounts(path)
+  if (!storage) return false
+  const existed = removeAccount(storage, id)
+  if (existed) await saveAccounts(storage, path)
+  return existed
+}
+
+export async function reorderAccountsPersistent(
+  orderedIds: string[],
+  path = getAccountStoragePath(),
+) {
+  const storage = await loadAccounts(path)
+  if (!storage) return
+  reorderAccounts(storage, orderedIds)
+  await saveAccounts(storage, path)
+}
+
+export async function setAccountEnabledPersistent(
+  id: string,
+  enabled: boolean,
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  const storage = await loadAccounts(path)
+  if (!storage) return false
+  const found = setAccountEnabled(storage, id, enabled)
+  if (found) await saveAccounts(storage, path)
+  return found
+}
+
+export async function addAccountPersistent(
+  account: FallbackAccount,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  upsertAccount(storage, account)
+  await saveAccounts(storage, path)
 }
 
 export function getQuotaNextRefreshAt(
@@ -1400,10 +1645,21 @@ function cachedQuotaSnapshotStillRelevant(
 }
 
 function isTransientQuotaError(error: unknown) {
-  const message = formatErrorMessage(error)
-  if (/Claude quota check failed: (429|5\d\d)\b/.test(message)) return true
-  if (message.includes('Quota refresh is already in progress')) return true
+  const status = (error as { status?: unknown }).status
+  if (typeof status === 'number' && Number.isFinite(status)) {
+    if (status === 429 || status >= 500) return true
+  }
+
+  const formattedMessage = formatErrorMessage(error)
+  if (/Claude quota check failed: (429|5\d\d)\b/.test(formattedMessage)) {
+    return true
+  }
+  if (formattedMessage.includes('Quota refresh is already in progress')) {
+    return true
+  }
+
   if (!(error instanceof Error)) return false
+  const message = error.message
   const code = (error as Error & { code?: unknown }).code
   return (
     message.includes('fetch failed') ||
@@ -1439,6 +1695,7 @@ function mapUsageWindow(
   checkedAt: number,
 ): AccountQuotaWindow | undefined {
   if (typeof window?.utilization !== 'number') return undefined
+  if (!Number.isFinite(window.utilization)) return undefined
   const usedPercent = clampPercent(window.utilization)
   return {
     usedPercent,
@@ -1467,7 +1724,14 @@ export async function fetchOAuthQuotaSnapshot(input: {
 
   if (!response.ok) {
     const body = await response.text().catch(() => '')
-    throw new Error(`Claude quota check failed: ${response.status} — ${body}`)
+    const error = Object.assign(
+      new Error(`Claude quota check failed: ${response.status} — ${body}`),
+      {
+        status: response.status,
+        retryAfter: parseRetryAfterHeader(response.headers.get('Retry-After')),
+      },
+    )
+    throw error
   }
 
   const checkedAt = input.now?.() ?? Date.now()
@@ -1486,6 +1750,58 @@ function updateStoredAccount(
     (candidate) => candidate.id === account.id,
   )
   if (index >= 0) storage.accounts[index] = account
+}
+
+export function upsertAccount(
+  storage: AccountStorage,
+  account: FallbackAccount,
+) {
+  const index = storage.accounts.findIndex(
+    (candidate) =>
+      candidate.id === account.id ||
+      (account.label && candidate.label === account.label),
+  )
+  if (index >= 0) {
+    storage.accounts[index] = {
+      ...storage.accounts[index],
+      ...account,
+      addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
+      ...(account.type === 'oauth' && {
+        quota: account.quota,
+        lastRefreshedAt: account.lastRefreshedAt,
+        lastRefreshError: account.lastRefreshError,
+        lastQuotaRefreshError: account.lastQuotaRefreshError,
+      }),
+    }
+    return
+  }
+  storage.accounts.push(account)
+}
+
+export function removeAccount(storage: AccountStorage, id: string): boolean {
+  const index = storage.accounts.findIndex((c) => c.id === id)
+  if (index < 0) return false
+  storage.accounts.splice(index, 1)
+  return true
+}
+
+export function reorderAccounts(storage: AccountStorage, orderedIds: string[]) {
+  const orderMap = new Map(orderedIds.map((id, i) => [id, i]))
+  const known = storage.accounts.filter((a) => orderMap.has(a.id))
+  const unknown = storage.accounts.filter((a) => !orderMap.has(a.id))
+  known.sort((a, b) => (orderMap.get(a.id) ?? 0) - (orderMap.get(b.id) ?? 0))
+  storage.accounts = [...known, ...unknown]
+}
+
+export function setAccountEnabled(
+  storage: AccountStorage,
+  id: string,
+  enabled: boolean,
+): boolean {
+  const account = storage.accounts.find((c) => c.id === id)
+  if (!account) return false
+  account.enabled = enabled
+  return true
 }
 
 function formatErrorMessage(error: unknown) {
@@ -1515,7 +1831,7 @@ function recordQuotaRefreshError(
     now,
     previous: account.lastQuotaRefreshError,
   })
-  if (error instanceof ClaudeOAuthRefreshError) {
+  if ((error as { isRefreshError?: boolean }).isRefreshError) {
     recordRefreshError(account, error, now)
   }
 }
@@ -1742,7 +2058,7 @@ export class FallbackAccountManager {
         await this.refreshAccount(account, storage)
         changed = true
       } catch (error) {
-        log('[refresh] fallback oauth background failed', {
+        logger.warn('refresh', 'fallback oauth background failed', {
           accountId: account.id,
           error: error instanceof Error ? error.message : String(error),
         })

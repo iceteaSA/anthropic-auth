@@ -1,4 +1,5 @@
 export type CommandModalName =
+  | 'claude-account'
   | 'claude-cache'
   | 'claude-cachekeep'
   | 'claude-quota'
@@ -6,6 +7,7 @@ export type CommandModalName =
   | 'claude-fast'
   | 'claude-routing'
   | 'claude-killswitch'
+  | 'claude-logging'
 
 export interface OpenDialogPayload {
   command: CommandModalName
@@ -23,6 +25,7 @@ export interface RpcNotification {
 export interface ApplyRequest {
   command: CommandModalName
   arguments: string
+  sessionId?: string
 }
 
 export interface ApplyResult {

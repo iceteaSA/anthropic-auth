@@ -16,7 +16,11 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
-import { getSidebarState } from '../sidebar-state'
+import {
+  drainSidebarWrites,
+  getSidebarState,
+  getSidebarStateFile,
+} from '../sidebar-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -89,6 +93,7 @@ function createFallbackStorage(
 
 async function useTempAccountFile(storage: AccountStorage) {
   if (tempConfigDir) {
+    await drainSidebarWrites()
     await rm(tempConfigDir, { recursive: true, force: true })
   }
   tempConfigDir = await mkdtemp(join(tmpdir(), 'anthropic-plugin-test-'))
@@ -103,6 +108,19 @@ async function useTempAccountFile(storage: AccountStorage) {
   await saveAccounts(storage)
 }
 
+function restoreProcessTestFiles() {
+  const testDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
+  if (!testDir) return
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(
+    testDir,
+    'anthropic-auth.json',
+  )
+  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+    testDir,
+    'sidebar-state.json',
+  )
+}
+
 async function waitForSidebarState(
   predicate: (state: Awaited<ReturnType<typeof getSidebarState>>) => boolean,
 ) {
@@ -113,6 +131,13 @@ async function waitForSidebarState(
   }
   const state = await getSidebarState()
   throw new Error(`Sidebar state did not match: ${JSON.stringify(state)}`)
+}
+
+async function waitForMockCall(fn: { mock?: { calls: unknown[] } }) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if ((fn.mock?.calls.length ?? 0) > 0) return
+    await Bun.sleep(10)
+  }
 }
 
 /**
@@ -314,14 +339,22 @@ describe('auth.methods', () => {
   })
 })
 
+test('test setup keeps sidebar state off the production default path', () => {
+  const testDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
+  expect(typeof testDir).toBe('string')
+  if (!testDir) throw new Error('missing test directory')
+  restoreProcessTestFiles()
+  expect(getSidebarStateFile().startsWith(`${testDir}/`)).toBe(true)
+})
+
 describe('provider.models', () => {
   beforeEach(async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
   afterEach(async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    await drainSidebarWrites()
+    restoreProcessTestFiles()
     if (tempConfigDir) {
       await rm(tempConfigDir, { recursive: true, force: true })
       tempConfigDir = undefined
@@ -467,8 +500,8 @@ describe('auth.loader', () => {
     globalThis.setInterval = originalSetInterval
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    await drainSidebarWrites()
+    restoreProcessTestFiles()
     if (tempConfigDir) {
       await rm(tempConfigDir, { recursive: true, force: true })
       tempConfigDir = undefined
@@ -692,9 +725,13 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
+    await drainSidebarWrites()
 
     const state = await waitForSidebarState(
-      (candidate) => candidate.activeId === 'fallback-1',
+      (candidate) =>
+        candidate.activeId === 'fallback-1' &&
+        candidate.route === 'fallback-first' &&
+        candidate.fallbacks[0]?.quota?.five_hour?.usedPercent === 25,
     )
     expect(state.route).toBe('fallback-first')
     expect(state.fallbacks[0]?.quota?.five_hour?.usedPercent).toBe(25)
@@ -1623,6 +1660,53 @@ describe('auth.loader', () => {
     expect(saved.claudeCache).toEqual({ enabled: true, mode: 'explicit' })
   })
 
+  test('config hook registers every modal command so they appear in the command palette', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const plugin = await getPlugin()
+
+    // Seed a pre-existing command from another plugin / opencode itself — the
+    // config hook must MERGE into config.command, never clobber it.
+    const preExisting = { template: 'other-plugin-cmd', description: 'foreign' }
+    const result: { command?: Record<string, unknown> } = {
+      command: { 'other-plugin-cmd': preExisting },
+    }
+    await plugin.config(result)
+
+    const registered = Object.keys(result.command ?? {})
+
+    // Passthrough-survival: the foreign command must still be present (the hook
+    // spreads ...(config.command ?? {}) — dropping that spread would silently
+    // wipe every other plugin's commands).
+    expect(result.command?.['other-plugin-cmd']).toEqual(preExisting)
+
+    // Every modal command must be registered — if one is missing it won't appear
+    // in the slash-command palette and users will get "No matching items".
+    const required = [
+      'claude-account',
+      'claude-cache',
+      'claude-cachekeep',
+      'claude-quota',
+      'claude-dump',
+      'claude-fast',
+      'claude-routing',
+      'claude-killswitch',
+      'claude-logging',
+    ]
+    for (const name of required) {
+      expect(registered).toContain(name)
+    }
+
+    // The config hook must not register extra claude-* commands beyond the
+    // modalCommands set (drift in either direction is a bug). Exactly the 9
+    // required names should be claude-* keys — no more, no less. (The foreign
+    // 'other-plugin-cmd' is excluded from this count via the claude- prefix.)
+    const claudeRegistered = registered.filter((name) =>
+      name.startsWith('claude-'),
+    )
+    expect(claudeRegistered).toHaveLength(required.length)
+    expect([...claudeRegistered].sort()).toEqual([...required].sort())
+  })
+
   test('handles /claude-cachekeep command and persists window', async () => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -2399,8 +2483,8 @@ describe('auth.loader', () => {
     )
 
     expect(intervalHandlers.length).toBeGreaterThanOrEqual(2)
-    intervalHandlers[intervalHandlers.length - 1]!()
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    for (const handler of intervalHandlers) handler()
+    await waitForMockCall(mockClient.auth.set)
 
     expect(mockClient.auth.set).toHaveBeenCalledWith({
       path: { id: 'anthropic' },
@@ -2458,8 +2542,8 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
-    intervalHandlers[intervalHandlers.length - 1]!()
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    for (const handler of intervalHandlers) handler()
+    await waitForMockCall(mockClient.auth.set)
 
     expect(mockClient.auth.set).toHaveBeenCalledWith({
       path: { id: 'anthropic' },
@@ -3600,17 +3684,14 @@ describe('auth.loader', () => {
     globalThis.fetch = mock((input: any, init: any) => {
       const url = extractUrl(input)
       if (url.includes('/api/oauth/usage')) {
-        // Delay the background main refresh so it settles AFTER the fallback
-        // write — this is the race that causes the clobber in production.
-        return Bun.sleep(40).then(
-          () =>
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0.95 },
-                seven_day: { utilization: 0.1 },
-              }),
-              { status: 200 },
-            ),
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.95 },
+              seven_day: { utilization: 0.1 },
+            }),
+            { status: 200 },
+          ),
         )
       }
       // Anthropic messages call — fallback serves 200, main would not be reached.
@@ -3636,15 +3717,14 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
+    await drainSidebarWrites()
 
     // Fallback served → active id should be the fallback.
     const state = await waitForSidebarState(
-      (candidate) => candidate.activeId === 'fallback-1',
+      (candidate) =>
+        candidate.activeId === 'fallback-1' && candidate.route === 'fallback',
     )
     expect(state.route).toBe('fallback')
-
-    // Let the fire-and-forget refreshMain().then(...) settle.
-    await Bun.sleep(80)
 
     // REGRESSION: pre-fix the async callback rewrites activeId to 'main'.
     const after = await getSidebarState()
