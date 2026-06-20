@@ -272,6 +272,7 @@ export function queueTuiPreferenceUpdate(
 }
 
 const WATCH_DEBOUNCE_MS = 150
+const WATCH_POLL_MS = 100
 
 // Watches the directory rather than the file: editors and our own atomic
 // writes replace the file via rename, which kills file-level watchers.
@@ -296,14 +297,35 @@ export function watchTuiPreferences(onChange: () => void): () => void {
   const name = basename(file)
   let timer: ReturnType<typeof nativeSetTimeout> | null = null
   let lastSeen: string | null = null
-  // Seed asynchronously; a real change that fires before the seed resolves
-  // still wins because the debounce re-reads the file fresh and compares
-  // against `lastSeen` (which will be `null` → does not match → fires).
+  let observedEvent = false
+  let disposed = false
+
+  const checkForChange = async () => {
+    const text = await readFile(file, 'utf8').catch(() => null)
+    if (disposed || text === null) return
+    if (text === lastSeen) return
+    lastSeen = text
+    onChange()
+  }
+
+  const scheduleCheck = () => {
+    observedEvent = true
+    if (timer) nativeClearTimeout(timer)
+    timer = nativeSetTimeout(() => {
+      timer = null
+      void checkForChange()
+    }, WATCH_DEBOUNCE_MS)
+  }
+
+  // Seed asynchronously. If a real file event arrives before the read resolves,
+  // do not let the seed overwrite that pending change; the debounced re-read
+  // will compare against the previous value and fire.
   void readFile(file, 'utf8')
     .then((text) => {
-      if (lastSeen === null) lastSeen = text
+      if (!observedEvent && lastSeen === null) lastSeen = text
     })
     .catch(() => {})
+
   try {
     const watcher = watch(dirname(file), (_event, filename) => {
       // Exact match against the preferences file name, plus the temp file
@@ -312,21 +334,34 @@ export function watchTuiPreferences(onChange: () => void): () => void {
         filename === name ||
         (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
       if (filename != null && !isOurs) return
-      if (timer) nativeClearTimeout(timer)
-      timer = nativeSetTimeout(() => {
-        timer = null
-        void readFile(file, 'utf8')
-          .catch(() => null)
-          .then((text) => {
-            if (text === null) return
-            if (text === lastSeen) return
-            lastSeen = text
-            onChange()
-          })
-      }, WATCH_DEBOUNCE_MS)
+      scheduleCheck()
     })
+
+    // Bun's fs.watch can miss atomic temp-file rename updates on some
+    // backends, so keep a low-cost polling loop as the correctness path.
+    // Use recursive timers instead of fs.watchFile because watchFile can keep
+    // Bun test processes alive long after unwatchFile().
+    let pollTimer: ReturnType<typeof nativeSetTimeout> | null = null
+    let pollInFlight = false
+    const schedulePoll = () => {
+      if (disposed || pollTimer) return
+      pollTimer = nativeSetTimeout(() => {
+        pollTimer = null
+        if (disposed || pollInFlight) return
+        pollInFlight = true
+        void checkForChange().finally(() => {
+          pollInFlight = false
+          schedulePoll()
+        })
+      }, WATCH_POLL_MS)
+      pollTimer.unref?.()
+    }
+    schedulePoll()
+
     return () => {
+      disposed = true
       if (timer) nativeClearTimeout(timer)
+      if (pollTimer) nativeClearTimeout(pollTimer)
       watcher.close()
     }
   } catch {
