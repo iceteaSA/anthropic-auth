@@ -1402,6 +1402,7 @@ function cachedQuotaSnapshotStillRelevant(
 function isTransientQuotaError(error: unknown) {
   const message = formatErrorMessage(error)
   if (/Claude quota check failed: (429|5\d\d)\b/.test(message)) return true
+  if (message.includes('Quota refresh is already in progress')) return true
   if (!(error instanceof Error)) return false
   const code = (error as Error & { code?: unknown }).code
   return (

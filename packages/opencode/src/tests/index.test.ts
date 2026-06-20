@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import {
   type AccountStorage,
   getAccountStatePath,
+  hashRefreshToken,
   loadAccounts,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   resetCache1hState,
@@ -2530,6 +2531,82 @@ describe('auth.loader', () => {
     expect(savedState.main.lastRefreshError.nextRetryAt).toBeGreaterThan(
       Date.now(),
     )
+  })
+
+  test('fallback-first uses stale passing fallback quota while quota refresh is in progress even when main refresh is backed off', async () => {
+    const now = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        refresh: {
+          enabled: true,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 240,
+          mainLastRefreshError: {
+            message:
+              'Claude OAuth refresh failed: 400 — {"error":"invalid_grant"}',
+            checkedAt: now,
+            nextRetryAt: now + 60_000,
+            retryCount: 1,
+            tokenHash: hashRefreshToken('main-refresh'),
+          },
+        },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: now + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 25,
+                remainingPercent: 75,
+                checkedAt: now - 10 * 60_000,
+                resetsAt: '2099-01-01T00:00:00Z',
+              },
+              seven_day: {
+                usedPercent: 30,
+                remainingPercent: 70,
+                checkedAt: now - 10 * 60_000,
+                resetsAt: '2099-01-01T00:00:00Z',
+              },
+            },
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        throw new Error('Quota refresh is already in progress')
+      }
+      if (url.includes('/v1/oauth/token')) {
+        throw new Error('main refresh should not be attempted')
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response('fallback-ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: now - 1_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('fallback-ok')
+    expect(authorizations).toEqual(['Bearer fallback-access'])
   })
 
   test('fetch wrapper refreshes expired token', async () => {

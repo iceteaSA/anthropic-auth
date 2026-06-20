@@ -1199,6 +1199,46 @@ describe('FallbackAccountManager', () => {
     expect(accounts.map((account) => account.id)).toEqual(['stale-good-quota'])
   })
 
+  test('uses cached passing quota when a stale quota refresh is already in progress', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'stale-good-quota',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: 20_000_000,
+      quota: {
+        five_hour: {
+          usedPercent: 30,
+          remainingPercent: 70,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+        seven_day: {
+          usedPercent: 62,
+          remainingPercent: 38,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() => {
+      throw new Error('Quota refresh is already in progress')
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 10 * 60_000,
+    })
+
+    const accounts = await manager.getUsableFallbackAccounts()
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(accounts.map((account) => account.id)).toEqual(['stale-good-quota'])
+  })
+
   test('does not use cached failing quota when a stale quota refresh is rate limited', async () => {
     const storage = baseStorage()
     storage.accounts.push({
