@@ -2,10 +2,69 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import type { ReadableStreamDefaultReader as NodeReadableStreamDefaultReader } from 'node:stream/web'
+import {
+  clearTimeout as nativeClearTimeout,
+  setTimeout as nativeSetTimeout,
+} from 'node:timers'
 import { fileURLToPath } from 'node:url'
 import { getAccountStatePath } from '@cortexkit/anthropic-auth-core'
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
+const fixedOAuthState = '11111111111141118111111111111111'
+const fixedOAuthPreload = `Object.defineProperty(globalThis.crypto, 'randomUUID', { value: () => '11111111-1111-4111-8111-111111111111', configurable: true })\n`
+
+function readChunkWithTimeout(
+  reader: NodeReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>,
+  ms: number,
+) {
+  let timer: ReturnType<typeof nativeSetTimeout> | undefined
+  return Promise.race([
+    reader.read().finally(() => {
+      if (timer) nativeClearTimeout(timer)
+    }),
+    new Promise<null>((resolve) => {
+      timer = nativeSetTimeout(() => resolve(null), ms)
+    }),
+  ])
+}
+
+async function readUntil(
+  reader: NodeReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>,
+  stdout: string,
+  predicate: (text: string) => boolean,
+) {
+  const decoder = new TextDecoder()
+  const deadline = Date.now() + 3_000
+  while (!predicate(stdout)) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      throw new Error(`Timed out waiting for CLI output. Saw:\n${stdout}`)
+    }
+    const chunk = await readChunkWithTimeout(reader, remaining)
+    if (chunk === null) {
+      throw new Error(`Timed out waiting for CLI output. Saw:\n${stdout}`)
+    }
+    if (chunk.done) {
+      throw new Error(`CLI exited before expected output. Saw:\n${stdout}`)
+    }
+    stdout += decoder.decode(chunk.value, { stream: true })
+  }
+  return stdout
+}
+
+async function readRemaining(
+  reader: NodeReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>,
+  stdout: string,
+) {
+  const decoder = new TextDecoder()
+  for (;;) {
+    const chunk = await reader.read()
+    if (chunk.done) break
+    stdout += decoder.decode(chunk.value, { stream: true })
+  }
+  return stdout
+}
 
 let tempDir: string
 
@@ -94,7 +153,7 @@ describe('CLI login', () => {
 
     await writeFile(
       preloadPath,
-      `globalThis.fetch = async () => new Response(JSON.stringify({ access_token: 'cli-access', refresh_token: 'cli-refresh', expires_in: 3600 }), { status: 200 })\n`,
+      `${fixedOAuthPreload}globalThis.fetch = async () => new Response(JSON.stringify({ access_token: 'cli-access', refresh_token: 'cli-refresh', expires_in: 3600 }), { status: 200 })\n`,
       'utf8',
     )
 
@@ -113,32 +172,19 @@ describe('CLI login', () => {
     )
 
     const reader = proc.stdout.getReader()
-    const decoder = new TextDecoder()
     let stdout = ''
-    let state: string | undefined
-
+    stdout = await readUntil(reader, stdout, (text) =>
+      text.includes('Fallback account label'),
+    )
     proc.stdin.write('cli-label\n')
-
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
-      state = stdout.match(/[?&]state=([a-f0-9]+)/)?.[1]
-      if (state) break
-    }
-
-    expect(state).toBeString()
-
+    stdout = await readUntil(reader, stdout, (text) =>
+      text.includes('Paste the full callback URL'),
+    )
     proc.stdin.write(
-      `https://platform.claude.com/oauth/code/callback?code=cli-code&state=${state}\n`,
+      `https://platform.claude.com/oauth/code/callback?code=cli-code&state=${fixedOAuthState}\n`,
     )
     proc.stdin.end()
-
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
-    }
+    stdout = await readRemaining(reader, stdout)
 
     const [exitCode, stderr] = await Promise.all([
       proc.exited,
@@ -208,7 +254,7 @@ describe('CLI login', () => {
     )
     await writeFile(
       preloadPath,
-      `globalThis.fetch = async () => new Response(JSON.stringify({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600 }), { status: 200 })\n`,
+      `${fixedOAuthPreload}globalThis.fetch = async () => new Response(JSON.stringify({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600 }), { status: 200 })\n`,
       'utf8',
     )
 
@@ -227,30 +273,15 @@ describe('CLI login', () => {
     )
 
     const reader = proc.stdout.getReader()
-    const decoder = new TextDecoder()
     let stdout = ''
-    let state: string | undefined
-
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
-      state = stdout.match(/[?&]state=([a-f0-9]+)/)?.[1]
-      if (state) break
-    }
-
-    expect(state).toBeString()
-
+    stdout = await readUntil(reader, stdout, (text) =>
+      text.includes('Paste the full callback URL'),
+    )
     proc.stdin.write(
-      `https://platform.claude.com/oauth/code/callback?code=cli-code&state=${state}\n`,
+      `https://platform.claude.com/oauth/code/callback?code=cli-code&state=${fixedOAuthState}\n`,
     )
     proc.stdin.end()
-
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      stdout += decoder.decode(chunk.value, { stream: true })
-    }
+    stdout = await readRemaining(reader, stdout)
 
     const [exitCode, stderr] = await Promise.all([
       proc.exited,
