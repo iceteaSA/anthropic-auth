@@ -604,7 +604,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       },
       lastUpdated: Date.now(),
     }
-    setSidebarState(state).catch((error) =>
+    return setSidebarState(state).catch((error) =>
       log('[sidebar] state write failed', {
         error: error instanceof Error ? error.message : String(error),
       }),
@@ -2093,7 +2093,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             trace?: PerfTrace,
             options?: {
               returnLastOnExhausted?: boolean
-              onSuccess?: (account: { id: string; access?: string }) => void
+              onSuccess?: (account: {
+                id: string
+                access?: string
+              }) => void | Promise<void>
             },
           ) {
             if (!accounts.length) return currentResponse ?? null
@@ -2139,7 +2142,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
               if (!fallbackAgain) {
                 await fallbackManager.markUsed(account)
-                options?.onSuccess?.(account)
+                await options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
                 // request, so keep its quota fresh on the same cadence as main.
                 // Non-blocking; only the served account, never idle fallbacks.
