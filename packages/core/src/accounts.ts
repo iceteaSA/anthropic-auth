@@ -1354,6 +1354,12 @@ export function formatRefreshBackoffMessage(
   return `Claude OAuth refresh is backed off for ${seconds}s after: ${error.message}`
 }
 
+export function isQuotaPolicyAuthError(error: unknown) {
+  const status = (error as { status?: unknown }).status
+  if (status === 403) return true
+  return /Claude quota check failed: 403\b/.test(formatErrorMessage(error))
+}
+
 export function buildQuotaOperationError(input: {
   error: unknown
   now: number
@@ -1885,6 +1891,7 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (isQuotaPolicyAuthError(error)) return
   account.lastQuotaRefreshError = buildQuotaOperationError({
     error,
     now,
