@@ -2,6 +2,22 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.11.0
+
+### Minor Changes
+
+- Add interactive account-management and logging flows for OpenCode and Pi, including fallback account list/enable/disable/reorder/remove actions, API-key route setup, OAuth fallback login helpers, and persisted log-level settings.
+- Add shared leveled redacting rotating logging, CacheKeep per-warm cost logging, and an opt-in CacheKeep subagent toggle.
+
+### Patch Changes
+
+- Harden account storage and refresh coordination with serialized account-store updates, stale-lock re-election fixes, safer atomic writes, malformed sidebar-state guards, RPC multi-session isolation, and runtime-state loading when the editable config file is absent.
+- Improve account cleanup and re-login UX by clearing removed fallback runtime state, showing dead fallback accounts that need re-login, and preserving clearer OAuth account labels.
+- Treat Claude quota endpoint `403` responses as account/org-policy auth failures without arming quota backoff or OAuth refresh backoff.
+- Update OpenCode, OpenTUI, Pi, Miniflare, Biome, GitHub Actions, and related development dependencies.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the account/logging parity work and account-management fixes, [@jonmast](https://github.com/jonmast) for the runtime-state load fix, and [@eddieparc](https://github.com/eddieparc) for reporting and proposing the quota `403` backoff boundary fix.
+
 ## 1.10.3
 
 ### Patch Changes
