@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.12.0
+
+### Minor Changes
+
+- Handle Anthropic auth slash commands with an Effect-compatible `204 No Content` response shape, matching OpenCode's current command-interception path while keeping the legacy sentinel fallback for older hosts.
+
 ## 1.11.0
 
 ### Minor Changes

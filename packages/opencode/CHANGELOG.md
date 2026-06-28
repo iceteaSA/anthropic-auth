@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.12.0
+
+### Minor Changes
+
+- Handle Anthropic auth slash commands with an Effect-compatible `204 No Content` response shape, avoiding logged plugin errors in current OpenCode while keeping the legacy sentinel fallback for older hosts.
+
 ## 1.11.0
 
 ### Minor Changes
