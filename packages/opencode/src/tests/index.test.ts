@@ -50,6 +50,25 @@ const MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 const EMPTY_POST = { method: 'POST', body: '{}' } as const
 let tempConfigDir: string | undefined
 
+async function expectHandledCommandResponse(promise: Promise<unknown>) {
+  try {
+    await promise
+    throw new Error('Expected handled command sentinel')
+  } catch (error) {
+    expect(String(error)).toContain(
+      '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__',
+    )
+    const value = error as Record<string, unknown>
+    expect(value['~effect/http/HttpServerResponse']).toBe(
+      '~effect/http/HttpServerResponse',
+    )
+    expect(value['~effect/ErrorReporter/ignore']).toBe(true)
+    expect(value.status).toBe(204)
+    expect((value.body as { _tag?: unknown })?._tag).toBe('Empty')
+    expect((value.cookies as { cookies?: unknown })?.cookies).toEqual({})
+  }
+}
+
 function createFallbackStorage(
   overrides?: Partial<AccountStorage>,
 ): AccountStorage {
@@ -1685,13 +1704,13 @@ describe('auth.loader', () => {
       description: expect.stringContaining('account routing'),
     })
 
-    await expect(
+    await expectHandledCommandResponse(
       plugin['command.execute.before']({
         command: 'claude-cache',
         arguments: 'on',
         sessionID: 'session-1',
       }),
-    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    )
 
     expect(mockClient.session.promptAsync).toHaveBeenCalledWith({
       path: { id: 'session-1' },

@@ -139,6 +139,10 @@ import {
 } from './transform.ts'
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
+const HTTP_SERVER_RESPONSE_TYPE_ID = '~effect/http/HttpServerResponse'
+const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
+const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
+const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
@@ -312,12 +316,25 @@ async function sendIgnoredMessage(
   )
 }
 
-function _throwHandledSentinel(): never {
-  throw new Error(HANDLED_SENTINEL)
-}
-
 function cleanAbort(): never {
-  throw new Error(HANDLED_SENTINEL)
+  // OpenCode currently has no handled/cancel return contract for
+  // command.execute.before. Throw an Error for legacy hosts, but duck-type an
+  // Effect HttpServerResponse.empty({ status: 204 }) so OpenCode 1.17+ treats
+  // handled slash commands as a clean no-content response instead of logging a
+  // plugin error.
+  const sentinel = new Error(HANDLED_SENTINEL) as Error &
+    Record<string, unknown>
+  sentinel[HTTP_SERVER_RESPONSE_TYPE_ID] = HTTP_SERVER_RESPONSE_TYPE_ID
+  sentinel[ERROR_REPORTER_IGNORE] = true
+  sentinel.status = 204
+  sentinel.statusText = undefined
+  sentinel.headers = {}
+  sentinel.cookies = {
+    [HTTP_COOKIES_TYPE_ID]: HTTP_COOKIES_TYPE_ID,
+    cookies: {},
+  }
+  sentinel.body = { [HTTP_BODY_TYPE_ID]: HTTP_BODY_TYPE_ID, _tag: 'Empty' }
+  throw sentinel
 }
 
 function shouldInjectParallelToolPrompt(input: {
