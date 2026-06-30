@@ -4,6 +4,7 @@ import {
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
   isClaudeFableOrMythos5Model,
@@ -412,7 +413,9 @@ export async function buildAnthropicRequest(
   // thinking visible (display defaults to "omitted") and map reasoning to
   // output_config effort. Pi's typed options cannot express thinking-disabled,
   // so there is no disable case here (see transform.ts for the raw-body path).
-  if (isFableOrMythos5 || isSonnet5) {
+  if (isFableOrMythos5) {
+    body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  } else if (isSonnet5) {
     body.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
   }
 
