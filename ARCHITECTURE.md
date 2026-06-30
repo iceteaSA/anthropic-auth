@@ -16,7 +16,7 @@
 **@cortexkit/anthropic-auth-core (Shared Core):**
 - Purpose: Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic
 - Location: `packages/core/src/`
-- Contains: OAuth authorization/token exchange (`auth.ts`), account storage (`accounts.ts`), PKCE generation (`pkce.ts`), quota management (`quota-manager.ts`, `quotas.ts`), cache control (`cache1h.ts`, `cachekeep.ts`), relay protocol (`relay.ts`), dump capture (`dump.ts`), Claude Code identity and body signing (`claude-code.ts`, `cch.ts`), routing (`routing.ts`), killswitch thresholds (`killswitch.ts`), fast mode (`fast.ts`), model specs (`models.ts`), and constants (`constants.ts`)
+- Contains: OAuth authorization/token exchange (`auth.ts`), account storage (`accounts.ts`), PKCE generation (`pkce.ts`), quota management (`quota-manager.ts`, `quotas.ts`), cache control (`cache1h.ts`, `cachekeep.ts`), relay protocol (`relay.ts`), dump capture (`dump.ts`), Claude Code identity and body signing (`claude-code.ts`, `cch.ts`), routing (`routing.ts`), killswitch thresholds (`killswitch.ts`), fast mode (`fast.ts`), model specs (`models.ts`), provider-error contract (`provider.ts`), logging-level command (`logging.ts`), shared command execution (`commands/account.ts`), and constants (`constants.ts`)
 - Depends on: `xxhash-wasm` (for cch body signing), Node.js built-ins (`crypto`, `fs`, `os`)
 - Used by: Both `@cortexkit/opencode-anthropic-auth` and `@cortexkit/pi-anthropic-auth`
 
@@ -32,7 +32,7 @@
 - Location: `packages/pi/src/`
 - Contains: Extension entry point (`index.ts`), command registration (`commands.ts`), request body conversion (`convert.ts`), Pi-specific path resolution (`paths.ts`), streaming provider implementation (`stream.ts`)
 - Depends on: `@cortexkit/anthropic-auth-core`, `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui` (all peer)
-- Used by: Pi agent (loaded as Pi package)
+- Used by: Pi agent (loaded as Pi package). Wires the shared `claude-account` and `claude-logging` command helpers from core (`packages/core/src/commands/account.ts`, `packages/core/src/logging.ts`) to persistent account/log-level state
 
 **End-to-End Tests:**
 - Purpose: Integration tests for the full OpenCode plugin flow with mock Anthropic and relay servers
@@ -45,12 +45,12 @@
 
 1. **Plugin load** — OpenCode loads `@cortexkit/opencode-anthropic-auth` plugin, which starts background refresh timers, creates `QuotaManager` and `FallbackAccountManager`, initializes RPC server, and registers `auth.loader` + `provider.models` hooks — `packages/opencode/src/index.ts`
 2. **Auth loader** — When OpenCode creates an Anthropic session, the plugin's `auth.loader` runs: captures the OAuth `getAuth` function, starts main token refresh background loop — `packages/opencode/src/index.ts` (AnthropicAuthPlugin → auth.loader)
-3. **Command registration** — Plugin registers `/claude-cache`, `/claude-cachekeep`, `/claude-quota`, `/claude-dump`, `/claude-fast`, `/claude-routing`, `/claude-killswitch` — `packages/opencode/src/index.ts` (config hook)
+3. **Command registration** — Plugin registers `/claude-cache`, `/claude-cachekeep`, `/claude-quota`, `/claude-dump`, `/claude-fast`, `/claude-routing`, `/claude-killswitch`, `/claude-account`, `/claude-logging` — `packages/opencode/src/index.ts` (config hook)
 4. **Request interception** — OpenCode's fetch wrapper calls the plugin's hooks — `packages/opencode/src/index.ts` (experimental fetch wrapping)
 5. **URL rewrite** — `rewriteUrl()` adds `?beta=true` to `/v1/messages` and overrides base URL when `ANTHROPIC_BASE_URL` is set — `packages/opencode/src/transform.ts`
 6. **Request body rewrite** — `rewriteRequestBody()` strips trailing assistant messages, normalizes Fable/Mythos thinking, injects billing header, sanitizes system prompt (removes OpenCode identity), prepends Claude Code identity, applies cache strategy (explicit/automatic/hybrid), adds fast mode, prefixes tool names with `mcp_`, creates `cch` over serialized body — `packages/opencode/src/transform.ts`
 7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in routing order (main-first or fallback-first), respecting quota policy and killswitch thresholds — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`
-8. **Relay** — `sendViaRelay()` sends full or patched body to Cloudflare Worker, which streams Anthropic response back — `packages/core/src/relay.ts`
+8. **Relay** — `sendViaRelay()` sends full or patched body to Cloudflare Worker, which streams Anthropic response back. The Worker reads `RELAY_PLAN` from its bindings and gates websocket transport + request logging on `paid` (free plans get HTTP-only and no log lines). Non-429/403 upstream errors are mirrored into the `RELAY_STATE` KV namespace (TTL 7d) for post-mortem debugging — `packages/core/src/relay.ts` (`WORKER_SCRIPT`)
 9. **SSE stream** — Response body is wrapped in `createStrippedStream()` which reverses the tool name prefix in streaming SSE events — `packages/opencode/src/transform.ts`
 10. **Sidebar update** — `writeSidebarState()` writes quota/routing/cache state to a JSON file read by the TUI sidebar widget (separate process via RPC) — `packages/opencode/src/sidebar-state.ts`
 
@@ -59,14 +59,15 @@
 1. **Extension load** — Pi loads `@cortexkit/pi-anthropic-auth` package, which calls `registerCommands()` and `pi.registerProvider("anthropic", ...)` — `packages/pi/src/index.ts`
 2. **Provider registration** — Provider defines OAuth login/refresh functions (delegating to core's `authorize`/`exchange`/`refreshClaudeOAuthToken`) and a `streamSimple` function — `packages/pi/src/index.ts`
 3. **Stream implementation** — `streamCortexKitAnthropic()` in `packages/pi/src/stream.ts` builds the Anthropic request, sends via relay or direct, handles fallback routing and cache keepalive
-4. **Slash commands** — `/claude-*` commands registered in `packages/pi/src/commands.ts` reuse core command execution functions
+4. **Slash commands** — `/claude-*` commands registered in `packages/pi/src/commands.ts` reuse core command execution functions. `claude-account` and `claude-logging` delegate to the shared helpers in `packages/core/src/commands/account.ts` and `packages/core/src/logging.ts` so behavior stays identical to the OpenCode plugin
 
 **Quota Refresh Flow:**
 1. Background timer fires at `checkIntervalMinutes` (default 5) — `packages/core/src/quota-manager.ts`
 2. `QuotaManager.refreshMain()` fetches `https://api.anthropic.com/api/oauth/usage` with the access token
 3. On success: persists quota snapshot to sidecar state file, updates sidebar state — `packages/opencode/src/index.ts` (onMainQuotaFetched callback)
 4. On 429: records backoff with `nextRetryAt` timestamp — prevents further refreshes during backoff — `packages/core/src/accounts.ts`
-5. Fallback accounts: `FallbackAccountManager` refreshes per-account quotas in background, persists to state, notifies sidebar — `packages/opencode/src/index.ts`
+5. On 400 `invalid_grant`: marks the account as `needsReauth` (refresh token is permanently dead; preserved OAuth session cancels do not erase it) — `packages/core/src/accounts.ts`
+6. Fallback accounts: `FallbackAccountManager` refreshes per-account quotas in background, persists to state, notifies sidebar. Routing falls through to fallbacks during main quota-refresh contention rather than blocking — `packages/opencode/src/index.ts`
 
 **Cache Keepalive Flow:**
 1. `CacheKeepManager` tracks recently used hybrid-cache sessions — `packages/core/src/cachekeep.ts`
@@ -103,7 +104,7 @@
 **SidebarState:**
 - Purpose: Shared state file between OpenCode server process and TUI widget process for live quota/routing/cache display
 - Location: `packages/opencode/src/sidebar-state.ts`
-- Pattern: JSON file under `$TMPDIR`; server writes after each routing decision or quota refresh; TUI polls on interval
+- Pattern: JSON file under `$TMPDIR`; server writes after each routing decision or quota refresh; TUI polls on interval. Per-account state carries `killed` (killswitch-blocked), `enabled` (disabled by `/claude-account`), and `needsReauth` (400 invalid_grant refresh permanently dead) flags; main state additionally carries `quotaBackedOff`/`refreshBackedOff` and `*Until` timestamps so the TUI can surface refresh contention and 401-armed refresh backoff distinctly
 
 **RPC Server/Client:**
 - Purpose: Loopback HTTP server for TUI ↔ OpenCode server IPC — modal dialogs and notification delivery
@@ -120,7 +121,7 @@
 **OpenCode CLI:**
 - Location: `packages/opencode/src/cli.ts`
 - Triggers: User runs `bunx @cortexkit/opencode-anthropic-auth <command>`
-- Responsibilities: Fallback account login (OAuth + API key), account listing, relay setup (Cloudflare Worker provisioning)
+- Responsibilities: Fallback account login (OAuth + API key, including in-modal add-account flows via the server pending-state), account listing, relay setup (Cloudflare Worker provisioning — Worker PUT must bind `RELAY_PLAN`, `RELAY_TOKEN`, and `RELAY_STATE` together; the plan gates websocket transport and request logging on the Worker side)
 
 **Pi Extension:**
 - Location: `packages/pi/src/index.ts`
@@ -130,11 +131,13 @@
 **TUI Sidebar Widget:**
 - Location: `packages/opencode/src/tui.tsx`
 - Triggers: OpenCode TUI loads the plugin from `tui.json`
-- Responsibilities: Render quota/reporting sidebar, open command modal dialogs on `/claude-*` commands, honor TUI preferences from `tui-preferences.jsonc`
+- Responsibilities: Render quota/reporting sidebar with per-account killswitch indicators (`killed`, `needsReauth`, `quotaBackedOff`/`refreshBackedOff`), open command modal dialogs on `/claude-*` commands (including in-modal API-key + OAuth add-account flows with OSC-52 copyable authorize URLs), honor TUI preferences from `tui-preferences.jsonc`
 
 ## Error Handling
 
 **Strategy:** Fail-closed on parse failures (returns original request body vs crashing); 429 backoff with exponential retry for token refresh; retryable stream errors detected and bubbled as synthetic `ECONNRESET` for retry by the caller; killswitch blocks requests before they hit the API when quota drops below configured thresholds. API-key fallback routes only trigger after confirmed quota exhaustion (stale cached quota never triggers them).
+
+**ProviderHttpError contract:** Refresh and quota-fetch errors flow through a duck-typed `ProviderHttpError` shape (`packages/core/src/provider.ts`) — `{ status?, retryAfter?, isRefreshError? }` — instead of `instanceof` checks against provider-specific classes. The `isRefreshError` flag arms the refresh-backoff path independently of HTTP status, so non-401 refresh failures preserve backoff rather than falling through to the quota-cache update. Same contract classifies frontend-retryable 5xx responses.
 
 ## Cross-Cutting Concerns
 

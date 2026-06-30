@@ -6,7 +6,9 @@
 anthropic-auth/
 ├── packages/
 │   ├── core/                   # Shared core library
-│   │   └── src/                # Reusable OAuth, quota, cache, relay, signing
+│   │   └── src/
+│   │       ├── commands/       # Shared slash-command execution helpers
+│   │       └── (see packages/core/src/ for the rest)
 │   ├── opencode/               # OpenCode plugin + CLI
 │   │   ├── src/
 │   │   │   ├── rpc/            # Loopback RPC server/client for TUI IPC
@@ -34,7 +36,12 @@ anthropic-auth/
 **`packages/core/src/`:**
 - Purpose: All reusable OAuth, account management, quota, cache, relay, dump, signing, routing, and command execution logic
 - Contains: TypeScript modules, each focused on one concern
-- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers)
+- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API + killswitch thresholds), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol — bundled `WORKER_SCRIPT` string includes the `RELAY_PLAN`-gated transport, request logging, and KV error logging), `quota-manager.ts` (centralized quota cache with token-aware reads and refresh-backoff), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (duck-typed `ProviderHttpError` contract for error classification across providers), `logging.ts` (`/claude-logging` command parser + executor)
+
+**`packages/core/src/commands/`:**
+- Purpose: Shared slash-command execution helpers reused by OpenCode and Pi
+- Contains: One file per cross-package command
+- Key files: `account.ts` (`/claude-account` command — list/enable/disable/reorder/remove fallback accounts; main account is read-only)
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
@@ -79,13 +86,16 @@ anthropic-auth/
 
 **Core Logic:**
 - `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → refresh
-- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, file locking
-- `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness
-- `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
+- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, file locking, killswitch config, refresh-error classification (`isRefreshError` duck-typed flag), 400 `invalid_grant` permanent-death detection
+- `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness, token-aware reads (a cached snapshot bound to a stale access token is dropped so account-switches never reuse the previous account's quota)
+- `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol. Bundled `WORKER_SCRIPT` reads `RELAY_PLAN` (free vs paid) to gate websocket transport and request logging, mirrors non-429/403 upstream errors into the `RELAY_STATE` KV namespace for debugging
 - `packages/core/src/cch.ts`: XXH64-based request body signing
 - `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager
 - `packages/core/src/routing.ts`: Main-first / fallback-first routing mode
 - `packages/core/src/killswitch.ts`: Per-account hard-block thresholds
+- `packages/core/src/provider.ts`: Duck-typed `ProviderHttpError` contract (`{ status?, retryAfter?, isRefreshError? }`) shared across `accounts.ts` and `auth.ts` for error classification
+- `packages/core/src/logging.ts`: `/claude-logging` command parser + executor (status + level-set)
+- `packages/core/src/commands/account.ts`: `/claude-account` command parser + executor (list/enable/disable/reorder/remove/add)
 - `packages/opencode/src/transform.ts`: Request rewriting, system sanitization, cache strategy, tool prefix, SSE stripping
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation
 
@@ -110,7 +120,7 @@ anthropic-auth/
 
 **New OpenCode hook or fetch transform:** `packages/opencode/src/` — follow the pattern in `index.ts` for hook registration or `transform.ts` for pipeline steps. Add tests in `packages/opencode/src/tests/`.
 
-**New slash command:** Register the command name in `packages/core/src/constants.ts` (or a dedicated module), implement execution logic in core (shared) or per-package (if platform-specific), add the command hook in `packages/opencode/src/index.ts` (config hook) or `packages/pi/src/commands.ts`.
+**New shared slash command:** Add the command parser + executor under `packages/core/src/commands/<name>.ts` (or `packages/core/src/<name>.ts` for single-file commands like `logging.ts`), export it from `packages/core/src/index.ts`, then wire it into both `packages/opencode/src/index.ts` (config hook + `command.execute.before` modal list) and `packages/pi/src/commands.ts`. Add tests under `packages/opencode/src/tests/` (and `packages/pi/src/tests/` if Pi has package-specific behavior).
 
 **New TUI feature:** `packages/opencode/src/tui/` — add components as `.tsx` files using SolidJS + OpenTUI. Add RPC protocol types in `packages/opencode/src/rpc/protocol.ts` if the feature needs server-to-TUI IPC.
 
