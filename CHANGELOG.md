@@ -2,6 +2,14 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.12.1
+
+### Patch Changes
+
+- Request visible summarized adaptive thinking for Claude Sonnet 5 in OpenCode and Pi, while preserving explicit disabled-thinking requests on OpenCode's raw Anthropic body path.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the Sonnet 5 adaptive-thinking fix.
+
 ## 1.12.0
 
 ### Minor Changes

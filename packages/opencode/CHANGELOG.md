@@ -2,6 +2,14 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.12.1
+
+### Patch Changes
+
+- Request visible summarized adaptive thinking for Claude Sonnet 5, while preserving explicit disabled-thinking requests and canonicalizing them to the accepted bare disabled shape.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the Sonnet 5 adaptive-thinking fix.
+
 ## 1.12.0
 
 ### Minor Changes
