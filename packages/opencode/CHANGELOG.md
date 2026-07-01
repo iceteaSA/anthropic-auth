@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.12.2
+
+### Patch Changes
+
+- Update OpenCode SDK/plugin dependencies.
+
 ## 1.12.1
 
 ### Patch Changes

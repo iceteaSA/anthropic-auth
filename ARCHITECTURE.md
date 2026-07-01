@@ -16,14 +16,14 @@
 **@cortexkit/anthropic-auth-core (Shared Core):**
 - Purpose: Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic
 - Location: `packages/core/src/`
-- Contains: OAuth authorization/token exchange (`auth.ts`), account storage (`accounts.ts`), PKCE generation (`pkce.ts`), quota management (`quota-manager.ts`, `quotas.ts`), cache control (`cache1h.ts`, `cachekeep.ts`), relay protocol (`relay.ts`), dump capture (`dump.ts`), Claude Code identity and body signing (`claude-code.ts`, `cch.ts`), routing (`routing.ts`), killswitch thresholds (`killswitch.ts`), fast mode (`fast.ts`), model specs (`models.ts`), and constants (`constants.ts`)
+- Contains: OAuth authorization/token exchange (`auth.ts`), account storage (`accounts.ts`), PKCE generation (`pkce.ts`), quota management (`quota-manager.ts`, `quotas.ts`), cache control (`cache1h.ts`, `cachekeep.ts`), relay protocol (`relay.ts`), dump capture (`dump.ts`), Claude Code identity and body signing (`claude-code.ts`, `cch.ts`), routing (`routing.ts`), killswitch thresholds (`killswitch.ts`), fast mode (`fast.ts`), model specs (`models.ts`), logging commands and config (`logging.ts`), provider HTTP error contracts (`provider.ts`), account command execution (`commands/account.ts`), shared structured logger (`logger.ts`), and constants (`constants.ts`)
 - Depends on: `xxhash-wasm` (for cch body signing), Node.js built-ins (`crypto`, `fs`, `os`)
 - Used by: Both `@cortexkit/opencode-anthropic-auth` and `@cortexkit/pi-anthropic-auth`
 
 **@cortexkit/opencode-anthropic-auth (OpenCode Plugin):**
 - Purpose: OpenCode plugin that intercepts Anthropic fetch requests, provides CLI, TUI sidebar, and command modal dialogs
 - Location: `packages/opencode/src/`
-- Contains: Plugin entry point (`index.ts`), CLI (`cli.ts`), request transform/SSE stripping (`transform.ts`), system prompt sanitization (`sanitize-memo.ts`, `prompt-context.ts`), TUI sidebar widget (`tui.tsx`), TUI preferences (`tui-preferences.ts`), command modal dialogs (`tui/command-dialogs.tsx`), loopback RPC server/client for TUI IPC (`rpc/`)
+- Contains: Plugin entry point (`index.ts`), CLI (`cli.ts`), request transform/SSE stripping (`transform.ts`), system prompt sanitization (`sanitize-memo.ts`, `prompt-context.ts`), TUI sidebar widget (`tui.tsx`), TUI preferences (`tui-preferences.ts`), command modal dialogs (`tui/command-dialogs.tsx`), loopback RPC server/client for TUI IPC (`rpc/`), and TUI sidebar IPC state management (`sidebar-state.ts`)
 - Depends on: `@cortexkit/anthropic-auth-core`, `@opencode-ai/plugin` (peer), `@opentui/core` + `@opentui/solid` + `solid-js` (TUI), `jsonc-parser` (TUI preferences)
 - Used by: OpenCode agent (loaded as plugin + TUI plugin)
 
@@ -45,7 +45,7 @@
 
 1. **Plugin load** — OpenCode loads `@cortexkit/opencode-anthropic-auth` plugin, which starts background refresh timers, creates `QuotaManager` and `FallbackAccountManager`, initializes RPC server, and registers `auth.loader` + `provider.models` hooks — `packages/opencode/src/index.ts`
 2. **Auth loader** — When OpenCode creates an Anthropic session, the plugin's `auth.loader` runs: captures the OAuth `getAuth` function, starts main token refresh background loop — `packages/opencode/src/index.ts` (AnthropicAuthPlugin → auth.loader)
-3. **Command registration** — Plugin registers `/claude-cache`, `/claude-cachekeep`, `/claude-quota`, `/claude-dump`, `/claude-fast`, `/claude-routing`, `/claude-killswitch` — `packages/opencode/src/index.ts` (config hook)
+3. **Command registration** — Plugin registers `/claude-cache`, `/claude-cachekeep`, `/claude-quota`, `/claude-dump`, `/claude-fast`, `/claude-routing`, `/claude-killswitch`, `/claude-account`, `/claude-logging` — `packages/opencode/src/index.ts` (config hook)
 4. **Request interception** — OpenCode's fetch wrapper calls the plugin's hooks — `packages/opencode/src/index.ts` (experimental fetch wrapping)
 5. **URL rewrite** — `rewriteUrl()` adds `?beta=true` to `/v1/messages` and overrides base URL when `ANTHROPIC_BASE_URL` is set — `packages/opencode/src/transform.ts`
 6. **Request body rewrite** — `rewriteRequestBody()` strips trailing assistant messages, normalizes Fable/Mythos thinking, injects billing header, sanitizes system prompt (removes OpenCode identity), prepends Claude Code identity, applies cache strategy (explicit/automatic/hybrid), adds fast mode, prefixes tool names with `mcp_`, creates `cch` over serialized body — `packages/opencode/src/transform.ts`
