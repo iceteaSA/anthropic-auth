@@ -6,9 +6,11 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
+  isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   mergeAnthropicBetas,
@@ -776,6 +778,31 @@ function normalizeFableMythosRequest(
   return { replacedExisting: hadThinking }
 }
 
+/**
+ * Sonnet 5 has adaptive thinking on by default but defaults `display` to
+ * "omitted", so the thinking field returns empty. Inject
+ * `{type:"adaptive",display:"summarized"}` to make it visible — UNLESS the
+ * caller explicitly disabled thinking. Unlike Fable/Mythos (which reject a
+ * disable), Sonnet 5 accepts `{type:"disabled"}`, so an intentional opt-out is
+ * preserved rather than force-enabled. A manual `{type:"enabled",budget_tokens}`
+ * would 400 on Sonnet 5, so it is overwritten with the adaptive form.
+ */
+function normalizeSonnet5Request(
+  parsed: Record<string, unknown>,
+): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
+  if (!isClaudeSonnet5Model(parsed.model)) return null
+  const hadThinking = Object.hasOwn(parsed, 'thinking')
+  const thinking = parsed.thinking
+  if (isRecord(thinking) && thinking.type === 'disabled') {
+    // `display` is invalid alongside `type:"disabled"` (nothing to display) and
+    // can 400; canonicalize to a bare disabled object while keeping thinking off.
+    parsed.thinking = { type: 'disabled' }
+    return { replacedExisting: hadThinking, display: 'disabled' }
+  }
+  parsed.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
+  return { replacedExisting: hadThinking, display: 'summarized' }
+}
+
 function applyCache1hStrategy(
   parsed: Record<string, unknown>,
   options: { enabled: boolean; mode: Cache1hMode },
@@ -902,6 +929,7 @@ export async function rewriteRequestBody(
     const modelNormalizeStart = rewriteNowMs()
     const removedNonAnthropicThinking = stripNonAnthropicThinkingBlocks(parsed)
     const fableMythosThinking = normalizeFableMythosRequest(parsed)
+    const sonnet5Thinking = normalizeSonnet5Request(parsed)
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
@@ -910,6 +938,8 @@ export async function rewriteRequestBody(
         : undefined,
       replacedFableMythosThinking:
         fableMythosThinking?.replacedExisting ?? false,
+      sonnet5ThinkingDisplay: sonnet5Thinking?.display,
+      replacedSonnet5Thinking: sonnet5Thinking?.replacedExisting ?? false,
       removedNonAnthropicThinking,
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })

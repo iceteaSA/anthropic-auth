@@ -938,6 +938,66 @@ describe('rewriteRequestBody', () => {
     expect(result.output_config).toEqual({ effort: 'xhigh' })
   })
 
+  test('requests summarized adaptive thinking for Sonnet 5 without thinking', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('replaces manual enabled thinking with adaptive summarized for Sonnet 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5-20260630',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 10_000 },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(result.thinking.budget_tokens).toBeUndefined()
+  })
+
+  test('preserves explicitly disabled thinking for Sonnet 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('strips display from disabled thinking for Sonnet 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled', display: 'summarized' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('does not touch thinking for non-Sonnet5 models', async () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 5_000 },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'enabled', budget_tokens: 5_000 })
+  })
+
   test('strips OpenAI encrypted reasoning blocks before sending to Anthropic', async () => {
     const body = JSON.stringify({
       model: 'claude-opus-4-8',
