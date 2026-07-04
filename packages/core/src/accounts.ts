@@ -484,6 +484,59 @@ function objectWithDefinedEntries(value: Record<string, unknown>) {
   )
 }
 
+function numericField(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function accountCredentialTimestamp(value: Record<string, unknown>): number {
+  return Math.max(
+    numericField(value.lastRefreshedAt),
+    numericField(value.lastUsed),
+    numericField(value.addedAt),
+  )
+}
+
+function legacyConfigCredentialsAreNewer(
+  account: Record<string, unknown>,
+  stateAccount: Record<string, unknown>,
+): boolean {
+  if (account.type !== 'oauth') return false
+  if (typeof account.refresh !== 'string' || !account.refresh.trim()) {
+    return false
+  }
+  const tokenChanged = Boolean(
+    (typeof account.access === 'string' &&
+      typeof stateAccount.access === 'string' &&
+      account.access !== stateAccount.access) ||
+      (typeof account.refresh === 'string' &&
+        typeof stateAccount.refresh === 'string' &&
+        account.refresh !== stateAccount.refresh),
+  )
+  if (!tokenChanged) return false
+  return (
+    accountCredentialTimestamp(account) >
+    accountCredentialTimestamp(stateAccount)
+  )
+}
+
+function mergeConfigAccountAndState(
+  account: Record<string, unknown>,
+  stateAccount: Record<string, unknown>,
+): Record<string, unknown> {
+  if (legacyConfigCredentialsAreNewer(account, stateAccount)) {
+    const merged = { ...stateAccount, ...account }
+    const configTimestamp = accountCredentialTimestamp(account)
+    if (configTimestamp > numericField(merged.lastRefreshedAt)) {
+      merged.lastRefreshedAt = configTimestamp
+    }
+    delete merged.quota
+    delete merged.lastRefreshError
+    delete merged.lastQuotaRefreshError
+    return merged
+  }
+  return { ...account, ...stateAccount }
+}
+
 function mergeConfigAndState(
   configValue: unknown,
   stateValue: unknown,
@@ -505,7 +558,7 @@ function mergeConfigAndState(
           typeof account.id === 'string' && isRecord(stateAccounts[account.id])
             ? (stateAccounts[account.id] as Record<string, unknown>)
             : {}
-        return { ...account, ...stateAccount }
+        return mergeConfigAccountAndState(account, stateAccount)
       })
     : []
 
@@ -597,12 +650,16 @@ function mergeAccountRuntimeState(
   const existingEntry = existing as AccountRuntimeEntry
   const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
   const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
+  const tokenChanged = Boolean(
+    (existingEntry.access &&
+      incoming.access &&
+      existingEntry.access !== incoming.access) ||
+      (existingEntry.refresh &&
+        incoming.refresh &&
+        existingEntry.refresh !== incoming.refresh),
+  )
+
   if (existingQuotaCheckedAt > incomingQuotaCheckedAt) {
-    const tokenChanged = Boolean(
-      existingEntry.access &&
-        incoming.access &&
-        existingEntry.access !== incoming.access,
-    )
     const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
     const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
     if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
@@ -616,9 +673,26 @@ function mergeAccountRuntimeState(
       }
       return merged
     }
+
+    const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
+    if (tokenChanged) {
+      if ('quota' in incoming) {
+        merged.quota = existingEntry.quota
+        if ('lastQuotaRefreshError' in existingEntry) {
+          merged.lastQuotaRefreshError = existingEntry.lastQuotaRefreshError
+        } else {
+          delete merged.lastQuotaRefreshError
+        }
+      } else {
+        delete merged.quota
+        delete merged.lastQuotaRefreshError
+      }
+      if (!('lastRefreshError' in incoming)) delete merged.lastRefreshError
+      return merged
+    }
+
     return {
-      ...existingEntry,
-      ...incoming,
+      ...merged,
       quota: existingEntry.quota,
       lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
     }

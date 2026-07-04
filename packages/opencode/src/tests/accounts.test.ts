@@ -224,6 +224,127 @@ describe('account storage', () => {
     await expect(loadAccounts()).resolves.toEqual(storage)
   })
 
+  test('prefers newer legacy config OAuth credentials over stale runtime state', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [
+          {
+            id: 'umut',
+            label: 'umut',
+            type: 'oauth',
+            enabled: true,
+            addedAt: 1,
+            lastUsed: 2_000,
+            access: 'new-access',
+            refresh: 'new-refresh',
+            expires: 3_000,
+          },
+        ],
+      }),
+      'utf8',
+    )
+    await writeFile(
+      getAccountStatePath(),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          umut: {
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires: 1_000,
+            lastRefreshedAt: 1_000,
+            lastRefreshError: {
+              message: 'Claude OAuth refresh failed: 400 invalid_grant',
+              checkedAt: 1_500,
+              nextRetryAt: 99_999,
+              status: 400,
+              permanent: true,
+            },
+            lastQuotaRefreshError: {
+              message: 'refresh backed off',
+              checkedAt: 1_500,
+            },
+            quota: {
+              five_hour: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: 1_500,
+              },
+            },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts[0]
+    expect(account?.type).toBe('oauth')
+    if (account?.type !== 'oauth') throw new Error('expected oauth account')
+    expect(account).toMatchObject({
+      id: 'umut',
+      access: 'new-access',
+      refresh: 'new-refresh',
+      expires: 3_000,
+      lastUsed: 2_000,
+      lastRefreshedAt: 2_000,
+    })
+    expect(account.lastRefreshError).toBeUndefined()
+    expect(account.lastQuotaRefreshError).toBeUndefined()
+    expect(account.quota).toBeUndefined()
+  })
+
+  test('keeps newer runtime OAuth credentials over older legacy config credentials', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [
+          {
+            id: 'umut',
+            label: 'umut',
+            type: 'oauth',
+            enabled: true,
+            addedAt: 1,
+            lastUsed: 500,
+            access: 'old-config-access',
+            refresh: 'old-config-refresh',
+            expires: 500,
+          },
+        ],
+      }),
+      'utf8',
+    )
+    await writeFile(
+      getAccountStatePath(),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          umut: {
+            access: 'new-state-access',
+            refresh: 'new-state-refresh',
+            expires: 2_000,
+            lastRefreshedAt: 2_000,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts()
+    expect(loaded?.accounts[0]).toMatchObject({
+      id: 'umut',
+      access: 'new-state-access',
+      refresh: 'new-state-refresh',
+      expires: 2_000,
+      lastRefreshedAt: 2_000,
+    })
+  })
+
   test('drops API fallback routes with invalid base URLs on load', async () => {
     await writeFile(
       accountPath,

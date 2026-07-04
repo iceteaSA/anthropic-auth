@@ -1142,6 +1142,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           enabled: true,
           addedAt: now,
           lastUsed: now,
+          lastRefreshedAt: now,
         }
         await addAccountPersistent(account, accountStoragePath)
         logger.info('commands', 'account added', {
