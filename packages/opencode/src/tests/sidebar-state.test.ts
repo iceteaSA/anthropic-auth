@@ -263,6 +263,18 @@ describe('normalizeSidebarState', () => {
       },
     ])
   })
+
+  test('preserves empty scoped quota array when scoped is the only quota key', () => {
+    const normalized = normalizeSidebarState({
+      main: { quota: { scoped: [] } },
+      fallbacks: [],
+      route: 'main',
+      lastUpdated: 0,
+    })
+
+    expect(normalized.main.quota).not.toBeNull()
+    expect(normalized.main.quota?.scoped).toEqual([])
+  })
 })
 
 describe('computeQuotaPacing', () => {
