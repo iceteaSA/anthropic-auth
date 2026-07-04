@@ -184,7 +184,7 @@ describe('getCollapsedQuotaSummary', () => {
           },
         ],
       }).text,
-    ).toBe('5h: 13% 7d: 7% Fable: 42%')
+    ).toBe('5h: 13% 7d: 7% Fa: 42%')
   })
 
   test('returns no collapsed quota text when no windows are available', () => {

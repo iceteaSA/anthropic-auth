@@ -256,8 +256,9 @@ export function resolveActiveAccount(state: SidebarState): {
   return { id: 'main', name: 'main', quota: state.main?.quota ?? null }
 }
 
-function collapsedScopedLabel(title: string) {
-  return title.replace(/\s+only$/i, '')
+export function formatScopedQuotaLabel(title: string) {
+  const label = title.replace(/\s+only$/i, '').trim()
+  return /^fable$/i.test(label) ? 'Fa' : label
 }
 
 export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
@@ -292,7 +293,7 @@ export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
       `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
       ...scoped.map(
         (window) =>
-          `${collapsedScopedLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
+          `${formatScopedQuotaLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
       ),
     ].join(' '),
   }

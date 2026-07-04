@@ -23,6 +23,7 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
+  formatScopedQuotaLabel,
   getCollapsedQuotaSummary,
   getSidebarState,
   type QuotaPacing,
@@ -173,10 +174,6 @@ function formatUntil(until: number | undefined): string {
   const hrs = Math.floor(mins / 60)
   const rm = mins % 60
   return rm > 0 ? `${hrs}h${rm}m` : `${hrs}h`
-}
-
-function scopedQuotaLabel(title: string) {
-  return title.replace(/\s+only$/i, '')
 }
 
 // --- Reusable components (aft-style) ---------------------------------------
@@ -357,7 +354,7 @@ function AccountBlock(props: {
             <QuotaRow
               theme={props.theme}
               appearance={props.appearance}
-              label={scopedQuotaLabel(window.title)}
+              label={formatScopedQuotaLabel(window.title)}
               window={window}
               pacing={pacingFor(window, SEVEN_DAY_MS)}
             />
