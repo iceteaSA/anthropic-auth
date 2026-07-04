@@ -284,18 +284,23 @@ export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
     }
   }
 
+  const scopedSegments = scoped.map(
+    (window) =>
+      `${formatScopedQuotaLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
+  )
+  const primarySegments =
+    fiveHourUsedPercent == null && sevenDayUsedPercent == null
+      ? []
+      : [
+          `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`}`,
+          `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
+        ]
+
   return {
     fiveHourUsedPercent,
     sevenDayUsedPercent,
     scopedUsedPercents,
-    text: [
-      `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`}`,
-      `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
-      ...scoped.map(
-        (window) =>
-          `${formatScopedQuotaLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
-      ),
-    ].join(' '),
+    text: [...primarySegments, ...scopedSegments].join(' '),
   }
 }
 
