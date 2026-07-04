@@ -1189,6 +1189,163 @@ describe('FallbackAccountManager', () => {
     expect(quotaSnapshotPassesModelScope(quota, 'claude-opus-4-8')).toBe(true)
   })
 
+  test('mergeAccountRuntimeState: windowless {scoped:[]} replaces stale exhausted-Fable quota', async () => {
+    // GPT repro: persist an exhausted-Fable scoped window at T1, then save a
+    // windowless empty-scoped snapshot stamped T2 > T1. mergeAccountRuntimeState
+    // must NOT treat the empty snapshot as stale and resurrect the old Fable
+    // window — loadAccounts must return scoped: [].
+    const accountId = 'merge-empty-scoped'
+    const T1 = 1_000
+    const T2 = 2_000
+
+    const first = baseStorage()
+    first.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: T1,
+        },
+        seven_day: {
+          usedPercent: 15,
+          remainingPercent: 85,
+          checkedAt: T1,
+        },
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: T1,
+          },
+        ],
+      },
+    })
+    await saveAccounts(first)
+
+    const second = baseStorage()
+    second.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: { scoped: [], checkedAt: T2 },
+    })
+    await saveAccounts(second)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(
+      loaded?.accounts.find((entry) => entry.id === accountId),
+    )
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('mergeAccountRuntimeState: real promo-end path lands empty scoped', async () => {
+    // Reachable-path lock: persist an account with five_hour/seven_day + a
+    // Fable scoped window at T1, then save the post-promo snapshot (5h/7d at
+    // T2, scoped: [], top-level checkedAt: T2). Loaded quota.scoped must be [].
+    const accountId = 'merge-promo-end'
+    const T1 = 1_000
+    const T2 = 2_000
+
+    const first = baseStorage()
+    first.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: T1,
+        },
+        seven_day: {
+          usedPercent: 15,
+          remainingPercent: 85,
+          checkedAt: T1,
+        },
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 42,
+            remainingPercent: 58,
+            checkedAt: T1,
+          },
+        ],
+      },
+    })
+    await saveAccounts(first)
+
+    const second = baseStorage()
+    second.accounts.push({
+      id: accountId,
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: T2,
+        },
+        seven_day: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: T2,
+        },
+        scoped: [],
+        checkedAt: T2,
+      },
+    })
+    await saveAccounts(second)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(
+      loaded?.accounts.find((entry) => entry.id === accountId),
+    )
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('top-level checkedAt round-trips through save/load', async () => {
+    const storage = baseStorage()
+    const stampedAt = 1_234_567
+    storage.accounts.push({
+      id: 'with-checked-at',
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: stampedAt,
+        },
+        checkedAt: stampedAt,
+      },
+    })
+    await saveAccounts(storage)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(
+      loaded?.accounts.find((entry) => entry.id === 'with-checked-at'),
+    )
+    expect(account.quota?.checkedAt).toBe(stampedAt)
+  })
+
   test('refreshes fallback tokens within the four-hour minimum window', async () => {
     const storage = baseStorage()
     storage.refresh = {
