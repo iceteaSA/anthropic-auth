@@ -169,9 +169,65 @@ describe('getCollapsedQuotaSummary', () => {
     ).toBe('5h: 13% 7d: —')
   })
 
+  test('formats scoped model quota windows in collapsed quota text', () => {
+    expect(
+      getCollapsedQuotaSummary({
+        five_hour: { usedPercent: 13, remainingPercent: 87 },
+        seven_day: { usedPercent: 7, remainingPercent: 93 },
+        scoped: [
+          {
+            id: 'claude-weekly-scoped-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 42,
+            remainingPercent: 58,
+          },
+        ],
+      }).text,
+    ).toBe('5h: 13% 7d: 7% Fable: 42%')
+  })
+
   test('returns no collapsed quota text when no windows are available', () => {
     expect(getCollapsedQuotaSummary(null).text).toBeNull()
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
+  })
+})
+
+describe('normalizeSidebarState', () => {
+  test('preserves valid scoped quota windows and drops malformed ones', () => {
+    const normalized = normalizeSidebarState({
+      main: {
+        quota: {
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelId: 'claude-fable-5',
+              modelName: 'Fable',
+              usedPercent: 5,
+              remainingPercent: 95,
+              resetsAt: '2026-07-08T09:00:00Z',
+            },
+            { id: 'broken', title: 'Broken only', usedPercent: Number.NaN },
+          ],
+        },
+      },
+      fallbacks: [],
+      route: 'main',
+      lastUpdated: 0,
+    })
+
+    expect(normalized.main.quota?.scoped).toEqual([
+      {
+        id: 'claude-weekly-scoped-fable',
+        title: 'Fable only',
+        modelId: 'claude-fable-5',
+        modelName: 'Fable',
+        usedPercent: 5,
+        remainingPercent: 95,
+        resetsAt: '2026-07-08T09:00:00Z',
+      },
+    ])
   })
 })
 

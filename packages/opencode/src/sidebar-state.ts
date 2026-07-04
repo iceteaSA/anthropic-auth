@@ -4,9 +4,17 @@ export interface QuotaWindow {
   resetsAt?: string
 }
 
+export interface ScopedQuotaWindow extends QuotaWindow {
+  id: string
+  title: string
+  modelId?: string
+  modelName: string
+}
+
 export interface AccountQuota {
   five_hour?: QuotaWindow
   seven_day?: QuotaWindow
+  scoped?: ScopedQuotaWindow[]
 }
 
 export interface SidebarAccountState {
@@ -65,13 +73,67 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
 }
 
+function normalizeQuotaWindow(value: unknown): QuotaWindow | undefined {
+  if (!isRecord(value)) return undefined
+  const usedPercent = Number(value.usedPercent)
+  const remainingPercent = Number(value.remainingPercent)
+  if (!Number.isFinite(usedPercent) || !Number.isFinite(remainingPercent)) {
+    return undefined
+  }
+  return {
+    usedPercent,
+    remainingPercent,
+    resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
+  }
+}
+
+function normalizeAccountQuota(value: unknown): AccountQuota | null {
+  if (!isRecord(value)) return null
+  const quota: AccountQuota = {}
+  const fiveHour = normalizeQuotaWindow(value.five_hour)
+  const sevenDay = normalizeQuotaWindow(value.seven_day)
+  if (fiveHour) quota.five_hour = fiveHour
+  if (sevenDay) quota.seven_day = sevenDay
+
+  if (Array.isArray(value.scoped)) {
+    const scoped = value.scoped
+      .map((entry): ScopedQuotaWindow | undefined => {
+        if (!isRecord(entry)) return undefined
+        const window = normalizeQuotaWindow(entry)
+        if (!window) return undefined
+        if (typeof entry.id !== 'string' || !entry.id.trim()) return undefined
+        if (typeof entry.title !== 'string' || !entry.title.trim()) {
+          return undefined
+        }
+        if (typeof entry.modelName !== 'string' || !entry.modelName.trim()) {
+          return undefined
+        }
+        const modelId =
+          typeof entry.modelId === 'string' && entry.modelId.trim()
+            ? entry.modelId.trim()
+            : undefined
+        return {
+          ...window,
+          id: entry.id.trim(),
+          title: entry.title.trim(),
+          ...(modelId && { modelId }),
+          modelName: entry.modelName.trim(),
+        }
+      })
+      .filter((entry): entry is ScopedQuotaWindow => entry != null)
+    if (scoped.length) quota.scoped = scoped
+  }
+
+  return Object.keys(quota).length ? quota : null
+}
+
 export function normalizeSidebarState(raw: unknown): SidebarState {
   if (!isRecord(raw)) return { ...DEFAULT_SIDEBAR_STATE }
 
   const main: SidebarState['main'] = { quota: null }
   if (isRecord(raw.main)) {
     const m = raw.main
-    main.quota = isRecord(m.quota) ? (m.quota as AccountQuota) : null
+    main.quota = normalizeAccountQuota(m.quota)
     if (typeof m.quotaBackedOff === 'boolean')
       main.quotaBackedOff = m.quotaBackedOff
     if (typeof m.quotaBackoffUntil === 'number')
@@ -89,7 +151,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         .map((entry) => ({
           id: entry.id as string,
           label: typeof entry.label === 'string' ? entry.label : undefined,
-          quota: isRecord(entry.quota) ? (entry.quota as AccountQuota) : null,
+          quota: normalizeAccountQuota(entry.quota),
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
@@ -194,21 +256,45 @@ export function resolveActiveAccount(state: SidebarState): {
   return { id: 'main', name: 'main', quota: state.main?.quota ?? null }
 }
 
+function collapsedScopedLabel(title: string) {
+  return title.replace(/\s+only$/i, '')
+}
+
 export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
   fiveHourUsedPercent: number | null
   sevenDayUsedPercent: number | null
+  scopedUsedPercents: number[]
   text: string | null
 } {
   const fiveHourUsedPercent = quota?.five_hour?.usedPercent ?? null
   const sevenDayUsedPercent = quota?.seven_day?.usedPercent ?? null
-  if (fiveHourUsedPercent == null && sevenDayUsedPercent == null) {
-    return { fiveHourUsedPercent, sevenDayUsedPercent, text: null }
+  const scoped = quota?.scoped ?? []
+  const scopedUsedPercents = scoped.map((window) => window.usedPercent)
+  if (
+    fiveHourUsedPercent == null &&
+    sevenDayUsedPercent == null &&
+    scoped.length === 0
+  ) {
+    return {
+      fiveHourUsedPercent,
+      sevenDayUsedPercent,
+      scopedUsedPercents,
+      text: null,
+    }
   }
 
   return {
     fiveHourUsedPercent,
     sevenDayUsedPercent,
-    text: `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`} 7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
+    scopedUsedPercents,
+    text: [
+      `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`}`,
+      `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
+      ...scoped.map(
+        (window) =>
+          `${collapsedScopedLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
+      ),
+    ].join(' '),
   }
 }
 

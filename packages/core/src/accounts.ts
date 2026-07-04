@@ -37,7 +37,7 @@ export type OAuthAccount = AccountBase & {
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
-  quota?: Partial<Record<QuotaWindowName, AccountQuotaWindow>>
+  quota?: OAuthQuotaSnapshot
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -105,6 +105,19 @@ export type AccountQuotaWindow = {
   remainingPercent: number
   resetsAt?: string
   checkedAt: number
+}
+
+export type AccountScopedQuotaWindow = AccountQuotaWindow & {
+  id: string
+  title: string
+  modelId?: string
+  modelName: string
+}
+
+export type OAuthQuotaSnapshot = Partial<
+  Record<QuotaWindowName, AccountQuotaWindow>
+> & {
+  scoped?: AccountScopedQuotaWindow[]
 }
 
 export type RoutingMode = 'main-first' | 'fallback-first'
@@ -245,14 +258,25 @@ type OAuthUsageWindow = {
   resets_at?: string
 }
 
+type OAuthUsageLimit = {
+  kind?: string
+  group?: string
+  percent?: number
+  resets_at?: string
+  scope?: {
+    model?: {
+      id?: string | null
+      display_name?: string | null
+    } | null
+    surface?: unknown
+  } | null
+}
+
 type OAuthUsageResponse = {
   five_hour?: OAuthUsageWindow
   seven_day?: OAuthUsageWindow
+  limits?: OAuthUsageLimit[]
 }
-
-export type OAuthQuotaSnapshot = Partial<
-  Record<QuotaWindowName, AccountQuotaWindow>
->
 
 export type AccountManagerOptions = {
   now?: () => number
@@ -399,30 +423,63 @@ function normalizeOperationError(
   }
 }
 
+function normalizeQuotaWindow(value: unknown): AccountQuotaWindow | undefined {
+  if (!isRecord(value)) return undefined
+  const usedPercent = Number(value.usedPercent)
+  const remainingPercent = Number(value.remainingPercent)
+  const checkedAt = Number(value.checkedAt)
+  if (
+    !Number.isFinite(usedPercent) ||
+    !Number.isFinite(remainingPercent) ||
+    !Number.isFinite(checkedAt)
+  ) {
+    return undefined
+  }
+  return {
+    usedPercent,
+    remainingPercent,
+    checkedAt,
+    resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
+  }
+}
+
 function normalizeQuota(value: unknown): OAuthAccount['quota'] {
   if (!isRecord(value)) return undefined
   const quota: OAuthAccount['quota'] = {}
   for (const key of ['five_hour', 'seven_day'] as const) {
-    const window = value[key]
-    if (!isRecord(window)) continue
-    const usedPercent = Number(window.usedPercent)
-    const remainingPercent = Number(window.remainingPercent)
-    const checkedAt = Number(window.checkedAt)
-    if (
-      !Number.isFinite(usedPercent) ||
-      !Number.isFinite(remainingPercent) ||
-      !Number.isFinite(checkedAt)
-    ) {
-      continue
-    }
-    quota[key] = {
-      usedPercent,
-      remainingPercent,
-      checkedAt,
-      resetsAt:
-        typeof window.resetsAt === 'string' ? window.resetsAt : undefined,
-    }
+    const normalized = normalizeQuotaWindow(value[key])
+    if (normalized) quota[key] = normalized
   }
+
+  if (Array.isArray(value.scoped)) {
+    const scoped = value.scoped
+      .map((entry): AccountScopedQuotaWindow | undefined => {
+        if (!isRecord(entry)) return undefined
+        const window = normalizeQuotaWindow(entry)
+        if (!window) return undefined
+        if (typeof entry.id !== 'string' || !entry.id.trim()) return undefined
+        if (typeof entry.title !== 'string' || !entry.title.trim()) {
+          return undefined
+        }
+        if (typeof entry.modelName !== 'string' || !entry.modelName.trim()) {
+          return undefined
+        }
+        const modelId =
+          typeof entry.modelId === 'string' && entry.modelId.trim()
+            ? entry.modelId.trim()
+            : undefined
+        return {
+          ...window,
+          id: entry.id.trim(),
+          title: entry.title.trim(),
+          ...(modelId && { modelId }),
+          modelName: entry.modelName.trim(),
+        }
+      })
+      .filter((entry): entry is AccountScopedQuotaWindow => entry != null)
+    if (scoped.length) quota.scoped = scoped
+  }
+
   return Object.keys(quota).length ? quota : undefined
 }
 
@@ -639,6 +696,7 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   return Math.max(
     quota?.five_hour?.checkedAt ?? 0,
     quota?.seven_day?.checkedAt ?? 0,
+    ...(quota?.scoped?.map((window) => window.checkedAt) ?? []),
   )
 }
 
@@ -1829,6 +1887,54 @@ function clampPercent(value: number) {
   return value
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function slugForQuotaIdentity(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+function mapScopedWeeklyLimits(
+  limits: OAuthUsageLimit[] | undefined,
+  checkedAt: number,
+): AccountScopedQuotaWindow[] | undefined {
+  if (!Array.isArray(limits)) return undefined
+  const seen = new Set<string>()
+  const scoped: AccountScopedQuotaWindow[] = []
+  for (const limit of limits) {
+    if (limit?.kind !== 'weekly_scoped' || limit.group !== 'weekly') continue
+    if (typeof limit.percent !== 'number' || !Number.isFinite(limit.percent)) {
+      continue
+    }
+    const modelName = nonEmptyString(limit.scope?.model?.display_name)
+    if (!modelName) continue
+    const identity = nonEmptyString(limit.scope?.model?.id) ?? modelName
+    const slug = slugForQuotaIdentity(identity)
+    if (!slug) continue
+    const id = `claude-weekly-scoped-${slug}`
+    if (seen.has(id)) continue
+    seen.add(id)
+
+    const usedPercent = clampPercent(limit.percent)
+    const modelId = nonEmptyString(limit.scope?.model?.id)
+    scoped.push({
+      id,
+      title: `${modelName} only`,
+      ...(modelId && { modelId }),
+      modelName,
+      usedPercent,
+      remainingPercent: clampPercent(100 - usedPercent),
+      resetsAt: limit.resets_at,
+      checkedAt,
+    })
+  }
+  return scoped.length ? scoped : undefined
+}
+
 function mapUsageWindow(
   window: OAuthUsageWindow | undefined,
   checkedAt: number,
@@ -1848,7 +1954,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   accessToken: string
   fetchImpl?: typeof fetch
   now?: () => number
-}) {
+}): Promise<OAuthQuotaSnapshot> {
   const fetchImpl = input.fetchImpl ?? fetch
   const response = await fetchImpl(QUOTA_URL, {
     method: 'GET',
@@ -1878,6 +1984,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   return {
     five_hour: mapUsageWindow(usage.five_hour, checkedAt),
     seven_day: mapUsageWindow(usage.seven_day, checkedAt),
+    scoped: mapScopedWeeklyLimits(usage.limits, checkedAt),
   } satisfies OAuthQuotaSnapshot
 }
 

@@ -175,6 +175,10 @@ function formatUntil(until: number | undefined): string {
   return rm > 0 ? `${hrs}h${rm}m` : `${hrs}h`
 }
 
+function scopedQuotaLabel(title: string) {
+  return title.replace(/\s+only$/i, '')
+}
+
 // --- Reusable components (aft-style) ---------------------------------------
 
 function SectionHeader(props: {
@@ -348,6 +352,17 @@ function AccountBlock(props: {
           window={props.quota?.seven_day}
           pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
         />
+        <For each={props.quota?.scoped ?? []}>
+          {(window) => (
+            <QuotaRow
+              theme={props.theme}
+              appearance={props.appearance}
+              label={scopedQuotaLabel(window.title)}
+              window={window}
+              pacing={pacingFor(window, SEVEN_DAY_MS)}
+            />
+          )}
+        </For>
       </Show>
     </box>
   )
@@ -548,9 +563,21 @@ function QuotaSidebar(props: {
     const quota = activeAccount().quota
     if (!quota) return false
     const now = Date.now()
-    const windows: Array<[typeof quota.five_hour, number]> = [
+    const windows: Array<
+      [
+        (
+          | { usedPercent: number; remainingPercent: number; resetsAt?: string }
+          | undefined
+        ),
+        number,
+      ]
+    > = [
       [quota.five_hour, FIVE_HOUR_MS],
       [quota.seven_day, SEVEN_DAY_MS],
+      ...(quota.scoped ?? []).map((window): [typeof window, number] => [
+        window,
+        SEVEN_DAY_MS,
+      ]),
     ]
     return windows.some(
       ([w, ms]) =>
@@ -562,6 +589,7 @@ function QuotaSidebar(props: {
     const values = [
       summary.fiveHourUsedPercent,
       summary.sevenDayUsedPercent,
+      ...summary.scopedUsedPercents,
     ].filter((value): value is number => value != null)
     // Pacing deficit is an advisory projection, not actual quota exhaustion,
     // so it can only BUMP the usage tone up to warn at most — never soften a

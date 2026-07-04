@@ -320,8 +320,8 @@ async function sendAnthropicRequest(options: {
 function quotaSnapshotIsExhausted(
   quota: Awaited<ReturnType<QuotaManager['refreshMain']>> | undefined,
 ) {
-  return Object.values(quota ?? {}).some(
-    (window) => window && window.remainingPercent <= 0,
+  return (['five_hour', 'seven_day'] as const).some(
+    (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
   )
 }
 

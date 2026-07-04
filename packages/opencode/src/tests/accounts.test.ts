@@ -2421,6 +2421,77 @@ describe('isTransientQuotaError via duck-typed error classification', () => {
 // fetchOAuthQuotaSnapshot attaches .status + .retryAfter (producer)
 // ---------------------------------------------------------------------------
 describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
+  test('parses weekly scoped model quota limits from OAuth usage payload', async () => {
+    const fetchImpl = (async () => {
+      return new Response(
+        JSON.stringify({
+          five_hour: {
+            utilization: 12,
+            resets_at: '2026-07-04T12:00:00Z',
+          },
+          seven_day: {
+            utilization: 34,
+            resets_at: '2026-07-08T09:00:00Z',
+          },
+          limits: [
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: 5,
+              resets_at: '2026-07-08T09:00:00Z',
+              scope: {
+                model: { id: null, display_name: 'Fable' },
+                surface: null,
+              },
+              is_active: false,
+            },
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: 7,
+              resets_at: '2026-07-08T09:00:00Z',
+              scope: {
+                model: { id: 'claude/fable.5:promo', display_name: 'Fable' },
+              },
+            },
+            { kind: 'daily', group: 'daily', percent: 10 },
+          ],
+        }),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+
+    const quota = await fetchOAuthQuotaSnapshot({
+      accessToken: 't',
+      fetchImpl,
+      now: () => 1_000_000,
+    })
+
+    expect(quota.five_hour?.usedPercent).toBe(12)
+    expect(quota.seven_day?.remainingPercent).toBe(66)
+    expect(quota.scoped).toEqual([
+      {
+        id: 'claude-weekly-scoped-fable',
+        title: 'Fable only',
+        modelName: 'Fable',
+        usedPercent: 5,
+        remainingPercent: 95,
+        resetsAt: '2026-07-08T09:00:00Z',
+        checkedAt: 1_000_000,
+      },
+      {
+        id: 'claude-weekly-scoped-claude-fable-5-promo',
+        title: 'Fable only',
+        modelId: 'claude/fable.5:promo',
+        modelName: 'Fable',
+        usedPercent: 7,
+        remainingPercent: 93,
+        resetsAt: '2026-07-08T09:00:00Z',
+        checkedAt: 1_000_000,
+      },
+    ])
+  })
+
   test('429 response → thrown error carries .status=429 + .retryAfter', async () => {
     let thrown: unknown = null
     const fetchImpl = (async () => {
