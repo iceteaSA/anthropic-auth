@@ -826,6 +826,489 @@ describe('auth.loader', () => {
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
+  test('routes Fable requests to OAuth fallback when main scoped Fable quota is exhausted', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 0, remainingPercent: 100 },
+            seven_day: { usedPercent: 0, remainingPercent: 100 },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: Date.now(),
+              },
+            ],
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: Date.now(),
+              },
+              scoped: [
+                {
+                  id: 'claude-weekly-scoped-fable',
+                  title: 'Fable only',
+                  modelName: 'Fable',
+                  usedPercent: 25,
+                  remainingPercent: 75,
+                  checkedAt: Date.now(),
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(authorizations).toEqual(['Bearer fallback-access'])
+  })
+
+  test('keeps non-Fable requests on main when only main Fable quota is exhausted', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 0, remainingPercent: 100 },
+            seven_day: { usedPercent: 0, remainingPercent: 100 },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: Date.now(),
+              },
+            ],
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+      }),
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(authorizations).toEqual(['Bearer main-access'])
+  })
+
+  test('does not route API-key fallback for scoped Fable exhaustion alone', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 0, remainingPercent: 100 },
+            seven_day: { usedPercent: 0, remainingPercent: 100 },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: Date.now(),
+              },
+            ],
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'kie-opus',
+            label: 'Kie Opus',
+            type: 'api',
+            apiKey: 'kie-key',
+            baseURL: 'https://api.kie.ai/claude',
+            authHeader: 'authorization-bearer',
+          },
+        ],
+      }),
+    )
+
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      requests.push({
+        url,
+        authorization: new Headers(init?.headers).get('authorization'),
+      })
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      authorization: 'Bearer main-access',
+    })
+  })
+
+  test('refreshes stale scoped Fable exhaustion before skipping main', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 0, remainingPercent: 100 },
+            seven_day: { usedPercent: 0, remainingPercent: 100 },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: Date.now() - 60 * 60 * 1000,
+              },
+            ],
+          },
+          mainQuotaCheckedAt: Date.now() - 60 * 60 * 1000,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+      }),
+    )
+
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    let quotaCalls = 0
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        quotaCalls++
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+              limits: [
+                {
+                  kind: 'weekly_scoped',
+                  group: 'weekly',
+                  percent: 10,
+                  resets_at: null,
+                  scope: { model: { id: null, display_name: 'Fable' } },
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      requests.push({
+        url,
+        authorization: new Headers(init?.headers).get('authorization'),
+      })
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(quotaCalls).toBe(1)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.authorization).toBe('Bearer main-access')
+  })
+
+  test('killswitch fallback handoff filters exhausted matching scoped model quota', async () => {
+    const now = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        killswitch: {
+          enabled: true,
+          main: { five_hour: 50, seven_day: 20 },
+        },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 70, remainingPercent: 30 },
+            seven_day: { usedPercent: 10, remainingPercent: 90 },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 10,
+                remainingPercent: 90,
+                checkedAt: now,
+              },
+            ],
+          },
+          mainQuotaCheckedAt: now,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'fallback-empty',
+            type: 'oauth',
+            access: 'fallback-empty-access',
+            refresh: 'fallback-empty-refresh',
+            expires: now + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: now,
+              },
+              seven_day: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: now,
+              },
+              scoped: [
+                {
+                  id: 'claude-weekly-scoped-fable',
+                  title: 'Fable only',
+                  modelName: 'Fable',
+                  usedPercent: 100,
+                  remainingPercent: 0,
+                  checkedAt: now,
+                },
+              ],
+            },
+          },
+          {
+            id: 'fallback-ok',
+            type: 'oauth',
+            access: 'fallback-ok-access',
+            refresh: 'fallback-ok-refresh',
+            expires: now + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: now,
+              },
+              seven_day: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: now,
+              },
+              scoped: [
+                {
+                  id: 'claude-weekly-scoped-fable',
+                  title: 'Fable only',
+                  modelName: 'Fable',
+                  usedPercent: 25,
+                  remainingPercent: 75,
+                  checkedAt: now,
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 70 },
+              seven_day: { utilization: 10 },
+              limits: [
+                {
+                  kind: 'weekly_scoped',
+                  group: 'weekly',
+                  percent: 10,
+                  resets_at: null,
+                  scope: { model: { id: null, display_name: 'Fable' } },
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(authorizations).toEqual(['Bearer fallback-ok-access'])
+  })
+
   test('does not route to API-key fallback when main OAuth quota is low but not exhausted', async () => {
     await useTempAccountFile(
       createFallbackStorage({

@@ -1592,6 +1592,48 @@ function failClosedOnUnknownQuota(storage: AccountStorage | null) {
   )
 }
 
+function scopedQuotaModelKey(model: unknown): string | null {
+  if (typeof model !== 'string') return null
+  const normalized = model.toLowerCase()
+  if (normalized.includes('fable')) return 'fable'
+  if (normalized.includes('mythos')) return 'mythos'
+  return null
+}
+
+export function getScopedQuotaWindowForModel(
+  quota: OAuthQuotaSnapshot | undefined,
+  model: unknown,
+): AccountScopedQuotaWindow | undefined {
+  const key = scopedQuotaModelKey(model)
+  if (!key) return undefined
+  return quota?.scoped?.find((window) => {
+    const haystack = [window.modelId, window.modelName, window.title]
+      .filter((value): value is string => typeof value === 'string')
+      .join(' ')
+      .toLowerCase()
+    return haystack.includes(key)
+  })
+}
+
+export function quotaSnapshotModelScopeIsExhausted(
+  quota: OAuthQuotaSnapshot | undefined,
+  model: unknown,
+) {
+  const window = getScopedQuotaWindowForModel(quota, model)
+  return Boolean(
+    window &&
+      Number.isFinite(window.remainingPercent) &&
+      window.remainingPercent <= 0,
+  )
+}
+
+export function quotaSnapshotPassesModelScope(
+  quota: OAuthQuotaSnapshot | undefined,
+  model: unknown,
+) {
+  return !quotaSnapshotModelScopeIsExhausted(quota, model)
+}
+
 export function quotaSnapshotPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
   storage: AccountStorage | null,
@@ -2168,7 +2210,10 @@ export class FallbackAccountManager {
     this.quotaTimer = null
   }
 
-  async getUsableFallbackAccounts(existingStorage?: AccountStorage | null) {
+  async getUsableFallbackAccounts(
+    existingStorage?: AccountStorage | null,
+    options: { modelId?: string } = {},
+  ) {
     const storage =
       existingStorage !== undefined ? existingStorage : await this.load()
     if (!storage) return []
@@ -2211,7 +2256,13 @@ export class FallbackAccountManager {
         // QuotaManager cache (the same source as the staleness check above) so
         // an active-route refresh that updated only the cache is not ignored.
         if (
-          this.accountPassesQuotaPolicy(this.quotaPolicyAccount(next), storage)
+          this.accountPassesQuotaPolicy(
+            this.quotaPolicyAccount(next),
+            storage,
+            {
+              modelId: options.modelId,
+            },
+          )
         )
           usable.push(next)
       } catch (error) {
@@ -2230,8 +2281,21 @@ export class FallbackAccountManager {
               error: formatErrorMessage(error),
             },
           )
-          usable.push(account)
-        } else if (!failClosedOnUnknownQuota(storage)) {
+          if (
+            this.accountPassesQuotaPolicy(
+              this.quotaPolicyAccount(account),
+              storage,
+              {
+                modelId: options.modelId,
+              },
+            )
+          ) {
+            usable.push(account)
+          }
+        } else if (
+          !failClosedOnUnknownQuota(storage) &&
+          quotaSnapshotPassesModelScope(account.quota, options.modelId)
+        ) {
           usable.push(account)
         }
       }
@@ -2255,8 +2319,12 @@ export class FallbackAccountManager {
   accountPassesQuotaPolicy(
     account: OAuthAccount,
     storage: AccountStorage | null,
+    options: { modelId?: string } = {},
   ) {
-    return quotaSnapshotPassesPolicy(account.quota, storage)
+    return (
+      quotaSnapshotPassesPolicy(account.quota, storage) &&
+      quotaSnapshotPassesModelScope(account.quota, options.modelId)
+    )
   }
 
   /**

@@ -24,6 +24,7 @@ import {
   getCache1hPersistentMode,
   getLogLevel,
   getPersistedLogLevel,
+  getScopedQuotaWindowForModel,
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
@@ -34,6 +35,8 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   QuotaManager,
+  quotaSnapshotModelScopeIsExhausted,
+  quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   removeAccount,
   removeAccountPersistent,
@@ -1036,6 +1039,88 @@ describe('FallbackAccountManager', () => {
     expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
     expect(expectOAuthAccount(saved?.accounts[0]).expires).toBe(3_601_000)
     expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
+  })
+
+  test('filters fallback accounts with exhausted matching scoped model quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push(
+      {
+        id: 'fable-empty',
+        type: 'oauth',
+        access: 'empty-access',
+        refresh: 'empty-refresh',
+        expires: Date.now() + 5 * 60 * 60 * 1000,
+        quota: {
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          seven_day: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 100,
+              remainingPercent: 0,
+              checkedAt: 1_000,
+            },
+          ],
+        },
+      },
+      {
+        id: 'fable-ok',
+        type: 'oauth',
+        access: 'ok-access',
+        refresh: 'ok-refresh',
+        expires: Date.now() + 5 * 60 * 60 * 1000,
+        quota: {
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          seven_day: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            checkedAt: 1_000,
+          },
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: 1_000,
+            },
+          ],
+        },
+      },
+    )
+    await saveAccounts(storage)
+
+    const manager = new FallbackAccountManager({ now: () => 1_000 })
+
+    expect(
+      (
+        await manager.getUsableFallbackAccounts(undefined, {
+          modelId: 'claude-fable-5',
+        })
+      ).map((account) => account.id),
+    ).toEqual(['fable-ok'])
+    expect(
+      (
+        await manager.getUsableFallbackAccounts(undefined, {
+          modelId: 'claude-opus-4-8',
+        })
+      ).map((account) => account.id),
+    ).toEqual(['fable-empty', 'fable-ok'])
   })
 
   test('refreshes fallback tokens within the four-hour minimum window', async () => {
@@ -2490,6 +2575,31 @@ describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
         checkedAt: 1_000_000,
       },
     ])
+  })
+
+  test('matches scoped model quota only for the matching model family', () => {
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: 1 },
+      seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: 1 },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: 1,
+        },
+      ],
+    }
+
+    expect(getScopedQuotaWindowForModel(quota, 'claude-fable-5')?.title).toBe(
+      'Fable only',
+    )
+    expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5')).toBe(
+      true,
+    )
+    expect(quotaSnapshotPassesModelScope(quota, 'claude-opus-4-8')).toBe(true)
   })
 
   test('429 response → thrown error carries .status=429 + .retryAfter', async () => {
