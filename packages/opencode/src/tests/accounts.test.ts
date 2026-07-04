@@ -1190,10 +1190,10 @@ describe('FallbackAccountManager', () => {
   })
 
   test('mergeAccountRuntimeState: windowless {scoped:[]} replaces stale exhausted-Fable quota', async () => {
-    // GPT repro: persist an exhausted-Fable scoped window at T1, then save a
-    // windowless empty-scoped snapshot stamped T2 > T1. mergeAccountRuntimeState
-    // must NOT treat the empty snapshot as stale and resurrect the old Fable
-    // window — loadAccounts must return scoped: [].
+    // Persist an exhausted-Fable scoped window at T1, then save a windowless
+    // empty-scoped snapshot stamped T2 > T1. mergeAccountRuntimeState must NOT
+    // treat the empty snapshot as stale and resurrect the old Fable window —
+    // loadAccounts must return scoped: [].
     const accountId = 'merge-empty-scoped'
     const T1 = 1_000
     const T2 = 2_000
