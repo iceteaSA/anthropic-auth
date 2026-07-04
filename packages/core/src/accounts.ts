@@ -477,7 +477,11 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
         }
       })
       .filter((entry): entry is AccountScopedQuotaWindow => entry != null)
-    if (scoped.length) quota.scoped = scoped
+    // Preserve empty `[]` so a downstream reader can distinguish "scoped
+    // owned by anthropic-auth, none visible" from "no scoped data on this
+    // snapshot". Pre-feature inputs without a `scoped` key are not affected
+    // — only inputs that already carried an array reach this line.
+    quota.scoped = scoped
   }
 
   return Object.keys(quota).length ? quota : undefined
@@ -1943,8 +1947,8 @@ function slugForQuotaIdentity(value: string): string {
 function mapScopedWeeklyLimits(
   limits: OAuthUsageLimit[] | undefined,
   checkedAt: number,
-): AccountScopedQuotaWindow[] | undefined {
-  if (!Array.isArray(limits)) return undefined
+): AccountScopedQuotaWindow[] {
+  if (!Array.isArray(limits)) return []
   const seen = new Set<string>()
   const scoped: AccountScopedQuotaWindow[] = []
   for (const limit of limits) {
@@ -1974,7 +1978,7 @@ function mapScopedWeeklyLimits(
       checkedAt,
     })
   }
-  return scoped.length ? scoped : undefined
+  return scoped
 }
 
 function mapUsageWindow(

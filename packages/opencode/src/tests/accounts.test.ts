@@ -1123,6 +1123,72 @@ describe('FallbackAccountManager', () => {
     ).toEqual(['fable-empty', 'fable-ok'])
   })
 
+  test('preserves an empty scoped quota array through save/load when scoped is the only quota key', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'empty-scoped-only',
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: { scoped: [] },
+    })
+    await saveAccounts(storage)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota).toBeDefined()
+    expect(account.quota?.scoped).toBeDefined()
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('preserves an empty scoped quota array alongside five_hour', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'empty-scoped-with-five-hour',
+      type: 'oauth',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 60 * 60 * 1000,
+      quota: {
+        five_hour: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: 1_000,
+        },
+        scoped: [],
+      },
+    })
+    await saveAccounts(storage)
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota?.five_hour?.usedPercent).toBe(10)
+    expect(account.quota?.scoped).toBeDefined()
+    expect(account.quota?.scoped).toEqual([])
+  })
+
+  test('routing predicate treats empty scoped array as not exhausted (invariant lock)', () => {
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: 1_000,
+      },
+      seven_day: {
+        usedPercent: 5,
+        remainingPercent: 95,
+        checkedAt: 1_000,
+      },
+      scoped: [],
+    }
+    expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5')).toBe(
+      false,
+    )
+    expect(quotaSnapshotPassesModelScope(quota, 'claude-fable-5')).toBe(true)
+    expect(quotaSnapshotPassesModelScope(quota, 'claude-opus-4-8')).toBe(true)
+  })
+
   test('refreshes fallback tokens within the four-hour minimum window', async () => {
     const storage = baseStorage()
     storage.refresh = {
