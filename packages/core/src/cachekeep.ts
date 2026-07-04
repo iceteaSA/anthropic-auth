@@ -267,6 +267,7 @@ export type CacheKeepTarget = {
   bodyText: string
   cacheExpiresAt: number
   dayKey: string
+  oauthAccountId?: string
 }
 
 export class CacheKeepManager {
@@ -361,6 +362,7 @@ export class CacheKeepManager {
     bodyText: string
     storage: AccountStorage | null
     cacheMode: string
+    oauthAccountId?: string
   }) {
     if (!input.sessionId)
       return { tracked: false, reason: 'missing session id' }
@@ -395,6 +397,7 @@ export class CacheKeepManager {
       bodyText: input.bodyText,
       cacheExpiresAt: now + CACHE_KEEP_TTL_MS,
       dayKey: today,
+      oauthAccountId: input.oauthAccountId,
     })
     this.pruneTargets(now, today)
     this.start()

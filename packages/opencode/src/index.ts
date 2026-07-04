@@ -555,25 +555,53 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     prepareHeaders: async (headers, target) => {
-      if (!latestGetAuth) return headers
-      const auth = await latestGetAuth()
-      if (auth.type !== 'oauth') return headers
-      if (!auth.access || (auth.expires && auth.expires < Date.now())) {
-        if (!latestRefreshMainAccessToken) return headers
-        auth.access = await latestRefreshMainAccessToken()
+      let accessToken: string | undefined
+      const accountId = target.oauthAccountId
+      if (accountId && accountId !== 'main') {
+        const storage = await loadAccounts(accountStoragePath)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId &&
+            candidate.enabled !== false &&
+            isOAuthAccount(candidate),
+        )
+        if (account && storage) {
+          let current = account
+          try {
+            current = await fallbackManager.refreshAccount(account, storage)
+          } catch (error) {
+            logger.warn('cachekeep', 'fallback token refresh failed', {
+              accountId,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+          accessToken = current.access
+        }
+        accessToken ??= headers
+          .get('authorization')
+          ?.match(/^Bearer\s+(.+)$/i)?.[1]
+      } else {
+        if (!latestGetAuth) return headers
+        const auth = await latestGetAuth()
+        if (auth.type !== 'oauth') return headers
+        if (!auth.access || (auth.expires && auth.expires < Date.now())) {
+          if (!latestRefreshMainAccessToken) return headers
+          auth.access = await latestRefreshMainAccessToken()
+        }
+        accessToken = auth.access
       }
-      if (!auth.access) return headers
+      if (!accessToken) return headers
       try {
         const parsedBody = JSON.parse(target.bodyText) as Record<
           string,
           unknown
         >
         const identity = await resolveClaudeCodeIdentity(
-          auth.access,
+          accessToken,
           typeof parsedBody.model === 'string' ? parsedBody.model : undefined,
         )
         headers.delete('anthropic-beta')
-        setOAuthHeaders(headers, auth.access, {
+        setOAuthHeaders(headers, accessToken, {
           body: parsedBody,
           identity,
         })
@@ -585,7 +613,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         )
         if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
       } catch {
-        setOAuthHeaders(headers, auth.access)
+        setOAuthHeaders(headers, accessToken)
       }
       return headers
     },
@@ -2251,6 +2279,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             trace?: PerfTrace,
             route = 'unknown',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+            oauthAccountId = 'main',
           ) {
             const start = nowMs()
             let requestStorage = currentStorage
@@ -2349,7 +2378,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
             const rewritten = rewriteUrl(input)
             if (
-              route === 'main' &&
               typeof body === 'string' &&
               isCache1hEnabled() &&
               getCache1hMode() === 'hybrid'
@@ -2364,6 +2392,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   bodyText: body,
                   storage,
                   cacheMode: 'hybrid',
+                  oauthAccountId,
                 })
                 trace?.mark('cachekeep_track', {
                   session: relayAffinity,
@@ -2577,6 +2606,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   trace,
                   `fallback_${index}`,
                   storage,
+                  account.id,
                 )
               }
               lastResponse = response

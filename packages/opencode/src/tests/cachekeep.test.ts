@@ -156,6 +156,47 @@ describe('CacheKeepManager', () => {
     manager.stop()
   })
 
+  test('passes OAuth account identity to prewarm header refresh', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    let seenAccountId: string | undefined
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+      prepareHeaders: (headers, target) => {
+        seenAccountId = target.oauthAccountId
+        return headers
+      },
+    })
+
+    await manager.track({
+      sessionId: 'ses_1',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers({ authorization: 'Bearer fallback' }),
+      bodyText: JSON.stringify({
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+      oauthAccountId: 'fallback-account',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+    expect(seenAccountId).toBe('fallback-account')
+    manager.stop()
+  })
+
   test('lets callers refresh headers before prewarm fetch', async () => {
     let now = new Date('2026-05-18T10:00:00').getTime()
     let seenAuthorization = ''

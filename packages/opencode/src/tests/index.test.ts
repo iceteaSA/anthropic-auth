@@ -826,6 +826,72 @@ describe('auth.loader', () => {
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
+  test('cachekeep tracks OAuth fallback routes with OpenCode session affinity', async () => {
+    const nowHour = new Date().getHours()
+    const startHour = (nowHour + 23) % 24
+    const endHour = (nowHour + 1) % 24
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, startHour, endHour },
+      }),
+    )
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'session-1' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-cachekeep',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls
+    const latestCall = promptCalls.at(-1)?.[0]
+    expect(latestCall?.body.parts[0]?.text).toContain('Tracked sessions: 1')
+  })
+
   test('routes Fable requests to OAuth fallback when main scoped Fable quota is exhausted', async () => {
     await useTempAccountFile(
       createFallbackStorage({
