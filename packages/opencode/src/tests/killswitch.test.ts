@@ -17,6 +17,8 @@ import {
   setKillswitchPersistent,
 } from '@cortexkit/anthropic-auth-core'
 
+import { formatKillswitchBlockMessage } from '../index.ts'
+
 let tempDir: string
 let accountPath: string
 
@@ -533,5 +535,44 @@ describe('getQuotaRefreshEveryNRequests', () => {
 
     storage.quota = { ...storage.quota!, refreshEveryNRequests: Infinity }
     expect(getQuotaRefreshEveryNRequests(storage)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatKillswitchBlockMessage — scope-aware 429 message
+// ---------------------------------------------------------------------------
+describe('formatKillswitchBlockMessage', () => {
+  test('scoped-driven: names the model + weekly phrasing', () => {
+    const message = formatKillswitchBlockMessage({
+      retryAfterSeconds: 300,
+      modelName: 'Claude Fable 5',
+    })
+    expect(message).toContain('Claude Fable 5')
+    expect(message).toContain('weekly limit reached')
+    expect(message).toContain('5m 0s')
+    expect(message).not.toContain('Killswitch: no routable accounts')
+  })
+
+  test('account-level: generic phrasing when no modelName', () => {
+    const message = formatKillswitchBlockMessage({
+      retryAfterSeconds: 300,
+    })
+    expect(message).toContain('Killswitch: no routable accounts')
+    expect(message).toContain('5m 0s')
+  })
+
+  test('scoped: modelName is generic (e.g. Mythos), no hardcoded Fable string', () => {
+    const message = formatKillswitchBlockMessage({
+      retryAfterSeconds: 60,
+      modelName: 'Claude Mythos 5',
+    })
+    expect(message).toContain('Claude Mythos 5')
+    expect(message).not.toContain('Fable')
+  })
+
+  test('retry hint formatting — minutes and seconds', () => {
+    const message = formatKillswitchBlockMessage({ retryAfterSeconds: 754 })
+    // 754s = 12m 34s
+    expect(message).toContain('12m 34s')
   })
 })

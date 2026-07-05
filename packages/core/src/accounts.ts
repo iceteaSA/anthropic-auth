@@ -123,7 +123,7 @@ export type OAuthQuotaSnapshot = Partial<
 export type RoutingMode = 'main-first' | 'fallback-first'
 
 export type KillswitchThresholds = Partial<
-  Record<QuotaWindowName | '5h' | '1w', number>
+  Record<QuotaWindowName | '5h' | '1w' | 'scoped', number>
 >
 
 export type KillswitchConfig = {
@@ -1656,16 +1656,21 @@ export function quotaSnapshotPassesPolicy(
 // thresholds, even if the API would still accept them.
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_KILLSWITCH_THRESHOLDS: Record<QuotaWindowName, number> = {
+export const DEFAULT_KILLSWITCH_THRESHOLDS: Record<
+  QuotaWindowName | 'scoped',
+  number
+> = {
   five_hour: 5,
   seven_day: 10,
+  scoped: 0,
 }
 
-function normalizeKillswitchThresholds(
+export function normalizeKillswitchThresholds(
   thresholds: KillswitchThresholds | undefined,
-): Record<QuotaWindowName, number> {
+): Record<QuotaWindowName | 'scoped', number> {
   const fiveHour = thresholds?.five_hour ?? thresholds?.['5h']
   const sevenDay = thresholds?.seven_day ?? thresholds?.['1w']
+  const scoped = thresholds?.scoped
   return {
     five_hour:
       typeof fiveHour === 'number' && Number.isFinite(fiveHour)
@@ -1675,6 +1680,10 @@ function normalizeKillswitchThresholds(
       typeof sevenDay === 'number' && Number.isFinite(sevenDay)
         ? sevenDay
         : DEFAULT_KILLSWITCH_THRESHOLDS.seven_day,
+    scoped:
+      typeof scoped === 'number' && Number.isFinite(scoped)
+        ? scoped
+        : DEFAULT_KILLSWITCH_THRESHOLDS.scoped,
   }
 }
 
@@ -1682,10 +1691,10 @@ export function isKillswitchEnabled(storage: AccountStorage | null) {
   return storage?.killswitch?.enabled === true
 }
 
-function getKillswitchThresholdsForAccount(
+export function getKillswitchThresholdsForAccount(
   storage: AccountStorage | null,
   accountId?: string,
-): Record<QuotaWindowName, number> {
+): Record<QuotaWindowName | 'scoped', number> {
   if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
   if (accountId && storage.killswitch.accounts?.[accountId]) {
     return normalizeKillswitchThresholds(storage.killswitch.accounts[accountId])
@@ -1696,11 +1705,16 @@ function getKillswitchThresholdsForAccount(
 /**
  * Returns true if the account's quota is above its killswitch threshold.
  * When killswitch is disabled, always returns true.
+ *
+ * When `modelId` is provided, the per-account `scoped` threshold is also
+ * evaluated against the quota window matching that model — additive to the
+ * 5h/7d check. A model with no matching scoped window is unaffected.
  */
 export function killswitchPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
   storage: AccountStorage | null,
   accountId?: string,
+  modelId?: string,
 ) {
   if (!isKillswitchEnabled(storage)) return true
   const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
@@ -1721,23 +1735,51 @@ export function killswitchPassesPolicy(
     if (window.remainingPercent < thresholds[key]) return false
   }
   if (sawUnknownWindow) return !failClosedOnUnknownQuota(storage)
+  if (modelId) {
+    // Scoped check is additive to the 5h/7d evaluation above. A missing
+    // scoped window (no carve-out for this model) is not "unknown quota" —
+    // only a PRESENT window at/below threshold blocks. The comparison is
+    // inclusive (`<=`) so the default 0 fires at exhaustion.
+    const scopedWindow = getScopedQuotaWindowForModel(quota, modelId)
+    if (
+      scopedWindow &&
+      Number.isFinite(scopedWindow.remainingPercent) &&
+      scopedWindow.remainingPercent <= thresholds.scoped
+    ) {
+      return false
+    }
+  }
   return true
 }
 
 /**
  * Find the earliest reset time across all accounts' quota windows.
  * Returns seconds from `now` until that reset, or 300 as a fallback.
+ *
+ * When `scopedModelId` is provided, the matched scoped window's `resetsAt`
+ * is also considered so the retry hint reflects the weekly reset for a
+ * scoped-driven block.
  */
 export function killswitchRetryAfterSeconds(
   mainQuota: OAuthQuotaSnapshot | undefined,
   fallbackAccounts: Array<{ quota?: OAuthQuotaSnapshot }>,
   now: number,
+  scopedModelId?: string,
 ): number {
   const resetTimes: number[] = []
   const allQuotas = [mainQuota, ...fallbackAccounts.map((a) => a.quota)]
   for (const quota of allQuotas) {
     for (const key of ['five_hour', 'seven_day'] as const) {
       const resetStr = quota?.[key]?.resetsAt
+      if (!resetStr) continue
+      const resetTime = Date.parse(resetStr)
+      if (Number.isFinite(resetTime) && resetTime > now) {
+        resetTimes.push(resetTime)
+      }
+    }
+    if (scopedModelId) {
+      const scopedWindow = getScopedQuotaWindowForModel(quota, scopedModelId)
+      const resetStr = scopedWindow?.resetsAt
       if (!resetStr) continue
       const resetTime = Date.parse(resetStr)
       if (Number.isFinite(resetTime) && resetTime > now) {

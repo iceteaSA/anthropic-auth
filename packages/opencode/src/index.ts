@@ -48,6 +48,7 @@ import {
   getQuotaNextRefreshAt,
   getRelayConfig,
   getRoutingMode,
+  getScopedQuotaWindowForModel,
   hashRefreshToken,
   isApiKeyAccount,
   isCache1hEnabled,
@@ -152,6 +153,25 @@ const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
 const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
+
+/**
+ * Format the user-facing 429 message for a killswitch block. When the block
+ * is scoped-driven (the request's model matches a scoped window that is at
+ * or below the killswitch threshold), the message names the model so the
+ * operator can distinguish a per-model weekly block from a whole-account
+ * kill. Otherwise the generic account-level message is used.
+ */
+export function formatKillswitchBlockMessage(input: {
+  retryAfterSeconds: number
+  modelName?: string
+}): string {
+  const minutes = Math.floor(input.retryAfterSeconds / 60)
+  const seconds = input.retryAfterSeconds % 60
+  const retryHint = `Retry in ${minutes}m ${seconds}s.`
+  return input.modelName
+    ? `${input.modelName} weekly limit reached, no routable accounts. ${retryHint}`
+    : `Killswitch: no routable accounts. ${retryHint}`
+}
 
 type NotificationRequest = {
   path: { id: string }
@@ -2558,6 +2578,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     getFallbackQuota(account),
                     storageArg,
                     account.id,
+                    options.modelId,
                   )
                 : true,
             )
@@ -2731,7 +2752,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   ? // Prefer the fresh QuotaManager cache (updated by the eager
                     // killswitch refresh) over the request-start storage snapshot,
                     // matching the other killswitch fallback filters.
-                    killswitchPassesPolicy(getFallbackQuota(a), storage, a.id)
+                    killswitchPassesPolicy(
+                      getFallbackQuota(a),
+                      storage,
+                      a.id,
+                      modelId,
+                    )
                   : true,
               )
               if (accounts.length < before) {
@@ -3133,7 +3159,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 // refresh failed on the first request) killswitchPassesPolicy
                 // returns false under failClosedOnUnknownQuota, so the killswitch
                 // must still block / reroute instead of falling through to main.
-                !killswitchPassesPolicy(mainQuota, storage)
+                // accountId stays undefined for main; the optional trailing
+                // modelId adds the per-model scoped check.
+                !killswitchPassesPolicy(
+                  mainQuota,
+                  storage,
+                  undefined,
+                  requestModelId,
+                )
               ) {
                 // Main is killswitch-killed. Decide where to route from the SAME
                 // set routing will actually use — usable fallbacks that also
@@ -3197,17 +3230,29 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       a.enabled !== false && isOAuthAccount(a),
                   )
                   .map((a) => ({ ...a, quota: getFallbackQuota(a) }))
+                // Detect a scoped-driven block: the request's model matches a
+                // scoped window on main that is at/below the killswitch
+                // threshold. The message names the model so the operator can
+                // tell a per-model weekly block from a whole-account kill.
+                const scopedWindow = requestModelId
+                  ? getScopedQuotaWindowForModel(mainQuota, requestModelId)
+                  : undefined
                 const retryAfter = killswitchRetryAfterSeconds(
                   mainQuota,
                   fallbackAccounts,
                   now,
+                  scopedWindow ? requestModelId : undefined,
                 )
+                const message = formatKillswitchBlockMessage({
+                  retryAfterSeconds: retryAfter,
+                  modelName: scopedWindow?.modelName,
+                })
                 return new Response(
                   JSON.stringify({
                     type: 'error',
                     error: {
                       type: 'rate_limit_error',
-                      message: `Killswitch: no routable accounts. Retry in ${Math.floor(retryAfter / 60)}m ${retryAfter % 60}s.`,
+                      message,
                     },
                   }),
                   {
