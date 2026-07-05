@@ -571,4 +571,104 @@ describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
     expect(seconds).toBeGreaterThanOrEqual(359)
     expect(seconds).toBeLessThanOrEqual(361)
   })
+
+  // Regression for FINDING 1: when a scopedModelId is provided, the 5h/7d
+  // resetsAt must NOT also be collected. Otherwise the 5h reset (hours away)
+  // always beats the weekly scoped reset (days away) in Math.min, and the
+  // client retries the request hours before the actual weekly block clears.
+  test('scoped branch REPLACES 5h/7d, not adds to it (FINDING 1)', () => {
+    const now = Date.now()
+    const twoHours = 2 * 60 * 60 * 1000
+    const twoDays = 2 * 24 * 60 * 60 * 1000
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        resetsAt: new Date(now + twoHours).toISOString(),
+        checkedAt: now,
+      },
+      seven_day: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        resetsAt: new Date(now + twoHours).toISOString(),
+        checkedAt: now,
+      },
+      scoped: [
+        scopeWindow(
+          0,
+          { name: 'Claude Fable 5', id: 'claude-fable-5' },
+          { resetsAt: new Date(now + twoDays).toISOString() },
+        ),
+      ],
+    }
+    const seconds = killswitchRetryAfterSeconds(
+      mainQuota,
+      [],
+      now,
+      'claude-fable-5',
+    )
+    // Expected: ~2 days + 60s buffer. The 5h/7d reset (~2h) must be ignored
+    // because the block is scoped-driven.
+    const expected = Math.ceil(twoDays / 1000) + 60
+    expect(seconds).toBeGreaterThanOrEqual(expected - 2)
+    expect(seconds).toBeLessThanOrEqual(expected + 2)
+  })
+
+  test('scoped branch: matched scoped window in FALLBACK is the only source (FINDING 1 fallback case)', () => {
+    const now = Date.now()
+    const twoHours = 2 * 60 * 60 * 1000
+    const twoDays = 2 * 24 * 60 * 60 * 1000
+    // main has NO scoped window, but 5h resetsAt in 2h. A fallback carries
+    // a Fable window that resets in 2 days. The 5h reset on the fallback
+    // must be ignored too — the branch is scoped REPLACEMENT, per-quota.
+    const mainQuota: OAuthQuotaSnapshot = {}
+    const fallbacks = [
+      {
+        quota: {
+          five_hour: {
+            usedPercent: 95,
+            remainingPercent: 5,
+            resetsAt: new Date(now + twoHours).toISOString(),
+            checkedAt: now,
+          },
+          scoped: [
+            scopeWindow(
+              0,
+              { name: 'Claude Fable 5', id: 'claude-fable-5' },
+              { resetsAt: new Date(now + twoDays).toISOString() },
+            ),
+          ],
+        },
+      },
+    ]
+    const seconds = killswitchRetryAfterSeconds(
+      mainQuota,
+      fallbacks,
+      now,
+      'claude-fable-5',
+    )
+    const expected = Math.ceil(twoDays / 1000) + 60
+    expect(seconds).toBeGreaterThanOrEqual(expected - 2)
+    expect(seconds).toBeLessThanOrEqual(expected + 2)
+  })
+
+  test('scoped branch: no matched scoped window in any quota → 300 fallback (FINDING 1 empty)', () => {
+    const now = Date.now()
+    // main has a 5h reset but NO scoped window for the requested model.
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        resetsAt: new Date(now + 7_200_000).toISOString(),
+        checkedAt: now,
+      },
+    }
+    const seconds = killswitchRetryAfterSeconds(
+      mainQuota,
+      [],
+      now,
+      'claude-fable-5',
+    )
+    expect(seconds).toBe(300)
+  })
 })

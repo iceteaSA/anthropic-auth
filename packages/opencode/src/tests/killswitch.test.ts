@@ -781,4 +781,104 @@ describe('resolveScopedDrivenBlock', () => {
     })
     expect(result.isScopedDriven).toBe(false)
   })
+
+  // Regression for FINDING 2: when BOTH 5h/7d AND the Fable window are
+  // exhausted, the real block reason is account-level (5h/7d), yet the
+  // old code only checked the scoped window and reported scoped-driven.
+  // That misleads the operator (saying "Fable weekly limit" when the
+  // account is dead for ALL models) and misroutes the retry-after to
+  // the weekly window. Account-level 5h/7d must take priority.
+  test('BOTH 5h/7d AND Fable exhausted → NOT scoped-driven (FINDING 2)', () => {
+    // 5h threshold 10, 5h remaining 4 → 4 < 10, BLOCKED
+    // 7d threshold 10, 7d remaining 4 → 4 < 10, BLOCKED
+    // scoped threshold 0, Fable remaining 0 → 0 <= 0, BLOCKED
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 10, seven_day: 10, scoped: 0 },
+    }
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(0)],
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-fable-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(false)
+  })
+
+  test('BOTH 5h/7d AND Fable exhausted — Sonnet request → NOT scoped-driven (FINDING 2 Sonnet variant)', () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 10, seven_day: 10, scoped: 0 },
+    }
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 96,
+        remainingPercent: 4,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(0)],
+    }
+    // Sonnet has no matching scoped window, so the 5h/7d guard short-
+    // circuits. Important: result is still NOT scoped-driven.
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-sonnet-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(false)
+  })
+
+  test('HEALTHY 5h/7d + EXHAUSTED Fable → still IS scoped-driven (FINDING 2 regression lock)', () => {
+    // This is the MUST-2 proof test, restated as a regression lock for
+    // FINDING 2: the 5h/7d guard must not over-trigger and turn a
+    // genuine scoped-driven block into account-level.
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+    }
+    const mainQuota: OAuthQuotaSnapshot = {
+      // 5h/7d HEALTHY — they must pass the no-modelId policy check.
+      five_hour: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(0)],
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-fable-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(true)
+    if (result.isScopedDriven) {
+      expect(result.modelName).toBe('Claude Fable 5')
+      expect(result.modelId).toBe('claude-fable-5')
+    }
+  })
 })

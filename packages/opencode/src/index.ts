@@ -181,6 +181,12 @@ export function formatKillswitchBlockMessage(input: {
  * actually at or below the per-account scoped threshold. A Fable request
  * with a healthy Fable window is therefore correctly classified as
  * account-level (the 5h/7d breach killed the account, not the Fable quota).
+ *
+ * Priority: account-level 5h/7d always wins. `killswitchPassesPolicy` called
+ * WITHOUT a modelId evaluates only 5h/7d; if it returns false, 5h/7d drove
+ * the block, so this is account-level regardless of the scoped window's
+ * state. Only when 5h/7d pass AND the matched scoped window is at/below the
+ * scoped threshold do we call it scoped-driven.
  */
 export function resolveScopedDrivenBlock(input: {
   mainQuota: OAuthQuotaSnapshot | undefined
@@ -190,6 +196,10 @@ export function resolveScopedDrivenBlock(input: {
   | { isScopedDriven: true; modelName: string; modelId: string }
   | { isScopedDriven: false } {
   if (!input.requestModelId) return { isScopedDriven: false }
+  if (!killswitchPassesPolicy(input.mainQuota, input.storage)) {
+    // 5h/7d already killed the account — account-level, not scoped-driven.
+    return { isScopedDriven: false }
+  }
   const matchedWindow = getScopedQuotaWindowForModel(
     input.mainQuota,
     input.requestModelId,

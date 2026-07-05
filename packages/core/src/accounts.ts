@@ -1760,9 +1760,11 @@ export function killswitchPassesPolicy(
  * Find the earliest reset time across all accounts' quota windows.
  * Returns seconds from `now` until that reset, or 300 as a fallback.
  *
- * When `scopedModelId` is provided, the matched scoped window's `resetsAt`
- * is also considered so the retry hint reflects the weekly reset for a
- * scoped-driven block.
+ * When `scopedModelId` is provided, ONLY the matched scoped window's
+ * `resetsAt` is considered — the 5h/7d resets are intentionally ignored
+ * so the retry hint reflects the weekly reset, not the sooner 5h reset
+ * (which would cause a retry-storm against a block that won't clear for
+ * days). With `scopedModelId` undefined, the 5h/7d behavior is unchanged.
  */
 export function killswitchRetryAfterSeconds(
   mainQuota: OAuthQuotaSnapshot | undefined,
@@ -1773,14 +1775,6 @@ export function killswitchRetryAfterSeconds(
   const resetTimes: number[] = []
   const allQuotas = [mainQuota, ...fallbackAccounts.map((a) => a.quota)]
   for (const quota of allQuotas) {
-    for (const key of ['five_hour', 'seven_day'] as const) {
-      const resetStr = quota?.[key]?.resetsAt
-      if (!resetStr) continue
-      const resetTime = Date.parse(resetStr)
-      if (Number.isFinite(resetTime) && resetTime > now) {
-        resetTimes.push(resetTime)
-      }
-    }
     if (scopedModelId) {
       const scopedWindow = getScopedQuotaWindowForModel(quota, scopedModelId)
       const resetStr = scopedWindow?.resetsAt
@@ -1788,6 +1782,15 @@ export function killswitchRetryAfterSeconds(
       const resetTime = Date.parse(resetStr)
       if (Number.isFinite(resetTime) && resetTime > now) {
         resetTimes.push(resetTime)
+      }
+    } else {
+      for (const key of ['five_hour', 'seven_day'] as const) {
+        const resetStr = quota?.[key]?.resetsAt
+        if (!resetStr) continue
+        const resetTime = Date.parse(resetStr)
+        if (Number.isFinite(resetTime) && resetTime > now) {
+          resetTimes.push(resetTime)
+        }
       }
     }
   }
