@@ -179,7 +179,7 @@ Example:
   },
   "killswitch": {
     "enabled": false,
-    "main": { "five_hour": 5, "seven_day": 10 },
+    "main": { "five_hour": 5, "seven_day": 10, "scoped": 0 },
     "accounts": {}
   },
   "claudeCache": {
@@ -294,18 +294,20 @@ Add a `killswitch` block to the sidecar config:
   "enabled": true,
   "main": {
     "five_hour": 5,
-    "seven_day": 10
+    "seven_day": 10,
+    "scoped": 0
   },
   "accounts": {
     "work-alt": {
       "five_hour": 10,
-      "seven_day": 20
+      "seven_day": 20,
+      "scoped": 0
     }
   }
 }
 ```
 
-Thresholds are remaining-percent values. With `five_hour: 5`, the account is killed when less than 5% of the 5-hour quota window remains. Accounts without an entry in `accounts` fall back to the `main` thresholds. The aliases `5h` and `1w` are also accepted.
+Thresholds are remaining-percent values. With `five_hour: 5`, the account is killed when less than 5% of the 5-hour quota window remains. The optional `scoped` threshold applies to matching model-scoped quota windows (for example Fable weekly quota) and blocks when the scoped remaining percent is at or below the threshold. Accounts without an entry in `accounts` fall back to the `main` thresholds. The aliases `5h` and `1w` are also accepted.
 
 Behavior:
 
@@ -321,7 +323,8 @@ Manage the killswitch from inside OpenCode:
 /claude-killswitch on           — enable with current or default thresholds
 /claude-killswitch off          — disable
 /claude-killswitch set all:5,10 — set all accounts to 5h≥5%, 1w≥10%
-/claude-killswitch set main:3,8 work-alt:5,10 — per-account thresholds
+/claude-killswitch set main:3,8,0 — set main to 5h≥3%, 1w≥8%, scoped≤0%
+/claude-killswitch set main:3,8,0 work-alt:5,10,0 — per-account thresholds
 ```
 
 Changes made with `/claude-killswitch` are persisted to the sidecar config.

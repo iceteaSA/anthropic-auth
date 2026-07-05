@@ -7,6 +7,31 @@ type ApplyFn = (
   args: string,
 ) => Promise<{ text: string; knobs: Record<string, unknown> }>
 
+type KillswitchDialogConfig = {
+  enabled?: boolean
+  main?: Record<string, number>
+  accounts?: Record<string, Record<string, number>>
+}
+
+export function buildKillswitchThresholdSeed(
+  config: KillswitchDialogConfig,
+  accountIds: string[],
+) {
+  const readT = (t: Record<string, number> | undefined) => {
+    const fh = t?.five_hour ?? t?.['5h'] ?? 5
+    const sd = t?.seven_day ?? t?.['1w'] ?? 10
+    const scoped = t?.scoped ?? 0
+    return { fh, sd, scoped }
+  }
+  const mainT = readT(config.main)
+  const seedParts = [`main:${mainT.fh},${mainT.sd},${mainT.scoped}`]
+  for (const id of accountIds) {
+    const t = readT(config.accounts?.[id] ?? config.main)
+    seedParts.push(`${id}:${t.fh},${t.sd},${t.scoped}`)
+  }
+  return seedParts.join(' ')
+}
+
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
@@ -150,25 +175,10 @@ export function openCommandDialog(
   }
 
   if (payload.command === 'claude-killswitch') {
-    const config = (payload.knobs.config ?? {}) as {
-      enabled?: boolean
-      main?: Record<string, number>
-      accounts?: Record<string, Record<string, number>>
-    }
+    const config = (payload.knobs.config ?? {}) as KillswitchDialogConfig
     const accountIds = (payload.knobs.accountIds as string[]) ?? []
     const enabled = config.enabled === true
-    const readT = (t: Record<string, number> | undefined) => {
-      const fh = t?.five_hour ?? t?.['5h'] ?? 5
-      const sd = t?.seven_day ?? t?.['1w'] ?? 10
-      return { fh, sd }
-    }
-    const mainT = readT(config.main)
-    const seedParts = [`main:${mainT.fh},${mainT.sd}`]
-    for (const id of accountIds) {
-      const t = readT(config.accounts?.[id] ?? config.main)
-      seedParts.push(`${id}:${t.fh},${t.sd}`)
-    }
-    const seed = seedParts.join(' ')
+    const seed = buildKillswitchThresholdSeed(config, accountIds)
 
     const openEdit = () => {
       const DialogPrompt = api.ui.DialogPrompt
@@ -177,7 +187,7 @@ export function openCommandDialog(
         <DialogPrompt
           title='Killswitch thresholds'
           description={() => <text>{payload.text}</text>}
-          placeholder='main:5,10 work-alt:5,10'
+          placeholder='main:5,10,0 work-alt:5,10,0'
           value={seed}
           onConfirm={(value: string) => {
             void apply('claude-killswitch', `set ${value.trim()}`).then((r) => {
@@ -206,7 +216,7 @@ export function openCommandDialog(
           {
             title: 'Edit thresholds…',
             value: 'edit',
-            description: 'Set per-account 5h,1w cutoffs',
+            description: 'Set per-account 5h,1w,scoped cutoffs',
           },
         ]}
         onSelect={(option) => {

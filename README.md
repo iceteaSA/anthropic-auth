@@ -181,7 +181,7 @@ Example:
   },
   "killswitch": {
     "enabled": false,
-    "main": { "five_hour": 5, "seven_day": 10 },
+    "main": { "five_hour": 5, "seven_day": 10, "scoped": 0 },
     "accounts": {}
   },
   "claudeCache": {
@@ -213,7 +213,7 @@ Example:
 }
 ```
 
-The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
+The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. Killswitch `scoped` thresholds apply to matching model-scoped quota windows such as Fable weekly quota. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Background refresh and quota checks write only the state file, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
@@ -326,7 +326,7 @@ In the OpenCode TUI, the `/claude-*` commands open interactive modal dialogs ins
 - `/claude-dump` — toggle request dump capture on or off.
 - `/claude-cache` — select the 1-hour cache mode (off, explicit, automatic, or hybrid).
 - `/claude-cachekeep` — enter a cache keepalive window (`HH-HH`) or `off`.
-- `/claude-killswitch` — enable or disable the killswitch, or edit per-account `5h,1w` thresholds.
+- `/claude-killswitch` — enable or disable the killswitch, or edit per-account `5h,1w,scoped` thresholds.
 
 Applying a change in a modal persists it through the same configuration the slash arguments use, so the modal and the typed command (`/claude-routing fallback-first`, etc.) are equivalent. Outside the OpenCode TUI (OpenCode desktop or headless), the commands print their text summary as before; Pi is unaffected.
 

@@ -49,7 +49,7 @@
 4. **Request interception** — OpenCode's fetch wrapper calls the plugin's hooks — `packages/opencode/src/index.ts` (experimental fetch wrapping)
 5. **URL rewrite** — `rewriteUrl()` adds `?beta=true` to `/v1/messages` and overrides base URL when `ANTHROPIC_BASE_URL` is set — `packages/opencode/src/transform.ts`
 6. **Request body rewrite** — `rewriteRequestBody()` strips trailing assistant messages, normalizes Fable/Mythos thinking, injects billing header, sanitizes system prompt (removes OpenCode identity), prepends Claude Code identity, applies cache strategy (explicit/automatic/hybrid), adds fast mode, prefixes tool names with `mcp_`, creates `cch` over serialized body — `packages/opencode/src/transform.ts`
-7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in routing order (main-first or fallback-first), respecting quota policy and killswitch thresholds — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`
+7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in routing order (main-first or fallback-first), respecting quota policy, model-scoped quotas, and killswitch thresholds — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`
 8. **Relay** — `sendViaRelay()` sends full or patched body to Cloudflare Worker, which streams Anthropic response back — `packages/core/src/relay.ts`
 9. **SSE stream** — Response body is wrapped in `createStrippedStream()` which reverses the tool name prefix in streaming SSE events — `packages/opencode/src/transform.ts`
 10. **Sidebar update** — `writeSidebarState()` writes quota/routing/cache state to a JSON file read by the TUI sidebar widget (separate process via RPC) — `packages/opencode/src/sidebar-state.ts`
@@ -58,19 +58,19 @@
 
 1. **Extension load** — Pi loads `@cortexkit/pi-anthropic-auth` package, which calls `registerCommands()` and `pi.registerProvider("anthropic", ...)` — `packages/pi/src/index.ts`
 2. **Provider registration** — Provider defines OAuth login/refresh functions (delegating to core's `authorize`/`exchange`/`refreshClaudeOAuthToken`) and a `streamSimple` function — `packages/pi/src/index.ts`
-3. **Stream implementation** — `streamCortexKitAnthropic()` in `packages/pi/src/stream.ts` builds the Anthropic request, sends via relay or direct, handles fallback routing and cache keepalive
+3. **Stream implementation** — `streamCortexKitAnthropic()` in `packages/pi/src/stream.ts` builds the Anthropic request, sends via relay or direct, handles fallback routing (including model-scoped quota routing) and cache keepalive
 4. **Slash commands** — `/claude-*` commands registered in `packages/pi/src/commands.ts` reuse core command execution functions
 
 **Quota Refresh Flow:**
 1. Background timer fires at `checkIntervalMinutes` (default 5) — `packages/core/src/quota-manager.ts`
-2. `QuotaManager.refreshMain()` fetches `https://api.anthropic.com/api/oauth/usage` with the access token
+2. `QuotaManager.refreshMain()` fetches `https://api.anthropic.com/api/oauth/usage` (including standard five-hour/seven-day windows and weekly scoped model limits) with the access token
 3. On success: persists quota snapshot to sidecar state file, updates sidebar state — `packages/opencode/src/index.ts` (onMainQuotaFetched callback)
 4. On 429: records backoff with `nextRetryAt` timestamp — prevents further refreshes during backoff — `packages/core/src/accounts.ts`
 5. Fallback accounts: `FallbackAccountManager` refreshes per-account quotas in background, persists to state, notifies sidebar — `packages/opencode/src/index.ts`
 
 **Cache Keepalive Flow:**
-1. `CacheKeepManager` tracks recently used hybrid-cache sessions — `packages/core/src/cachekeep.ts`
-2. ~5 minutes before the 1-hour cache TTL expires, sends a `max_tokens: 0` pre-warm request to extend the cache entry
+1. `CacheKeepManager` tracks recently used hybrid-cache sessions and their associated `oauthAccountId` — `packages/core/src/cachekeep.ts`
+2. ~5 minutes before the 1-hour cache TTL expires, sends a `max_tokens: 0` pre-warm request (authenticated using the corresponding main or fallback account credentials) to extend the cache entry
 3. Removes response-only fields (streaming, thinking, structured output, forced tool choice) from the pre-warm body
 
 ## Key Abstractions
@@ -88,7 +88,7 @@
 **CacheKeepManager:**
 - Purpose: Tracks hybrid-cache sessions and sends pre-warm requests before 1-hour TTL expiry
 - Location: `packages/core/src/cachekeep.ts`
-- Pattern: In-memory target tracking with configurable time window; supports up to 32 concurrent sessions
+- Pattern: In-memory target tracking with configurable time window; tracks the associated `oauthAccountId` to pre-warm using the correct credentials; supports up to 32 concurrent sessions
 
 **AccountStorage (sidecar file):**
 - Purpose: Persisted configuration and runtime state — fallback accounts, quotas, refresh backoff, killswitch settings, cache/relay config
@@ -103,7 +103,7 @@
 **SidebarState:**
 - Purpose: Shared state file between OpenCode server process and TUI widget process for live quota/routing/cache display
 - Location: `packages/opencode/src/sidebar-state.ts`
-- Pattern: JSON file under `$TMPDIR`; server writes after each routing decision or quota refresh; TUI polls on interval
+- Pattern: JSON file under `$TMPDIR`; server writes after each routing decision or quota refresh; TUI polls on interval. Supports displaying standard usage windows alongside scoped model quotas (e.g. Fable weekly limit)
 
 **RPC Server/Client:**
 - Purpose: Loopback HTTP server for TUI ↔ OpenCode server IPC — modal dialogs and notification delivery
@@ -134,7 +134,7 @@
 
 ## Error Handling
 
-**Strategy:** Fail-closed on parse failures (returns original request body vs crashing); 429 backoff with exponential retry for token refresh; retryable stream errors detected and bubbled as synthetic `ECONNRESET` for retry by the caller; killswitch blocks requests before they hit the API when quota drops below configured thresholds. API-key fallback routes only trigger after confirmed quota exhaustion (stale cached quota never triggers them).
+**Strategy:** Fail-closed on parse failures (returns original request body vs crashing); 429 backoff with exponential retry for token refresh; retryable stream errors detected and bubbled as synthetic `ECONNRESET` for retry by the caller; killswitch blocks requests before they hit the API when quota drops below configured thresholds. Fallback routing triggers on confirmed standard quota exhaustion or model-scoped quota exhaustion (stale cached quota never triggers API-key fallback routes).
 
 ## Cross-Cutting Concerns
 
