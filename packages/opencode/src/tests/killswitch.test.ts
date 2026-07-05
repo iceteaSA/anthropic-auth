@@ -608,21 +608,20 @@ describe('resolveScopedDrivenBlock', () => {
   }
 
   test('5h/7d-driven block + HEALTHY Fable window → NOT scoped-driven (MUST-2)', () => {
-    // Main quota is exhausted on 5h/7d (killswitch will fire), but the
-    // Fable window is at 100% remaining — well above the scoped threshold.
-    // The current (buggy) code names Fable; the fix must produce a generic
-    // account-level message because the block is 5h/7d-driven, not
-    // scoped-driven.
+    // Main quota is exhausted on 5h/7d (remaining below the strict-`<`
+    // thresholds of 5/10, so the killswitch genuinely fires), but the Fable
+    // window is at 100% remaining — well above the scoped threshold. The block
+    // must be classified account-level (generic message), not scoped-driven.
     const storage = killswitchStorage(0)
     const mainQuota: OAuthQuotaSnapshot = {
       five_hour: {
-        usedPercent: 95,
-        remainingPercent: 5,
+        usedPercent: 96,
+        remainingPercent: 4,
         checkedAt: Date.now(),
       },
       seven_day: {
-        usedPercent: 90,
-        remainingPercent: 10,
+        usedPercent: 91,
+        remainingPercent: 9,
         checkedAt: Date.now(),
       },
       scoped: [fableWindow(100)], // perfectly healthy
