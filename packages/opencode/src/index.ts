@@ -43,6 +43,7 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getKillswitchConfig,
+  getKillswitchThresholdsForAccount,
   getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
@@ -171,6 +172,41 @@ export function formatKillswitchBlockMessage(input: {
   return input.modelName
     ? `${input.modelName} weekly limit reached, no routable accounts. ${retryHint}`
     : `Killswitch: no routable accounts. ${retryHint}`
+}
+
+/**
+ * Decide whether a killswitch block is scoped-driven (a per-model weekly
+ * block) versus a whole-account 5h/7d-driven block. A block is scoped-driven
+ * only when the request's model matches a scoped window AND that window is
+ * actually at or below the per-account scoped threshold. A Fable request
+ * with a healthy Fable window is therefore correctly classified as
+ * account-level (the 5h/7d breach killed the account, not the Fable quota).
+ */
+export function resolveScopedDrivenBlock(input: {
+  mainQuota: OAuthQuotaSnapshot | undefined
+  requestModelId: string | undefined
+  storage: AccountStorage | null
+}):
+  | { isScopedDriven: true; modelName: string; modelId: string }
+  | { isScopedDriven: false } {
+  if (!input.requestModelId) return { isScopedDriven: false }
+  const matchedWindow = getScopedQuotaWindowForModel(
+    input.mainQuota,
+    input.requestModelId,
+  )
+  if (!matchedWindow) return { isScopedDriven: false }
+  if (!Number.isFinite(matchedWindow.remainingPercent)) {
+    return { isScopedDriven: false }
+  }
+  const thresholds = getKillswitchThresholdsForAccount(input.storage)
+  if (matchedWindow.remainingPercent <= thresholds.scoped) {
+    return {
+      isScopedDriven: true,
+      modelName: matchedWindow.modelName,
+      modelId: input.requestModelId,
+    }
+  }
+  return { isScopedDriven: false }
 }
 
 type NotificationRequest = {
@@ -3230,22 +3266,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       a.enabled !== false && isOAuthAccount(a),
                   )
                   .map((a) => ({ ...a, quota: getFallbackQuota(a) }))
-                // Detect a scoped-driven block: the request's model matches a
-                // scoped window on main that is at/below the killswitch
-                // threshold. The message names the model so the operator can
-                // tell a per-model weekly block from a whole-account kill.
-                const scopedWindow = requestModelId
-                  ? getScopedQuotaWindowForModel(mainQuota, requestModelId)
-                  : undefined
+                // Decide whether the block is scoped-driven (request's
+                // model matches a scoped window that is at/below the scoped
+                // threshold) vs a whole-account 5h/7d-driven block. A
+                // healthy Fable window + 5h/7d breach is NOT scoped-driven.
+                const scoped = resolveScopedDrivenBlock({
+                  mainQuota,
+                  requestModelId,
+                  storage,
+                })
                 const retryAfter = killswitchRetryAfterSeconds(
                   mainQuota,
                   fallbackAccounts,
                   now,
-                  scopedWindow ? requestModelId : undefined,
+                  scoped.isScopedDriven ? scoped.modelId : undefined,
                 )
                 const message = formatKillswitchBlockMessage({
                   retryAfterSeconds: retryAfter,
-                  modelName: scopedWindow?.modelName,
+                  ...(scoped.isScopedDriven && { modelName: scoped.modelName }),
                 })
                 return new Response(
                   JSON.stringify({

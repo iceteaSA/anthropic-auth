@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  type AccountScopedQuotaWindow,
   type AccountStorage,
   executeKillswitchCommand,
   getKillswitchConfig,
@@ -12,12 +13,16 @@ import {
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
   loadAccounts,
+  type OAuthQuotaSnapshot,
   parseKillswitchCommandAction,
   saveAccounts,
   setKillswitchPersistent,
 } from '@cortexkit/anthropic-auth-core'
 
-import { formatKillswitchBlockMessage } from '../index.ts'
+import {
+  formatKillswitchBlockMessage,
+  resolveScopedDrivenBlock,
+} from '../index.ts'
 
 let tempDir: string
 let accountPath: string
@@ -574,5 +579,206 @@ describe('formatKillswitchBlockMessage', () => {
     const message = formatKillswitchBlockMessage({ retryAfterSeconds: 754 })
     // 754s = 12m 34s
     expect(message).toContain('12m 34s')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveScopedDrivenBlock — must-2: a healthy scoped window must NOT be
+// treated as scoped-driven; the 5h/7d block must keep the generic message
+// even when the request's model happens to match a scoped carve-out.
+// ---------------------------------------------------------------------------
+describe('resolveScopedDrivenBlock', () => {
+  const fableWindow = (remaining: number): AccountScopedQuotaWindow => ({
+    id: 'claude-weekly-scoped-fable',
+    title: 'Claude Fable 5 only',
+    modelName: 'Claude Fable 5',
+    modelId: 'claude-fable-5',
+    usedPercent: 100 - remaining,
+    remainingPercent: remaining,
+    checkedAt: Date.now(),
+  })
+
+  const killswitchStorage = (scoped: number): AccountStorage => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10, scoped },
+    }
+    return storage
+  }
+
+  test('5h/7d-driven block + HEALTHY Fable window → NOT scoped-driven (MUST-2)', () => {
+    // Main quota is exhausted on 5h/7d (killswitch will fire), but the
+    // Fable window is at 100% remaining — well above the scoped threshold.
+    // The current (buggy) code names Fable; the fix must produce a generic
+    // account-level message because the block is 5h/7d-driven, not
+    // scoped-driven.
+    const storage = killswitchStorage(0)
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 90,
+        remainingPercent: 10,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(100)], // perfectly healthy
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-fable-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(false)
+  })
+
+  test('EXHAUSTED Fable window at/below scoped threshold → IS scoped-driven (MUST-2 proof)', () => {
+    const storage = killswitchStorage(0)
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 90,
+        remainingPercent: 10,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(0)], // exhausted
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-fable-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(true)
+    if (result.isScopedDriven) {
+      expect(result.modelName).toBe('Claude Fable 5')
+      expect(result.modelId).toBe('claude-fable-5')
+    }
+  })
+
+  test('raised scoped threshold (20) marks a 20% Fable window as scoped-driven (MUST-2 boundary)', () => {
+    const storage = killswitchStorage(20)
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 50,
+        remainingPercent: 50,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 50,
+        remainingPercent: 50,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(20)],
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-fable-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(true)
+  })
+
+  test('same 20% threshold + 21% remaining Fable window → NOT scoped-driven', () => {
+    const storage = killswitchStorage(20)
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 50,
+        remainingPercent: 50,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 50,
+        remainingPercent: 50,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(21)],
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-fable-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(false)
+  })
+
+  test('Sonnet request: no matching scoped window → NOT scoped-driven', () => {
+    const storage = killswitchStorage(0)
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 90,
+        remainingPercent: 10,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(0)],
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-sonnet-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(false)
+  })
+
+  test('no requestModelId → NOT scoped-driven', () => {
+    const storage = killswitchStorage(0)
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 90,
+        remainingPercent: 10,
+        checkedAt: Date.now(),
+      },
+      scoped: [fableWindow(0)],
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: undefined,
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(false)
+  })
+
+  test('non-finite remainingPercent on a matched window → NOT scoped-driven', () => {
+    const storage = killswitchStorage(0)
+    const mainQuota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 95,
+        remainingPercent: 5,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        usedPercent: 90,
+        remainingPercent: 10,
+        checkedAt: Date.now(),
+      },
+      scoped: [
+        {
+          ...fableWindow(0),
+          remainingPercent: Number.NaN,
+        },
+      ],
+    }
+    const result = resolveScopedDrivenBlock({
+      mainQuota,
+      requestModelId: 'claude-fable-5',
+      storage,
+    })
+    expect(result.isScopedDriven).toBe(false)
   })
 })

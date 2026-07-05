@@ -1734,12 +1734,15 @@ export function killswitchPassesPolicy(
     }
     if (window.remainingPercent < thresholds[key]) return false
   }
-  if (sawUnknownWindow) return !failClosedOnUnknownQuota(storage)
+  // Scoped check is additive to the 5h/7d evaluation above and is an
+  // INDEPENDENT block reason — it must run before the unknown-window
+  // fail-closed decision, so an exhausted scoped window blocks even when
+  // 5h/7d is missing/non-finite (the latter only changes the fall-through
+  // for accounts that did not already block on scoped). A missing scoped
+  // window (no carve-out for this model) is not "unknown quota" — only a
+  // PRESENT window at/below threshold blocks. The comparison is inclusive
+  // (`<=`) so the default 0 fires at exhaustion.
   if (modelId) {
-    // Scoped check is additive to the 5h/7d evaluation above. A missing
-    // scoped window (no carve-out for this model) is not "unknown quota" —
-    // only a PRESENT window at/below threshold blocks. The comparison is
-    // inclusive (`<=`) so the default 0 fires at exhaustion.
     const scopedWindow = getScopedQuotaWindowForModel(quota, modelId)
     if (
       scopedWindow &&
@@ -1749,6 +1752,7 @@ export function killswitchPassesPolicy(
       return false
     }
   }
+  if (sawUnknownWindow) return !failClosedOnUnknownQuota(storage)
   return true
 }
 

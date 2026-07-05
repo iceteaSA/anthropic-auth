@@ -355,6 +355,87 @@ describe('killswitchPassesPolicy — scoped model dimension', () => {
       killswitchPassesPolicy(quota, storage, undefined, 'claude-fable-5'),
     ).toBe(true)
   })
+
+  // Regression for MUST-1: when 5h/7d is missing/non-finite AND
+  // failClosedOnUnknownQuota=false, the function must STILL evaluate the
+  // scoped check — an exhausted scoped window is its own block reason,
+  // independent of the unknown 5h/7d fail-closed decision.
+  test('scoped check runs even when 5h/7d is unknown and fail-OPEN (MUST-1)', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+    }
+    // Both 5h/7d absent → sawUnknownWindow=true. With fail-OPEN the old
+    // code would short-circuit to true and skip the scoped check.
+    const quota: OAuthQuotaSnapshot = {
+      scoped: [
+        scopeWindow(0, { name: 'Claude Fable 5', id: 'claude-fable-5' }),
+      ],
+    }
+    expect(
+      killswitchPassesPolicy(quota, storage, undefined, 'claude-fable-5'),
+    ).toBe(false)
+  })
+
+  test('scoped check runs when one 5h/7d window is non-finite + fail-OPEN (MUST-1 variant)', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+    }
+    // five_hour present + non-finite (sawUnknownWindow=true), seven_day absent.
+    const quota: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: Number.NaN,
+        checkedAt: Date.now(),
+      },
+      scoped: [
+        scopeWindow(0, { name: 'Claude Fable 5', id: 'claude-fable-5' }),
+      ],
+    }
+    expect(
+      killswitchPassesPolicy(quota, storage, undefined, 'claude-fable-5'),
+    ).toBe(false)
+  })
+
+  test('healthy scoped window with unknown 5h/7d + fail-OPEN still passes (MUST-1 complement)', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+    }
+    // Unknown 5h/7d, but the Fable window is HEALTHY (above threshold).
+    // The scoped check passes, then the unknown-5h/7d fail-OPEN decision
+    // also passes. Final: true.
+    const quota: OAuthQuotaSnapshot = {
+      scoped: [
+        scopeWindow(50, { name: 'Claude Fable 5', id: 'claude-fable-5' }),
+      ],
+    }
+    expect(
+      killswitchPassesPolicy(quota, storage, undefined, 'claude-fable-5'),
+    ).toBe(true)
+  })
+
+  test('absent scoped window with unknown 5h/7d + fail-OPEN still passes (MUST-1 complement)', () => {
+    const storage = baseStorage()
+    storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+    }
+    // No scoped array at all (Sonnet-style: no carve-out). The scoped check
+    // doesn't fire, then the unknown-5h/7d fail-OPEN decision passes.
+    const quota: OAuthQuotaSnapshot = {}
+    expect(
+      killswitchPassesPolicy(quota, storage, undefined, 'claude-sonnet-5'),
+    ).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------
