@@ -2,6 +2,21 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.13.0
+
+### Minor Changes
+
+- Add model-scoped OAuth quota support for Anthropic weekly scoped limits such as Fable, including sidebar/quota-summary display and model-aware OAuth fallback routing. Fable scoped exhaustion can route Fable requests to an OAuth fallback while other models continue using the main account.
+- Add per-model scoped killswitch thresholds so matching scoped quota windows can hard-block an account without poisoning routing for other models.
+
+### Patch Changes
+
+- Fix same-label fallback OAuth re-login state merging so fresh credentials clear stale reauth/quota errors and invalidate old quota cache entries.
+- Keep CacheKeep tracking on OAuth fallback routes and prewarm with the same OAuth account that served the cached request.
+- Shorten the Fable scoped quota sidebar label to `Fa` and preserve scoped killswitch thresholds in the TUI edit modal.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the scoped killswitch contribution.
+
 ## 1.12.2
 
 ### Patch Changes
