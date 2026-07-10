@@ -121,7 +121,11 @@ function normalizeAccountQuota(value: unknown): AccountQuota | null {
         }
       })
       .filter((entry): entry is ScopedQuotaWindow => entry != null)
-    if (scoped.length) quota.scoped = scoped
+    // Preserve empty `[]` so a sidebar reader can distinguish "scoped owned
+    // by anthropic-auth, none visible" from "no quota data at all". The OUTER
+    // Array.isArray guard means pre-feature inputs without a `scoped` key are
+    // not affected — only inputs that already carried an array reach this line.
+    quota.scoped = scoped
   }
 
   return Object.keys(quota).length ? quota : null
@@ -284,18 +288,23 @@ export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
     }
   }
 
+  const scopedSegments = scoped.map(
+    (window) =>
+      `${formatScopedQuotaLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
+  )
+  const primarySegments =
+    fiveHourUsedPercent == null && sevenDayUsedPercent == null
+      ? []
+      : [
+          `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`}`,
+          `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
+        ]
+
   return {
     fiveHourUsedPercent,
     sevenDayUsedPercent,
     scopedUsedPercents,
-    text: [
-      `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`}`,
-      `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
-      ...scoped.map(
-        (window) =>
-          `${formatScopedQuotaLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
-      ),
-    ].join(' '),
+    text: [...primarySegments, ...scopedSegments].join(' '),
   }
 }
 

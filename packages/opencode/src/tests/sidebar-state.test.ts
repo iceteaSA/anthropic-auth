@@ -191,6 +191,40 @@ describe('getCollapsedQuotaSummary', () => {
     expect(getCollapsedQuotaSummary(null).text).toBeNull()
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
   })
+
+  test('omits 5h/7d placeholders when only scoped windows are visible', () => {
+    const summary = getCollapsedQuotaSummary({
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100,
+          remainingPercent: 0,
+        },
+      ],
+    })
+    expect(summary.text).toBe('Fa: 100%')
+    expect(summary.text).not.toContain('5h:')
+    expect(summary.text).not.toContain('7d:')
+    expect(summary.text).not.toContain('—')
+  })
+
+  test('preserves partial-dash primary segment alongside scoped windows', () => {
+    const summary = getCollapsedQuotaSummary({
+      five_hour: { usedPercent: 23, remainingPercent: 77 },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 42,
+          remainingPercent: 58,
+        },
+      ],
+    })
+    expect(summary.text).toBe('5h: 23% 7d: — Fa: 42%')
+  })
 })
 
 describe('normalizeSidebarState', () => {
@@ -228,6 +262,18 @@ describe('normalizeSidebarState', () => {
         resetsAt: '2026-07-08T09:00:00Z',
       },
     ])
+  })
+
+  test('preserves empty scoped quota array when scoped is the only quota key', () => {
+    const normalized = normalizeSidebarState({
+      main: { quota: { scoped: [] } },
+      fallbacks: [],
+      route: 'main',
+      lastUpdated: 0,
+    })
+
+    expect(normalized.main.quota).not.toBeNull()
+    expect(normalized.main.quota?.scoped).toEqual([])
   })
 })
 

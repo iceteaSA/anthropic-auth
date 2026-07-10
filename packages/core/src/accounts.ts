@@ -118,6 +118,12 @@ export type OAuthQuotaSnapshot = Partial<
   Record<QuotaWindowName, AccountQuotaWindow>
 > & {
   scoped?: AccountScopedQuotaWindow[]
+  // Top-level freshness stamp for the whole snapshot. mergeAccountRuntimeState
+  // uses this when the snapshot has no per-window checkedAt (e.g. a windowless
+  // empty-scoped snapshot) — without it, a windowless refresh gets read as
+  // checkedAt=0 and treated as stale, so an old per-window quota resurrects
+  // instead of being overwritten.
+  checkedAt?: number
 }
 
 export type RoutingMode = 'main-first' | 'fallback-first'
@@ -451,6 +457,15 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     if (normalized) quota[key] = normalized
   }
 
+  // Persist a top-level snapshot checkedAt through normalize so the
+  // mergeAccountRuntimeState freshness comparison stays meaningful when the
+  // snapshot has no per-window checkedAt (e.g. {scoped:[]}). Pre-feature
+  // inputs without this key are unaffected — only on-disk snapshots that
+  // already carry it reach this branch.
+  if (typeof value.checkedAt === 'number' && Number.isFinite(value.checkedAt)) {
+    quota.checkedAt = value.checkedAt
+  }
+
   if (Array.isArray(value.scoped)) {
     const scoped = value.scoped
       .map((entry): AccountScopedQuotaWindow | undefined => {
@@ -477,7 +492,11 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
         }
       })
       .filter((entry): entry is AccountScopedQuotaWindow => entry != null)
-    if (scoped.length) quota.scoped = scoped
+    // Preserve empty `[]` so a downstream reader can distinguish "scoped
+    // owned by anthropic-auth, none visible" from "no scoped data on this
+    // snapshot". Pre-feature inputs without a `scoped` key are not affected
+    // — only inputs that already carried an array reach this line.
+    quota.scoped = scoped
   }
 
   return Object.keys(quota).length ? quota : undefined
@@ -697,6 +716,7 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
     quota?.five_hour?.checkedAt ?? 0,
     quota?.seven_day?.checkedAt ?? 0,
     ...(quota?.scoped?.map((window) => window.checkedAt) ?? []),
+    quota?.checkedAt ?? 0,
   )
 }
 
@@ -1992,8 +2012,8 @@ function slugForQuotaIdentity(value: string): string {
 function mapScopedWeeklyLimits(
   limits: OAuthUsageLimit[] | undefined,
   checkedAt: number,
-): AccountScopedQuotaWindow[] | undefined {
-  if (!Array.isArray(limits)) return undefined
+): AccountScopedQuotaWindow[] {
+  if (!Array.isArray(limits)) return []
   const seen = new Set<string>()
   const scoped: AccountScopedQuotaWindow[] = []
   for (const limit of limits) {
@@ -2023,7 +2043,7 @@ function mapScopedWeeklyLimits(
       checkedAt,
     })
   }
-  return scoped.length ? scoped : undefined
+  return scoped
 }
 
 function mapUsageWindow(
@@ -2076,6 +2096,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
     five_hour: mapUsageWindow(usage.five_hour, checkedAt),
     seven_day: mapUsageWindow(usage.seven_day, checkedAt),
     scoped: mapScopedWeeklyLimits(usage.limits, checkedAt),
+    checkedAt,
   } satisfies OAuthQuotaSnapshot
 }
 
