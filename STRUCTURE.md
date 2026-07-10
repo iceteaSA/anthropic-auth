@@ -34,12 +34,12 @@ anthropic-auth/
 **`packages/core/src/`:**
 - Purpose: All reusable OAuth, account management, quota, cache, relay, dump, signing, routing, and command execution logic
 - Contains: TypeScript modules, each focused on one concern
-- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (fallback routing mode), `killswitch.ts` (hard-block thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
+- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (fallback routing mode), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
 - Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar widget), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (shared state file for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar widget), `tui/command-dialogs.tsx` (command modal dialog components), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (shared state file for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -85,7 +85,7 @@ anthropic-auth/
 - `packages/core/src/cch.ts`: XXH64-based request body signing
 - `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager
 - `packages/core/src/routing.ts`: Main-first / fallback-first routing mode
-- `packages/core/src/killswitch.ts`: Per-account hard-block thresholds
+- `packages/core/src/killswitch.ts`: Per-account and model-scoped hard-block thresholds and command execution logic
 - `packages/core/src/provider.ts`: Duck-typed provider HTTP error classification
 - `packages/core/src/logging.ts`: Logging level command execution logic
 - `packages/core/src/commands/account.ts`: Account slash command execution logic
@@ -101,6 +101,7 @@ anthropic-auth/
 - `packages/opencode/src/sidebar-state.ts`: Shared state file for TUI sidebar IPC
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Prompt context resolver for OpenCode hidden command replies
+- `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation
 
 **Tests:**

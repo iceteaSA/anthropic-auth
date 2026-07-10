@@ -49,7 +49,7 @@
 4. **Request interception** — OpenCode's fetch wrapper calls the plugin's hooks — `packages/opencode/src/index.ts` (experimental fetch wrapping)
 5. **URL rewrite** — `rewriteUrl()` adds `?beta=true` to `/v1/messages` and overrides base URL when `ANTHROPIC_BASE_URL` is set — `packages/opencode/src/transform.ts`
 6. **Request body rewrite** — `rewriteRequestBody()` strips trailing assistant messages, normalizes Fable/Mythos thinking, injects billing header, sanitizes system prompt (removes OpenCode identity), prepends Claude Code identity, applies cache strategy (explicit/automatic/hybrid), adds fast mode, prefixes tool names with `mcp_`, creates `cch` over serialized body — `packages/opencode/src/transform.ts`
-7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in routing order (main-first or fallback-first), respecting quota policy, model-scoped quotas, and killswitch thresholds — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`
+7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in routing order (main-first or fallback-first), respecting quota policy, model-scoped quotas, and killswitch thresholds (including per-model scoped thresholds). If all accounts fail the killswitch policy, a 429 block response is returned immediately; this block is classified as scoped-driven (matching a specific model's weekly limit) or account-level (5h/7d limits) with a model-specific or generic retry hint — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`, `packages/opencode/src/index.ts`
 8. **Relay** — `sendViaRelay()` sends full or patched body to Cloudflare Worker, which streams Anthropic response back — `packages/core/src/relay.ts`
 9. **SSE stream** — Response body is wrapped in `createStrippedStream()` which reverses the tool name prefix in streaming SSE events — `packages/opencode/src/transform.ts`
 10. **Sidebar update** — `writeSidebarState()` writes quota/routing/cache state to a JSON file read by the TUI sidebar widget (separate process via RPC) — `packages/opencode/src/sidebar-state.ts`
@@ -134,7 +134,7 @@
 
 ## Error Handling
 
-**Strategy:** Fail-closed on parse failures (returns original request body vs crashing); 429 backoff with exponential retry for token refresh; retryable stream errors detected and bubbled as synthetic `ECONNRESET` for retry by the caller; killswitch blocks requests before they hit the API when quota drops below configured thresholds. Fallback routing triggers on confirmed standard quota exhaustion or model-scoped quota exhaustion (stale cached quota never triggers API-key fallback routes).
+**Strategy:** Fail-closed on parse failures (returns original request body vs crashing); 429 backoff with exponential retry for token refresh; retryable stream errors detected and bubbled as synthetic `ECONNRESET` for retry by the caller; killswitch blocks requests before they hit the API when quota drops below configured thresholds (including per-model scoped thresholds evaluated against the requested model). Blocks are classified as scoped-driven (when a specific model's weekly limit is reached) or account-level (5h/7d limits), generating detailed user-facing error messages. Fallback routing triggers on confirmed standard quota exhaustion or model-scoped quota exhaustion (stale cached quota never triggers API-key fallback routes).
 
 ## Cross-Cutting Concerns
 
