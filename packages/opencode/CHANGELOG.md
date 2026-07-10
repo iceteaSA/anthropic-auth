@@ -2,6 +2,20 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.14.0
+
+### Minor Changes
+
+- Expose Claude Sonnet 5 in the Pi Anthropic provider catalog, completing its existing adaptive-thinking request support.
+
+### Patch Changes
+
+- Preserve empty model-scoped quota arrays through account-state loading, runtime-state merges, and sidebar normalization so a fresh quota response can clear a previously stored scoped window.
+- Omit unavailable 5h/7d placeholders from collapsed quota summaries when only a scoped model window is present.
+- Update OpenTUI Solid, OpenCode SDK, Biome, and generated project documentation.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the scoped-quota persistence fixes and [@nodnarbnitram](https://github.com/nodnarbnitram) for the Pi Sonnet 5 catalog contribution.
+
 ## 1.13.0
 
 ### Minor Changes
