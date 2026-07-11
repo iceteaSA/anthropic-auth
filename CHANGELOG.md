@@ -2,6 +2,14 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.15.0
+
+### Minor Changes
+
+- Add automatic OpenCode recovery for Fable content-filter refusals: transparently route the session through Opus 4.8 for a 10-response recovery window, prewarm Fable after each successful Opus response, and return to Fable without changing the selected session model.
+- Preserve both model caches during recovery by warming Fable with the OAuth account that served the refused request and retaining an Opus standby cache bridge when healthy Fable turns move the previous Opus boundary outside Anthropic's 20-block lookback.
+- Show session-specific recovery status in the OpenCode TUI sidebar and send safe transition notices in OpenCode Desktop without spending quota or creating an extra provider response.
+
 ## 1.14.0
 
 ### Minor Changes
