@@ -19,6 +19,10 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
 import {
+  drainNotifications,
+  resetNotificationsForTest,
+} from '../rpc/notifications'
+import {
   drainSidebarWrites,
   getSidebarState,
   getSidebarStateFile,
@@ -41,7 +45,7 @@ function createMockClient(messages?: unknown[]) {
       messages: messages
         ? mock(() => Promise.resolve({ data: messages }))
         : undefined,
-      promptAsync: mock(() => Promise.resolve()),
+      promptAsync: mock((_input: unknown) => Promise.resolve()),
     },
   }
 }
@@ -579,6 +583,7 @@ describe('auth.loader', () => {
     resetCache1hState()
     resetDumpState()
     resetFastModeState()
+    resetNotificationsForTest()
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -588,6 +593,7 @@ describe('auth.loader', () => {
     globalThis.setInterval = originalSetInterval
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
+    resetNotificationsForTest()
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -4587,6 +4593,478 @@ describe('auth.loader', () => {
 
     expect(response.status).toBe(429)
     expect(calls).toBe(1)
+  })
+
+  test('downgrades a filtered Fable session for ten successful Opus turns and warms Fable after each', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: false },
+      }),
+    )
+    const normalModels: string[] = []
+    const warmBodies: Array<Record<string, unknown>> = []
+    let firstFable = true
+    let releaseFinalWarm: (() => void) | undefined
+    const successfulSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const refusalSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+              limits: [],
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (body.max_tokens === 0) {
+        warmBodies.push(body)
+        const warmResponse = () =>
+          new Response(
+            JSON.stringify({ usage: { cache_read_input_tokens: 100 } }),
+            { status: 200 },
+          )
+        if (warmBodies.length === 10) {
+          return new Promise<Response>((resolve) => {
+            releaseFinalWarm = () => resolve(warmResponse())
+          })
+        }
+        return Promise.resolve(warmResponse())
+      }
+      normalModels.push(String(body.model))
+      if (body.model === 'claude-fable-5' && firstFable) {
+        firstFable = false
+        return Promise.resolve(new Response(refusalSse, { status: 200 }))
+      }
+      return Promise.resolve(new Response(successfulSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_fable_filter' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 128_000,
+        stream: true,
+        system: [{ type: 'text', text: 'stable system' }],
+        messages: [{ role: 'user', content: 'same session input' }],
+      }),
+    }
+
+    const filtered = await result.fetch(MESSAGES_URL, request)
+    const reader = filtered.body!.getReader()
+    let caught: unknown
+    try {
+      while (!(await reader.read()).done) {}
+    } catch (error) {
+      caught = error
+    }
+    expect((caught as { code?: string }).code).toBe('ECONNRESET')
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+    const switchedState = await waitForSidebarState((state) =>
+      Boolean(
+        state.fableRecoveries?.some(
+          (recovery) =>
+            recovery.sessionId === 'ses_fable_filter' &&
+            recovery.mode === 'opus',
+        ),
+      ),
+    )
+    expect(
+      switchedState.fableRecoveries?.find(
+        (recovery) => recovery.sessionId === 'ses_fable_filter',
+      )?.remaining,
+    ).toBe(10)
+
+    const firstOpus = await result.fetch(MESSAGES_URL, request)
+    await firstOpus.text()
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_fable_filter',
+          status: { type: 'idle' },
+        },
+      },
+    })
+    await waitForMockCall(mockClient.session.promptAsync)
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
+    expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        path: { id: 'ses_fable_filter' },
+        body: expect.objectContaining({
+          noReply: false,
+          parts: [
+            expect.objectContaining({
+              type: 'text',
+              ignored: true,
+              text: expect.stringContaining('Switched to Opus 4.8'),
+            }),
+          ],
+        }),
+      }),
+    )
+    const switchNotificationClosure = await result.fetch(MESSAGES_URL, request)
+    expect(await switchNotificationClosure.text()).toContain('message_stop')
+    expect(normalModels).toHaveLength(2)
+
+    for (let turn = 1; turn < 10; turn++) {
+      const response = await result.fetch(MESSAGES_URL, request)
+      await response.text()
+    }
+
+    for (let attempt = 0; attempt < 100 && warmBodies.length < 10; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    expect(normalModels).toEqual([
+      'claude-fable-5',
+      ...Array.from({ length: 10 }, () => 'claude-opus-4-8'),
+    ])
+    expect(warmBodies).toHaveLength(10)
+    for (const warm of warmBodies) {
+      expect(warm.model).toBe('claude-fable-5')
+      expect(warm.max_tokens).toBe(0)
+      expect(warm.stream).toBeUndefined()
+      expect(warm.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      })
+      expect(warm.messages).toHaveLength(1)
+      expect(warm.messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: 'user',
+            content: expect.arrayContaining([
+              expect.objectContaining({ text: 'same session input' }),
+            ]),
+          }),
+        ]),
+      )
+    }
+
+    const restoredPromise = result.fetch(MESSAGES_URL, request)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(normalModels).toHaveLength(11)
+    expect(releaseFinalWarm).toBeDefined()
+    const waitingState = await waitForSidebarState((state) =>
+      Boolean(
+        state.fableRecoveries?.some(
+          (recovery) =>
+            recovery.sessionId === 'ses_fable_filter' &&
+            recovery.mode === 'opus' &&
+            recovery.remaining === 0,
+        ),
+      ),
+    )
+    expect(
+      waitingState.fableRecoveries?.find(
+        (recovery) => recovery.sessionId === 'ses_fable_filter',
+      )?.mode,
+    ).toBe('opus')
+    releaseFinalWarm?.()
+    const restored = await restoredPromise
+    await restored.text()
+    expect(normalModels.at(-1)).toBe('claude-fable-5')
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_fable_filter',
+          status: { type: 'idle' },
+        },
+      },
+    })
+
+    for (
+      let attempt = 0;
+      attempt < 100 && mockClient.session.promptAsync.mock.calls.length < 2;
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(2)
+    expect(mockClient.session.promptAsync.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({
+        path: { id: 'ses_fable_filter' },
+        body: expect.objectContaining({
+          noReply: false,
+          parts: [
+            expect.objectContaining({
+              type: 'text',
+              ignored: true,
+              text: expect.stringContaining('Returning to Fable 5'),
+            }),
+          ],
+        }),
+      }),
+    )
+    const restoreNotificationClosure = await result.fetch(MESSAGES_URL, request)
+    expect(await restoreNotificationClosure.text()).toContain('message_stop')
+    expect(normalModels).toHaveLength(12)
+
+    const restoredState = await waitForSidebarState((state) =>
+      Boolean(
+        state.fableRecoveries?.some(
+          (recovery) =>
+            recovery.sessionId === 'ses_fable_filter' &&
+            recovery.mode === 'fable',
+        ),
+      ),
+    )
+    expect(
+      restoredState.fableRecoveries?.find(
+        (recovery) => recovery.sessionId === 'ses_fable_filter',
+      )?.remaining,
+    ).toBe(0)
+  })
+
+  test('uses the sidebar instead of promptAsync when the matching TUI is connected', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+      }),
+    )
+    resetNotificationsForTest()
+    drainNotifications(0, 'ses_tui_fable')
+    const refusal =
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
+
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(refusal, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_tui_fable' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    try {
+      await response.text()
+    } catch {}
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_tui_fable',
+          status: { type: 'idle' },
+        },
+      },
+    })
+
+    await Bun.sleep(10)
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+    const state = await waitForSidebarState((candidate) =>
+      Boolean(
+        candidate.fableRecoveries?.some(
+          (recovery) =>
+            recovery.sessionId === 'ses_tui_fable' &&
+            recovery.mode === 'opus' &&
+            recovery.remaining === 10,
+        ),
+      ),
+    )
+    expect(state.fableRecoveries).toHaveLength(1)
+  })
+
+  test('warms Fable with the OAuth account that was filtered when Opus routes elsewhere', async () => {
+    const now = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: false },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: { usedPercent: 0, remainingPercent: 100 },
+            seven_day: { usedPercent: 0, remainingPercent: 100 },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: now,
+              },
+            ],
+          },
+          mainQuotaCheckedAt: now,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'fable-fallback',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: now + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: now,
+              },
+              seven_day: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: now,
+              },
+              scoped: [
+                {
+                  id: 'claude-weekly-scoped-fable',
+                  title: 'Fable only',
+                  modelName: 'Fable',
+                  usedPercent: 25,
+                  remainingPercent: 75,
+                  checkedAt: now,
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    )
+    const calls: Array<{ model: string; auth: string; warm: boolean }> = []
+    let firstFable = true
+    const success =
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+    const refusal =
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      const body = JSON.parse(String(init?.body)) as {
+        model: string
+        max_tokens?: number
+      }
+      const auth = new Headers(init?.headers).get('authorization') ?? ''
+      calls.push({ model: body.model, auth, warm: body.max_tokens === 0 })
+      if (body.max_tokens === 0) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      if (body.model === 'claude-fable-5' && firstFable) {
+        firstFable = false
+        return Promise.resolve(new Response(refusal, { status: 200 }))
+      }
+      return Promise.resolve(new Response(success, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_account_bound_fable' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 100,
+        system: [{ type: 'text', text: 'stable system' }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    const filtered = await result.fetch(MESSAGES_URL, request)
+    const filteredReader = filtered.body!.getReader()
+    try {
+      while (!(await filteredReader.read()).done) {}
+    } catch {}
+
+    const opus = await result.fetch(MESSAGES_URL, request)
+    await opus.text()
+    for (let attempt = 0; attempt < 100 && calls.length < 3; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+
+    expect(calls).toEqual([
+      {
+        model: 'claude-fable-5',
+        auth: 'Bearer fallback-access',
+        warm: false,
+      },
+      { model: 'claude-opus-4-8', auth: 'Bearer main-access', warm: false },
+      {
+        model: 'claude-fable-5',
+        auth: 'Bearer fallback-access',
+        warm: true,
+      },
+    ])
   })
 
   test('background fallback refresh updates the sidebar without a request', async () => {

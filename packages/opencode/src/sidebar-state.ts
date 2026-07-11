@@ -27,6 +27,13 @@ export interface SidebarAccountState {
   needsReauth: boolean
 }
 
+export interface FableRecoverySidebarState {
+  sessionId: string
+  mode: 'opus' | 'fable'
+  remaining: number
+  changedAt: number
+}
+
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
@@ -45,6 +52,7 @@ export interface SidebarState {
     window?: string
     trackedSessions?: number
   }
+  fableRecoveries?: FableRecoverySidebarState[]
   lastUpdated: number
 }
 
@@ -185,6 +193,32 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     }
   }
 
+  const fableRecoveries: FableRecoverySidebarState[] = Array.isArray(
+    raw.fableRecoveries,
+  )
+    ? raw.fableRecoveries
+        .filter(isRecord)
+        .flatMap((recovery): FableRecoverySidebarState[] => {
+          if (
+            typeof recovery.sessionId !== 'string' ||
+            (recovery.mode !== 'opus' && recovery.mode !== 'fable') ||
+            typeof recovery.remaining !== 'number' ||
+            !Number.isFinite(recovery.remaining) ||
+            typeof recovery.changedAt !== 'number' ||
+            !Number.isFinite(recovery.changedAt)
+          )
+            return []
+          return [
+            {
+              sessionId: recovery.sessionId,
+              mode: recovery.mode,
+              remaining: Math.max(0, Math.floor(recovery.remaining)),
+              changedAt: recovery.changedAt,
+            },
+          ]
+        })
+    : []
+
   return {
     main,
     fallbacks,
@@ -197,6 +231,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
     cacheKeep,
+    fableRecoveries: fableRecoveries.length > 0 ? fableRecoveries : undefined,
     lastUpdated: typeof raw.lastUpdated === 'number' ? raw.lastUpdated : 0,
   }
 }
@@ -263,6 +298,18 @@ export function resolveActiveAccount(state: SidebarState): {
 export function formatScopedQuotaLabel(title: string) {
   const label = title.replace(/\s+only$/i, '').trim()
   return /^fable$/i.test(label) ? 'Fa' : label
+}
+
+export function getFableRecoverySummary(
+  state: SidebarState,
+  sessionId: string,
+): string | undefined {
+  const recovery = state.fableRecoveries?.find(
+    (candidate) => candidate.sessionId === sessionId,
+  )
+  if (!recovery) return undefined
+  if (recovery.mode === 'fable') return 'Fable 5 · restored'
+  return `Opus 4.8 · ${recovery.remaining} left`
 }
 
 export function getCollapsedQuotaSummary(quota: AccountQuota | null): {

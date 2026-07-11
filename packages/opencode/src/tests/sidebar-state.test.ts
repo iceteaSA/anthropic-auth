@@ -8,6 +8,7 @@ import {
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
   getCollapsedQuotaSummary,
+  getFableRecoverySummary,
   getSidebarState,
   normalizeSidebarState,
   resolveActiveAccount,
@@ -147,6 +148,52 @@ describe('resolveActiveAccount', () => {
   })
 })
 
+describe('getFableRecoverySummary', () => {
+  test('shows the Opus recovery countdown only for the matching session', () => {
+    const state = make({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'opus',
+          remaining: 7,
+          changedAt: 123,
+        },
+        {
+          sessionId: 'ses_other',
+          mode: 'fable',
+          remaining: 0,
+          changedAt: 124,
+        },
+      ],
+    })
+
+    expect(getFableRecoverySummary(state, 'ses_fable')).toBe(
+      'Opus 4.8 · 7 left',
+    )
+    expect(getFableRecoverySummary(state, 'ses_other')).toBe(
+      'Fable 5 · restored',
+    )
+    expect(getFableRecoverySummary(state, 'ses_unknown')).toBeUndefined()
+  })
+
+  test('shows the transition back to Fable', () => {
+    const state = make({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'fable',
+          remaining: 0,
+          changedAt: 456,
+        },
+      ],
+    })
+
+    expect(getFableRecoverySummary(state, 'ses_fable')).toBe(
+      'Fable 5 · restored',
+    )
+  })
+})
+
 describe('getCollapsedQuotaSummary', () => {
   test('formats both active-account quota windows', () => {
     expect(getCollapsedQuotaSummary(quota(13)).text).toBe('5h: 13% 7d: 13%')
@@ -262,6 +309,39 @@ describe('normalizeSidebarState', () => {
         resetsAt: '2026-07-08T09:00:00Z',
       },
     ])
+  })
+
+  test('normalizes valid Fable recovery state and rejects malformed state', () => {
+    const valid = normalizeSidebarState({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'opus',
+          remaining: 7.8,
+          changedAt: 123,
+        },
+      ],
+    })
+    expect(valid.fableRecoveries).toEqual([
+      {
+        sessionId: 'ses_fable',
+        mode: 'opus',
+        remaining: 7,
+        changedAt: 123,
+      },
+    ])
+
+    const invalid = normalizeSidebarState({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_fable',
+          mode: 'other',
+          remaining: 7,
+          changedAt: 123,
+        },
+      ],
+    })
+    expect(invalid.fableRecoveries).toBeUndefined()
   })
 
   test('preserves empty scoped quota array when scoped is the only quota key', () => {

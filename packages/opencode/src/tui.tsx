@@ -25,6 +25,7 @@ import {
   FIVE_HOUR_MS,
   formatScopedQuotaLabel,
   getCollapsedQuotaSummary,
+  getFableRecoverySummary,
   getSidebarState,
   type QuotaPacing,
   resolveActiveAccount,
@@ -501,6 +502,7 @@ function createSidebarController(
 function QuotaSidebar(props: {
   api: TuiPluginApi
   controller: SidebarController
+  sessionId: string
 }) {
   const prefs = props.controller.prefs
   const collapsed = props.controller.collapsed
@@ -604,6 +606,14 @@ function QuotaSidebar(props: {
   const needsReauth = () => enabledFallbacks().some((f) => f.needsReauth)
   const degraded = () => quotaBackedOff() || refreshBackedOff() || needsReauth()
 
+  const fableRecoverySummary = () =>
+    getFableRecoverySummary(state(), props.sessionId)
+  const fableRecoveryTone = (): Tone =>
+    state().fableRecoveries?.find(
+      (recovery) => recovery.sessionId === props.sessionId,
+    )?.mode === 'opus'
+      ? 'warn'
+      : 'ok'
   const cacheKeep = () => state().cacheKeep
   const showCache = () =>
     prefs().sections.cache && cacheKeep() != null && cacheKeep()?.window != null
@@ -679,6 +689,15 @@ function QuotaSidebar(props: {
             </text>
           </CollapsedRow>
         </Show>
+        <Show when={fableRecoverySummary()}>
+          {(summary: () => string) => (
+            <CollapsedRow theme={theme()} label='Recovery'>
+              <text fg={toneColor(theme(), fableRecoveryTone())}>
+                <b>{summary()}</b>
+              </text>
+            </CollapsedRow>
+          )}
+        </Show>
       </Show>
 
       {/* Expanded: full sections. Also render when there's no data so the
@@ -745,6 +764,17 @@ function QuotaSidebar(props: {
           />
         </Show>
 
+        <Show when={fableRecoverySummary()}>
+          {(summary: () => string) => (
+            <StatRow
+              theme={theme()}
+              label='Recovery'
+              value={summary()}
+              tone={fableRecoveryTone()}
+            />
+          )}
+        </Show>
+
         {/* Cache */}
         <Show when={showCache()}>
           <SectionHeader theme={theme()} title='Cache' />
@@ -795,8 +825,14 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     order: computeEffectiveOrder(root, PLUGIN_KEY, DEFAULT_SLOT_ORDER),
     slots: {
-      sidebar_content(_ctx: unknown, _props: { session_id: string }) {
-        return <QuotaSidebar api={api} controller={controller} />
+      sidebar_content(_ctx: unknown, props: { session_id: string }) {
+        return (
+          <QuotaSidebar
+            api={api}
+            controller={controller}
+            sessionId={props.session_id}
+          />
+        )
       },
     },
   })

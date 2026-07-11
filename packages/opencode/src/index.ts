@@ -113,6 +113,11 @@ import {
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
+import {
+  FableFallbackManager,
+  type FableFallbackPlan,
+  type FableStandbyCacheAnchor,
+} from './fable-fallback.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   drainNotifications,
@@ -135,8 +140,10 @@ import {
 import {
   addFastModeBetaHeader,
   createStrippedStream,
+  extractLatestHybridMessageCacheAnchor,
   isInsecure,
   mergeHeaders,
+  prepareFableCacheWarmSource,
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
@@ -222,7 +229,7 @@ export function resolveScopedDrivenBlock(input: {
 type NotificationRequest = {
   path: { id: string }
   body: {
-    noReply: true
+    noReply: boolean
     parts: Array<{ type: 'text'; text: string; ignored: true }>
     agent?: string
     model?: { providerID: string; modelID: string }
@@ -355,13 +362,14 @@ async function sendIgnoredMessage(
   ctx: Parameters<Plugin>[0],
   sessionId: string,
   text: string,
+  noReply = true,
 ) {
   const session = ctx.client.session as PluginSessionClient | undefined
   const promptContext = await resolvePromptContext(ctx.client, sessionId)
   const request: NotificationRequest = {
     path: { id: sessionId },
     body: {
-      noReply: true,
+      noReply,
       parts: [{ type: 'text', text, ignored: true }],
     },
   }
@@ -382,6 +390,34 @@ async function sendIgnoredMessage(
   throw new Error(
     'OpenCode session prompt API is unavailable for ignored replies.',
   )
+}
+
+function createDesktopNotificationClosureResponse() {
+  const messageId = `msg_${randomUUID().replaceAll('-', '')}`
+  const events = [
+    `event: message_start\ndata: ${JSON.stringify({
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-fable-5',
+        stop_reason: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    })}\n\n`,
+    `event: message_delta\ndata: ${JSON.stringify({
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 0 },
+    })}\n\n`,
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ]
+  return new Response(events.join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  })
 }
 
 function cleanAbort(): never {
@@ -431,6 +467,25 @@ const ZERO_MODEL_COST = {
   output: 0,
   cache: { read: 0, write: 0 },
 }
+
+type FableWarmTarget = {
+  url: string
+  headers: Headers
+  bodyText: string
+  oauthAccountId: string
+}
+
+type FableRequestContext = {
+  plan: FableFallbackPlan
+  warmTarget?: FableWarmTarget
+  opusCacheAnchor?: FableStandbyCacheAnchor
+  standbyBridgeLogged?: boolean
+}
+
+const FABLE_SWITCHED_TO_OPUS_NOTICE =
+  'Fable content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Fable cache warm.'
+const FABLE_RESTORED_NOTICE =
+  'Fable recovery window complete. Returning to Fable 5.'
 
 type AnthropicProviderModel = {
   id?: string
@@ -563,6 +618,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       cause: error instanceof Error ? error : undefined,
     })
   }
+  const fableFallbackManager = new FableFallbackManager()
   const quotaManager = new QuotaManager({
     storage: initialStorage,
     onMainQuotaFetched: async (
@@ -631,21 +687,26 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             candidate.enabled !== false &&
             isOAuthAccount(candidate),
         )
-        if (account && storage) {
-          let current = account
-          try {
-            current = await fallbackManager.refreshAccount(account, storage)
-          } catch (error) {
-            logger.warn('cachekeep', 'fallback token refresh failed', {
-              accountId,
-              error: error instanceof Error ? error.message : String(error),
-            })
-          }
-          accessToken = current.access
+        if (!account || !storage) {
+          throw new Error(
+            `OAuth account ${accountId} is unavailable for cache prewarm`,
+          )
         }
-        accessToken ??= headers
-          .get('authorization')
-          ?.match(/^Bearer\s+(.+)$/i)?.[1]
+        let current = account
+        try {
+          current = await fallbackManager.refreshAccount(account, storage)
+        } catch (error) {
+          logger.warn('cachekeep', 'fallback token refresh failed', {
+            accountId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+        accessToken = current.access
+        if (!accessToken) {
+          throw new Error(
+            `OAuth account ${accountId} has no access token for cache prewarm`,
+          )
+        }
       } else {
         if (!latestGetAuth) return headers
         const auth = await latestGetAuth()
@@ -684,6 +745,72 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       return headers
     },
   })
+
+  const fableWarmChains = new Map<string, Promise<void>>()
+
+  function warmFableAfterOpus(context: FableRequestContext) {
+    const sessionId = context.plan.sessionId
+    const run = async () => {
+      const target = context.warmTarget
+      if (!target) {
+        logger.debug('fable-fallback', 'cache warm skipped', {
+          session: sessionId,
+          reason: 'Opus response was not served by an OAuth route',
+        })
+        return
+      }
+      const source = prepareFableCacheWarmSource(
+        target.bodyText,
+        context.plan.requestedModel,
+      )
+      if (!source.ok) {
+        logger.warn('fable-fallback', 'cache warm skipped', {
+          session: sessionId,
+          reason: source.reason,
+        })
+        return
+      }
+
+      try {
+        const result = await cacheKeepManager.prewarmNow({
+          sessionId,
+          url: target.url,
+          headers: target.headers,
+          bodyText: source.bodyText,
+          oauthAccountId: context.plan.cacheAccountId ?? target.oauthAccountId,
+        })
+        if (result.ok) {
+          logger.debug('fable-fallback', 'Fable cache warmed', {
+            session: sessionId,
+            remaining: fableFallbackManager.remaining(sessionId),
+            ...(result.usage && { usage: result.usage }),
+          })
+          return
+        }
+        logger.warn('fable-fallback', 'Fable cache warm skipped', {
+          session: sessionId,
+          status: result.status,
+          reason: result.reason,
+        })
+      } catch (error) {
+        logger.warn('fable-fallback', 'Fable cache warm failed', {
+          session: sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    const previous = fableWarmChains.get(sessionId) ?? Promise.resolve()
+    const current = previous.then(run, run)
+    fableWarmChains.set(sessionId, current)
+    void current.finally(() => {
+      if (fableWarmChains.get(sessionId) === current) {
+        fableWarmChains.delete(sessionId)
+      }
+    })
+    return current
+  }
+
   setCache1hState({
     enabled: isCache1hPersistentlyEnabled(initialStorage),
     mode: getCache1hPersistentMode(initialStorage),
@@ -724,6 +851,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     route: 'main',
   }
   const sidebarStateFile = getSidebarStateFile()
+  const fableRecoveryNotices = new Map<
+    string,
+    NonNullable<SidebarState['fableRecoveries']>[number]
+  >()
+  const pendingDesktopRecoveryNotices = new Map<string, string[]>()
+  const pendingDesktopNotificationClosures = new Map<string, number>()
+  const idleSessions = new Set<string>()
 
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -807,6 +941,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             : undefined,
         trackedSessions: cacheKeepManager.trackedCount(),
       },
+      fableRecoveries:
+        fableRecoveryNotices.size > 0
+          ? [...fableRecoveryNotices.values()]
+          : undefined,
       lastUpdated: Date.now(),
     }
     return setSidebarState(state, sidebarStateFile).catch((error) =>
@@ -991,6 +1129,82 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         // auth not yet available — sidebar will refresh on next request
       }
     }
+  }
+
+  function publishFableRecoveryNotice(
+    notice: Omit<
+      NonNullable<SidebarState['fableRecoveries']>[number],
+      'changedAt'
+    >,
+    storage: AccountStorage | null,
+    auth: { access?: string; refresh?: string },
+    desktopText?: string,
+  ) {
+    fableRecoveryNotices.delete(notice.sessionId)
+    fableRecoveryNotices.set(notice.sessionId, {
+      ...notice,
+      changedAt: Date.now(),
+    })
+    if (fableRecoveryNotices.size > 128) {
+      const oldest = fableRecoveryNotices.keys().next().value
+      if (oldest) fableRecoveryNotices.delete(oldest)
+    }
+    void writeSidebarState(storage, {
+      activeId: lastSidebarRouting.activeId,
+      route: lastSidebarRouting.route,
+      mainAccessToken: auth.access,
+      mainRefreshToken: auth.refresh,
+    })
+
+    if (!desktopText || isTuiConnected(notice.sessionId)) return
+    const pending = pendingDesktopRecoveryNotices.get(notice.sessionId) ?? []
+    pending.push(desktopText)
+    pendingDesktopRecoveryNotices.set(notice.sessionId, pending.slice(-2))
+    if (idleSessions.has(notice.sessionId)) {
+      void flushDesktopRecoveryNotices(notice.sessionId)
+    }
+  }
+
+  async function flushDesktopRecoveryNotices(sessionId: string) {
+    const pending = pendingDesktopRecoveryNotices.get(sessionId)
+    if (!pending?.length) return
+    pendingDesktopRecoveryNotices.delete(sessionId)
+    if (isTuiConnected(sessionId)) return
+
+    for (const text of pending) {
+      pendingDesktopNotificationClosures.set(
+        sessionId,
+        (pendingDesktopNotificationClosures.get(sessionId) ?? 0) + 1,
+      )
+      try {
+        // PromptAsync is the only server-plugin path that renders arbitrary text
+        // in OpenCode Desktop. Let it open a turn, then satisfy that turn locally
+        // in the fetch wrapper so no provider request or recovery count is spent.
+        await sendIgnoredMessage(ctx, sessionId, text, false)
+      } catch (error) {
+        const closures = pendingDesktopNotificationClosures.get(sessionId) ?? 0
+        if (closures <= 1) pendingDesktopNotificationClosures.delete(sessionId)
+        else pendingDesktopNotificationClosures.set(sessionId, closures - 1)
+        logger.warn('fable-fallback', 'Desktop notification failed', {
+          session: sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+  }
+
+  function clearFableRecoveryNotice(
+    sessionId: string | null | undefined,
+    storage: AccountStorage | null,
+    auth: { access?: string; refresh?: string },
+  ) {
+    if (!sessionId || !fableRecoveryNotices.delete(sessionId)) return
+    void writeSidebarState(storage, {
+      activeId: lastSidebarRouting.activeId,
+      route: lastSidebarRouting.route,
+      mainAccessToken: auth.access,
+      mainRefreshToken: auth.refresh,
+    })
   }
 
   async function executePersistentCache1hCommand(argumentsText: string) {
@@ -1554,6 +1768,43 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   }
 
   return {
+    event: async ({ event }: { event: unknown }) => {
+      const value = event as unknown as {
+        type?: string
+        properties?: {
+          sessionID?: string
+          status?: { type?: string }
+          info?: { id?: string }
+        }
+      }
+      const sessionId =
+        value.properties?.sessionID ?? value.properties?.info?.id
+      if (!sessionId) return
+
+      const becameIdle =
+        value.type === 'session.idle' ||
+        (value.type === 'session.status' &&
+          value.properties?.status?.type === 'idle')
+      if (becameIdle) {
+        idleSessions.delete(sessionId)
+        idleSessions.add(sessionId)
+        if (idleSessions.size > 256) {
+          const oldest = idleSessions.values().next().value
+          if (oldest) idleSessions.delete(oldest)
+        }
+        await flushDesktopRecoveryNotices(sessionId)
+        return
+      }
+
+      if (value.type === 'session.status' || value.type === 'session.deleted') {
+        idleSessions.delete(sessionId)
+      }
+      if (value.type === 'session.deleted') {
+        pendingDesktopRecoveryNotices.delete(sessionId)
+        pendingDesktopNotificationClosures.delete(sessionId)
+        fableRecoveryNotices.delete(sessionId)
+      }
+    },
     config: async (config: { command?: Record<string, unknown> }) => {
       config.command = {
         ...(config.command ?? {}),
@@ -2238,8 +2489,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             trace?: PerfTrace,
             route = 'api_fallback',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+            fableRequest?: FableRequestContext,
           ) {
             void currentStorage
+            if (fableRequest?.plan.downgraded) {
+              fableRequest.warmTarget = undefined
+              fableRequest.opusCacheAnchor = undefined
+            }
             const start = nowMs()
             const requestHeaders = mergeHeaders(input, init)
             const directAffinity =
@@ -2346,6 +2602,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             route = 'unknown',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             oauthAccountId = 'main',
+            fableRequest?: FableRequestContext,
           ) {
             const start = nowMs()
             let requestStorage = currentStorage
@@ -2400,14 +2657,50 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   return false
                 }
               })()
+              const cacheEnabled = !subagentRequest && isCache1hEnabled()
+              const cacheMode = getCache1hMode()
+              const standbyCacheAnchor =
+                fableRequest?.plan.downgraded &&
+                fableRequest.plan.standbyCacheAnchor?.oauthAccountId ===
+                  oauthAccountId
+                  ? fableRequest.plan.standbyCacheAnchor
+                  : undefined
               body = await rewriteRequestBody(body, {
-                cache1hEnabled: !subagentRequest && isCache1hEnabled(),
-                cache1hMode: getCache1hMode(),
+                cache1hEnabled: cacheEnabled,
+                cache1hMode: cacheMode,
                 fastModeEnabled: fastModeRequested,
                 identity,
-                perf: (stage, data) =>
-                  trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
+                hybridStandbyAnchor: standbyCacheAnchor,
+                perf: (stage, data) => {
+                  trace?.mark(`rewrite_body_${stage}`, { route, ...data })
+                  if (
+                    stage === 'cache_strategy' &&
+                    data?.standbyBridgeApplied === true &&
+                    fableRequest &&
+                    !fableRequest.standbyBridgeLogged
+                  ) {
+                    fableRequest.standbyBridgeLogged = true
+                    logger.info(
+                      'fable-fallback',
+                      'restored standby Opus cache bridge',
+                      {
+                        session: fableRequest.plan.sessionId,
+                        distanceBlocks: data?.standbyDistanceBlocks,
+                      },
+                    )
+                  }
+                },
               })
+              if (
+                fableRequest?.plan.downgraded &&
+                cacheEnabled &&
+                cacheMode === 'hybrid'
+              ) {
+                const anchor = extractLatestHybridMessageCacheAnchor(body)
+                fableRequest.opusCacheAnchor = anchor
+                  ? { ...anchor, oauthAccountId }
+                  : undefined
+              }
               const headerBodyParseStart = nowMs()
               try {
                 setOAuthHeaders(requestHeaders, accessToken, {
@@ -2443,6 +2736,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             }
 
             const rewritten = rewriteUrl(input)
+            if (fableRequest && typeof body === 'string') {
+              fableRequest.warmTarget = {
+                url: rewritten.url?.toString() ?? rewritten.input.toString(),
+                headers: new Headers(requestHeaders),
+                bodyText: body,
+                oauthAccountId,
+              }
+            }
             if (
               typeof body === 'string' &&
               isCache1hEnabled() &&
@@ -2643,6 +2944,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 id: string
                 access?: string
               }) => void | Promise<void>
+              fableRequest?: FableRequestContext
             },
           ) {
             if (!accounts.length) return currentResponse ?? null
@@ -2662,6 +2964,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   trace,
                   `api_fallback_${index}`,
                   storage,
+                  options?.fableRequest,
                 )
               } else {
                 const access = account.access
@@ -2674,6 +2977,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   `fallback_${index}`,
                   storage,
                   account.id,
+                  options?.fableRequest,
                 )
               }
               lastResponse = response
@@ -2726,6 +3030,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               access?: string
             }) => void,
             modelId?: string,
+            fableRequest?: FableRequestContext,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
@@ -2821,7 +3126,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 storage,
                 currentResponse,
                 trace,
-                { onSuccess: onFallbackSuccess },
+                {
+                  onSuccess: onFallbackSuccess,
+                  fableRequest,
+                },
               )) ?? currentResponse
             )
           }
@@ -2829,6 +3137,40 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
+              const incomingHeaders = mergeHeaders(input, init)
+              const sessionId =
+                incomingHeaders.get('x-session-affinity') ||
+                incomingHeaders.get('x-opencode-session')
+              if (sessionId) idleSessions.delete(sessionId)
+              const pendingNotificationClosures = sessionId
+                ? (pendingDesktopNotificationClosures.get(sessionId) ?? 0)
+                : 0
+              if (sessionId && pendingNotificationClosures > 0) {
+                if (pendingNotificationClosures === 1) {
+                  pendingDesktopNotificationClosures.delete(sessionId)
+                } else {
+                  pendingDesktopNotificationClosures.set(
+                    sessionId,
+                    pendingNotificationClosures - 1,
+                  )
+                }
+                return createDesktopNotificationClosureResponse()
+              }
+              let fablePlan = fableFallbackManager.plan(sessionId, init?.body)
+              if (fablePlan && !fablePlan.downgraded) {
+                const finalWarm = fableWarmChains.get(fablePlan.sessionId)
+                if (finalWarm) {
+                  await finalWarm
+                  fablePlan = fableFallbackManager.plan(sessionId, init?.body)
+                }
+              }
+              const fableRequest: FableRequestContext | undefined = fablePlan
+                ? { plan: fablePlan }
+                : undefined
+              if (fablePlan?.downgraded) {
+                init = { ...init, body: fablePlan.bodyText }
+              }
+
               const initialBody = init?.body
               const trace = createPerfTrace({
                 bodyBytes:
@@ -2836,6 +3178,94 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     ? initialBody.length
                     : undefined,
               })
+              const wrapResponse = (response: Response) =>
+                createStrippedStream(response, {
+                  perf: (stage, data) => trace.mark(stage, data),
+                  ...(!fablePlan?.downgraded && fablePlan
+                    ? {
+                        onContentFilter: () => {
+                          if (!fableRequest?.warmTarget) {
+                            logger.debug(
+                              'fable-fallback',
+                              'content filter recovery unavailable for non-OAuth route',
+                              { session: fablePlan.sessionId },
+                            )
+                            return false
+                          }
+                          const remaining = fableFallbackManager.activate(
+                            fablePlan,
+                            fableRequest.warmTarget.oauthAccountId,
+                          )
+                          logger.info(
+                            'fable-fallback',
+                            'content filter detected; switching session to Opus 4.8',
+                            { session: fablePlan.sessionId, remaining },
+                          )
+                          publishFableRecoveryNotice(
+                            {
+                              sessionId: fablePlan.sessionId,
+                              mode: 'opus',
+                              remaining,
+                            },
+                            storage,
+                            auth,
+                            FABLE_SWITCHED_TO_OPUS_NOTICE,
+                          )
+                        },
+                      }
+                    : {}),
+                  ...(fablePlan?.downgraded && fableRequest
+                    ? {
+                        onComplete: (finishReason: string) => {
+                          const completed = fableFallbackManager.complete(
+                            fablePlan,
+                            fableRequest.opusCacheAnchor,
+                          )
+                          if (!completed.counted) return
+                          logger.info(
+                            'fable-fallback',
+                            'Opus 4.8 turn completed',
+                            {
+                              session: fablePlan.sessionId,
+                              finishReason,
+                              remaining: completed.remaining,
+                            },
+                          )
+                          publishFableRecoveryNotice(
+                            {
+                              sessionId: fablePlan.sessionId,
+                              mode: 'opus',
+                              remaining: completed.remaining,
+                            },
+                            storage,
+                            auth,
+                          )
+                          const warm = warmFableAfterOpus(fableRequest)
+                          if (completed.remaining === 0) {
+                            const notifyRestored = () => {
+                              if (
+                                fableFallbackManager.remaining(
+                                  fablePlan.sessionId,
+                                ) !== 0
+                              )
+                                return
+                              publishFableRecoveryNotice(
+                                {
+                                  sessionId: fablePlan.sessionId,
+                                  mode: 'fable',
+                                  remaining: 0,
+                                },
+                                storage,
+                                auth,
+                                FABLE_RESTORED_NOTICE,
+                              )
+                            }
+                            void warm.then(notifyRestored, notifyRestored)
+                          }
+                        },
+                      }
+                    : {}),
+                })
               const authStart = nowMs()
               const auth = await getAuth()
               trace.mark('get_auth', {
@@ -2857,6 +3287,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               quotaManager.seedFallbacksFromAccounts(
                 (storage?.accounts ?? []).filter(isOAuthAccount),
               )
+              if (!fablePlan) {
+                clearFableRecoveryNotice(sessionId, storage, auth)
+              }
               const replayableRequest = isReplayableRequest(input, init?.body)
               const requestModelId = parseRequestModel(init?.body)
               // Count every replayable request up front — before the
@@ -2913,15 +3346,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       returnLastOnExhausted: false,
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback-first'),
+                      fableRequest,
                     },
                   )
                   if (fallbackResponse) {
                     trace.done('return_fallback_first', {
                       status: fallbackResponse.status,
                     })
-                    return createStrippedStream(fallbackResponse, {
-                      perf: (stage, data) => trace.mark(stage, data),
-                    })
+                    return wrapResponse(fallbackResponse)
                   }
                   preselectedFallbackAccounts = undefined
                 } catch (error) {
@@ -3108,15 +3540,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       {
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
+                        fableRequest,
                       },
                     )
                     if (fallbackResponse) {
                       trace.done('return_preselected_fallback', {
                         status: fallbackResponse.status,
                       })
-                      return createStrippedStream(fallbackResponse, {
-                        perf: (stage, data) => trace.mark(stage, data),
-                      })
+                      return wrapResponse(fallbackResponse)
                     }
                   }
                 } catch (error) {
@@ -3262,9 +3693,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     trace.done('return_killswitch_fallback', {
                       status: fallbackResponse.status,
                     })
-                    return createStrippedStream(fallbackResponse, {
-                      perf: (stage, data) => trace.mark(stage, data),
-                    })
+                    return wrapResponse(fallbackResponse)
                   }
                 }
                 // Nowhere to route (no surviving fallback, or none produced a
@@ -3320,6 +3749,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace,
                 'main',
                 storage,
+                'main',
+                fableRequest,
               )
               let fallbackServed = false
               const response = await tryFallbackAccounts(
@@ -3335,13 +3766,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   writeCurrentSidebarState(account.id, 'fallback')
                 },
                 requestModelId,
+                fableRequest,
               )
               if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 
               trace.done('return_response', { status: response.status })
-              return createStrippedStream(response, {
-                perf: (stage, data) => trace.mark(stage, data),
-              })
+              return wrapResponse(response)
             },
           }
         }

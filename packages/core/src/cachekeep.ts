@@ -11,6 +11,7 @@ export const CACHE_KEEP_EXTENDED_TTL_BETA = 'extended-cache-ttl-2025-04-11'
 export const CACHE_KEEP_MAX_TARGETS = 32
 export const CACHE_KEEP_MAX_BODY_BYTES = 16 * 1024 * 1024
 export const CACHE_KEEP_STALE_TARGET_MS = 2 * CACHE_KEEP_TTL_MS
+export const CACHE_KEEP_PREWARM_TIMEOUT_MS = 30_000
 
 const STATUS_TITLE = '## Claude Cache Keep Status'
 const ENABLED_TITLE = '## Claude Cache Keep Enabled'
@@ -270,6 +271,17 @@ export type CacheKeepTarget = {
   oauthAccountId?: string
 }
 
+export type CacheKeepPrewarmResult =
+  | {
+      ok: true
+      usage?: {
+        input_tokens?: number
+        cache_creation_input_tokens?: number
+        cache_read_input_tokens?: number
+      }
+    }
+  | { ok: false; reason: string; status?: number }
+
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
   private timer: ReturnType<typeof setInterval> | null = null
@@ -279,6 +291,7 @@ export class CacheKeepManager {
       loadStorage: () => Promise<AccountStorage | null>
       fetchImpl?: typeof fetch
       now?: () => number
+      prewarmTimeoutMs?: number
       prepareHeaders?: (
         headers: Headers,
         target: CacheKeepTarget,
@@ -404,6 +417,29 @@ export class CacheKeepManager {
     return { tracked: true }
   }
 
+  async prewarmNow(input: {
+    sessionId: string
+    url: string
+    headers: Headers
+    bodyText: string
+    oauthAccountId?: string
+  }): Promise<CacheKeepPrewarmResult> {
+    const headers: Record<string, string> = {}
+    input.headers.forEach((value, key) => {
+      headers[key] = value
+    })
+    const target: CacheKeepTarget = {
+      id: input.sessionId,
+      url: input.url,
+      headers,
+      bodyText: input.bodyText,
+      cacheExpiresAt: this.options.now?.() ?? Date.now(),
+      dayKey: '',
+      oauthAccountId: input.oauthAccountId,
+    }
+    return this.sendPrewarm(target)
+  }
+
   async tick() {
     const storage = await this.options.loadStorage()
     const window = getCacheKeepWindow(storage)
@@ -427,16 +463,11 @@ export class CacheKeepManager {
     }
   }
 
-  private async prewarm(target: CacheKeepTarget, now: number) {
+  private async sendPrewarm(
+    target: CacheKeepTarget,
+  ): Promise<CacheKeepPrewarmResult> {
     const prewarm = await buildCacheKeepPrewarmBody(target.bodyText)
-    if (!prewarm.ok) {
-      logger.debug('cachekeep', 'prewarm skipped', {
-        session: target.id,
-        reason: prewarm.reason,
-      })
-      this.targets.delete(target.id)
-      return
-    }
+    if (!prewarm.ok) return prewarm
 
     const fetchImpl = this.options.fetchImpl ?? fetch
     const prewarmTarget = { ...target, bodyText: prewarm.bodyText }
@@ -452,15 +483,19 @@ export class CacheKeepManager {
       method: 'POST',
       headers,
       body: prewarm.bodyText,
+      signal: AbortSignal.timeout(
+        this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
+      ),
     })
     if (!response.ok) {
-      logger.warn('cachekeep', 'prewarm failed', {
-        session: target.id,
+      return {
+        ok: false,
+        reason: await response
+          .text()
+          .catch(() => '')
+          .then((body) => body || `HTTP ${response.status}`),
         status: response.status,
-        body: await response.text().catch(() => ''),
-      })
-      target.cacheExpiresAt = now + CACHE_KEEP_PREWARM_LEAD_MS + 5 * 60_000
-      return
+      }
     }
     const data = (await response.json().catch(() => null)) as Record<
       string,
@@ -473,14 +508,33 @@ export class CacheKeepManager {
           cache_read_input_tokens?: number
         }
       | undefined
-    target.cacheExpiresAt = now + CACHE_KEEP_TTL_MS
-    if (usage) {
-      logger.debug('cachekeep', 'prewarm succeeded', {
-        session: target.id,
-        usage,
-      })
-    } else {
-      logger.debug('cachekeep', 'prewarm succeeded', { session: target.id })
+    return { ok: true, ...(usage && { usage }) }
+  }
+
+  private async prewarm(target: CacheKeepTarget, now: number) {
+    const result = await this.sendPrewarm(target)
+    if (!result.ok) {
+      if (result.status == null) {
+        logger.debug('cachekeep', 'prewarm skipped', {
+          session: target.id,
+          reason: result.reason,
+        })
+        this.targets.delete(target.id)
+      } else {
+        logger.warn('cachekeep', 'prewarm failed', {
+          session: target.id,
+          status: result.status,
+          reason: result.reason,
+        })
+        target.cacheExpiresAt = now + CACHE_KEEP_PREWARM_LEAD_MS + 5 * 60_000
+      }
+      return
     }
+
+    target.cacheExpiresAt = now + CACHE_KEEP_TTL_MS
+    logger.debug('cachekeep', 'prewarm succeeded', {
+      session: target.id,
+      ...(result.usage && { usage: result.usage }),
+    })
   }
 }
