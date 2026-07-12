@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url'
 
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = join(pluginRoot, '../..')
+const coreRoot = join(repoRoot, 'packages/core')
 const packageName = '@cortexkit/opencode-anthropic-auth'
+const corePackageName = '@cortexkit/anthropic-auth-core'
 const runtimeSpecifiers = [
   '@opentui/core',
   '@opentui/core/testing',
@@ -88,6 +90,21 @@ try {
   const tarball = join(tempRoot, parsePackedFilename(packStdout))
   check('npm pack produced a tarball', existsSync(tarball), tarball)
 
+  // Release CI validates the new version before that version of core exists on
+  // npm. Pack core locally too so this remains a real isolated installation
+  // without depending on an already-published workspace version.
+  const corePackStdout = run(
+    'npm',
+    ['pack', '--json', '--pack-destination', tempRoot],
+    coreRoot,
+  )
+  const coreTarball = join(tempRoot, parsePackedFilename(corePackStdout))
+  check(
+    'npm pack produced a core tarball',
+    existsSync(coreTarball),
+    coreTarball,
+  )
+
   await mkdir(installRoot, { recursive: true })
   await writeFile(
     join(installRoot, 'package.json'),
@@ -95,7 +112,13 @@ try {
       {
         private: true,
         type: 'module',
-        dependencies: { [packageName]: `file:${tarball}` },
+        dependencies: {
+          [corePackageName]: `file:${coreTarball}`,
+          [packageName]: `file:${tarball}`,
+        },
+        overrides: {
+          [corePackageName]: `file:${coreTarball}`,
+        },
       },
       null,
       2,
