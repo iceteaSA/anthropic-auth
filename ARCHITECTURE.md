@@ -133,8 +133,9 @@
 - Responsibilities: Register Anthropic provider override, register slash commands
 
 **TUI Sidebar Widget:**
-- Location: `packages/opencode/src/tui.tsx`
+- Location: source in `packages/opencode/src/tui.tsx`; package loader in `packages/opencode/src/tui/entry.mjs`
 - Triggers: OpenCode TUI loads the plugin from `tui.json`
+- Packaging: build-time Solid/OpenTUI transformation emits `src/tui-compiled/` with host-runtime virtual imports; the loader selects that compiled tree on OpenTUI 0.4.x and retains raw TSX only for older hosts/development checkouts
 - Responsibilities: Render quota/reporting sidebar, open command modal dialogs on `/claude-*` commands, honor TUI preferences from `tui-preferences.jsonc`
 
 ## Error Handling

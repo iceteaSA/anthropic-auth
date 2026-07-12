@@ -283,16 +283,22 @@ describe('package metadata', () => {
       files?: string[]
       'oc-plugin'?: string[]
       scripts?: Record<string, string>
+      dependencies?: Record<string, string>
     }
 
     expect(packageJson.exports?.['./tui']).toEqual({
       types: './dist/tui.d.ts',
-      import: './src/tui.tsx',
+      import: './src/tui/entry.mjs',
     })
     expect(packageJson.files).toContain('src/tui.tsx')
+    expect(packageJson.files).toContain('src/tui')
+    expect(packageJson.files).toContain('src/tui-compiled')
     expect(packageJson.files).toContain('src/sidebar-state.ts')
     expect(packageJson['oc-plugin']).toEqual(['server', 'tui'])
-    expect(packageJson.scripts?.build).not.toContain('--outfile dist/tui.js')
+    expect(packageJson.scripts?.build).toContain('bun run build:tui')
+    for (const dependency of ['@opentui/core', '@opentui/solid', 'solid-js']) {
+      expect(packageJson.dependencies?.[dependency]).toMatch(/^\d/)
+    }
   })
 
   test('package TUI entrypoint imports under OpenTUI runtime support', () => {
