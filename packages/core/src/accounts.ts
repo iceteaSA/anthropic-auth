@@ -854,23 +854,118 @@ async function writeJsonAtomic(path: string, value: unknown) {
   }
 }
 
+export interface SaveAccountsOptions {
+  /** Account ids intentionally removed by this mutation. */
+  removedAccountIds?: readonly string[]
+  /** Preserve disk order when a stale snapshot is missing newer accounts. */
+  preserveExistingAccountOrder?: boolean
+}
+
+function sameAccountIdentity(
+  left: FallbackAccount,
+  right: FallbackAccount,
+): boolean {
+  return (
+    left.id === right.id ||
+    Boolean(left.label && right.label && left.label === right.label)
+  )
+}
+
+function mergeAccountsForSave(
+  existing: readonly FallbackAccount[],
+  incoming: readonly FallbackAccount[],
+  options: SaveAccountsOptions,
+): FallbackAccount[] {
+  const removedIds = new Set(options.removedAccountIds ?? [])
+  const current = existing.filter((account) => !removedIds.has(account.id))
+  const next = incoming.filter((account) => !removedIds.has(account.id))
+  const missing = current.filter(
+    (account) =>
+      !next.some((candidate) => sameAccountIdentity(candidate, account)),
+  )
+  if (!missing.length) return [...next]
+  if (options.preserveExistingAccountOrder === false) {
+    return [...next, ...missing]
+  }
+
+  const usedIncoming = new Set<number>()
+  const merged = current.map((account) => {
+    const index = next.findIndex(
+      (candidate, candidateIndex) =>
+        !usedIncoming.has(candidateIndex) &&
+        sameAccountIdentity(candidate, account),
+    )
+    const candidate = next[index]
+    if (!candidate) return account
+    usedIncoming.add(index)
+    return candidate
+  })
+  for (let index = 0; index < next.length; index++) {
+    const candidate = next[index]
+    if (!usedIncoming.has(index) && candidate) merged.push(candidate)
+  }
+  return merged
+}
+
+const ACCOUNT_CONFIG_LOCK_TTL_MS = 10_000
+const ACCOUNT_CONFIG_LOCK_WAIT_MS = 12_000
+
+async function acquireAccountConfigWriteLock(path: string) {
+  await mkdir(dirname(path), { recursive: true })
+  const deadline = Date.now() + ACCOUNT_CONFIG_LOCK_WAIT_MS
+  while (true) {
+    const lock = await acquireRefreshFileLock({
+      name: 'config-write',
+      ttlMs: ACCOUNT_CONFIG_LOCK_TTL_MS,
+      path,
+      renew: true,
+    })
+    if (lock) return lock
+    if (Date.now() >= deadline) {
+      throw new Error(
+        'Timed out waiting for the account configuration write lock',
+      )
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
 export function saveAccounts(
   storage: AccountStorage,
   path = getAccountStoragePath(),
+  options: SaveAccountsOptions = {},
 ): Promise<void> {
   const resolvedPath = path
-  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath))
+  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath, options))
 }
 
-async function saveAccountsLocked(storage: AccountStorage, path: string) {
-  const existing = await loadExistingTopLevelFields(path)
-  const nextConfig = { ...existing, ...configFromStorage(storage) }
-  await writeJsonAtomic(path, nextConfig)
-  await saveAccountStateUnlocked(storage, path, {
-    mainQuota: true,
-    mainRefresh: true,
-    accounts: true,
-  })
+async function saveAccountsLocked(
+  storage: AccountStorage,
+  path: string,
+  options: SaveAccountsOptions,
+) {
+  const lock = await acquireAccountConfigWriteLock(path)
+  try {
+    const current = await loadAccounts(path)
+    const nextStorage: AccountStorage = {
+      ...storage,
+      accounts: mergeAccountsForSave(
+        current?.accounts ?? [],
+        storage.accounts,
+        options,
+      ),
+    }
+    const existing = await loadExistingTopLevelFields(path)
+    const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+    await writeJsonAtomic(path, nextConfig)
+    await saveAccountStateUnlocked(nextStorage, path, {
+      mainQuota: true,
+      mainRefresh: true,
+      accounts: true,
+    })
+  } finally {
+    await lock.release()
+  }
 }
 
 function applyMainQuotaStatePatch(
@@ -1841,7 +1936,9 @@ export async function removeAccountPersistent(
   const storage = await loadAccounts(path)
   if (!storage) return false
   const existed = removeAccount(storage, id)
-  if (existed) await saveAccounts(storage, path)
+  if (existed) {
+    await saveAccounts(storage, path, { removedAccountIds: [id] })
+  }
   return existed
 }
 
@@ -1852,7 +1949,7 @@ export async function reorderAccountsPersistent(
   const storage = await loadAccounts(path)
   if (!storage) return
   reorderAccounts(storage, orderedIds)
-  await saveAccounts(storage, path)
+  await saveAccounts(storage, path, { preserveExistingAccountOrder: false })
 }
 
 export async function setAccountEnabledPersistent(

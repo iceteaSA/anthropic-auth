@@ -3525,6 +3525,79 @@ describe('setAccountEnabled', () => {
 
 // -- Persistent round-trip tests -----------------------------------------------
 
+describe('multi-account persistence', () => {
+  test('a stale full snapshot cannot delete a newer account from config or state', async () => {
+    const current = baseStorage()
+    current.accounts.push({
+      id: 'umut',
+      label: 'umut',
+      type: 'oauth',
+      access: 'umut-access',
+      refresh: 'umut-refresh',
+    })
+    await saveAccounts(current, accountPath)
+
+    const stale = baseStorage()
+    stale.accounts.push({
+      id: 'yiyi',
+      label: 'yiyi',
+      type: 'oauth',
+      access: 'yiyi-access',
+      refresh: 'yiyi-refresh',
+    })
+    await saveAccounts(stale, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts.map((account) => account.id)).toEqual([
+      'umut',
+      'yiyi',
+    ])
+    expect(
+      expectOAuthAccount(
+        loaded?.accounts.find((account) => account.id === 'umut'),
+      ).refresh,
+    ).toBe('umut-refresh')
+    expect(
+      expectOAuthAccount(
+        loaded?.accounts.find((account) => account.id === 'yiyi'),
+      ).refresh,
+    ).toBe('yiyi-refresh')
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(Object.keys(state.accounts)).toEqual(['umut', 'yiyi'])
+  })
+
+  test('concurrent account additions preserve both accounts', async () => {
+    await Promise.all([
+      addAccountPersistent(
+        {
+          id: 'first',
+          label: 'first',
+          type: 'oauth',
+          refresh: 'first-refresh',
+        },
+        accountPath,
+      ),
+      addAccountPersistent(
+        {
+          id: 'second',
+          label: 'second',
+          type: 'oauth',
+          refresh: 'second-refresh',
+        },
+        accountPath,
+      ),
+    ])
+
+    const loaded = await loadAccounts(accountPath)
+    expect(new Set(loaded?.accounts.map((account) => account.id))).toEqual(
+      new Set(['first', 'second']),
+    )
+  })
+})
+
 describe('removeAccountPersistent', () => {
   test('persists removal across load', async () => {
     const storage = baseStorage()

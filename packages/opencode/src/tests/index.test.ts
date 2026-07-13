@@ -4313,12 +4313,23 @@ describe('auth.loader', () => {
         'message-1',
       )
       now = 120000
+      // The second quota fetch never resolves. A correct background refresh
+      // still lets the model response settle; a blocking implementation hits
+      // this deadlock backstop regardless of machine speed.
+      let timeout: ReturnType<typeof setTimeout> | undefined
       const second = await Promise.race([
         result
           .fetch(MESSAGES_URL, EMPTY_POST)
           .then((response: Response) => response.text()),
-        new Promise((resolve) => setTimeout(() => resolve('blocked'), 20)),
-      ])
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('model request blocked on quota refresh')),
+            2_000,
+          )
+        }),
+      ]).finally(() => {
+        if (timeout) clearTimeout(timeout)
+      })
 
       expect(second).toBe('message-2')
       // Background quota refresh involves file-lock I/O; wait for it to fire.
