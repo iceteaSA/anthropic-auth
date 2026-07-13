@@ -51,7 +51,7 @@
 6. **Request body rewrite** — `rewriteRequestBody()` strips trailing assistant messages, normalizes Fable/Mythos thinking and Sonnet 5 adaptive thinking, injects billing header, sanitizes system prompt (removes OpenCode identity), prepends Claude Code identity, applies cache strategy (explicit/automatic/hybrid), adds fast mode, prefixes tool names with `mcp_`, creates `cch` over serialized body — `packages/opencode/src/transform.ts`
 7. **Routing** — `shouldFallbackStatus()` checks if response should trigger fallback; `FallbackAccountManager` iterates accounts in routing order (main-first or fallback-first), respecting quota policy, model-scoped quotas, and killswitch thresholds (including per-model scoped thresholds). If all accounts fail the killswitch policy, a 429 block response is returned immediately; this block is classified as scoped-driven (matching a specific model's weekly limit) or account-level (5h/7d limits) with a model-specific or generic retry hint — `packages/core/src/routing.ts`, `packages/core/src/accounts.ts`, `packages/opencode/src/index.ts`
 8. **Relay** — `sendViaRelay()` sends full or patched body to Cloudflare Worker, which streams Anthropic response back — `packages/core/src/relay.ts`
-9. **SSE stream and Fable recovery** — Response body is wrapped in `createStrippedStream()`, which reverses the tool name prefix and detects Anthropic `refusal` finishes. For selected Fable sessions, a refusal activates a session-local 10-response Opus 4.8 downgrade; every successful downgraded response triggers a zero-output Fable prewarm through `CacheKeepManager` using the OAuth account that served the filtered Fable request. The last successful Opus tail anchor is retained per session and OAuth account; if Fable later refuses after that anchor has moved outside Anthropic's 20-block lookback, the retry spends the system cache slot on an explicit old-Opus-to-current-tail bridge rather than rewriting the intervening Opus cache. Recovery transitions are written per session to the TUI sidebar state; when no matching TUI is connected, OpenCode Desktop receives immediate ignored/no-reply `promptAsync` notices for the switch to Opus and return to Fable. Each notice is assigned a message ID immediately before the active assistant message: Desktop displays it immediately by creation time, while OpenCode's run loop sees it as older than the active assistant and cannot mistake it for pending user work or create an extra provider response — `packages/opencode/src/transform.ts`, `packages/opencode/src/fable-fallback.ts`, `packages/opencode/src/index.ts`
+9. **SSE stream and Fable recovery** — Response body is wrapped in `createStrippedStream()`, which reverses the tool name prefix and detects Anthropic `refusal` finishes. For selected Fable sessions, a refusal activates a session-local 10-response Opus 4.8 downgrade; every successful downgraded response triggers a zero-output Fable prewarm through `CacheKeepManager` using the OAuth account that served the filtered Fable request. The last successful Opus tail anchor is retained per session and OAuth account; if Fable later refuses after that anchor has moved outside Anthropic's 20-block lookback, the retry spends the system cache slot on an explicit old-Opus-to-current-tail bridge rather than rewriting the intervening Opus cache. Recovery transitions are written per session to the TUI sidebar state; when no matching TUI is connected, OpenCode Desktop receives immediate ignored/no-reply `promptAsync` notices for the switch to Opus and return to Fable. Each notice is assigned a message ID immediately before the active assistant message: Desktop displays it immediately by creation time, while OpenCode's run loop sees it as older than the active assistant and cannot mistake it for pending user work or create an extra provider response — `packages/opencode/src/transform.ts`, `packages/opencode/src/fable-fallback.ts`, `packages/opencode/src/prompt-context.ts`, `packages/opencode/src/index.ts`
 10. **Sidebar update** — `writeSidebarState()` writes quota/routing/cache state plus bounded per-session Fable recovery status to a JSON file read by the TUI sidebar widget (separate process via RPC) — `packages/opencode/src/sidebar-state.ts`
 
 **Pi Request Lifecycle:**
@@ -72,6 +72,7 @@
 1. `CacheKeepManager` tracks recently used hybrid-cache sessions and their associated `oauthAccountId` — `packages/core/src/cachekeep.ts`
 2. ~5 minutes before the 1-hour cache TTL expires, sends a `max_tokens: 0` pre-warm request (authenticated using the corresponding main or fallback account credentials) to extend the cache entry
 3. Removes response-only fields (streaming, thinking, structured output, forced tool choice) from the pre-warm body
+4. Each manager publishes session IDs and cache timing (never request bodies, headers, or tokens) to a host-scoped temporary lease registry; status commands aggregate live records across project/plugin processes, and stale process records age out after three minutes
 
 ## Key Abstractions
 
@@ -88,12 +89,22 @@
 **CacheKeepManager:**
 - Purpose: Tracks hybrid-cache sessions and sends pre-warm requests before 1-hour TTL expiry; also exposes immediate zero-output prewarming for Fable content-filter recovery
 - Location: `packages/core/src/cachekeep.ts`
-- Pattern: In-memory target tracking with configurable time window; tracks the associated `oauthAccountId` to pre-warm using the correct credentials; supports up to 32 concurrent sessions
+- Pattern: In-memory target tracking with configurable time window; tracks the associated `oauthAccountId` to pre-warm using the correct credentials; supports up to 32 concurrent sessions per manager and publishes sanitized tracking snapshots on changes/heartbeats
+
+**CacheKeepSessionRegistry:**
+- Purpose: Aggregates current CacheKeep session visibility across independently loaded OpenCode project plugins or Pi processes without sharing request payloads or credentials
+- Location: `packages/core/src/cachekeep-registry.ts`
+- Pattern: One atomic JSON lease record per manager under the system temporary directory; records contain only session IDs and cache timing, are separated into OpenCode/Pi scopes, deduplicate by session ID, and are ignored after a three-minute stale lease
 
 **FableFallbackManager:**
 - Purpose: Maintains session-local Fable content-filter recovery state, rewriting the next 10 successful model requests to Opus 4.8 before probing Fable again
 - Location: `packages/opencode/src/fable-fallback.ts`
 - Pattern: Bounded, expiring in-memory session map with cycle IDs so late responses cannot decrement a newer recovery cycle; preserves the OAuth account identity used for Fable cache prewarming and the newest account-bound Opus tail fingerprint for a later model-specific cache bridge
+
+**PromptContextResolver:**
+- Purpose: Resolves the active agent, model, variant, and latest message IDs (assistant and user) from the OpenCode session message history
+- Location: `packages/opencode/src/prompt-context.ts`
+- Pattern: Traverses recent session messages via the client API to reconstruct the current model/variant context for synthetic/ignored notification turns. This prevents OpenCode from resetting to default model configurations or misattributing background prompt notices.
 
 **AccountStorage (sidecar file):**
 - Purpose: Persisted configuration and runtime state — fallback accounts, quotas, refresh backoff, killswitch settings, cache/relay config

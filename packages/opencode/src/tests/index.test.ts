@@ -130,6 +130,10 @@ async function useTempAccountFile(storage: AccountStorage) {
     tempConfigDir,
     'sidebar-state.json',
   )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
+    tempConfigDir,
+    'cachekeep-registry',
+  )
   await saveAccounts(storage)
 }
 
@@ -143,6 +147,10 @@ function restoreProcessTestFiles() {
   process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
     testDir,
     'sidebar-state.json',
+  )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
+    testDir,
+    'cachekeep-registry',
   )
 }
 
@@ -301,26 +309,10 @@ describe('package metadata', () => {
     }
   })
 
-  test('package TUI entrypoint imports under OpenTUI runtime support', () => {
-    const result = Bun.spawnSync({
-      cmd: [
-        process.execPath,
-        '-e',
-        `import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure'
-ensureRuntimePluginSupport()
-const mod = await import('@cortexkit/opencode-anthropic-auth/tui')
-if (mod.default?.id !== 'cortexkit.anthropic-auth' || typeof mod.default?.tui !== 'function') {
-  throw new Error('invalid TUI plugin export')
-}
-`,
-      ],
-      cwd: new URL('../..', import.meta.url).pathname,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-    if (result.exitCode !== 0) {
-      throw new Error(new TextDecoder().decode(result.stderr))
-    }
+  test('raw TUI fallback is loadable for development hosts', async () => {
+    const mod = await import('../tui.tsx')
+    expect(mod.default?.id).toBe('cortexkit.anthropic-auth')
+    expect(mod.default?.tui).toBeFunction()
   })
 })
 
@@ -443,6 +435,11 @@ test('test setup keeps sidebar state off the production default path', () => {
   if (!testDir) throw new Error('missing test directory')
   restoreProcessTestFiles()
   expect(getSidebarStateFile().startsWith(`${testDir}/`)).toBe(true)
+  expect(
+    process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR?.startsWith(
+      `${testDir}/`,
+    ),
+  ).toBe(true)
 })
 
 describe('provider.models', () => {
@@ -838,7 +835,7 @@ describe('auth.loader', () => {
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
-  test('cachekeep tracks OAuth fallback routes with OpenCode session affinity', async () => {
+  test('cachekeep lists tracked sessions across OpenCode plugin instances', async () => {
     const nowHour = new Date().getHours()
     const startHour = (nowHour + 23) % 24
     const endHour = (nowHour + 1) % 24
@@ -888,6 +885,35 @@ describe('auth.loader', () => {
       }),
     })
 
+    const secondPlugin = await getPlugin(createMockClient())
+    const secondResult = await secondPlugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await secondResult.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'session-2' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    const registryDirectory =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR
+    if (!registryDirectory)
+      throw new Error('missing cachekeep registry directory')
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const entries = await readdir(registryDirectory).catch(() => [])
+      if (entries.filter((entry) => entry.endsWith('.json')).length >= 2) break
+      await Bun.sleep(10)
+    }
     await expectHandledCommandResponse(
       plugin['command.execute.before']({
         command: 'claude-cachekeep',
@@ -901,7 +927,10 @@ describe('auth.loader', () => {
       }
     ).mock.calls
     const latestCall = promptCalls.at(-1)?.[0]
-    expect(latestCall?.body.parts[0]?.text).toContain('Tracked sessions: 1')
+    expect(latestCall?.body.parts[0]?.text).toContain('Tracked sessions: 2')
+    expect(latestCall?.body.parts[0]?.text).toContain(
+      'Sessions:\n- session-1\n- session-2',
+    )
   })
 
   test('routes Fable requests to OAuth fallback when main scoped Fable quota is exhausted', async () => {

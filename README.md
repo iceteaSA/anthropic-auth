@@ -457,7 +457,9 @@ In OpenCode, subagent requests do not receive 1-hour TTL caching. The plugin det
 
 The hour range uses local 24-hour time and is start-inclusive/end-exclusive. `09-23` means cache keepalive may run from 09:00 until 22:59. Overnight windows such as `23-09` are accepted.
 
-Cache keepalive only tracks requests when `/claude-cache` is enabled in `hybrid` mode. For each active session seen that day, the package keeps an in-memory clone of the latest rewritten Anthropic request and sends a non-streaming `max_tokens: 0` pre-warm request about five minutes before the 1-hour cache entry would expire. Nothing is written to disk except the schedule configuration.
+Cache keepalive only tracks requests when `/claude-cache` is enabled in `hybrid` mode. For each active session seen that day, the package keeps an in-memory clone of the latest rewritten Anthropic request and sends a non-streaming `max_tokens: 0` pre-warm request about five minutes before the 1-hour cache entry would expire. Running `/claude-cachekeep` without arguments lists every live tracked session across OpenCode projects and plugin processes; Pi reports its own separately scoped live sessions.
+
+Request bodies, headers, and tokens remain in memory. A lease-backed file under the system temporary directory shares only session IDs and cache timing for cross-instance status; records from stopped processes disappear from status after about three minutes.
 
 Pre-warm requests preserve explicit cache anchors but remove response-only fields that Anthropic rejects with `max_tokens: 0`, such as streaming, enabled thinking, structured output format, and forced/any tool choice. The feature works only while OpenCode or Pi is running and the machine is awake, and cache writes are still billed when the cache entry is no longer warm.
 

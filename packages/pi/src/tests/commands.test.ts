@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { CacheKeepSessionRegistry } from '@cortexkit/anthropic-auth-core'
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -9,6 +10,7 @@ import type {
 import { registerCommands } from '../commands'
 
 const ENV_KEY = 'PI_ANTHROPIC_AUTH_FILE'
+const CACHEKEEP_REGISTRY_ENV_KEY = 'PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR'
 
 function mockNotify(): { ctx: ExtensionCommandContext; notified: string[] } {
   const notified: string[] = []
@@ -50,10 +52,12 @@ beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'pi-commands-test-'))
   accountPath = join(tempDir, 'anthropic-auth.json')
   process.env[ENV_KEY] = accountPath
+  process.env[CACHEKEEP_REGISTRY_ENV_KEY] = join(tempDir, 'cachekeep-registry')
 })
 
 afterEach(async () => {
   delete process.env[ENV_KEY]
+  delete process.env[CACHEKEEP_REGISTRY_ENV_KEY]
   await rm(tempDir, { recursive: true, force: true })
 })
 
@@ -264,5 +268,46 @@ describe('claude-logging persistence', () => {
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.logging?.level).toBe('warn')
+  })
+})
+
+describe('claude-cachekeep status', () => {
+  test('lists tracked sessions from all live Pi instances', async () => {
+    const registryDirectory = process.env[CACHEKEEP_REGISTRY_ENV_KEY]
+    if (!registryDirectory)
+      throw new Error('missing cachekeep registry directory')
+    const registry = new CacheKeepSessionRegistry({
+      directory: registryDirectory,
+      instanceId: 'other-pi-instance',
+    })
+    const cacheExpiresAt = Date.now() + 60 * 60_000
+    await registry.publish([
+      {
+        id: 'pi-session-1',
+        cacheExpiresAt,
+        nextPrewarmAt: cacheExpiresAt - 5 * 60_000,
+      },
+    ])
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, startHour: 0, endHour: 23 },
+      }),
+      'utf8',
+    )
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-cachekeep')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('', ctx)
+
+    expect(notified[0]).toContain('Tracked sessions: 1')
+    expect(notified[0]).toContain('Sessions:\n- pi-session-1')
   })
 })

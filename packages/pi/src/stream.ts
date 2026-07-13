@@ -3,10 +3,12 @@ import {
   applyClaudeCodeHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
+  CacheKeepSessionRegistry,
   dumpDirectRequest,
   FAST_MODE_BETA,
   FallbackAccountManager,
   getCache1hPersistentMode,
+  getDefaultCacheKeepRegistryDirectory,
   getRelayConfig,
   getRoutingMode,
   isApiKeyAccount,
@@ -47,8 +49,24 @@ function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
+let cacheKeepRegistry: CacheKeepSessionRegistry | undefined
+let cacheKeepRegistryDirectory: string | undefined
+
+function getPiCacheKeepRegistry() {
+  const directory =
+    process.env.PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
+    getDefaultCacheKeepRegistryDirectory('pi')
+  if (!cacheKeepRegistry || cacheKeepRegistryDirectory !== directory) {
+    cacheKeepRegistry = new CacheKeepSessionRegistry({ directory })
+    cacheKeepRegistryDirectory = directory
+  }
+  return cacheKeepRegistry
+}
+
 const cacheKeepManager = new CacheKeepManager({
   loadStorage: () => loadAccounts(getPiAccountStoragePath()),
+  onTrackedSessionsChanged: (sessions) =>
+    getPiCacheKeepRegistry().publish(sessions),
   prepareHeaders: async (headers, target) => {
     const authorization = headers.get('authorization') ?? ''
     const match = /^Bearer\s+(.+)$/i.exec(authorization)
@@ -80,6 +98,10 @@ const cacheKeepManager = new CacheKeepManager({
     return headers
   },
 })
+
+export async function getPiTrackedCacheKeepSessions() {
+  return getPiCacheKeepRegistry().list(cacheKeepManager.trackedSessions())
+}
 
 function mapStopReason(reason: string | null | undefined): StopReason {
   switch (reason) {

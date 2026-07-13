@@ -12,6 +12,7 @@ import {
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
+  CacheKeepSessionRegistry,
   CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
@@ -42,6 +43,7 @@ import {
   getCache1hMode,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getDefaultCacheKeepRegistryDirectory,
   getKillswitchConfig,
   getKillswitchThresholdsForAccount,
   getPersistedLogLevel,
@@ -678,8 +680,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   fallbackManager.startBackgroundRefresh()
   let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
+  const cacheKeepRegistry = new CacheKeepSessionRegistry({
+    directory:
+      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
+      getDefaultCacheKeepRegistryDirectory('opencode'),
+  })
+  let aggregateCacheKeepSessions: ReturnType<
+    CacheKeepManager['trackedSessions']
+  > = []
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    onTrackedSessionsChanged: async (sessions) => {
+      await cacheKeepRegistry.publish(sessions)
+      aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)
+    },
     prepareHeaders: async (headers, target) => {
       let accessToken: string | undefined
       const accountId = target.oauthAccountId
@@ -815,6 +829,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return current
   }
 
+  async function getAllTrackedCacheKeepSessions() {
+    aggregateCacheKeepSessions = await cacheKeepRegistry.list(
+      cacheKeepManager.trackedSessions(),
+    )
+    return aggregateCacheKeepSessions
+  }
+
   setCache1hState({
     enabled: isCache1hPersistentlyEnabled(initialStorage),
     mode: getCache1hPersistentMode(initialStorage),
@@ -940,7 +961,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           storage?.cacheKeep?.endHour != null
             ? `${storage.cacheKeep.startHour}-${storage.cacheKeep.endHour}`
             : undefined,
-        trackedSessions: cacheKeepManager.trackedCount(),
+        trackedSessions: aggregateCacheKeepSessions.length,
       },
       fableRecoveries:
         fableRecoveryNotices.size > 0
@@ -1237,14 +1258,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
 
     const window = getCacheKeepWindow(storage)
-    const stats = cacheKeepManager.stats(window)
+    const trackedSessionDetails = await getAllTrackedCacheKeepSessions()
+    const nextPrewarmAt = trackedSessionDetails.length
+      ? Math.min(
+          ...trackedSessionDetails.map((session) => session.nextPrewarmAt),
+        )
+      : undefined
     return executeCacheKeepCommand({
       argumentsText,
       enabled: isCacheKeepPersistentlyEnabled(storage),
       window,
       hybridActive: isCacheKeepHybridActive(storage),
-      trackedSessions: stats.trackedSessions,
-      nextPrewarmAt: stats.nextPrewarmAt,
+      trackedSessions: trackedSessionDetails.length,
+      trackedSessionDetails,
+      nextPrewarmAt,
     })
   }
 

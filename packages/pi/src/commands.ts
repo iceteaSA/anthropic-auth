@@ -48,6 +48,7 @@ import type {
 } from '@earendil-works/pi-coding-agent'
 
 import { getPiAccountStoragePath } from './paths.ts'
+import { getPiTrackedCacheKeepSessions } from './stream.ts'
 
 type NotifyKind = 'info' | 'warning' | 'error'
 
@@ -116,6 +117,12 @@ export function registerCommands(pi: ExtensionAPI) {
         storage = await setCacheKeepSubagentsEnabled(action.enabled, path)
       }
 
+      const trackedSessionDetails = await getPiTrackedCacheKeepSessions()
+      const nextPrewarmAt = trackedSessionDetails.length
+        ? Math.min(
+            ...trackedSessionDetails.map((session) => session.nextPrewarmAt),
+          )
+        : undefined
       notify(
         ctx,
         executeCacheKeepCommand({
@@ -123,6 +130,9 @@ export function registerCommands(pi: ExtensionAPI) {
           enabled: isCacheKeepPersistentlyEnabled(storage),
           window: getCacheKeepWindow(storage),
           hybridActive: isCacheKeepHybridActive(storage),
+          trackedSessions: trackedSessionDetails.length,
+          trackedSessionDetails,
+          nextPrewarmAt,
         }),
         action.type === 'usage' ? 'warning' : 'info',
       )

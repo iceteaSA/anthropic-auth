@@ -1,4 +1,5 @@
 import type { AccountStorage } from './accounts.ts'
+import type { CacheKeepTrackedSession } from './cachekeep-registry.ts'
 import { signRequestBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { logger } from './logger.ts'
@@ -36,6 +37,7 @@ export type CacheKeepStatus = {
   enabled: boolean
   window?: CacheKeepWindow
   trackedSessions?: number
+  trackedSessionDetails?: CacheKeepTrackedSession[]
   nextPrewarmAt?: number
   hybridActive?: boolean
 }
@@ -147,6 +149,12 @@ export function buildCacheKeepStatusSummary(status: CacheKeepStatus) {
   if (typeof status.trackedSessions === 'number') {
     lines.push(`Tracked sessions: ${status.trackedSessions}`)
   }
+  if (status.trackedSessionDetails?.length) {
+    lines.push('Sessions:')
+    for (const session of status.trackedSessionDetails) {
+      lines.push(`- ${session.id}`)
+    }
+  }
   if (status.nextPrewarmAt) {
     lines.push(
       `Next prewarm: ${new Date(status.nextPrewarmAt).toLocaleString()}`,
@@ -160,6 +168,7 @@ export function executeCacheKeepCommand(input: {
   enabled?: boolean
   window?: CacheKeepWindow
   trackedSessions?: number
+  trackedSessionDetails?: CacheKeepTrackedSession[]
   nextPrewarmAt?: number
   hybridActive?: boolean
 }) {
@@ -168,6 +177,7 @@ export function executeCacheKeepCommand(input: {
     enabled: input.enabled ?? false,
     window: input.window,
     trackedSessions: input.trackedSessions,
+    trackedSessionDetails: input.trackedSessionDetails,
     nextPrewarmAt: input.nextPrewarmAt,
     hybridActive: input.hybridActive,
   }
@@ -296,6 +306,9 @@ export class CacheKeepManager {
         headers: Headers,
         target: CacheKeepTarget,
       ) => Promise<Headers> | Headers
+      onTrackedSessionsChanged?: (
+        sessions: readonly CacheKeepTrackedSession[],
+      ) => Promise<void> | void
     },
   ) {}
 
@@ -334,8 +347,34 @@ export class CacheKeepManager {
     return { trackedSessions: targets.length, nextPrewarmAt }
   }
 
+  trackedSessions(): CacheKeepTrackedSession[] {
+    return [...this.targets.values()]
+      .map((target) => ({
+        id: target.id,
+        cacheExpiresAt: target.cacheExpiresAt,
+        nextPrewarmAt: target.cacheExpiresAt - CACHE_KEEP_PREWARM_LEAD_MS,
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id))
+  }
+
   trackedCount(): number {
     return this.targets.size
+  }
+
+  private publishTrackedSessions() {
+    const callback = this.options.onTrackedSessionsChanged
+    if (!callback) return
+    try {
+      void Promise.resolve(callback(this.trackedSessions())).catch((error) => {
+        logger.warn('cachekeep', 'failed to publish tracked sessions', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    } catch (error) {
+      logger.warn('cachekeep', 'failed to publish tracked sessions', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
 
   private totalBodyBytes() {
@@ -413,6 +452,7 @@ export class CacheKeepManager {
       oauthAccountId: input.oauthAccountId,
     })
     this.pruneTargets(now, today)
+    this.publishTrackedSessions()
     this.start()
     return { tracked: true }
   }
@@ -448,12 +488,19 @@ export class CacheKeepManager {
 
     this.pruneTargets(now, today)
     if (!this.targets.size) {
+      this.publishTrackedSessions()
       this.stop()
       return
     }
 
-    if (!isCacheKeepHybridActive(storage)) return
-    if (!isWithinCacheKeepWindow(window, new Date(now))) return
+    if (!isCacheKeepHybridActive(storage)) {
+      this.publishTrackedSessions()
+      return
+    }
+    if (!isWithinCacheKeepWindow(window, new Date(now))) {
+      this.publishTrackedSessions()
+      return
+    }
 
     logger.debug('cachekeep', 'fired', { targets: this.targets.size })
     const dueAt = now + CACHE_KEEP_PREWARM_LEAD_MS
@@ -461,6 +508,7 @@ export class CacheKeepManager {
       if (target.cacheExpiresAt > dueAt) continue
       await this.prewarm(target, now)
     }
+    this.publishTrackedSessions()
   }
 
   private async sendPrewarm(

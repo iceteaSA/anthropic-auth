@@ -14,6 +14,7 @@ anthropic-auth/
 │   │   │   │   ├── fixtures/   # Test fixtures (realistic system prompts)
 │   │   │   │   └── __snapshots__/
 │   │   │   └── tui/            # Command modal dialog components
+│   │   ├── scripts/            # Build and smoke-testing scripts for the TUI
 │   │   └── dist/               # Built output (git-ignored)
 │   ├── pi/                     # Pi provider extension
 │   │   ├── src/
@@ -44,6 +45,11 @@ anthropic-auth/
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
 - Contains: `rpc-server.ts`, `rpc-client.ts`, `rpc-dir.ts`, `port-file.ts`, `protocol.ts`, `notifications.ts`
+
+**`packages/opencode/scripts/`:**
+- Purpose: Build and smoke-testing scripts for the precompiled TUI
+- Contains: SolidJS build transformation and package installation validation
+- Key files: `build-tui.ts` (compiles the SolidJS/OpenTUI files to `src/tui-compiled/` with virtual modules), `smoke-tui-pack-install.ts` (validates TUI installation and dependency resolution)
 
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
@@ -84,6 +90,7 @@ anthropic-auth/
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
 - `packages/core/src/cch.ts`: XXH64-based request body signing
 - `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager
+- `packages/core/src/cachekeep-registry.ts`: Temporary lease registry for cross-process tracked-session status
 - `packages/core/src/routing.ts`: Main-first / fallback-first routing mode
 - `packages/core/src/killswitch.ts`: Per-account and model-scoped hard-block thresholds and command execution logic
 - `packages/core/src/provider.ts`: Duck-typed provider HTTP error classification
@@ -101,7 +108,7 @@ anthropic-auth/
 - `packages/opencode/src/fable-fallback.ts`: Per-session 10-response Opus downgrade state and standby Opus cache-anchor identity for Fable content-filter recovery
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed Fable recovery state file for TUI sidebar IPC
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
-- `packages/opencode/src/prompt-context.ts`: Prompt context resolver for OpenCode hidden command replies
+- `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation
 
@@ -132,7 +139,7 @@ anthropic-auth/
 
 **New test:** Co-locate with source as `*.test.ts` — `packages/opencode/src/tests/` for unit tests covering opencode and core modules, `packages/pi/src/tests/` for Pi-specific tests, `packages/e2e-tests/tests/` for integration tests.
 
-**New script:** `scripts/` — use TypeScript (run with `bun`) or plain JavaScript for analysis tools. Reference `tsconfig.scripts.json` for TypeScript compilation options.
+**New script:** `scripts/` (for global analysis/development tools) or `packages/opencode/scripts/` (for TUI build/packaging validations) — use TypeScript (run with `bun`) or plain JavaScript. Reference `tsconfig.scripts.json` or `packages/opencode/tsconfig.scripts.json` for TypeScript compilation options.
 
 **New CLI command:** `packages/opencode/src/cli.ts` — add the subcommand handler following the `login`/`list`/`api add`/`relay setup` pattern.
 

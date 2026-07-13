@@ -88,10 +88,12 @@ OpenAI/Codex analogue) · **[G+A]** generic mechanism wrapping a provider-specif
 
 - **1h cache** (`core/cache1h.ts`, `/claude-cache on|off|mode explicit|automatic|hybrid`): chooses how
   `cache_control` breakpoints + extended-TTL beta are applied. **[A]** (Anthropic prompt-cache model).
-- **cacheKeep** (`core/cachekeep.ts`, `/claude-cachekeep status|off|HH-HH`): keeps the Anthropic
-  **1-hour** extended cache warm. SELF-ARMING via `track()` (every real main request arms the timer +
-  captures freshest body); 60s tick prewarms ≤5min before expiry; replays captured body w/ max_tokens=0.
-  **[G]** self-arming timer + replay pattern; **[A]** 1h TTL, cache_control gate, max_tokens=0. memory #405.
+- **cacheKeep** (`core/cachekeep.ts`, `core/cachekeep-registry.ts`, `/claude-cachekeep status|off|HH-HH`): keeps the Anthropic
+  **1-hour** extended cache warm. SELF-ARMING via `track()` (every eligible OAuth request arms the timer +
+  captures the freshest body); a 60s tick prewarms ≤5min before expiry and replays the captured body with
+  `max_tokens=0`. A temporary host-scoped lease registry lets status aggregate live session IDs across
+  plugin/process instances without persisting bodies, headers, or credentials. **[G]** self-arming timer +
+  replay/lease pattern; **[A]** 1h TTL, cache_control gate, max_tokens=0. memory #405.
 
 ## G. Fast mode — [A]
 
