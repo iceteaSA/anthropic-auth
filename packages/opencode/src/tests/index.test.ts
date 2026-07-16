@@ -26,6 +26,7 @@ import {
   drainSidebarWrites,
   getSidebarState,
   getSidebarStateFile,
+  setSidebarState,
 } from '../sidebar-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
@@ -156,6 +157,19 @@ async function waitForSidebarState(
   }
   const state = await getSidebarState()
   throw new Error(`Sidebar state did not match: ${JSON.stringify(state)}`)
+}
+
+async function seedSidebarRouting(
+  activeId: string,
+  route: string,
+  lastUpdated: number,
+) {
+  await setSidebarState({
+    ...(await getSidebarState()),
+    activeId,
+    route,
+    lastUpdated,
+  })
 }
 
 async function waitForMockCall(fn: { mock?: { calls: unknown[] } }) {
@@ -631,6 +645,177 @@ describe('auth.loader', () => {
     )
     expect(result.apiKey).toBe('')
     expect(result.fetch).toBeFunction()
+  })
+
+  test('boot seeds fallback-first sidebar routing from the first enabled OAuth fallback', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot preserves fresh sidebar routing from another live session', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    await seedSidebarRouting('work-alt', 'fallback-first', Date.now())
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-alt')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot ignores stale sidebar routing and derives fallback-first routing', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    await seedSidebarRouting('main', 'main', Date.now() - 11 * 60 * 1000)
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot ignores fresh sidebar routing for an unknown account', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    await seedSidebarRouting('removed-account', 'fallback-first', Date.now())
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot keeps main-first sidebar routing on main', async () => {
+    await useTempAccountFile(createFallbackStorage())
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('main')
+    expect(state.route).toBe('main')
+  })
+
+  test('/claude-quota preserves the last sidebar routing decision', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
   })
 
   test('dumps direct Anthropic requests when relay is disabled', async () => {

@@ -133,6 +133,7 @@ import type {
 import { getRpcDir } from './rpc/rpc-dir.ts'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
 import {
+  getSidebarState,
   getSidebarStateFile,
   type SidebarState,
   setSidebarState,
@@ -161,6 +162,37 @@ const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
 const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
+const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
+
+async function resolveInitialSidebarRouting(
+  storage: AccountStorage | null,
+): Promise<{ activeId: string | undefined; route: string }> {
+  const enabledOAuthAccounts = (storage?.accounts ?? []).filter(
+    (account): account is OAuthAccount =>
+      account.enabled !== false && isOAuthAccount(account),
+  )
+  const existing = await getSidebarState()
+  const existingAge = Date.now() - existing.lastUpdated
+  const existingActiveIdIsValid =
+    existing.activeId === 'main' ||
+    enabledOAuthAccounts.some((account) => account.id === existing.activeId)
+
+  if (
+    existing.activeId &&
+    existingAge >= 0 &&
+    existingAge <= SIDEBAR_ROUTING_FRESH_MS &&
+    existingActiveIdIsValid
+  ) {
+    return { activeId: existing.activeId, route: existing.route }
+  }
+
+  const firstFallback = enabledOAuthAccounts[0]
+  if (getRoutingMode(storage) === 'fallback-first' && firstFallback) {
+    return { activeId: firstFallback.id, route: 'fallback-first' }
+  }
+
+  return { activeId: 'main', route: 'main' }
+}
 
 /**
  * Format the user-facing 429 message for a killswitch block. When the block
@@ -622,6 +654,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       cause: error instanceof Error ? error : undefined,
     })
   }
+  const initialSidebarRouting =
+    await resolveInitialSidebarRouting(initialStorage)
   const fableFallbackManager = new FableFallbackManager()
   const quotaManager = new QuotaManager({
     storage: initialStorage,
@@ -850,10 +884,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   // Remembers the last explicit routing decision so quota-only sidebar refreshes
   // (background main/fallback quota landing) do not reset the active account.
-  let lastSidebarRouting: { activeId: string | undefined; route: string } = {
-    activeId: 'main',
-    route: 'main',
-  }
+  let lastSidebarRouting = initialSidebarRouting
   const sidebarStateFile = getSidebarStateFile()
   const fableRecoveryNotices = new Map<
     string,
@@ -1872,8 +1903,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ? await latestGetAuth().catch(() => undefined)
           : undefined
         writeSidebarState(cmdStorage, {
-          activeId: 'main',
-          route: 'main',
+          activeId: lastSidebarRouting.activeId,
+          route: lastSidebarRouting.route,
           mainAccessToken: cmdAuth?.access,
           mainRefreshToken: cmdAuth?.refresh,
         })
@@ -2292,8 +2323,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             (initialStorage?.accounts ?? []).filter(isOAuthAccount),
           )
           writeSidebarState(initialStorage, {
-            activeId: 'main',
-            route: 'main',
+            activeId: lastSidebarRouting.activeId,
+            route: lastSidebarRouting.route,
             mainAccessToken: auth.access,
             mainRefreshToken: auth.refresh,
           })
