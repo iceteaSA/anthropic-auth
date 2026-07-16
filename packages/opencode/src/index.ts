@@ -869,12 +869,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         try {
           accessToken = await getCurrentMainAccessToken()
         } catch (error) {
-          // R3: the manager is the single owner of the `prime fire failed`
+          // R3: the manager is the single owner of the fire-failure
           // warn. Return the error result so the manager logs it; the
           // adapter must NOT also log here or the cycle produces two
-          // duplicate warn events.
+          // duplicate warn events. Tag the failure as a token-refresh
+          // failure so the manager emits the spec's distinct
+          // `prime token refresh failed` event rather than the
+          // generic `prime fire failed`.
           return {
             ok: false,
+            reason: 'token-refresh',
             error: error instanceof Error ? error.message : String(error),
           }
         }
@@ -889,9 +893,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         )
         if (!account || !storage) {
           // R3: the manager is the single owner of `prime fire failed`.
-          // Return the error result silently so only one warn event fires.
+          // Return the error result silently so only one warn event
+          // fires. The unavailable-account case is a token-refresh
+          // failure (the token has gone away) so the manager emits
+          // the distinct `prime token refresh failed` event.
           return {
             ok: false,
+            reason: 'token-refresh',
             error: `prime: OAuth account ${accountId} is unavailable`,
           }
         }
@@ -904,10 +912,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           // the cycle at exactly one quota API call per account.
           current = await fallbackManager.refreshAccount(account, storage)
         } catch (error) {
-          // R3: same dedup — the manager logs `prime fire failed` once
-          // per cycle; the adapter returns the error silently.
+          // R3: same dedup — the manager logs the fire-failure warn
+          // once per cycle; the adapter returns the error silently.
+          // Tag as token-refresh so the manager emits the distinct
+          // `prime token refresh failed` event.
           return {
             ok: false,
+            reason: 'token-refresh',
             error: error instanceof Error ? error.message : String(error),
           }
         }

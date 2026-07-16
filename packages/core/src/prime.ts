@@ -60,7 +60,19 @@ export type PrimeSendResult =
       ms: number
       usage?: { inputTokens?: number; outputTokens?: number }
     }
-  | { ok: false; status?: number; ms?: number; error: string }
+  | {
+      ok: false
+      status?: number
+      ms?: number
+      error: string
+      // Discriminates the failure kind so the manager can emit the
+      // spec Logging table's two distinct warn events: `prime token
+      // refresh failed` (warn · prime · { account, error }) for
+      // token-refresh failures, `prime fire failed` (warn · prime ·
+      // { account, status?, error }) for HTTP / fetch / identity
+      // failures during the request itself.
+      reason?: 'token-refresh' | 'send'
+    }
 
 /**
  * Pure command parser — accepts `''` / `on` / `off` and treats anything else
@@ -749,17 +761,23 @@ export class PrimeManager {
     if (this.stopped) return
 
     if (!result.ok) {
-      // Token refresh failure during sendPrime is a distinct canonical
-      // event (warn · prime · { account, error }); the adapter's
-      // `logger.warn('prime', 'fallback token refresh failed', ...)` for
-      // the pre-send refresh is the matching main-refresh path. Both
-      // surface here as the fire-failed warn; the adapter's pre-send
-      // message has already documented the underlying token issue.
-      logger.warn('prime', 'prime fire failed', {
-        account: evaluation.label,
-        status: result.status,
-        error: result.error,
-      })
+      // Spec Logging table: two distinct warn events.
+      // - `prime token refresh failed` — token-refresh failure
+      //   before the request fires (reason: 'token-refresh').
+      // - `prime fire failed` — HTTP error / fetch throw /
+      //   identity failure during the request (reason: 'send').
+      if (result.reason === 'token-refresh') {
+        logger.warn('prime', 'prime token refresh failed', {
+          account: evaluation.label,
+          error: result.error,
+        })
+      } else {
+        logger.warn('prime', 'prime fire failed', {
+          account: evaluation.label,
+          status: result.status,
+          error: result.error,
+        })
+      }
       this.transient.set(evaluation.id, {
         lastPrimedAt: now,
         lastResult: 'error',

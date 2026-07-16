@@ -1231,6 +1231,76 @@ describe('PrimeManager — fresh-check skip does not record as primed', () => {
 })
 
 describe('PrimeManager — logging', () => {
+  test('token-refresh failure logs `prime token refresh failed` (warn) — distinct from the generic `prime fire failed`', async () => {
+    const previousLevel = getLogLevel()
+    setLogLevel('warn')
+    setLogLevelSource('warn')
+    // Only one eligible account (work-alt) so the assertion is
+    // unambiguous: exactly one `prime token refresh failed` record
+    // for the single fire path. Main has no stored quota, so its
+    // runForAccount short-circuits on the not-due branch.
+    const fixture = makePrimeFixture({})
+    fixture.storage.accounts.push({
+      id: 'work-alt',
+      type: 'oauth',
+      refresh: 'r',
+      quota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+      send: () => ({
+        ok: false,
+        reason: 'token-refresh',
+        error: 'main refresh failed',
+      }),
+    })
+    await h.manager.tick()
+
+    const tokenRefreshWarns = capturedPrimeSink.filter(
+      (r) =>
+        r.channel === 'prime' &&
+        r.level === 'warn' &&
+        r.message === 'prime token refresh failed',
+    )
+    expect(tokenRefreshWarns).toHaveLength(1)
+    const payload = tokenRefreshWarns[0]?.payload as
+      | { account?: string; error?: string }
+      | undefined
+    expect(payload?.account).toBe('work-alt')
+    expect(payload?.error).toBe('main refresh failed')
+
+    // The generic `prime fire failed` must NOT fire for a token-refresh
+    // failure — the two events are distinct in the spec Logging table.
+    const fireFailedWarns = capturedPrimeSink.filter(
+      (r) =>
+        r.channel === 'prime' &&
+        r.level === 'warn' &&
+        r.message === 'prime fire failed',
+    )
+    expect(fireFailedWarns).toHaveLength(0)
+    await h.cleanup()
+    setLogLevel(previousLevel)
+    setLogLevelSource(previousLevel)
+  })
+
   test('fire success emits info prime record; failure emits warn; skips emit debug/trace; payloads exclude secrets', async () => {
     const previousLevel = getLogLevel()
     setLogLevel('trace')

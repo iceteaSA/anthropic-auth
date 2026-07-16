@@ -6596,7 +6596,7 @@ describe('claude-prime — warn dedup (R3)', () => {
     globalThis.setInterval = originalSetInterval
   })
 
-  test('R3: a fire-time main token refresh failure produces exactly one warn·prime·prime fire failed record', async () => {
+  test('R3: a fire-time main token refresh failure produces exactly one warn·prime·prime token refresh failed record (distinct from the generic fire-failed event)', async () => {
     // Force the auth loader to throw on the SECOND getAuth call (i.e.
     // when sendPrime re-reads auth for a refresh). The first call
     // (during PrimeManager's fresh-check) succeeds; the second call
@@ -6690,15 +6690,28 @@ describe('claude-prime — warn dedup (R3)', () => {
     setDistSink(null)
     setLogLevel('info')
 
-    // Count `prime fire failed` warn·prime records. The MANAGER is the
-    // single owner of this event per the spec Logging table. The
-    // adapter must NOT also emit it.
+    // Count `prime token refresh failed` warn·prime records. The MANAGER
+    // is the single owner of this event per the spec Logging table. The
+    // adapter must NOT also emit it. The generic `prime fire failed`
+    // event must NOT fire for a token-refresh failure.
+    const tokenRefreshWarns = records.filter(
+      (r) =>
+        r.channel === 'prime' &&
+        r.level === 'warn' &&
+        r.message === 'prime token refresh failed',
+    )
+    expect(tokenRefreshWarns).toHaveLength(1)
+    const payload = tokenRefreshWarns[0]?.payload as
+      | { account?: string; error?: string }
+      | undefined
+    expect(payload?.account).toBe('main')
+    expect(payload?.error).toBe('main refresh failed')
     const fireFailedWarns = records.filter(
       (r) =>
         r.channel === 'prime' &&
         r.level === 'warn' &&
         r.message === 'prime fire failed',
     )
-    expect(fireFailedWarns).toHaveLength(1)
+    expect(fireFailedWarns).toHaveLength(0)
   })
 })
