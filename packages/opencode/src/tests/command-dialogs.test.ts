@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import { buildKillswitchThresholdSeed } from '../tui/command-dialogs'
+import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
+import {
+  buildKillswitchThresholdSeed,
+  buildPrimeStatusRows,
+} from '../tui/command-dialogs'
 
 describe('buildKillswitchThresholdSeed', () => {
   test('preserves scoped killswitch thresholds in the TUI edit seed', () => {
@@ -22,5 +26,57 @@ describe('buildKillswitchThresholdSeed', () => {
         'umut',
       ]),
     ).toBe('main:5,10,0 umut:5,10,0')
+  })
+})
+
+describe('buildPrimeStatusRows', () => {
+  const base = {
+    id: 'main',
+    label: 'main',
+    nextDueAt: null,
+  } as PrimeAccountStatus
+
+  test('renders future-due, successful prime, and active-window rows', () => {
+    const futureDue = Date.now() + 60 * 60_000
+    const past = Date.now() - 60_000
+    const rows = buildPrimeStatusRows([
+      { ...base, id: 'main', nextDueAt: futureDue },
+      {
+        id: 'work-alt',
+        label: 'work-alt',
+        nextDueAt: null,
+        lastPrimedAt: past,
+        lastResult: 'ok',
+        usage: { count: 12, inputTokens: 240, outputTokens: 12, since: 1 },
+        estimatedCostUsd: 0.00132,
+      },
+      {
+        id: 'expired',
+        label: 'expired',
+        // active window: a past nextDueAt means the reset has happened but
+        // the window already started; no row says "primed" and no future
+        // prime is due.
+        nextDueAt: past,
+      },
+    ])
+    expect(rows.length).toBeGreaterThanOrEqual(4)
+    expect(rows[0]).toContain('main · next prime')
+    expect(rows.find((r) => r.includes('work-alt · primed'))).toBeDefined()
+    expect(rows.find((r) => r.includes('12 primes'))).toBeDefined()
+    expect(rows.find((r) => r.includes('— window active'))).toBeDefined()
+  })
+
+  test('error row uses "primed HH:MM err" notation', () => {
+    const rows = buildPrimeStatusRows([
+      {
+        id: 'work-alt',
+        label: 'work-alt',
+        nextDueAt: null,
+        lastPrimedAt: Date.now() - 60_000,
+        lastResult: 'error',
+      },
+    ])
+    expect(rows[0]).toContain('primed')
+    expect(rows[0]).toContain('err')
   })
 })

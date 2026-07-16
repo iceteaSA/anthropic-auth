@@ -1,4 +1,5 @@
 /** @jsxImportSource @opentui/solid */
+import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 
@@ -39,6 +40,52 @@ function showText(api: TuiPluginApi, text: string) {
       <text>{text}</text>
     </box>
   ))
+}
+
+/**
+ * Format the per-account status lines shown in the Claude prime Status view.
+ * Pure: consumed by both the Status dialog and the sidebar expanded row.
+ */
+export function buildPrimeStatusRows(accounts: PrimeAccountStatus[]): string[] {
+  const rows: string[] = []
+  for (const account of accounts) {
+    if (account.usage?.count) {
+      const cost = account.estimatedCostUsd ?? 0
+      rows.push(
+        `${account.label}: ${account.usage.count} ${account.usage.count === 1 ? 'prime' : 'primes'} \u2248 $${formatUsd(cost)}`,
+      )
+    }
+    if (account.nextDueAt && account.nextDueAt > Date.now()) {
+      rows.push(
+        `${account.label} \u00b7 next prime ${formatHm(account.nextDueAt)}`,
+      )
+    } else if (account.lastPrimedAt) {
+      const time = formatHm(account.lastPrimedAt)
+      if (account.lastResult === 'error') {
+        rows.push(`${account.label} \u00b7 primed ${time} err`)
+      } else {
+        rows.push(`${account.label} \u00b7 primed ${time} \u2713`)
+      }
+    } else if (account.usage?.count) {
+      // already shown above
+    } else {
+      rows.push(`${account.label} \u2014 window active`)
+    }
+  }
+  return rows
+}
+
+function formatHm(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function formatUsd(value: number): string {
+  if (value === 0) return '0'
+  if (value < 0.0001) return value.toExponential(2)
+  return value.toFixed(Math.min(6, Math.max(0, 4)))
 }
 
 export function openCommandDialog(
@@ -169,6 +216,111 @@ export function openCommandDialog(
           })
         }}
         onCancel={() => api.ui.dialog.clear()}
+      />
+    ))
+    return
+  }
+
+  if (payload.command === 'claude-prime') {
+    let accounts: PrimeAccountStatus[] =
+      (payload.knobs.accounts as PrimeAccountStatus[] | undefined) ?? []
+    let enabled = payload.knobs.enabled === true
+    const current = enabled ? 'on' : 'off'
+
+    const rebuild = (newPayload: typeof payload) => {
+      // The apply response is the authoritative post-mutation state. We
+      // re-render against the returned knobs so the dialog reflects the
+      // fresh storage without optimistic local mutation.
+      payload = newPayload
+      accounts.length = 0
+      const newAccounts =
+        (newPayload.knobs.accounts as PrimeAccountStatus[] | undefined) ?? []
+      accounts.push(...newAccounts)
+      enabled = newPayload.knobs.enabled === true
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='Claude prime'
+          current={enabled ? 'on' : 'off'}
+          options={[
+            {
+              title: enabled ? 'Disable' : 'Enable',
+              value: enabled ? 'off' : 'on',
+            },
+            { title: 'Status', value: 'status' },
+            { title: 'Back', value: 'back' },
+          ]}
+          onSelect={(option) => {
+            if (option.value === 'back') {
+              api.ui.dialog.clear()
+              return
+            }
+            if (option.value === 'status') {
+              const lines = buildPrimeStatusRows(accounts)
+              const statusText = `Claude prime status:\n\n${lines.join('\n')}`
+              api.ui.dialog.setSize('xlarge')
+              api.ui.dialog.replace(() => (
+                <box flexDirection='column' padding={1} width='100%'>
+                  <text>{statusText}</text>
+                  <box marginTop={1}>
+                    <text>{'  Back'}</text>
+                  </box>
+                </box>
+              ))
+              return
+            }
+            // on/off: call apply and re-render
+            void apply('claude-prime', String(option.value)).then((r) => {
+              api.ui.toast({ message: r.text })
+              rebuild({
+                command: 'claude-prime',
+                text: r.text,
+                knobs: r.knobs,
+              })
+            })
+          }}
+        />
+      ))
+    }
+
+    const DialogSelect = api.ui.DialogSelect<string>
+    api.ui.dialog.setSize('xlarge')
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title='Claude prime'
+        current={current}
+        options={[
+          {
+            title: enabled ? 'Disable' : 'Enable',
+            value: enabled ? 'off' : 'on',
+          },
+          { title: 'Status', value: 'status' },
+          { title: 'Back', value: 'back' },
+        ]}
+        onSelect={(option) => {
+          if (option.value === 'back') {
+            api.ui.dialog.clear()
+            return
+          }
+          if (option.value === 'status') {
+            const lines = buildPrimeStatusRows(accounts)
+            const statusText = `Claude prime status:\n\n${lines.join('\n')}`
+            api.ui.dialog.setSize('xlarge')
+            api.ui.dialog.replace(() => (
+              <box flexDirection='column' padding={1} width='100%'>
+                <text>{statusText}</text>
+              </box>
+            ))
+            return
+          }
+          void apply('claude-prime', String(option.value)).then((r) => {
+            api.ui.toast({ message: r.text })
+            rebuild({
+              command: 'claude-prime',
+              text: r.text,
+              knobs: r.knobs,
+            })
+          })
+        }}
       />
     ))
     return
