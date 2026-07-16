@@ -5661,7 +5661,11 @@ describe('claude-prime direct request', () => {
     await mgr!.tick()
 
     expect(primeCalls).toHaveLength(1)
-    expect(primeCalls[0]?.url).toBe(MESSAGES_URL)
+    // The prime request routes through rewriteUrl which appends
+    // ?beta=true to /v1/messages URLs (house convention for direct
+    // Anthropic calls). Assert the URL is the messages endpoint with
+    // the beta param rather than the bare path.
+    expect(primeCalls[0]?.url).toBe(`${MESSAGES_URL}?beta=true`)
     const init = primeCalls[0]?.init
     const bodyText =
       typeof init?.body === 'string'
@@ -5849,7 +5853,8 @@ describe('claude-prime direct request', () => {
     await mgr!.tick()
 
     const primeCall = calls.find(
-      (c) => c.url === MESSAGES_URL && c.auth?.includes('fb-access'),
+      (c) =>
+        c.url === `${MESSAGES_URL}?beta=true` && c.auth?.includes('fb-access'),
     )
     expect(primeCall).toBeDefined()
     expect(primeCall?.auth).toContain('fb-access')
@@ -6016,5 +6021,240 @@ describe('claude-prime direct request', () => {
       outputTokens: 1,
       since: expect.any(Number),
     })
+  })
+
+  test('main prime refreshes a missing access token before firing (M2)', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    let authCallCount = 0
+    const primeCalls: Array<{ url: string; init: RequestInit | undefined }> = []
+    let _quotaCalls = 0
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.url
+      const _headers = new Headers(init?.headers ?? {})
+      if (url.includes('/v1/messages')) {
+        primeCalls.push({ url, init })
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              usage: { input_tokens: 20, output_tokens: 1 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        _quotaCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(Date.now() - 1_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'refreshed-main-access',
+              refresh_token: 'main-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    // First call: getAuth returns oauth WITHOUT access (triggers refresh).
+    // Second call: getAuth returns oauth WITH the refreshed access token.
+    await plugin.auth.loader(
+      () => {
+        authCallCount += 1
+        if (authCallCount === 1) {
+          return Promise.resolve({
+            type: 'oauth',
+            access: undefined,
+            refresh: 'main-refresh',
+            expires: undefined,
+          })
+        }
+        return Promise.resolve({
+          type: 'oauth',
+          access: 'refreshed-main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        })
+      },
+      { models: {} },
+    )
+    const mgr = (
+      plugin as unknown as { __primeManager?: { tick: () => Promise<void> } }
+    ).__primeManager
+    expect(mgr).toBeDefined()
+    await mgr!.tick()
+
+    // The prime request should have fired with the refreshed token.
+    expect(primeCalls).toHaveLength(1)
+    const init = primeCalls[0]?.init
+    const headers = new Headers(init?.headers ?? {})
+    expect(headers.get('authorization')).toContain('refreshed-main-access')
+  })
+
+  test('a new plugin instance stops the previous prime manager (M3a)', async () => {
+    const fixture = createFallbackStorage({
+      prime: { enabled: true },
+    })
+    await useTempAccountFile(fixture)
+    ;(globalThis as any).setInterval = mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    )
+    // First plugin invocation creates the prime manager and starts it.
+    const plugin1 = await getPlugin()
+    const mgr1 = (plugin1 as any).__primeManager
+    expect(mgr1).toBeDefined()
+    expect(mgr1.isStopped?.()).toBeFalsy()
+    // Second invocation (simulating /reload) must stop the previous
+    // instance before constructing a new one.
+    const plugin2 = await getPlugin()
+    const mgr2 = (plugin2 as any).__primeManager
+    expect(mgr2).toBeDefined()
+    expect(mgr2).not.toBe(mgr1)
+    expect(mgr1.isStopped()).toBe(true)
+  })
+})
+
+describe('claude-prime sidebar on toggle', () => {
+  let sidebarStateFile: string | undefined
+  async function readSidebar(): Promise<{
+    prime?: { enabled?: boolean; accounts?: unknown }
+  }> {
+    if (!sidebarStateFile) {
+      throw new Error('sidebar state file not configured')
+    }
+    const fs = await import('node:fs/promises')
+    try {
+      return JSON.parse(await fs.readFile(sidebarStateFile, 'utf8'))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        // Sidebar file has not been written yet — treat as empty
+        // (degenerate) state with no `prime` field.
+        return {}
+      }
+      throw error
+    }
+  }
+
+  test('/claude-prime on publishes prime section to the sidebar (M7)', async () => {
+    const fixture = createFallbackStorage({
+      prime: { enabled: false },
+    })
+    await useTempAccountFile(fixture)
+    sidebarStateFile = process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    ;(globalThis as any).setInterval = mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    )
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        }),
+      { models: {} },
+    )
+    // Baseline: prime disabled in storage → no prime section in sidebar.
+    const before = await readSidebar()
+    expect(before.prime).toBeUndefined()
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-prime',
+        arguments: 'on',
+        sessionID: 'ses_test',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    // After on, sidebar has the prime section.
+    const afterOn = await readSidebar()
+    expect(afterOn.prime?.enabled).toBe(true)
+    expect(afterOn.prime?.accounts).toBeDefined()
+  })
+
+  test('/claude-prime off removes prime section from the sidebar (M7)', async () => {
+    const fixture = createFallbackStorage({
+      prime: { enabled: true },
+    })
+    await useTempAccountFile(fixture)
+    sidebarStateFile = process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    ;(globalThis as any).setInterval = mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    )
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        }),
+      { models: {} },
+    )
+    // Prime a baseline sidebar write by issuing `/claude-prime on` (the
+    // mutation path publishes the sidebar section per M7).
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-prime',
+        arguments: 'on',
+        sessionID: 'ses_test',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const baseline = await readSidebar()
+    expect(baseline.prime?.enabled).toBe(true)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-prime',
+        arguments: 'off',
+        sessionID: 'ses_test',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    // After off, prime section is removed.
+    const afterOff = await readSidebar()
+    expect(afterOff.prime).toBeUndefined()
   })
 })

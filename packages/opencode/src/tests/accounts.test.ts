@@ -3895,4 +3895,67 @@ describe('incrementPrimeUsagePersistent', () => {
     expect(workAlt?.prime?.count).toBe(1)
     expect(loaded?.prime?.main?.count).toBe(1)
   })
+
+  test('malformed persisted prime counters are dropped on load', async () => {
+    // Write a state file with invalid counter shapes directly. The
+    // `normalizePrimeUsageCounters` validator must reject negative/NaN/
+    // string-coerced fields, so loadAccounts returns `prime === undefined`
+    // for the offending section — a regression that silently accepted
+    // them would let the sidebar render NaN$ totals.
+    const storage = baseStorage()
+    storage.prime = {
+      enabled: true,
+      main: { count: -1, inputTokens: 0, outputTokens: 0, since: -5 },
+    }
+    await saveAccounts(storage)
+
+    const loaded = await loadAccounts()
+    expect(loaded?.prime?.enabled).toBe(true)
+    expect(loaded?.prime?.main).toBeUndefined()
+
+    // NaN / string-coerced fields are also rejected. Cast through unknown
+    // so the test fixture can carry a malformed on-disk shape (the
+    // normalizer is what we're testing, not the input type).
+    const storage2 = baseStorage()
+    storage2.prime = {
+      enabled: true,
+      main: {
+        count: Number.NaN,
+        inputTokens: 0,
+        outputTokens: 0,
+        since: 0,
+      } as unknown as never,
+    }
+    await saveAccounts(storage2)
+    const loaded2 = await loadAccounts()
+    expect(loaded2?.prime?.main).toBeUndefined()
+
+    // A fallback account with a malformed counter is dropped from the
+    // account's prime field, but the rest of the account survives.
+    const storage3 = baseStorage()
+    storage3.accounts.push({
+      id: 'work-alt',
+      type: 'oauth',
+      refresh: 'r',
+      access: 'a',
+    })
+    await saveAccounts(storage3)
+    await incrementPrimeUsagePersistent(
+      'work-alt',
+      { inputTokens: 20, outputTokens: 1 },
+      accountPath,
+      1,
+    )
+    // Tamper the on-disk counter with a negative value.
+    const statePath = getAccountStatePath(accountPath)
+    const raw = JSON.parse(await readFile(statePath, 'utf8'))
+    raw.accounts['work-alt'].prime.count = -7
+    await writeFile(statePath, JSON.stringify(raw), 'utf8')
+    const loaded3 = await loadAccounts()
+    const workAlt3 = loaded3?.accounts.find((a) => a.id === 'work-alt') as
+      | OAuthAccount
+      | undefined
+    expect(workAlt3?.prime).toBeUndefined()
+    expect(workAlt3?.access).toBe('a')
+  })
 })

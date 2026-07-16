@@ -45,11 +45,16 @@ function mockPi(): {
 
 let tempDir: string
 let accountPath: string
+let statePath: string
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'pi-commands-test-'))
   accountPath = join(tempDir, 'anthropic-auth.json')
+  // The core's getAccountStatePath places the state file alongside
+  // the config when the config ends with the account file name.
+  statePath = join(tempDir, 'anthropic-auth-state.json')
   process.env[ENV_KEY] = accountPath
+  process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = statePath
 })
 
 afterEach(async () => {
@@ -264,5 +269,120 @@ describe('claude-logging persistence', () => {
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.logging?.level).toBe('warn')
+  })
+})
+
+describe('claude-prime — Pi display-only contract', () => {
+  // The plan + rev-1 / rev-2 require that Pi's `/claude-prime` handler
+  // is display-only: it must NEVER call `setPrimePersistentEnabled`,
+  // and on/off/status args must all return the same status text. The
+  // byte-for-byte config + runtime-state file invariance ensures a
+  // future edit that wires Pi to the persistent setter would fail this
+  // test.
+
+  function readConfigAndState() {
+    return Promise.all([
+      readFile(accountPath, 'utf8').then((text) => JSON.parse(text)),
+      readFile(statePath, 'utf8')
+        .then((text) => JSON.parse(text))
+        .catch(() => null),
+    ]).then(([config, state]) => ({ config, state }))
+  }
+
+  test('registers a claude-prime command (sanity)', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({ version: 1, accounts: [] }),
+      'utf8',
+    )
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    expect(commands.get('claude-prime')).toBeDefined()
+  })
+
+  test('status arg notifies the current status; config + state bytes are unchanged', async () => {
+    const initial = {
+      version: 1,
+      accounts: [],
+      prime: { enabled: true },
+    }
+    await writeFile(accountPath, JSON.stringify(initial), 'utf8')
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-prime')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('status', ctx)
+
+    expect(notified[0] ?? '').toContain('## Claude Prime Status')
+    const { config, state } = await readConfigAndState()
+    expect(config).toEqual(initial)
+    // state file either unchanged (no runtime state) or non-existent.
+    expect(state === null || state.version === 1).toBe(true)
+  })
+
+  test('on arg in Pi is display-only — never toggles the persistent setting', async () => {
+    const initial = {
+      version: 1,
+      accounts: [],
+      prime: { enabled: false },
+    }
+    await writeFile(accountPath, JSON.stringify(initial), 'utf8')
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-prime')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('on', ctx)
+
+    // The handler MUST notify, but the persistent state MUST stay off.
+    expect(notified.length).toBeGreaterThan(0)
+    const { config, state } = await readConfigAndState()
+    expect(config.prime?.enabled).toBe(false)
+    expect(state === null || state.prime?.enabled !== true).toBe(true)
+  })
+
+  test('off arg in Pi is display-only — never toggles the persistent setting', async () => {
+    const initial = {
+      version: 1,
+      accounts: [],
+      prime: { enabled: true },
+    }
+    await writeFile(accountPath, JSON.stringify(initial), 'utf8')
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-prime')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('off', ctx)
+
+    expect(notified.length).toBeGreaterThan(0)
+    const { config, state } = await readConfigAndState()
+    expect(config.prime?.enabled).toBe(true)
+    expect(state === null || state.prime?.enabled !== false).toBe(true)
+  })
+
+  test('empty arg in Pi shows the status and does not mutate storage', async () => {
+    const initial = {
+      version: 1,
+      accounts: [],
+      prime: { enabled: true },
+    }
+    await writeFile(accountPath, JSON.stringify(initial), 'utf8')
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-prime')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('', ctx)
+
+    expect(notified[0] ?? '').toContain('## Claude Prime Status')
+    const { config, state } = await readConfigAndState()
+    expect(config).toEqual(initial)
+    expect(state === null || state.version === 1).toBe(true)
   })
 })

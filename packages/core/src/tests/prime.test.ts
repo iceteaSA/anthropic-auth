@@ -987,6 +987,247 @@ describe('PrimeManager — lifecycle', () => {
     h.manager.stop()
     await h.cleanup()
   })
+
+  test('a tick already in flight aborts before claim when stop() is called', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    // Block refreshQuota until we call stop() so the manager is mid-tick.
+    let releaseRefresh: (() => void) | undefined
+    const refreshBlocked = new Promise<void>((resolve) => {
+      releaseRefresh = resolve
+    })
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    // Override the refresh adapter to block on the gate.
+    h.manager.options.refreshQuota = async () => {
+      await refreshBlocked
+      return {
+        quota: {
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            resetsAt: new Date(now - 1000).toISOString(),
+            checkedAt: 1,
+          },
+        },
+        fresh: true,
+      }
+    }
+    const tickPromise = h.manager.tick()
+    // Let the tick reach the refresh await.
+    await Bun.sleep(10)
+    h.manager.stop()
+    releaseRefresh!()
+    await tickPromise
+    // No claim should have been written because the post-refresh stop
+    // check aborted the cycle.
+    const remaining = await readdir(markerRoot)
+    expect(remaining).toEqual([])
+    await h.cleanup()
+  })
+})
+
+describe('PrimeManager — opt-in toggle', () => {
+  test('a tick after `prime.enabled=false` does not fire even if due', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    // Disable the feature in stored state.
+    fixture.storage.prime = { enabled: false }
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    await h.manager.tick()
+    expect(h.sendCalls).toEqual([])
+    expect((await readdir(markerRoot)).length).toBe(0)
+    await h.cleanup()
+  })
+
+  test('a tick that re-reads storage after refresh sees a fresh opt-in toggle', async () => {
+    // Fixture is initially enabled, but the loadStorage adapter flips to
+    // disabled after the refresh await — simulating an `/claude-prime off`
+    // racing with an in-flight tick. The post-refresh opt-in check must
+    // abort the cycle before claim.
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    let storageDisabled = false
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    h.manager.options.loadStorage = async () => {
+      if (storageDisabled) {
+        return { ...fixture.storage, prime: { enabled: false } }
+      }
+      return fixture.storage
+    }
+    h.manager.options.refreshQuota = async () => {
+      storageDisabled = true
+      return {
+        quota: {
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            resetsAt: new Date(now - 1000).toISOString(),
+            checkedAt: 1,
+          },
+        },
+        fresh: true,
+      }
+    }
+    await h.manager.tick()
+    expect(h.sendCalls).toEqual([])
+    expect((await readdir(markerRoot)).length).toBe(0)
+    await h.cleanup()
+  })
+})
+
+describe('PrimeManager — fresh-check staleness', () => {
+  test('a stale fresh-check (quota API in 429-backoff) skips without claiming', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      // Stored quota has a past resetsAt (so due). The fresh adapter
+      // returns a CACHED past resetsAt — i.e. the quota API was in 429
+      // backoff and the adapter just returned the cached value with
+      // `fresh: false`. Without the staleness guard a stale past resetsAt
+      // would let the manager claim+fire against an already-started
+      // window.
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+      quotaFreshIsStale: true,
+    })
+    await h.manager.tick()
+    expect(h.sendCalls).toEqual([])
+    expect((await readdir(markerRoot)).length).toBe(0)
+    // `prime fired` must NOT appear — the skip is a fresh-check skip, not
+    // a successful prime.
+    const fired = capturedPrimeSink.filter(
+      (r) => r.channel === 'prime' && r.message === 'prime fired',
+    )
+    expect(fired).toHaveLength(0)
+    await h.cleanup()
+  })
+})
+
+describe('PrimeManager — fresh-check skip does not record as primed', () => {
+  test('window-active observation does not touch lastPrimedAt/lastResult', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      // Fresh quota has a future resetsAt (window already running).
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 50,
+          remainingPercent: 50,
+          resetsAt: new Date(now + 5 * 60_000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    await h.manager.tick()
+    expect(h.sendCalls).toEqual([])
+    const stats = h.manager.stats(fixture.storage, now)
+    const mainStatus = stats.find((s) => s.id === 'main') as
+      | { lastPrimedAt?: number | null; lastResult?: 'ok' | 'error' }
+      | undefined
+    // lastPrimedAt / lastResult must NOT be set on a fresh-check skip.
+    // Otherwise the status would render "primed HH:MM ✓" for a request
+    // that never fired.
+    expect(mainStatus?.lastPrimedAt == null).toBe(true)
+    expect(mainStatus?.lastResult).toBeUndefined()
+    // `isWindowActive` exposes the observation separately so the
+    // status / sidebar can render "— window active" without conflating
+    // it with a successful prime.
+    expect(h.manager.isWindowActive('main')).toBe(true)
+    await h.cleanup()
+  })
 })
 
 describe('PrimeManager — logging', () => {

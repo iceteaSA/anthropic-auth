@@ -559,7 +559,6 @@ export class PrimeManager {
       logger.trace('prime', 'tick: feature disabled, skipping')
       return
     }
-    this.lastFallbackRefreshFailureKey = null
     const evaluations = evaluateAccounts(storage)
     await Promise.all(
       evaluations.map((evaluation) =>
