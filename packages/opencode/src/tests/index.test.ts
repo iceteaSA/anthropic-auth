@@ -5224,6 +5224,40 @@ describe('auth.loader', () => {
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
     })
 
+    test('primary adapter harvests one response frame and makes no corroborating usage request', async () => {
+      await useTempAccountFile(harvestStorage())
+      let messageCalls = 0
+      let usageCalls = 0
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) usageCalls++
+        if (url.includes('/v1/messages')) messageCalls++
+        return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+
+      expect(messageCalls).toBe(1)
+      expect(usageCalls).toBe(0)
+      expect(
+        records.filter(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+        ),
+      ).toHaveLength(1)
+      expect(state.main.quota.source).toBe('headers')
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
     test('fallback-served response updates that fallback and not main', async () => {
       await useTempAccountFile(harvestStorage(createFallbackStorage().accounts))
       let messages = 0
