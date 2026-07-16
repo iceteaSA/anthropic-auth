@@ -7,6 +7,7 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
+  formatPrimeAccountValue,
   formatPrimeCost,
   formatPrimeTime,
   getCollapsedQuotaSummary,
@@ -51,6 +52,51 @@ describe('prime display formatters', () => {
     expect(formatPrimeCost(0)).toBe('0')
     expect(formatPrimeCost(0.000025)).toBe('2.50e-5')
     expect(formatPrimeCost(0.125)).toBe('0.1250')
+  })
+
+  test('formats one sidebar value per prime account', () => {
+    const nextDueAt = Date.now() + 60 * 60_000
+    const lastPrimedAt = Date.now() - 60_000
+
+    expect(
+      formatPrimeAccountValue({
+        id: 'main',
+        label: 'main',
+        nextDueAt,
+      }),
+    ).toEqual({ text: formatPrimeTime(nextDueAt), hasError: false })
+    expect(
+      formatPrimeAccountValue({
+        id: 'work-alt',
+        label: 'work-alt',
+        lastPrimedAt,
+        lastResult: 'ok',
+        usage: { count: 3, inputTokens: 60, outputTokens: 3, since: 1 },
+        estimatedCostUsd: 0.000075,
+      }),
+    ).toEqual({
+      text: `primed ${formatPrimeTime(lastPrimedAt)} \u2713`,
+      hasError: false,
+    })
+    expect(
+      formatPrimeAccountValue({
+        id: 'work-alt',
+        label: 'work-alt',
+        usage: { count: 3, inputTokens: 60, outputTokens: 3, since: 1 },
+        estimatedCostUsd: 0.000075,
+      }),
+    ).toEqual({ text: '\u2713 3 \u2248 $7.50e-5', hasError: false })
+    expect(
+      formatPrimeAccountValue({
+        id: 'broken',
+        label: 'broken',
+        lastResult: 'error',
+      }),
+    ).toEqual({ text: 'err', hasError: true })
+    expect(formatPrimeAccountValue({ id: 'idle', label: 'idle' })).toEqual({
+      text: '\u2014',
+      hasError: false,
+    })
   })
 })
 

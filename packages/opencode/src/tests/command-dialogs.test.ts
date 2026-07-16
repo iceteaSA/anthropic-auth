@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test'
 import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
-import { formatPrimeSidebarValue } from '../tui'
 import {
   buildKillswitchThresholdSeed,
   buildPrimeStatusRows,
@@ -81,29 +80,6 @@ describe('buildPrimeStatusRows', () => {
     ])
     expect(rows[0]).toContain('primed')
     expect(rows[0]).toContain('err')
-  })
-})
-
-describe('formatPrimeSidebarValue', () => {
-  test('shows the next due time before cumulative usage', () => {
-    const nextDueAt = Date.now() + 60 * 60_000
-    const value = formatPrimeSidebarValue([
-      {
-        id: 'main',
-        label: 'main',
-        nextDueAt,
-        usage: { count: 1, inputTokens: 20, outputTokens: 1, since: 1 },
-        estimatedCostUsd: 0.000025,
-      },
-    ])
-
-    expect(value.text).toContain(
-      new Date(nextDueAt).toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
-    )
-    expect(value.text).toContain('1 prime')
   })
 })
 

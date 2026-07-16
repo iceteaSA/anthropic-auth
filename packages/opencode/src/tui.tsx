@@ -23,13 +23,11 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
-  formatPrimeCost,
-  formatPrimeTime,
+  formatPrimeAccountValue,
   formatScopedQuotaLabel,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
-  type PrimeSidebarAccountState,
   type QuotaPacing,
   resolveActiveAccount,
   SEVEN_DAY_MS,
@@ -213,44 +211,6 @@ function StatRow(props: {
       </text>
     </box>
   )
-}
-
-/**
- * Format the Prime row value for the expanded sidebar. Mirrors
- * `buildPrimeStatusRows` but compressed into a single line per the
- * sidebar one-line convention. Tone is 'warn' if any account has a
- * `lastResult: 'error'`, otherwise 'ok' / 'muted'.
- */
-export function formatPrimeSidebarValue(accounts: PrimeSidebarAccountState[]): {
-  text: string
-  hasError: boolean
-} {
-  if (accounts.length === 0) {
-    return { text: 'on', hasError: false }
-  }
-  const hasError = accounts.some((a) => a.lastResult === 'error')
-  const parts: string[] = []
-  for (const account of accounts) {
-    let seg = account.label
-    if (account.lastResult === 'error') {
-      seg += ' err'
-    } else if (account.nextDueAt && account.nextDueAt > Date.now()) {
-      seg += ` ${formatPrimeTime(account.nextDueAt)}`
-    } else if (account.usage?.count) {
-      seg += ` \u2713 ${account.usage.count}`
-    }
-    parts.push(seg)
-  }
-  const totalCount = accounts.reduce((sum, a) => sum + (a.usage?.count ?? 0), 0)
-  const totalCost = accounts.reduce(
-    (sum, a) => sum + (a.estimatedCostUsd ?? 0),
-    0,
-  )
-  let text = parts.join(' \u00b7 ')
-  if (totalCount > 0) {
-    text += ` \u00b7 ${totalCount} ${totalCount === 1 ? 'prime' : 'primes'} \u2248 $${formatPrimeCost(totalCost)}`
-  }
-  return { text, hasError }
 }
 
 // Compact row for the collapsed view: muted label left, caller-provided value
@@ -683,11 +643,8 @@ function QuotaSidebar(props: {
     prefs().sections.cache && cacheKeep() != null && cacheKeep()?.window != null
   const prime = () => state().prime
   const showPrime = () => prime() != null
-  const primeValue = () => {
-    const p = prime()
-    if (!p) return { text: 'on', hasError: false }
-    return formatPrimeSidebarValue(p.accounts)
-  }
+  const primeHasError = () =>
+    prime()?.accounts.some((account) => account.lastResult === 'error') ?? false
   const relayValue = () => {
     const r = state().relay
     if (!r) return '\u2014'
@@ -883,9 +840,22 @@ function QuotaSidebar(props: {
           <StatRow
             theme={theme()}
             label='Prime'
-            value={primeValue().text}
-            tone={primeValue().hasError ? 'warn' : 'ok'}
+            value={primeHasError() ? 'err' : 'on'}
+            tone={primeHasError() ? 'warn' : 'ok'}
           />
+          <For each={prime()?.accounts ?? []}>
+            {(account) => {
+              const value = () => formatPrimeAccountValue(account)
+              return (
+                <StatRow
+                  theme={theme()}
+                  label={account.label}
+                  value={value().text}
+                  tone={value().hasError ? 'warn' : 'text'}
+                />
+              )
+            }}
+          </For>
         </Show>
 
         {/* Health — only when something is wrong */}
