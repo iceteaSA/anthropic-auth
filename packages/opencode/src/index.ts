@@ -93,6 +93,7 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
+  primeQuotaSnapshotCheckedAt,
   type QuotaAccountSummary,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
@@ -790,20 +791,42 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
     const accessToken = await getCurrentMainAccessToken()
-    // Capture whether the quota API was in 429-backoff BEFORE the call so
-    // the manager can treat a cached return as "not fresh" (M1). When the
-    // QuotaManager is in backoff, refreshMain returns the cached snapshot
-    // without a network roundtrip; we mark `fresh: false` so the manager
-    // skips the claim and retries next tick.
-    const wasBackedOff = quotaManager.isBackedOff()
+    // Snapshot-derived freshness (R1): capture the baseline
+    // `checkedAt` of the cached quota BEFORE the call. If the result's
+    // `checkedAt` does not advance past the baseline, the result is
+    // cached (429-backoff, file-lock held by another process, or any
+    // future cached-return path) and the manager must skip. This is
+    // robust to every cached-return path without coupling to manager
+    // backoff state.
+    const baseline = primeQuotaSnapshotCheckedAt(quotaManager.getMain()?.quota)
     const quota = await quotaManager.refreshMain(accessToken)
-    return { quota, fresh: !wasBackedOff }
+    const fresh = primeQuotaSnapshotCheckedAt(quota) > baseline
+    return { quota, fresh }
   }
 
   async function refreshPrimeFallbackQuota(
     accountId: string,
   ): Promise<PrimeRefreshResult> {
-    const storage = await loadAccounts(accountStoragePath)
+    // R1: capture a pre-call baseline from the in-memory QuotaManager cache
+    // (token-aware) or the persisted account quota, so the fresh flag is
+    // derived from the snapshot's `checkedAt` advancing past the baseline.
+    // Robust to every cached-return path (backoff, file-lock, future ones).
+    const accountForBaseline = await loadAccounts(accountStoragePath)
+    const inMemoryBaseline = quotaManager.getFallback(
+      accountId,
+      accountForBaseline?.accounts.find(
+        (a): a is OAuthAccount =>
+          a.id === accountId && a.enabled !== false && isOAuthAccount(a),
+      )?.access ?? '',
+    )?.quota
+    const persistedBaseline = accountForBaseline?.accounts.find(
+      (a): a is OAuthAccount =>
+        a.id === accountId && a.enabled !== false && isOAuthAccount(a),
+    )?.quota
+    const baseline = primeQuotaSnapshotCheckedAt(
+      inMemoryBaseline ?? persistedBaseline,
+    )
+    const storage = accountForBaseline
     const account = storage?.accounts.find(
       (candidate): candidate is OAuthAccount =>
         candidate.id === accountId &&
@@ -813,25 +836,22 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (!account || !storage) {
       throw new Error(`prime: OAuth account ${accountId} is unavailable`)
     }
-    // Reuse the same fallback-manager refresh path used by the background
-    // quota refresh — this persists the refreshed quota to the state file
-    // (M1) so the next /claude-prime tick sees the fresh `resetsAt`
-    // instead of the stale stored one. The manager's own `refresh failed`
-    // warn (warn · prime · { account: label, error }) covers the
-    // adapter-level throw — do NOT log here to avoid duplicate warn
-    // events per (accountId, tick) on a persistently-dead token (rev-4).
-    let current = account
-    current = await fallbackManager.refreshAccountQuota(account, storage)
+    // Reuse the same fallback-manager refresh path used by the
+    // background quota refresh — it persists the refreshed quota to the
+    // state file (M1 persist requirement) and is the SINGLE usage-API
+    // call per tick for fallback fresh-checks. The redundant
+    // `quotaManager.refreshFallback` call was collapsed (R2).
+    const refreshed = await fallbackManager.refreshAccountQuota(
+      account,
+      storage,
+    )
     await fallbackManager.save(storage, [accountId])
-    if (!current.access) {
+    if (!refreshed.access) {
       throw new Error(`prime: OAuth account ${accountId} has no access token`)
     }
-    const wasBackedOff = quotaManager.isFallbackBackedOff(
-      accountId,
-      current.access,
-    )
-    const quota = await quotaManager.refreshFallback(accountId, current.access)
-    return { quota, fresh: !wasBackedOff }
+    const quota = refreshed.quota ?? {}
+    const fresh = primeQuotaSnapshotCheckedAt(quota) > baseline
+    return { quota, fresh }
   }
 
   async function sendPrime(
@@ -840,7 +860,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const start = performance.now()
     let accessToken: string | undefined
     let resolvedModel: string | undefined
-    let accountLabel: string | undefined
     try {
       if (accountId === 'main') {
         // Use the same refresh path the fresh-check uses, so a missing or
@@ -850,17 +869,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         try {
           accessToken = await getCurrentMainAccessToken()
         } catch (error) {
-          logger.warn('prime', 'prime fire failed', {
-            account: 'main',
-            error: error instanceof Error ? error.message : String(error),
-          })
+          // R3: the manager is the single owner of the `prime fire failed`
+          // warn. Return the error result so the manager logs it; the
+          // adapter must NOT also log here or the cycle produces two
+          // duplicate warn events.
           return {
             ok: false,
             error: error instanceof Error ? error.message : String(error),
           }
         }
         resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
-        accountLabel = 'main'
       } else {
         const storage = await loadAccounts(accountStoragePath)
         const account = storage?.accounts.find(
@@ -870,32 +888,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             isOAuthAccount(candidate),
         )
         if (!account || !storage) {
-          logger.warn('prime', 'prime fire failed', {
-            account: accountId,
-            error: `OAuth account ${accountId} is unavailable`,
-          })
+          // R3: the manager is the single owner of `prime fire failed`.
+          // Return the error result silently so only one warn event fires.
           return {
             ok: false,
             error: `prime: OAuth account ${accountId} is unavailable`,
           }
         }
-        accountLabel = account.label?.trim() || accountId
         let current = account
         try {
-          // Reuse the same refresh path the fresh-check uses so a stale
-          // token is refreshed before the fire, and the persisted state
-          // stays in sync.
-          current = await fallbackManager.refreshAccountQuota(account, storage)
-          await fallbackManager.save(storage, [accountId])
+          // R2: the fire path refreshes ONLY the token, not the quota.
+          // The fresh-check already performed the single usage-API
+          // call and persisted the result; the fire path reuses the
+          // in-memory quota via the headers / URL contract. This keeps
+          // the cycle at exactly one quota API call per account.
+          current = await fallbackManager.refreshAccount(account, storage)
         } catch (error) {
-          // Dedupe per (accountId, tick) — the manager wraps the run
-          // and uses the lastFallbackRefreshFailureKey to suppress a
-          // second emit if both the fresh-check and the fire paths
-          // produce identical refresh-failure events.
-          logger.warn('prime', 'prime fire failed', {
-            account: accountLabel,
-            error: error instanceof Error ? error.message : String(error),
-          })
+          // R3: same dedup — the manager logs `prime fire failed` once
+          // per cycle; the adapter returns the error silently.
           return {
             ok: false,
             error: error instanceof Error ? error.message : String(error),

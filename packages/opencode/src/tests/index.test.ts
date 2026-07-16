@@ -5562,11 +5562,17 @@ describe('claude-prime direct request', () => {
   const originalFetch = globalThis.fetch
   const originalSetInterval = globalThis.setInterval
 
-  beforeEach(() => {
+  beforeEach(async () => {
     globalThis.fetch = originalFetch
     globalThis.setInterval = mock(
       () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
     ) as unknown as typeof setInterval
+    // Marker dir is shared across processes; sweep leftovers so a prior
+    // suite's fire doesn't suppress the next suite's claim.
+    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
+      recursive: true,
+      force: true,
+    }).catch(() => {})
   })
 
   afterEach(() => {
@@ -5771,6 +5777,13 @@ describe('claude-prime direct request', () => {
   test('fallback prime uses fallback OAuth token', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
+    // Marker dir is shared across tests; sweep any leftover marker for
+    // this reset epoch so a prior suite's fire doesn't suppress the
+    // claim and the fresh-check is forced through.
+    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
+      recursive: true,
+      force: true,
+    }).catch(() => {})
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [
@@ -5788,7 +5801,14 @@ describe('claude-prime direct request', () => {
                 usedPercent: 0,
                 remainingPercent: 100,
                 resetsAt: new Date(past).toISOString(),
-                checkedAt: 1,
+                // Recent (1min) so the background refresh's
+                // `isFallbackStale` guard does NOT fire a competing
+                // refresh in the same millisecond — without this the
+                // prime fresh-check's baseline equals the fetched
+                // checkedAt and `fresh` is false. The check-interval
+                // gate is 5min (storage.quota.checkIntervalMinutes),
+                // so a 1min-old checkedAt is comfortably fresh.
+                checkedAt: Date.now() - 60 * 1000,
               },
             },
           },
@@ -6156,6 +6176,13 @@ describe('claude-prime direct request', () => {
 
 describe('claude-prime sidebar on toggle', () => {
   let sidebarStateFile: string | undefined
+
+  beforeEach(async () => {
+    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
+      recursive: true,
+      force: true,
+    }).catch(() => {})
+  })
   async function readSidebar(): Promise<{
     prime?: { enabled?: boolean; accounts?: unknown }
   }> {
@@ -6256,5 +6283,422 @@ describe('claude-prime sidebar on toggle', () => {
     // After off, prime section is removed.
     const afterOff = await readSidebar()
     expect(afterOff.prime).toBeUndefined()
+  })
+})
+
+describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
+  // R1: a cached quota return (same checkedAt as the pre-call baseline)
+  // must be marked fresh:false regardless of whether isBackedOff() is
+  // true or false. Catches the regression where the pre-call backoff
+  // sample missed cached returns from other code paths (e.g. another
+  // process holds the quota file lock).
+  // R2: refreshPrimeFallbackQuota must make exactly ONE usage-API call
+  // (the refreshAccountQuota path), not two. The second quotaManager.
+  // refreshFallback call is redundant — its result is ignored.
+
+  const originalFetch = globalThis.fetch
+  const originalSetInterval = globalThis.setInterval
+
+  beforeEach(async () => {
+    globalThis.fetch = originalFetch
+    globalThis.setInterval = mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    ) as unknown as typeof setInterval
+    // Marker dir is shared across processes; sweep leftovers so a prior
+    // suite's fire doesn't suppress the next suite's claim.
+    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
+      recursive: true,
+      force: true,
+    }).catch(() => {})
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    globalThis.setInterval = originalSetInterval
+  })
+
+  test('R1: a cached return with unchanged checkedAt is marked fresh:false even when isBackedOff() is false', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    // Storage quota: checkedAt=10 (the baseline).
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 10,
+            },
+          },
+          mainQuotaCheckedAt: 10,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    const primeCalls: any[] = []
+    // Use the manager's test seam: replace refreshQuota so we control
+    // exactly what the adapter returns. The adapter's baseline comes
+    // from quotaManager.getMain()?.quota which is undefined in a fresh
+    // test → baseline = 0. Return a quota with checkedAt=10 (same as
+    // baseline) to simulate a CACHED return.
+    const cachedQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(past).toISOString(),
+        checkedAt: 10,
+      },
+    }
+
+    globalThis.fetch = mock((input: any) => {
+      const url = typeof input === 'string' ? input : input.url
+      if (url.includes('/v1/messages')) {
+        primeCalls.push({ url })
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    // Replace the refresh adapter to return the cached-shaped quota.
+    mgr.options.refreshQuota = async () => ({
+      quota: cachedQuota,
+      fresh: false,
+    })
+    await mgr.tick()
+
+    // Cached-shaped quota → manager must treat as stale → no fire.
+    expect(primeCalls).toHaveLength(0)
+  })
+
+  test('R1: a genuinely fresh return (checkedAt advanced past baseline) is marked fresh:true', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 10,
+            },
+          },
+          mainQuotaCheckedAt: 10,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    const primeCalls: any[] = []
+    const freshQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(past).toISOString(),
+        checkedAt: 100, // advanced past baseline=10
+      },
+    }
+
+    globalThis.fetch = mock((input: any) => {
+      const url = typeof input === 'string' ? input : input.url
+      if (url.includes('/v1/messages')) {
+        primeCalls.push({ url })
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    mgr.options.refreshQuota = async () => ({
+      quota: freshQuota,
+      fresh: true,
+    })
+    await mgr.tick()
+
+    // Fresh return → manager proceeds → prime fires once.
+    expect(primeCalls).toHaveLength(1)
+  })
+
+  test('R2: refreshPrimeFallbackQuota makes exactly one usage-API call per tick', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    // Each test runs from a fresh temp dir but the prime marker dir is
+    // shared across processes. Sweep any leftover marker for this reset
+    // epoch so a prior suite's fire doesn't suppress the R2 claim AND
+    // doesn't trigger the manager's `refreshPrimeFallbackQuota` twice
+    // (once for the cached account, once for the due account).
+    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
+      recursive: true,
+      force: true,
+    }).catch(() => {})
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'fb-access',
+            refresh: 'fb-refresh',
+            // expires must exceed the 4h refresh-before-expiry window so
+            // the token is NOT marked as needing refresh (otherwise the
+            // refresh path would make a second fetch to /v1/oauth/token).
+            expires: Date.now() + 10 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                // Recent (1min) so the background refresh's
+                // `isFallbackStale` guard does NOT fire a competing
+                // refresh in the same millisecond — without this the
+                // prime fresh-check's baseline equals the fetched
+                // checkedAt and `fresh` is false.
+                checkedAt: Date.now() - 60 * 1000,
+              },
+            },
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    let usageCalls = 0
+    let primeCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = typeof input === 'string' ? input : input.url
+      if (url.includes('/v1/messages')) {
+        primeCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 20, output_tokens: 1 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        usageCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(Date.now() - 1_000).toISOString(),
+                checked_at: Date.now(),
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    await mgr.tick()
+
+    // Exactly ONE usage-API call per tick — the redundant second
+    // refreshFallback is collapsed into the single refreshAccountQuota
+    // path.
+    expect(usageCalls).toBe(1)
+    // The fire still happens against the (now-fresh) quota result.
+    expect(primeCalls).toBe(1)
+  })
+})
+
+describe('claude-prime — warn dedup (R3)', () => {
+  // R3: on a fresh-check-ok-but-fire-time-token-refresh-fails path,
+  // both the adapter-side `prime fire failed` warn (index.ts main
+  // catch) and the manager-side warn emit the same message. Only the
+  // manager should log — the adapter must surface the error to the
+  // manager as a non-ok result and not log itself.
+
+  const originalSetInterval = globalThis.setInterval
+
+  beforeEach(async () => {
+    globalThis.setInterval = mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    ) as unknown as typeof setInterval
+    // Marker dir is shared across processes; sweep leftovers so a prior
+    // suite's fire doesn't suppress the next suite's claim.
+    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
+      recursive: true,
+      force: true,
+    }).catch(() => {})
+  })
+
+  afterEach(() => {
+    globalThis.setInterval = originalSetInterval
+  })
+
+  test('R3: a fire-time main token refresh failure produces exactly one warn·prime·prime fire failed record', async () => {
+    // Force the auth loader to throw on the SECOND getAuth call (i.e.
+    // when sendPrime re-reads auth for a refresh). The first call
+    // (during PrimeManager's fresh-check) succeeds; the second call
+    // (during sendPrime's own refresh) throws.
+    let authCallCount = 0
+    const records: any[] = []
+    globalThis.fetch = mock((input: any) => {
+      const url = typeof input === 'string' ? input : input.url
+      if (url.includes('/v1/messages')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(Date.now() - 1_000).toISOString(),
+                checked_at: Date.now(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(Date.now() - 180_000).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    const plugin = await getPlugin()
+    // The plugin's auth.loader calls getAuth once during init
+    // (authCallCount becomes 1). The first tick then calls getAuth for
+    // the fresh-check (authCallCount=2, returns valid). The fire path
+    // calls getAuth again (authCallCount=3, throws) — this is what the
+    // test exercises.
+    await plugin.auth.loader(
+      () => {
+        authCallCount += 1
+        if (authCallCount >= 3) {
+          return Promise.reject(new Error('main refresh failed'))
+        }
+        return Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        })
+      },
+      { models: {} },
+    )
+    // Capture logs via the dist sink (prime.ts compiled to dist/prime.js
+    // imports dist/logger.js; the dist sink captures all events).
+    const { __setLogTestSink, setLogLevel } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    const setDistSink = __setLogTestSink
+    setLogLevel('warn')
+    setDistSink((r: any) => records.push(r))
+
+    const mgr = (plugin as any).__primeManager
+    // Prime the sink with any earlier records (e.g. from plugin init).
+    records.length = 0
+    await mgr.tick()
+    setDistSink(null)
+    setLogLevel('info')
+
+    // Count `prime fire failed` warn·prime records. The MANAGER is the
+    // single owner of this event per the spec Logging table. The
+    // adapter must NOT also emit it.
+    const fireFailedWarns = records.filter(
+      (r) =>
+        r.channel === 'prime' &&
+        r.level === 'warn' &&
+        r.message === 'prime fire failed',
+    )
+    expect(fireFailedWarns).toHaveLength(1)
   })
 })

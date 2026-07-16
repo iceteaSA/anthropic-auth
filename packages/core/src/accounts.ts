@@ -815,6 +815,24 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   )
 }
 
+/**
+ * Public helper for adapters that need to detect whether a quota API
+ * result is a fresh network response or a cached return. Compare the
+ * snapshot's `checkedAt` against a pre-call baseline (`0` for a
+ * baseline with no recorded snapshot). The caller captures the baseline
+ * from whichever source best represents the in-memory state at the
+ * moment of the call (e.g. `quotaManager.getMain()` for main, the
+ * in-memory `accounts[id].quota` for fallback, or `storage.prime.main`
+ * for the persisted snapshot). Using the snapshot's own `checkedAt`
+ * is robust to every cached-return path (429-backoff, file-lock held
+ * by another process, future ones) without coupling to manager state.
+ */
+export function primeQuotaSnapshotCheckedAt(
+  quota: OAuthQuotaSnapshot | undefined,
+): number {
+  return quotaSnapshotCheckedAt(quota)
+}
+
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
