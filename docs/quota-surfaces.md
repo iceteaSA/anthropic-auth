@@ -1,6 +1,6 @@
 # Anthropic quota surfaces
 
-Two independent surfaces expose Claude Pro/Max plan quota to OAuth clients. Both were captured live against real accounts on 2026-07-16 (one Max plan `main`, one Max plan `work-alt` with extra-usage credits enabled). Structural mirror of the openai-auth catalogue: Codex exposes the same two ideas as `x-codex-*` response headers (passive) — Anthropic additionally has a rich poll endpoint.
+Three independent surfaces expose Claude plan quota and account identity to OAuth clients. All captured live on 2026-07-16 against two accounts of **different kinds** — `main`: personal Max plan (`organization_type: claude_max`, `rate_limit_tier: default_claude_max_20x`, extra usage disabled) and `work-alt`: Team seat (`organization_type: claude_team`, `seat_tier: team_tier_1`, `rate_limit_tier: default_claude_max_5x`, extra usage enabled and exhausted). Account kind drives which quota headers/fields appear. Structural mirror of the openai-auth catalogue: Codex exposes the same two ideas as `x-codex-*` response headers (passive) — Anthropic additionally has a rich poll endpoint.
 
 | Surface | Transport | Freshness | Scoped per-model windows | Idle accounts |
 | --- | --- | --- | --- | --- |
@@ -93,9 +93,9 @@ Only `anthropic-organization-id` + `request-id` — the `ratelimit-unified` fami
 
 ## Surface 2 — `anthropic-ratelimit-unified-*` response headers
 
-Present on every `/v1/messages` response (200s included; OAuth transport). Captured live 2026-07-16 on both accounts — the header SET is conditional on account state, not fixed:
+Present on every `/v1/messages` response (200s included; OAuth transport). Captured live 2026-07-16 on both accounts — the header SET is conditional on account state and kind, not fixed:
 
-| Header | main (3%/12%, overage disabled) | work-alt (78%/40%, credits exhausted) |
+| Header | main — personal Max 20x (3%/12%, overage disabled) | work-alt — Team seat, Max-5x tier (78%/40%, credits exhausted) |
 | --- | --- | --- |
 | `…-unified-status` | `allowed` | `allowed` |
 | `…-unified-reset` | `1784252400` (epoch **seconds**) | `1784246400` |
@@ -146,6 +146,28 @@ Conditional headers (absent on main, present on work-alt): `fallback` appears on
 openai-auth is therefore push-based by necessity (QuotaManager fed via `setMain`/`setFallback`); anthropic-auth is pull-based by choice with push available as an optimization.
 
 ---
+
+## Surface 3 — profile API (account kind)
+
+```
+GET https://api.anthropic.com/api/oauth/profile
+authorization: Bearer <oauth access token>
+anthropic-beta: oauth-2025-04-20
+```
+
+Identity + plan metadata; the only surface exposing account KIND. Observed key fields:
+
+| Field | main | work-alt | Notes |
+| --- | --- | --- | --- |
+| `account.has_claude_max` | `true` | `false` | personal-plan flag only — false for Team seats |
+| `organization.organization_type` | `claude_max` | `claude_team` | the account-kind discriminator |
+| `organization.rate_limit_tier` | `default_claude_max_20x` | `default_claude_max_5x` | **quota multiplier tier** — a Team tier-1 seat gets Max-5x-equivalent limits |
+| `organization.seat_tier` | `null` | `team_tier_1` | Team seat level |
+| `organization.has_extra_usage_enabled` | `false` | `true` | matches `extra_usage.is_enabled` in the usage API + `overage-*` headers |
+| `organization.billing_type` | `stripe_subscription` | `stripe_subscription` | |
+| `application.slug` | `claude-code` | `claude-code` | OAuth app identity |
+
+Also returned: account/org uuids, email, subscription status/created, `enabled_plugins`. Not consumed by the plugin today — candidate uses: killswitch defaults per rate-limit tier, account-list labels (`Max 20x` / `Team 5x`), and explaining why the same utilization percent represents very different absolute capacity across accounts.
 
 ## Gaps / opportunities (not built)
 
