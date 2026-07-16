@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
 import { fetchOAuthQuotaSnapshot } from '../accounts.ts'
+import {
+  isQuotaBearingHeaderFrame,
+  normalizeQuotaHeaders,
+} from '../quota-headers.ts'
 
 const MAIN_USAGE_CAPTURE = {
   five_hour: { utilization: 4 },
@@ -47,6 +51,41 @@ const TEAM_USAGE_CAPTURE = {
   },
 }
 
+const MAIN_HEADERS = new Headers({
+  'anthropic-ratelimit-unified-status': 'allowed',
+  'anthropic-ratelimit-unified-reset': '1784252400',
+  'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+  'anthropic-ratelimit-unified-5h-status': 'allowed',
+  'anthropic-ratelimit-unified-5h-utilization': '0.03',
+  'anthropic-ratelimit-unified-5h-reset': '1784252400',
+  'anthropic-ratelimit-unified-7d-status': 'allowed',
+  'anthropic-ratelimit-unified-7d-utilization': '0.12',
+  'anthropic-ratelimit-unified-7d-reset': '1784502000',
+  'anthropic-ratelimit-unified-fallback-percentage': '0.5',
+  'anthropic-ratelimit-unified-overage-status': 'rejected',
+  'anthropic-ratelimit-unified-overage-disabled-reason': 'org_level_disabled',
+})
+
+const TEAM_HEADERS = new Headers({
+  'anthropic-ratelimit-unified-status': 'allowed',
+  'anthropic-ratelimit-unified-reset': '1784246400',
+  'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+  'anthropic-ratelimit-unified-5h-status': 'allowed',
+  'anthropic-ratelimit-unified-5h-utilization': '0.78',
+  'anthropic-ratelimit-unified-5h-reset': '1784246400',
+  'anthropic-ratelimit-unified-7d-status': 'allowed',
+  'anthropic-ratelimit-unified-7d-utilization': '0.4',
+  'anthropic-ratelimit-unified-7d-reset': '1784628000',
+  'anthropic-ratelimit-unified-fallback': 'available',
+  'anthropic-ratelimit-unified-fallback-percentage': '0.5',
+  'anthropic-ratelimit-unified-overage-status': 'rejected',
+  'anthropic-ratelimit-unified-overage-disabled-reason':
+    'org_spend_cap_reached',
+  'anthropic-ratelimit-unified-overage-utilization': '1.0',
+  'anthropic-ratelimit-unified-overage-surpassed-threshold': '1.0',
+  'anthropic-ratelimit-unified-overage-reset': '1785542400',
+})
+
 async function snapshotFor(capture: unknown) {
   return fetchOAuthQuotaSnapshot({
     accessToken: 'test-token',
@@ -84,5 +123,63 @@ describe('quota surface normalization', () => {
 
     expect(main.bindingWindow).toBe('claude-weekly-scoped-fable')
     expect(main.bindingWindowSource).toBe('poll')
+  })
+
+  test('classifies a frame only when at least one unified utilization header exists', () => {
+    expect(isQuotaBearingHeaderFrame(MAIN_HEADERS)).toBe(true)
+    expect(
+      isQuotaBearingHeaderFrame(
+        new Headers({ 'anthropic-ratelimit-unified-status': 'allowed' }),
+      ),
+    ).toBe(false)
+  })
+
+  test('normalizes the personal Max 20x capture with rounded percentages and ISO resets', () => {
+    const now = 1_700_000_000_000
+    const personal = normalizeQuotaHeaders(MAIN_HEADERS, now)
+
+    expect(personal).toMatchObject({
+      five_hour: { usedPercent: 3, remainingPercent: 97, checkedAt: now },
+      seven_day: { usedPercent: 12, remainingPercent: 88, checkedAt: now },
+      bindingWindow: 'five_hour',
+      bindingWindowSource: 'headers',
+      source: 'headers',
+      checkedAt: now,
+    })
+    expect(personal.five_hour?.resetsAt).toBe(
+      new Date(1784252400 * 1000).toISOString(),
+    )
+    expect(personal.fallbackAdvised).toBe(false)
+  })
+
+  test('normalizes the Team Max-5x capture and fallback advisory', () => {
+    const team = normalizeQuotaHeaders(TEAM_HEADERS)
+
+    expect(team.five_hour?.usedPercent).toBe(78)
+    expect(team.seven_day?.usedPercent).toBe(40)
+    expect(team.fallbackAdvised).toBe(true)
+  })
+
+  test('treats every non-core header as optional', () => {
+    const headers = new Headers({
+      'anthropic-ratelimit-unified-5h-utilization': '0.125',
+    })
+
+    expect(normalizeQuotaHeaders(headers).five_hour?.usedPercent).toBe(13)
+  })
+
+  test('rejects non-finite utilization and reset values without throwing', () => {
+    const headers = new Headers({
+      'anthropic-ratelimit-unified-5h-utilization': 'Infinity',
+      'anthropic-ratelimit-unified-5h-reset': 'not-a-number',
+      'anthropic-ratelimit-unified-7d-utilization': 'NaN',
+    })
+
+    expect(normalizeQuotaHeaders(headers)).toMatchObject({
+      fallbackAdvised: false,
+      source: 'headers',
+    })
+    expect(normalizeQuotaHeaders(headers).five_hour).toBeUndefined()
+    expect(normalizeQuotaHeaders(headers).seven_day).toBeUndefined()
   })
 })
