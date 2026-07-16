@@ -317,8 +317,8 @@ const ELIGIBILITY_REASON_LABEL: Record<PrimeEligibilityReason, string> = {
 /**
  * Eligibility check shared by the manager tick and the dialog preview.
  * Returns a discriminated result so the manager can log a specific reason
- * per the spec's Logging table. A killed account is blocked from spending
- * at all — `killswitchPassesPolicy` is called WITHOUT a modelId.
+ * per the spec's Logging table. Eligibility is evaluated for the Haiku model
+ * that the prime request actually sends.
  */
 export function primeIsEligible(input: {
   storage: AccountStorage | null
@@ -332,7 +332,14 @@ export function primeIsEligible(input: {
   if (!input.isEnabled) return { eligible: false, reason: 'disabled' }
   if (input.hasPermanentRefreshError)
     return { eligible: false, reason: 'needs-reauth' }
-  if (!killswitchPassesPolicy(input.quota, input.storage, input.accountId)) {
+  if (
+    !killswitchPassesPolicy(
+      input.quota,
+      input.storage,
+      input.accountId,
+      CLAUDE_HAIKU_4_5_MODEL_ID,
+    )
+  ) {
     return { eligible: false, reason: 'killswitch' }
   }
   return { eligible: true }

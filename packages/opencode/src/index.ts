@@ -571,6 +571,13 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
+export function primeQuotaSnapshotIsFreshSince(
+  quota: OAuthQuotaSnapshot | undefined,
+  refreshStartedAt: number,
+): boolean {
+  return primeQuotaSnapshotCheckedAt(quota) >= refreshStartedAt
+}
+
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
@@ -800,42 +807,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
     const accessToken = await getCurrentMainAccessToken()
-    // Snapshot-derived freshness (R1): capture the baseline
-    // `checkedAt` of the cached quota BEFORE the call. If the result's
-    // `checkedAt` does not advance past the baseline, the result is
-    // cached (429-backoff, file-lock held by another process, or any
-    // future cached-return path) and the manager must skip. This is
-    // robust to every cached-return path without coupling to manager
-    // backoff state.
-    const baseline = primeQuotaSnapshotCheckedAt(quotaManager.getMain()?.quota)
+    const refreshStartedAt = Date.now()
     const quota = await quotaManager.refreshMain(accessToken)
-    const fresh = primeQuotaSnapshotCheckedAt(quota) > baseline
+    const fresh = primeQuotaSnapshotIsFreshSince(quota, refreshStartedAt)
     return { quota, fresh }
   }
 
   async function refreshPrimeFallbackQuota(
     accountId: string,
   ): Promise<PrimeRefreshResult> {
-    // R1: capture a pre-call baseline from the in-memory QuotaManager cache
-    // (token-aware) or the persisted account quota, so the fresh flag is
-    // derived from the snapshot's `checkedAt` advancing past the baseline.
-    // Robust to every cached-return path (backoff, file-lock, future ones).
-    const accountForBaseline = await loadAccounts(accountStoragePath)
-    const inMemoryBaseline = quotaManager.getFallback(
-      accountId,
-      accountForBaseline?.accounts.find(
-        (a): a is OAuthAccount =>
-          a.id === accountId && a.enabled !== false && isOAuthAccount(a),
-      )?.access ?? '',
-    )?.quota
-    const persistedBaseline = accountForBaseline?.accounts.find(
-      (a): a is OAuthAccount =>
-        a.id === accountId && a.enabled !== false && isOAuthAccount(a),
-    )?.quota
-    const baseline = primeQuotaSnapshotCheckedAt(
-      inMemoryBaseline ?? persistedBaseline,
-    )
-    const storage = accountForBaseline
+    const storage = await loadAccounts(accountStoragePath)
     const account = storage?.accounts.find(
       (candidate): candidate is OAuthAccount =>
         candidate.id === accountId &&
@@ -850,6 +831,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     // state file (M1 persist requirement) and is the SINGLE usage-API
     // call per tick for fallback fresh-checks. The redundant
     // `quotaManager.refreshFallback` call was collapsed (R2).
+    const refreshStartedAt = Date.now()
     const refreshed = await fallbackManager.refreshAccountQuota(
       account,
       storage,
@@ -859,7 +841,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       throw new Error(`prime: OAuth account ${accountId} has no access token`)
     }
     const quota = refreshed.quota ?? {}
-    const fresh = primeQuotaSnapshotCheckedAt(quota) > baseline
+    const fresh = primeQuotaSnapshotIsFreshSince(quota, refreshStartedAt)
     return { quota, fresh }
   }
 

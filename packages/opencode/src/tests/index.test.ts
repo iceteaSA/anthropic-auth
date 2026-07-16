@@ -17,7 +17,7 @@ import {
   saveAccounts,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import { AnthropicAuthPlugin } from '../index'
+import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -6287,11 +6287,7 @@ describe('claude-prime sidebar on toggle', () => {
 })
 
 describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
-  // R1: a cached quota return (same checkedAt as the pre-call baseline)
-  // must be marked fresh:false regardless of whether isBackedOff() is
-  // true or false. Catches the regression where the pre-call backoff
-  // sample missed cached returns from other code paths (e.g. another
-  // process holds the quota file lock).
+  // R1: only snapshots stamped during the current refresh call are fresh.
   // R2: refreshPrimeFallbackQuota must make exactly ONE usage-API call
   // (the refreshAccountQuota path), not two. The second quotaManager.
   // refreshFallback call is redundant — its result is ignored.
@@ -6317,10 +6313,35 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
     globalThis.setInterval = originalSetInterval
   })
 
-  test('R1: a cached return with unchanged checkedAt is marked fresh:false even when isBackedOff() is false', async () => {
+  test('R1: a cached positive checkedAt before the refresh call is stale even with no baseline snapshot', () => {
+    const preCall = 10_000
+    const cachedQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: preCall - 1,
+      },
+    }
+
+    expect(primeQuotaSnapshotIsFreshSince(cachedQuota, preCall)).toBe(false)
+  })
+
+  test('R1: a snapshot stamped at the refresh-call boundary is fresh', () => {
+    const preCall = 10_000
+    const fetchedQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: preCall,
+      },
+    }
+
+    expect(primeQuotaSnapshotIsFreshSince(fetchedQuota, preCall)).toBe(true)
+  })
+
+  test('R1: the manager skips a quota result classified stale', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
-    // Storage quota: checkedAt=10 (the baseline).
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -6345,11 +6366,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
     )
 
     const primeCalls: any[] = []
-    // Use the manager's test seam: replace refreshQuota so we control
-    // exactly what the adapter returns. The adapter's baseline comes
-    // from quotaManager.getMain()?.quota which is undefined in a fresh
-    // test → baseline = 0. Return a quota with checkedAt=10 (same as
-    // baseline) to simulate a CACHED return.
     const cachedQuota = {
       five_hour: {
         usedPercent: 0,
@@ -6385,18 +6401,16 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
       { models: {} },
     )
     const mgr = (plugin as any).__primeManager
-    // Replace the refresh adapter to return the cached-shaped quota.
     mgr.options.refreshQuota = async () => ({
       quota: cachedQuota,
       fresh: false,
     })
     await mgr.tick()
 
-    // Cached-shaped quota → manager must treat as stale → no fire.
     expect(primeCalls).toHaveLength(0)
   })
 
-  test('R1: a genuinely fresh return (checkedAt advanced past baseline) is marked fresh:true', async () => {
+  test('R1: the manager fires after a quota result classified fresh', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
@@ -6428,7 +6442,7 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
         usedPercent: 0,
         remainingPercent: 100,
         resetsAt: new Date(past).toISOString(),
-        checkedAt: 100, // advanced past baseline=10
+        checkedAt: 100,
       },
     }
 
@@ -6464,7 +6478,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
     })
     await mgr.tick()
 
-    // Fresh return → manager proceeds → prime fires once.
     expect(primeCalls).toHaveLength(1)
   })
 
@@ -6578,9 +6591,11 @@ describe('claude-prime — warn dedup (R3)', () => {
   // manager should log — the adapter must surface the error to the
   // manager as a non-ok result and not log itself.
 
+  const originalFetch = globalThis.fetch
   const originalSetInterval = globalThis.setInterval
 
   beforeEach(async () => {
+    globalThis.fetch = originalFetch
     globalThis.setInterval = mock(
       () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
     ) as unknown as typeof setInterval
@@ -6593,6 +6608,7 @@ describe('claude-prime — warn dedup (R3)', () => {
   })
 
   afterEach(() => {
+    globalThis.fetch = originalFetch
     globalThis.setInterval = originalSetInterval
   })
 

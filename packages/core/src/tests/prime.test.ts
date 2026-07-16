@@ -20,6 +20,7 @@ import {
   getLogLevel,
   setLogLevel as setLogLevelSource,
 } from '../logger.ts'
+import { CLAUDE_HAIKU_4_5_MODEL_ID } from '../models.ts'
 import type { PrimeRefreshResult } from '../prime.ts'
 import {
   buildPrimeAccountStatuses,
@@ -32,6 +33,7 @@ import {
   type PrimeSendResult,
   type PrimeUsageCounters,
   parsePrimeCommandAction,
+  primeIsEligible,
 } from '../prime.ts'
 
 const STORAGE_TS = 1_721_111_111_000
@@ -280,7 +282,7 @@ function makePrimeFixture(opts?: {
   fallbackEnabled?: boolean
   fallbackType?: 'oauth' | 'api'
   fallbackPermanent?: boolean
-  killswitch?: { enabled?: boolean }
+  killswitch?: AccountStorage['killswitch']
 }) {
   const accountId = 'work-alt'
   const accounts: AccountStorage['accounts'] = []
@@ -624,6 +626,51 @@ describe('PrimeManager — claim atomicity', () => {
 })
 
 describe('PrimeManager — eligibility', () => {
+  test('haiku-scoped exhaustion blocks prime when 5h and 7d are healthy', () => {
+    const storage: AccountStorage = {
+      version: 1,
+      main: { type: 'opencode', provider: 'anthropic' },
+      accounts: [],
+      killswitch: {
+        enabled: true,
+        main: { five_hour: 5, seven_day: 10, scoped: 0 },
+      },
+    }
+
+    expect(
+      primeIsEligible({
+        storage,
+        accountId: 'main',
+        isOAuth: true,
+        isEnabled: true,
+        hasPermanentRefreshError: false,
+        quota: {
+          five_hour: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: 1,
+          },
+          seven_day: {
+            usedPercent: 30,
+            remainingPercent: 70,
+            checkedAt: 1,
+          },
+          scoped: [
+            {
+              id: 'haiku-weekly',
+              title: 'Haiku only',
+              modelId: CLAUDE_HAIKU_4_5_MODEL_ID,
+              modelName: 'Claude Haiku 4.5',
+              usedPercent: 100,
+              remainingPercent: 0,
+              checkedAt: 1,
+            },
+          ],
+        },
+      }),
+    ).toEqual({ eligible: false, reason: 'killswitch' })
+  })
+
   test('disabled fallback is skipped', async () => {
     const fixture = makePrimeFixture({
       fallbackEnabled: false,
