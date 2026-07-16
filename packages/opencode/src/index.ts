@@ -24,6 +24,7 @@ import {
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_LOGGING_COMMAND_NAME,
+  CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
@@ -36,6 +37,7 @@ import {
   executeFastModeCommand,
   executeKillswitchCommand,
   executeLoggingCommand,
+  executePrimeCommand,
   executeRoutingCommand,
   FallbackAccountManager,
   formatQuotaBackoffMessage,
@@ -88,6 +90,7 @@ import {
   parseDumpCommandAction,
   parseFastModeCommandAction,
   parseLoggingCommandAction,
+  parsePrimeCommandAction,
   parseRoutingCommandAction,
   type QuotaAccountSummary,
   QuotaManager,
@@ -115,6 +118,7 @@ import {
   setKillswitchPersistent,
   setLogLevel,
   setLogLevelPersistent,
+  setPrimePersistentEnabled,
   setRoutingMode,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
@@ -1493,6 +1497,36 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return executeLoggingCommand({ argumentsText, level })
   }
 
+  async function executePersistentPrimeCommand(argumentsText: string) {
+    const action = parsePrimeCommandAction(argumentsText)
+    const previous = isPrimePersistentlyEnabled(
+      await loadAccounts(accountStoragePath),
+    )
+    let enabled = previous
+    if (action.type === 'enable') {
+      enabled = true
+      if (!previous) {
+        await setPrimePersistentEnabled(true, accountStoragePath)
+        primeManager.start()
+        logger.info('commands', 'prime changed', { enabled: true })
+      }
+    } else if (action.type === 'disable') {
+      enabled = false
+      if (previous) {
+        await setPrimePersistentEnabled(false, accountStoragePath)
+        primeManager.stop()
+        logger.info('commands', 'prime changed', { enabled: false })
+      }
+    }
+
+    const storage = await loadAccounts(accountStoragePath)
+    return executePrimeCommand({
+      argumentsText,
+      enabled,
+      accounts: primeManager.stats(storage),
+    }).text
+  }
+
   async function executePersistentAccountCommand(
     argumentsText: string,
     sessionId?: string,
@@ -1784,6 +1818,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const storage = await loadAccounts(accountStoragePath)
       return { command, text, knobs: { window: getCacheKeepWindow(storage) } }
     }
+    if (command === 'claude-prime') {
+      const text = await executePersistentPrimeCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      const enabled = isPrimePersistentlyEnabled(storage)
+      return {
+        command,
+        text,
+        knobs: {
+          enabled,
+          accounts: primeManager.stats(storage),
+        },
+      }
+    }
     const storage = await loadAccounts()
     const config = getKillswitchConfig(storage)
     const accountIds = (storage?.accounts ?? [])
@@ -1967,6 +2014,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           description:
             'Keep hybrid Claude cache warm for recently used sessions during a local time window.',
         },
+        [CLAUDE_PRIME_COMMAND_NAME]: {
+          template: CLAUDE_PRIME_COMMAND_NAME,
+          description:
+            "Start each OAuth account's five-hour quota window after reset.",
+        },
 
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
           template: CLAUDE_QUOTAS_COMMAND_NAME,
@@ -2037,6 +2089,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         'claude-account',
         'claude-cache',
         'claude-cachekeep',
+        'claude-prime',
         'claude-quota',
         'claude-dump',
         'claude-fast',
