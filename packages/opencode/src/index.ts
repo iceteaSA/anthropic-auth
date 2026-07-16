@@ -731,6 +731,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const storage =
       (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
     if (served.accountId === 'main') {
+      let currentAccessToken: string | undefined
+      try {
+        const auth = await latestGetAuth?.()
+        if (auth?.type === 'oauth') currentAccessToken = auth.access
+      } catch {}
+      if (currentAccessToken !== served.accessToken) {
+        logger.trace('quota', 'skipped stale main response quota persistence')
+        return
+      }
       storage.quota = storage.quota ?? {}
       storage.quota.mainQuota = entry.quota
       storage.quota.mainQuotaCheckedAt = entry.checkedAt

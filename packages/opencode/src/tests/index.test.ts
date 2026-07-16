@@ -5413,13 +5413,15 @@ describe('auth.loader', () => {
         quota: { enabled: false },
       })
 
-    async function loadFetch() {
+    async function loadFetch(
+      getAccessToken: () => string = () => 'main-access',
+    ) {
       const plugin = await getPlugin()
       return plugin.auth.loader(
         () =>
           Promise.resolve({
             type: 'oauth' as const,
-            access: 'main-access',
+            access: getAccessToken(),
             refresh: 'main-refresh',
             expires: Date.now() + 100000,
           }),
@@ -5461,6 +5463,82 @@ describe('auth.loader', () => {
         (value) => value.main?.quota?.source === 'headers',
       )
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('main header push skips persistence after access-token rotation', async () => {
+      let liveAccessToken = 'old-main-access'
+      const existingQuota = {
+        five_hour: {
+          usedPercent: 11,
+          remainingPercent: 89,
+          checkedAt: 1,
+        },
+        source: 'poll' as const,
+        checkedAt: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainQuota: existingQuota,
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: tokenFingerprint('new-main-access'),
+          },
+        }),
+      )
+      let resolveResponse: ((response: Response) => void) | undefined
+      let markRequestStarted: (() => void) | undefined
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve
+      })
+      const requestAuthorizations: Array<string | null> = []
+      globalThis.fetch = mock(
+        (_input: string | URL | Request, init?: RequestInit) =>
+          new Promise<Response>((resolve) => {
+            requestAuthorizations.push(
+              new Headers(init?.headers).get('authorization'),
+            )
+            resolveResponse = resolve
+            markRequestStarted?.()
+          }),
+      ) as unknown as typeof fetch
+      const result = await loadFetch(() => liveAccessToken)
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      setLogLevel('debug')
+
+      const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
+      await requestStarted
+      liveAccessToken = 'new-main-access'
+      resolveResponse?.(new Response('main-ok', { headers: quotaHeaders }))
+      await responsePromise
+      await Bun.sleep(100)
+      const rawState = JSON.parse(
+        await readFile(
+          getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE),
+          'utf8',
+        ),
+      )
+      const reloaded = await loadAccounts()
+
+      expect(
+        records.some(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+        ),
+      ).toBe(true)
+      expect(requestAuthorizations[0]).toBe('Bearer old-main-access')
+      expect(rawState.main.quota).toEqual(existingQuota)
+      expect(rawState.main.quotaToken).toBe(tokenFingerprint('new-main-access'))
+      expect(reloaded?.quota?.mainQuota).toEqual(existingQuota)
+      expect(reloaded?.quota?.mainQuotaToken).toBe(
+        tokenFingerprint('new-main-access'),
+      )
+      __setLogTestSink(null)
+      setLogLevel('info')
     })
 
     test('main header push preserves persisted poll backoff across reload', async () => {
