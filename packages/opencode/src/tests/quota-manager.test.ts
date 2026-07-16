@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   acquireRefreshFileLock,
+  type OAuthQuotaSnapshot,
   QuotaManager,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -822,6 +823,152 @@ describe('QuotaManager', () => {
       expect(quotaA.five_hour?.usedPercent).not.toBe(
         quotaB.five_hour?.usedPercent,
       )
+    })
+  })
+
+  describe('header pushes', () => {
+    function headerSnapshot(checkedAt = now): OAuthQuotaSnapshot {
+      return {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt,
+        },
+        seven_day: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt,
+        },
+        bindingWindow: 'five_hour',
+        bindingWindowSource: 'headers',
+        fallbackAdvised: true,
+        source: 'headers',
+        checkedAt,
+      }
+    }
+
+    test('header push always replaces main five_hour and seven_day regardless of cached checkedAt', () => {
+      const qm = createQM()
+      qm.setMain('token', {
+        quota: {
+          five_hour: {
+            usedPercent: 1,
+            remainingPercent: 99,
+            checkedAt: now + 10_000,
+          },
+          seven_day: {
+            usedPercent: 2,
+            remainingPercent: 98,
+            checkedAt: now + 10_000,
+          },
+          checkedAt: now + 10_000,
+        },
+        checkedAt: now + 10_000,
+        refreshAfter: now + 20_000,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect(pushed.quota.five_hour?.usedPercent).toBe(78)
+      expect(pushed.quota.seven_day?.usedPercent).toBe(40)
+    })
+
+    test('header push preserves a non-empty scoped poll snapshot', () => {
+      const qm = createQM()
+      const scoped = [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 15,
+          remainingPercent: 85,
+          checkedAt: 100,
+        },
+      ]
+      qm.setMain('token', {
+        quota: { scoped, checkedAt: 100, source: 'poll' },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      expect(
+        qm.pushMainFromHeaders('token', headerSnapshot()).quota.scoped,
+      ).toEqual(scoped)
+    })
+
+    test('header push preserves present empty scoped array', () => {
+      const qm = createQM()
+      qm.setMain('token', {
+        quota: { scoped: [], checkedAt: 100, source: 'poll' },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect('scoped' in pushed.quota).toBe(true)
+      expect(pushed.quota.scoped).toEqual([])
+    })
+
+    test('header push preserves extraUsage and poll bindingWindow', () => {
+      const qm = createQM()
+      const extraUsage = {
+        used: { amountMinor: 10035, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        exhausted: true,
+      }
+      qm.setMain('token', {
+        quota: {
+          extraUsage,
+          bindingWindow: 'claude-weekly-scoped-fable',
+          bindingWindowSource: 'poll',
+          checkedAt: 100,
+          source: 'poll',
+        },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect(pushed.quota.extraUsage).toEqual(extraUsage)
+      expect(pushed.quota.bindingWindow).toBe('claude-weekly-scoped-fable')
+      expect(pushed.quota.bindingWindowSource).toBe('poll')
+    })
+
+    test('fallback header push updates only the named account', () => {
+      const qm = createQM()
+      qm.setFallback('other', {
+        quota: { checkedAt: 100 },
+        checkedAt: 100,
+        refreshAfter: 200,
+      })
+
+      qm.pushFallbackFromHeaders('target', 'target-token', headerSnapshot())
+
+      expect(qm.getFallback('target')?.quota.five_hour?.usedPercent).toBe(78)
+      expect(qm.getFallback('other')?.quota.checkedAt).toBe(100)
+    })
+
+    test('header push binds main and fallback entries to the supplied token fingerprint', () => {
+      const qm = createQM()
+
+      qm.pushMainFromHeaders('main-token', headerSnapshot())
+      qm.pushFallbackFromHeaders('fallback', 'fallback-token', headerSnapshot())
+
+      expect(qm.getMain('different-token')).toBeNull()
+      expect(qm.getFallback('fallback', 'different-token')).toBeNull()
+    })
+
+    test('header checkedAt moves refreshAfter through getQuotaNextRefreshAt', () => {
+      const qm = createQM()
+      const pushed = qm.pushMainFromHeaders(
+        'token',
+        headerSnapshot(now + 5_000),
+      )
+
+      expect(pushed.checkedAt).toBe(now + 5_000)
+      expect(pushed.refreshAfter).toBeGreaterThan(pushed.checkedAt)
     })
   })
 })
