@@ -23,6 +23,8 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
+  formatPrimeCost,
+  formatPrimeTime,
   formatScopedQuotaLabel,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
@@ -232,10 +234,10 @@ export function formatPrimeSidebarValue(accounts: PrimeSidebarAccountState[]): {
     let seg = account.label
     if (account.lastResult === 'error') {
       seg += ' err'
+    } else if (account.nextDueAt && account.nextDueAt > Date.now()) {
+      seg += ` ${formatPrimeTime(account.nextDueAt)}`
     } else if (account.usage?.count) {
       seg += ` \u2713 ${account.usage.count}`
-    } else if (account.nextDueAt && account.nextDueAt > Date.now()) {
-      seg += ` ${formatHm(account.nextDueAt)}`
     }
     parts.push(seg)
   }
@@ -246,22 +248,9 @@ export function formatPrimeSidebarValue(accounts: PrimeSidebarAccountState[]): {
   )
   let text = parts.join(' \u00b7 ')
   if (totalCount > 0) {
-    text += ` \u00b7 ${totalCount} ${totalCount === 1 ? 'prime' : 'primes'} \u2248 $${formatUsd(totalCost)}`
+    text += ` \u00b7 ${totalCount} ${totalCount === 1 ? 'prime' : 'primes'} \u2248 $${formatPrimeCost(totalCost)}`
   }
   return { text, hasError }
-}
-
-function formatHm(epochMs: number): string {
-  return new Date(epochMs).toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
-
-function formatUsd(value: number): string {
-  if (value === 0) return '0'
-  if (value < 0.0001) return value.toExponential(2)
-  return value.toFixed(Math.min(6, Math.max(0, 4)))
 }
 
 // Compact row for the collapsed view: muted label left, caller-provided value

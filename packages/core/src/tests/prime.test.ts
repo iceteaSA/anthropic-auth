@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readdir, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
@@ -34,6 +34,7 @@ import {
   type PrimeUsageCounters,
   parsePrimeCommandAction,
   primeIsEligible,
+  primeMarkerPath,
 } from '../prime.ts'
 
 const STORAGE_TS = 1_721_111_111_000
@@ -584,6 +585,13 @@ describe('PrimeManager — fresh-check', () => {
 })
 
 describe('PrimeManager — claim atomicity', () => {
+  test('sanitizes the account id into one marker path component', () => {
+    const markerPath = primeMarkerPath(markerRoot, '../escape', 123)
+    const resolvedRoot = `${resolve(markerRoot)}${sep}`
+    expect(resolve(markerPath).startsWith(resolvedRoot)).toBe(true)
+    expect(markerPath).toContain('..%2Fescape-123')
+  })
+
   test('two managers, same marker dir + reset epoch → exactly one fires', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
@@ -626,7 +634,7 @@ describe('PrimeManager — claim atomicity', () => {
 })
 
 describe('PrimeManager — eligibility', () => {
-  test('haiku-scoped exhaustion blocks prime when 5h and 7d are healthy', () => {
+  test('stored Haiku-scoped exhaustion remains eligible for an authoritative refresh', () => {
     const storage: AccountStorage = {
       version: 1,
       main: { type: 'opencode', provider: 'anthropic' },
@@ -668,13 +676,52 @@ describe('PrimeManager — eligibility', () => {
           ],
         },
       }),
-    ).toEqual({ eligible: false, reason: 'killswitch' })
+    ).toEqual({ eligible: true })
   })
 
   test('disabled fallback is skipped', async () => {
     const fixture = makePrimeFixture({
+      fallbackType: 'oauth',
       fallbackEnabled: false,
       fallbackQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    expect(fixture.storage.accounts).toHaveLength(1)
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    await h.manager.tick()
+    expect(h.sendCalls).toEqual([])
+    await h.cleanup()
+  })
+
+  test('reserved fallback id main is skipped instead of routing as synthetic main', async () => {
+    const previousLevel = getLogLevel()
+    setLogLevel('debug')
+    setLogLevelSource('debug')
+    const fixture = makePrimeFixture({})
+    fixture.storage.accounts.push({
+      id: 'main',
+      type: 'oauth',
+      refresh: 'r',
+      quota: {
         five_hour: {
           usedPercent: 0,
           remainingPercent: 100,
@@ -693,12 +740,25 @@ describe('PrimeManager — eligibility', () => {
           usedPercent: 0,
           remainingPercent: 100,
           resetsAt: new Date(now - 1000).toISOString(),
-          checkedAt: 1,
+          checkedAt: 2,
         },
       },
     })
+
     await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual([])
     expect(h.sendCalls).toEqual([])
+    expect(
+      capturedPrimeSink.some(
+        (record) =>
+          record.channel === 'prime' &&
+          record.message === 'ineligible' &&
+          record.payload?.reason === 'reserved-id',
+      ),
+    ).toBe(true)
+    setLogLevel(previousLevel)
+    setLogLevelSource(previousLevel)
     await h.cleanup()
   })
 
@@ -1227,6 +1287,123 @@ describe('PrimeManager — fresh-check staleness', () => {
       (r) => r.channel === 'prime' && r.message === 'prime fired',
     )
     expect(fired).toHaveLength(0)
+    await h.cleanup()
+  })
+})
+
+describe('PrimeManager — fresh killswitch policy', () => {
+  const scopedQuota = (remainingPercent: number): OAuthQuotaSnapshot => ({
+    five_hour: {
+      usedPercent: 0,
+      remainingPercent: 100,
+      resetsAt: new Date(500).toISOString(),
+      checkedAt: 1,
+    },
+    seven_day: {
+      usedPercent: 0,
+      remainingPercent: 100,
+      checkedAt: 1,
+    },
+    scoped: [
+      {
+        id: 'haiku-weekly',
+        title: 'Claude Haiku 4.5',
+        modelId: CLAUDE_HAIKU_4_5_MODEL_ID,
+        modelName: 'Claude Haiku 4.5',
+        usedPercent: 100 - remainingPercent,
+        remainingPercent,
+        checkedAt: 1,
+      },
+    ],
+  })
+
+  test('stored healthy but fresh Haiku-exhausted skips without claiming', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: scopedQuota(100),
+      killswitch: {
+        enabled: true,
+        main: { five_hour: 5, seven_day: 10, scoped: 0 },
+      },
+    })
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now: 500 + 120_000,
+      quotaFresh: scopedQuota(0),
+    })
+
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(h.sendCalls).toEqual([])
+    expect(await readdir(markerRoot)).toEqual([])
+    await h.cleanup()
+  })
+
+  test('stored Haiku-exhausted but fresh healthy after reset fires', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: scopedQuota(0),
+      killswitch: {
+        enabled: true,
+        main: { five_hour: 5, seven_day: 10, scoped: 0 },
+      },
+    })
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now: 500 + 120_000,
+      quotaFresh: scopedQuota(100),
+    })
+
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(h.sendCalls.map((call) => call.accountId)).toEqual(['main'])
+    await h.cleanup()
+  })
+})
+
+describe('PrimeManager — post-claim abort', () => {
+  test('releases its marker when persisted prime is disabled after claim', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 2,
+        },
+      },
+    })
+    let loadCount = 0
+    h.manager.options.loadStorage = async () => {
+      loadCount += 1
+      if (loadCount === 3) {
+        return { ...fixture.storage, prime: { enabled: false } }
+      }
+      return fixture.storage
+    }
+
+    await h.manager.tick()
+    expect(h.sendCalls).toEqual([])
+    expect(await readdir(markerRoot)).toEqual([])
+
+    await h.manager.tick()
+    expect(h.sendCalls.map((call) => call.accountId)).toEqual(['main'])
     await h.cleanup()
   })
 })

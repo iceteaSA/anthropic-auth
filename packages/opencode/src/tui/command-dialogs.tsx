@@ -2,6 +2,7 @@
 import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
+import { formatPrimeCost, formatPrimeTime } from '../sidebar-state.js'
 
 type ApplyFn = (
   command: OpenDialogPayload['command'],
@@ -12,6 +13,20 @@ type KillswitchDialogConfig = {
   enabled?: boolean
   main?: Record<string, number>
   accounts?: Record<string, Record<string, number>>
+}
+
+export const PRIME_DIALOG_OPTIONS = [
+  { title: 'Enable', value: 'on' },
+  { title: 'Disable', value: 'off' },
+  { title: 'Status', value: 'status' },
+  { title: 'Back', value: 'back' },
+]
+
+export function handlePrimeStatusOption(
+  option: { value: string },
+  renderMain: () => void,
+): void {
+  if (option.value === 'back') renderMain()
 }
 
 export function buildKillswitchThresholdSeed(
@@ -54,15 +69,15 @@ export function buildPrimeStatusRows(accounts: PrimeAccountStatus[]): string[] {
     if (account.usage?.count) {
       const cost = account.estimatedCostUsd ?? 0
       rows.push(
-        `${account.label}: ${account.usage.count} ${account.usage.count === 1 ? 'prime' : 'primes'} \u2248 $${formatUsd(cost)}`,
+        `${account.label}: ${account.usage.count} ${account.usage.count === 1 ? 'prime' : 'primes'} \u2248 $${formatPrimeCost(cost)}`,
       )
     }
     if (account.nextDueAt && account.nextDueAt > Date.now()) {
       rows.push(
-        `${account.label} \u00b7 next prime ${formatHm(account.nextDueAt)}`,
+        `${account.label} \u00b7 next prime ${formatPrimeTime(account.nextDueAt)}`,
       )
     } else if (account.lastPrimedAt) {
-      const time = formatHm(account.lastPrimedAt)
+      const time = formatPrimeTime(account.lastPrimedAt)
       if (account.lastResult === 'error') {
         rows.push(`${account.label} \u00b7 primed ${time} err`)
       } else {
@@ -75,19 +90,6 @@ export function buildPrimeStatusRows(accounts: PrimeAccountStatus[]): string[] {
     }
   }
   return rows
-}
-
-function formatHm(epochMs: number): string {
-  return new Date(epochMs).toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
-
-function formatUsd(value: number): string {
-  if (value === 0) return '0'
-  if (value < 0.0001) return value.toExponential(2)
-  return value.toFixed(Math.min(6, Math.max(0, 4)))
 }
 
 export function openCommandDialog(
@@ -244,11 +246,7 @@ export function openCommandDialog(
               title='Claude prime — status'
               current='back'
               options={[{ title: 'Back', value: 'back' }]}
-              onSelect={(option) => {
-                if (option.value === 'back') {
-                  renderMain()
-                }
-              }}
+              onSelect={(option) => handlePrimeStatusOption(option, renderMain)}
             />
           </box>
         </box>
@@ -261,12 +259,7 @@ export function openCommandDialog(
         <DialogSelect
           title='Claude prime'
           current={enabled ? 'on' : 'off'}
-          options={[
-            { title: 'Enable', value: 'on' },
-            { title: 'Disable', value: 'off' },
-            { title: 'Status', value: 'status' },
-            { title: 'Back', value: 'back' },
-          ]}
+          options={PRIME_DIALOG_OPTIONS}
           onSelect={(option) => {
             if (option.value === 'back') {
               api.ui.dialog.clear()

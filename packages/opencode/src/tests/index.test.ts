@@ -35,6 +35,14 @@ function extractUrl(input: string | URL | Request): string {
   return input.url
 }
 
+async function freshPrimeQuotaResponse(
+  body: unknown,
+  init: ResponseInit = { status: 200 },
+): Promise<Response> {
+  await Bun.sleep(2)
+  return new Response(JSON.stringify(body), init)
+}
+
 // Minimal mock of the OpenCode plugin client
 function createMockClient(messages?: unknown[]) {
   return {
@@ -2347,8 +2355,8 @@ describe('auth.loader', () => {
     }
 
     // The config hook must not register extra claude-* commands beyond the
-    // modalCommands set (drift in either direction is a bug). Exactly the 9
-    // required names should be claude-* keys — no more, no less. (The foreign
+    // modalCommands set (drift in either direction is a bug). Exactly
+    // `required.length` names should be claude-* keys — no more, no less. (The foreign
     // 'other-plugin-cmd' is excluded from this count via the claude- prefix.)
     const claudeRegistered = registered.filter((name) =>
       name.startsWith('claude-'),
@@ -5627,17 +5635,12 @@ describe('claude-prime direct request', () => {
       }
       if (url.includes('/api/oauth/usage')) {
         quotaCalls += 1
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(now - 1_000).toISOString(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
@@ -5737,17 +5740,12 @@ describe('claude-prime direct request', () => {
         )
       }
       if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(now - 1_000).toISOString(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
@@ -5839,17 +5837,12 @@ describe('claude-prime direct request', () => {
         )
       }
       if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(now - 1_000).toISOString(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
@@ -5914,17 +5907,12 @@ describe('claude-prime direct request', () => {
         return Promise.resolve(new Response('boom', { status: 500 }))
       }
       if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(now - 1_000).toISOString(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
@@ -5998,17 +5986,12 @@ describe('claude-prime direct request', () => {
         )
       }
       if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(now - 1_000).toISOString(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
@@ -6088,17 +6071,12 @@ describe('claude-prime direct request', () => {
       }
       if (url.includes('/api/oauth/usage')) {
         _quotaCalls += 1
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(Date.now() - 1_000).toISOString(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(Date.now() - 1_000).toISOString(),
+          },
+        })
       }
       if (url.includes('/v1/oauth/token')) {
         return Promise.resolve(
@@ -6326,13 +6304,26 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
     expect(primeQuotaSnapshotIsFreshSince(cachedQuota, preCall)).toBe(false)
   })
 
-  test('R1: a snapshot stamped at the refresh-call boundary is fresh', () => {
+  test('R1: a snapshot stamped at the refresh-call boundary is stale', () => {
     const preCall = 10_000
     const fetchedQuota = {
       five_hour: {
         usedPercent: 0,
         remainingPercent: 100,
         checkedAt: preCall,
+      },
+    }
+
+    expect(primeQuotaSnapshotIsFreshSince(fetchedQuota, preCall)).toBe(false)
+  })
+
+  test('R1: a snapshot stamped after the refresh-call boundary is fresh', () => {
+    const preCall = 10_000
+    const fetchedQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: preCall + 1,
       },
     }
 
@@ -6545,17 +6536,15 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
       }
       if (url.includes('/api/oauth/usage')) {
         usageCalls += 1
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(Date.now() - 1_000).toISOString(),
-                checked_at: Date.now(),
-              },
-            }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          ),
+        return freshPrimeQuotaResponse(
+          {
+            five_hour: {
+              utilization: 0,
+              resets_at: new Date(Date.now() - 1_000).toISOString(),
+              checked_at: Date.now(),
+            },
+          },
+          { status: 200, headers: { 'content-type': 'application/json' } },
         )
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
@@ -6630,18 +6619,13 @@ describe('claude-prime — warn dedup (R3)', () => {
         )
       }
       if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(Date.now() - 1_000).toISOString(),
-                checked_at: Date.now(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(Date.now() - 1_000).toISOString(),
+            checked_at: Date.now(),
+          },
+        })
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
@@ -6769,18 +6753,13 @@ describe('claude-prime — warn dedup (R3)', () => {
         )
       }
       if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: {
-                utilization: 0,
-                resets_at: new Date(Date.now() - 1_000).toISOString(),
-                checked_at: Date.now(),
-              },
-            }),
-            { status: 200 },
-          ),
-        )
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(Date.now() - 1_000).toISOString(),
+            checked_at: Date.now(),
+          },
+        })
       }
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch

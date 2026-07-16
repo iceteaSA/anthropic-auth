@@ -393,6 +393,19 @@ export function formatScopedQuotaLabel(title: string) {
   return /^fable$/i.test(label) ? 'Fa' : label
 }
 
+export function formatPrimeTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+export function formatPrimeCost(value: number): string {
+  if (value === 0) return '0'
+  if (value < 0.0001) return value.toExponential(2)
+  return value.toFixed(Math.min(6, Math.max(0, 4)))
+}
+
 export function getFableRecoverySummary(
   state: SidebarState,
   sessionId: string,

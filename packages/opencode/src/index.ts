@@ -575,7 +575,7 @@ export function primeQuotaSnapshotIsFreshSince(
   quota: OAuthQuotaSnapshot | undefined,
   refreshStartedAt: number,
 ): boolean {
-  return primeQuotaSnapshotCheckedAt(quota) >= refreshStartedAt
+  return primeQuotaSnapshotCheckedAt(quota) > refreshStartedAt
 }
 
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {

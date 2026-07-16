@@ -1822,9 +1822,13 @@ function failClosedOnUnknownQuota(storage: AccountStorage | null) {
   )
 }
 
+function normalizeScopedQuotaModel(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
 function scopedQuotaModelKey(model: unknown): string | null {
   if (typeof model !== 'string') return null
-  const normalized = model.toLowerCase()
+  const normalized = normalizeScopedQuotaModel(model)
   if (normalized.includes('fable')) return 'fable'
   if (normalized.includes('mythos')) return 'mythos'
   return normalized
@@ -1839,8 +1843,8 @@ export function getScopedQuotaWindowForModel(
   return quota?.scoped?.find((window) => {
     const haystack = [window.modelId, window.modelName, window.title]
       .filter((value): value is string => typeof value === 'string')
+      .map(normalizeScopedQuotaModel)
       .join(' ')
-      .toLowerCase()
     return haystack.includes(key)
   })
 }

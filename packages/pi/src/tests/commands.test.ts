@@ -1,4 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -59,7 +66,12 @@ beforeEach(async () => {
 
 afterEach(async () => {
   delete process.env[ENV_KEY]
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
   await rm(tempDir, { recursive: true, force: true })
+})
+
+afterAll(() => {
+  expect(process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE).toBeUndefined()
 })
 
 describe('claude-account persistence', () => {

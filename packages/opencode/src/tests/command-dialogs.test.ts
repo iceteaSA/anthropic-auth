@@ -1,8 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
+import { formatPrimeSidebarValue } from '../tui'
 import {
   buildKillswitchThresholdSeed,
   buildPrimeStatusRows,
+  handlePrimeStatusOption,
+  PRIME_DIALOG_OPTIONS,
 } from '../tui/command-dialogs'
 
 describe('buildKillswitchThresholdSeed', () => {
@@ -81,136 +84,44 @@ describe('buildPrimeStatusRows', () => {
   })
 })
 
-describe('openCommandDialog — claude-prime modal interaction (M6)', () => {
-  // We assert the modal contract by extracting the option set and the
-  // action handlers from the dialog-rendering closure. The apply
-  // callback lets us simulate a successful on/off, and the dialog
-  // ref exposes a working Back. The tests below would fail if the
-  // Status branch rendered an inert `<text>{'  Back'}</text>` (the
-  // pre-fix regression) because no `onSelect` handler is present.
-
-  type DialogRender = {
-    setSize: (size: string) => void
-    replace: (factory: () => unknown) => void
-    clear: () => void
-  }
-
-  type ApplyFn = (
-    command: 'claude-prime',
-    args: string,
-  ) => Promise<{ text: string; knobs: Record<string, unknown> }>
-
-  type DialogSpec = {
-    options: Array<{ title: string; value: string }>
-    onSelect: (option: { value: string; title: string }) => void
-  }
-
-  // Render the dialog to a captured spec. We re-render the main view on
-  // each `replace` so the post-mutation render is captured too. Status
-  // view is captured separately.
-  function _capturePrimeDialog(payload: {
-    enabled: boolean
-    accounts: PrimeAccountStatus[]
-  }): { specs: DialogSpec[]; dialog: DialogRender; apply: ApplyFn } {
-    const specs: DialogSpec[] = []
-    let _lastFactory: (() => unknown) | null = null
-    const dialog: DialogRender = {
-      setSize: () => {},
-      replace: (factory) => {
-        _lastFactory = factory
-        // Eagerly render so we can pull the DialogSpec out. The TSX
-        // returns a render descriptor; we instead poke at the props the
-        // factory passes to DialogSelect. To avoid pulling in a JSX
-        // runtime we extract the spec via a captured renderer.
-        const _result = factory()
-        // The factory is expected to return JSX; we can't introspect
-        // it without the JSX runtime. Instead, expose a side-channel:
-        // the factory invokes `DialogSelect` (a function). Replace it
-        // with a capture shim before render.
-        // (Implementation note: the real DialogSelect returns a JSX
-        // element when called; we replace it to record the spec.)
-        specs.push({
-          options: [],
-          onSelect: () => {},
-        })
+describe('formatPrimeSidebarValue', () => {
+  test('shows the next due time before cumulative usage', () => {
+    const nextDueAt = Date.now() + 60 * 60_000
+    const value = formatPrimeSidebarValue([
+      {
+        id: 'main',
+        label: 'main',
+        nextDueAt,
+        usage: { count: 1, inputTokens: 20, outputTokens: 1, since: 1 },
+        estimatedCostUsd: 0.000025,
       },
-      clear: () => {},
-    }
-    const apply: ApplyFn = async () => {
-      return { text: '', knobs: {} }
-    }
-    return { specs, dialog, apply }
-  }
+    ])
 
-  // The cleanest interaction-level test is to introspect the JSX the
-  // factory returns via the JSX runtime. opencode uses @opentui/solid
-  // which exposes a render factory. We avoid coupling the test to the
-  // runtime by asserting the contract: when `apply('claude-prime',
-  // 'on')` resolves, the dialog RE-RENDERS with a fresh `enabled` and
-  // the Status branch's Back action returns to the main view (not to a
-  // dead-end box).
+    expect(value.text).toContain(
+      new Date(nextDueAt).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    )
+    expect(value.text).toContain('1 prime')
+  })
+})
 
-  // The contract is verified via a real component render using the
-  // package's render helpers. Skipped here in favor of a contract-level
-  // assertion below.
+describe('openCommandDialog — claude-prime modal interaction (M6)', () => {
   test('main view exposes 4 options in spec order: Enable / Disable / Status / Back', () => {
-    // The test asserts the canonical option SET is the one opencode
-    // uses by reading the source — this catches the regression where
-    // Enable/Disable were collapsed into a single contextual toggle.
-    const src = require('node:fs').readFileSync(
-      require('node:path').join(__dirname, '..', 'tui', 'command-dialogs.tsx'),
-      'utf8',
-    )
-    // Find the claude-prime block and assert the four options.
-    const primeBlock = src.match(
-      /if \(payload\.command === 'claude-prime'\)[\s\S]*?return\s*\n\s*}/,
-    )
-    expect(primeBlock).not.toBeNull()
-    const block = primeBlock![0]
-    // Order matters: Enable, Disable, Status, Back. Match the main-view
-    // options by looking for the `value:` that pairs with the title, so
-    // the Status-view's "Back" entry doesn't trip up the ordering check.
-    const iEnable = block.search(/title:\s*'Enable',\s*value:\s*'on'/)
-    const iDisable = block.search(/title:\s*'Disable',\s*value:\s*'off'/)
-    const iStatus = block.search(/title:\s*'Status',\s*value:\s*'status'/)
-    const iBackMain = block.search(
-      /title:\s*'Back',\s*value:\s*'back',\s*\n\s*\}\]/,
-    )
-    void iBackMain
-    // Find the Last Back in the main view options array. The simpler
-    // approach: find the last `title: 'Back', value: 'back'` occurrence.
-    const allBacks: number[] = []
-    const re = /title:\s*'Back',\s*value:\s*'back'/g
-    let m: RegExpExecArray | null = re.exec(block)
-    while (m !== null) {
-      allBacks.push(m.index)
-      m = re.exec(block)
-    }
-    expect(iEnable).toBeGreaterThan(-1)
-    expect(iDisable).toBeGreaterThan(-1)
-    expect(iStatus).toBeGreaterThan(-1)
-    expect(allBacks.length).toBeGreaterThan(0)
-    const iBack = allBacks[allBacks.length - 1]!
-    expect(iEnable).toBeLessThan(iDisable)
-    expect(iDisable).toBeLessThan(iStatus)
-    expect(iStatus).toBeLessThan(iBack)
+    expect(PRIME_DIALOG_OPTIONS).toEqual([
+      { title: 'Enable', value: 'on' },
+      { title: 'Disable', value: 'off' },
+      { title: 'Status', value: 'status' },
+      { title: 'Back', value: 'back' },
+    ])
   })
 
   test('Status view has a working Back action that returns to the main view', () => {
-    // The Status branch must call `renderMain()` from its Back onSelect,
-    // not a no-op `<text>{'  Back'}</text>`. Assert the source contains
-    // the live return path.
-    const src = require('node:fs').readFileSync(
-      require('node:path').join(__dirname, '..', 'tui', 'command-dialogs.tsx'),
-      'utf8',
-    )
-    // Find the openStatusView function block.
-    const statusBlock = src.match(
-      /const openStatusView = \(\) => \{[\s\S]*?\}\n\s*const renderMain/,
-    )
-    expect(statusBlock).not.toBeNull()
-    const block = statusBlock![0]
-    // Must have an onSelect that calls renderMain on 'back'.
-    expect(block).toMatch(/onSelect[^}]*back[\s\S]*?renderMain\(\)/)
+    let returned = false
+    handlePrimeStatusOption({ value: 'back' }, () => {
+      returned = true
+    })
+    expect(returned).toBe(true)
   })
 })

@@ -151,6 +151,7 @@ export function buildPrimeAccountStatuses(
 
   const fallbacks: PrimeAccountStatus[] = (storage?.accounts ?? [])
     .filter(isOAuthAccount)
+    .filter((account) => account.id !== 'main')
     .filter((account) => account.enabled !== false)
     .map((account) => ({
       id: account.id,
@@ -317,8 +318,8 @@ const ELIGIBILITY_REASON_LABEL: Record<PrimeEligibilityReason, string> = {
 /**
  * Eligibility check shared by the manager tick and the dialog preview.
  * Returns a discriminated result so the manager can log a specific reason
- * per the spec's Logging table. Eligibility is evaluated for the Haiku model
- * that the prime request actually sends.
+ * per the spec's Logging table. Quota policy is evaluated authoritatively on
+ * the fresh snapshot immediately before claim.
  */
 export function primeIsEligible(input: {
   storage: AccountStorage | null
@@ -332,16 +333,6 @@ export function primeIsEligible(input: {
   if (!input.isEnabled) return { eligible: false, reason: 'disabled' }
   if (input.hasPermanentRefreshError)
     return { eligible: false, reason: 'needs-reauth' }
-  if (
-    !killswitchPassesPolicy(
-      input.quota,
-      input.storage,
-      input.accountId,
-      CLAUDE_HAIKU_4_5_MODEL_ID,
-    )
-  ) {
-    return { eligible: false, reason: 'killswitch' }
-  }
   return { eligible: true }
 }
 
@@ -397,6 +388,14 @@ function defaultMarkerDir(): string {
   return join(tmpdir(), 'opencode-anthropic-auth', 'prime')
 }
 
+export function primeMarkerPath(
+  markerDir: string,
+  accountId: 'main' | string,
+  resetsAtEpochMs: number,
+): string {
+  return join(markerDir, `${encodeURIComponent(accountId)}-${resetsAtEpochMs}`)
+}
+
 function primeAccountLabel(
   id: 'main' | string,
   fallback?: FallbackAccount,
@@ -428,6 +427,13 @@ function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
     storedFiveHour: storage.quota?.mainQuota?.five_hour,
   })
   for (const account of storage.accounts ?? []) {
+    if (account.id === 'main') {
+      logger.debug('prime', 'ineligible', {
+        account: primeAccountLabel(account.id, account),
+        reason: 'reserved-id',
+      })
+      continue
+    }
     if (!isOAuthAccount(account)) {
       // API-key accounts are surfaced here so the eligibility-skip debug
       // log fires once per tick and an operator can confirm the
@@ -633,8 +639,8 @@ export class PrimeManager {
         quota: evaluation.storedQuota,
       })
       if (!eligibility.eligible) {
-        // Per spec Logging table: every ineligible case (disabled /
-        // needs-reauth / killswitch / API-key) emits a debug log carrying
+        // Per spec Logging table: every stored-state ineligible case (disabled /
+        // needs-reauth / API-key) emits a debug log carrying
         // the account's display label and the specific reason. `trace`
         // would hide this from operators troubleshooting "why isn't prime
         // firing for my X account".
@@ -687,6 +693,21 @@ export class PrimeManager {
         return
       }
 
+      if (
+        !killswitchPassesPolicy(
+          fresh,
+          reloaded,
+          evaluation.id,
+          CLAUDE_HAIKU_4_5_MODEL_ID,
+        )
+      ) {
+        logger.debug('prime', 'ineligible', {
+          account: evaluation.label,
+          reason: primeEligibilityReasonLabel('killswitch'),
+        })
+        return
+      }
+
       const freshResetEpoch = storedResetMs(fresh?.five_hour)
       if (freshResetEpoch !== undefined && freshResetEpoch > now) {
         // Window already started by a real request. Track the active-
@@ -705,9 +726,8 @@ export class PrimeManager {
       // Use the FRESH snapshot's reset epoch if available; fall back to
       // the stored one. The marker key must stay stable per cycle.
       const markerEpoch = freshResetEpoch ?? storedResetEpoch ?? Math.floor(now)
-      const claimed = await this.tryClaim(evaluation.id, markerEpoch)
-      if (this.stopped) return
-      if (!claimed) {
+      const markerPath = await this.tryClaim(evaluation.id, markerEpoch)
+      if (!markerPath) {
         logger.debug('prime', 'claim lost', {
           account: evaluation.label,
           marker: `${evaluation.id}-${markerEpoch}`,
@@ -715,7 +735,13 @@ export class PrimeManager {
         return
       }
 
-      await this.fire(evaluation, now, reloaded)
+      const postClaimStorage = await this.options.loadStorage()
+      if (this.stopped || postClaimStorage?.prime?.enabled !== true) {
+        await rm(markerPath, { force: true })
+        return
+      }
+
+      await this.fire(evaluation, now, postClaimStorage)
     } catch (error) {
       logger.warn('prime', 'account evaluation failed', {
         account: evaluation.label,
@@ -727,9 +753,9 @@ export class PrimeManager {
   private async tryClaim(
     accountId: 'main' | string,
     resetsAtEpochMs: number,
-  ): Promise<boolean> {
+  ): Promise<string | null> {
     const dir = this.options.markerDir ?? defaultMarkerDir()
-    const markerPath = join(dir, `${accountId}-${resetsAtEpochMs}`)
+    const markerPath = primeMarkerPath(dir, accountId, resetsAtEpochMs)
     try {
       await mkdir(dir, { recursive: true })
     } catch {
@@ -737,10 +763,10 @@ export class PrimeManager {
     }
     try {
       await writeFile(markerPath, '', { encoding: 'utf8', flag: 'wx' })
-      return true
+      return markerPath
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
-      if (code === 'EEXIST') return false
+      if (code === 'EEXIST') return null
       throw error
     }
   }
