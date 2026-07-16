@@ -34,6 +34,16 @@ export interface FableRecoverySidebarState {
   changedAt: number
 }
 
+export interface PrimeSidebarAccountState {
+  id: string
+  label: string
+  nextDueAt?: number | null
+  lastPrimedAt?: number | null
+  lastResult?: 'ok' | 'error'
+  usage?: PrimeUsageCounters
+  estimatedCostUsd?: number
+}
+
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
@@ -52,6 +62,15 @@ export interface SidebarState {
     window?: string
     trackedSessions?: number
   }
+  /**
+   * Prime opt-in flag plus per-account status. Absent on the wire when
+   * the feature is disabled — `normalizeSidebarState` validates every
+   * account independently and drops any entry it cannot prove.
+   */
+  prime?: {
+    enabled: boolean
+    accounts: PrimeSidebarAccountState[]
+  }
   fableRecoveries?: FableRecoverySidebarState[]
   lastUpdated: number
 }
@@ -59,6 +78,8 @@ export interface SidebarState {
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+
+import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
@@ -79,6 +100,77 @@ export const DEFAULT_SIDEBAR_STATE: SidebarState = {
 }
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function normalizePrimeUsage(value: unknown): PrimeUsageCounters | undefined {
+  if (!isRecord(value)) return undefined
+  const count = Number(value.count)
+  const inputTokens = Number(value.inputTokens)
+  const outputTokens = Number(value.outputTokens)
+  const since = Number(value.since)
+  if (
+    ![count, inputTokens, outputTokens, since].every(Number.isFinite) ||
+    count < 0 ||
+    inputTokens < 0 ||
+    outputTokens < 0 ||
+    since < 0
+  ) {
+    return undefined
+  }
+  return {
+    count: Math.floor(count),
+    inputTokens: Math.floor(inputTokens),
+    outputTokens: Math.floor(outputTokens),
+    since: Math.floor(since),
+  }
+}
+
+function normalizePrimeAccount(
+  value: unknown,
+): PrimeSidebarAccountState | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.id !== 'string' || !value.id.trim()) return undefined
+  if (typeof value.label !== 'string' || !value.label.trim()) return undefined
+  const account: PrimeSidebarAccountState = {
+    id: value.id.trim(),
+    label: value.label.trim(),
+  }
+  if (value.nextDueAt === null) {
+    account.nextDueAt = null
+  } else if (isFiniteNumber(value.nextDueAt)) {
+    account.nextDueAt = value.nextDueAt
+  }
+  if (value.lastPrimedAt === null) {
+    account.lastPrimedAt = null
+  } else if (isFiniteNumber(value.lastPrimedAt)) {
+    account.lastPrimedAt = value.lastPrimedAt
+  }
+  if (value.lastResult === 'ok' || value.lastResult === 'error') {
+    account.lastResult = value.lastResult
+  }
+  const usage = normalizePrimeUsage(value.usage)
+  if (usage) account.usage = usage
+  if (isFiniteNumber(value.estimatedCostUsd)) {
+    account.estimatedCostUsd = value.estimatedCostUsd
+  }
+  return account
+}
+
+function normalizePrimeSection(
+  value: unknown,
+): SidebarState['prime'] | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.enabled !== 'boolean') return undefined
+  const accounts = Array.isArray(value.accounts)
+    ? value.accounts
+        .map(normalizePrimeAccount)
+        .filter((a): a is PrimeSidebarAccountState => a != null)
+    : []
+  return { enabled: value.enabled, accounts }
 }
 
 function normalizeQuotaWindow(value: unknown): QuotaWindow | undefined {
@@ -231,6 +323,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
     cacheKeep,
+    prime: normalizePrimeSection(raw.prime),
     fableRecoveries: fableRecoveries.length > 0 ? fableRecoveries : undefined,
     lastUpdated: typeof raw.lastUpdated === 'number' ? raw.lastUpdated : 0,
   }

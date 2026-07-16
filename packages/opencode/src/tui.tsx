@@ -27,6 +27,7 @@ import {
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
+  type PrimeSidebarAccountState,
   type QuotaPacing,
   resolveActiveAccount,
   SEVEN_DAY_MS,
@@ -210,6 +211,57 @@ function StatRow(props: {
       </text>
     </box>
   )
+}
+
+/**
+ * Format the Prime row value for the expanded sidebar. Mirrors
+ * `buildPrimeStatusRows` but compressed into a single line per the
+ * sidebar one-line convention. Tone is 'warn' if any account has a
+ * `lastResult: 'error'`, otherwise 'ok' / 'muted'.
+ */
+export function formatPrimeSidebarValue(accounts: PrimeSidebarAccountState[]): {
+  text: string
+  hasError: boolean
+} {
+  if (accounts.length === 0) {
+    return { text: 'on', hasError: false }
+  }
+  const hasError = accounts.some((a) => a.lastResult === 'error')
+  const parts: string[] = []
+  for (const account of accounts) {
+    let seg = account.label
+    if (account.lastResult === 'error') {
+      seg += ' err'
+    } else if (account.usage?.count) {
+      seg += ` \u2713 ${account.usage.count}`
+    } else if (account.nextDueAt && account.nextDueAt > Date.now()) {
+      seg += ` ${formatHm(account.nextDueAt)}`
+    }
+    parts.push(seg)
+  }
+  const totalCount = accounts.reduce((sum, a) => sum + (a.usage?.count ?? 0), 0)
+  const totalCost = accounts.reduce(
+    (sum, a) => sum + (a.estimatedCostUsd ?? 0),
+    0,
+  )
+  let text = parts.join(' \u00b7 ')
+  if (totalCount > 0) {
+    text += ` \u00b7 ${totalCount} ${totalCount === 1 ? 'prime' : 'primes'} \u2248 $${formatUsd(totalCost)}`
+  }
+  return { text, hasError }
+}
+
+function formatHm(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function formatUsd(value: number): string {
+  if (value === 0) return '0'
+  if (value < 0.0001) return value.toExponential(2)
+  return value.toFixed(Math.min(6, Math.max(0, 4)))
 }
 
 // Compact row for the collapsed view: muted label left, caller-provided value
@@ -620,6 +672,13 @@ function QuotaSidebar(props: {
   const cacheKeep = () => state().cacheKeep
   const showCache = () =>
     prefs().sections.cache && cacheKeep() != null && cacheKeep()?.window != null
+  const prime = () => state().prime
+  const showPrime = () => prime() != null
+  const primeValue = () => {
+    const p = prime()
+    if (!p) return { text: 'on', hasError: false }
+    return formatPrimeSidebarValue(p.accounts)
+  }
   const relayValue = () => {
     const r = state().relay
     if (!r) return '\u2014'
@@ -795,6 +854,16 @@ function QuotaSidebar(props: {
               tone='text'
             />
           </Show>
+        </Show>
+
+        {/* Prime — only when enabled. Expanded view only (no collapsed surface). */}
+        <Show when={showPrime()}>
+          <StatRow
+            theme={theme()}
+            label='Prime'
+            value={primeValue().text}
+            tone={primeValue().hasError ? 'warn' : 'ok'}
+          />
         </Show>
 
         {/* Health — only when something is wrong */}

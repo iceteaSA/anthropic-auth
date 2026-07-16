@@ -629,6 +629,62 @@ describe('normalizeSidebarState', () => {
     expect(out.cacheKeep).toBeUndefined()
   })
 
+  test('prime defaults to undefined when non-object', () => {
+    const out = normalizeSidebarState({ prime: 'bad' })
+    expect(out.prime).toBeUndefined()
+  })
+
+  test('prime defaults to undefined when enabled is non-boolean', () => {
+    const out = normalizeSidebarState({ prime: { enabled: 'yes' } })
+    expect(out.prime).toBeUndefined()
+  })
+
+  test('prime drops accounts with non-string id', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          { id: 'main' }, // no label → dropped
+          { id: 'work', label: 'work' },
+        ],
+      },
+    })
+    expect(out.prime?.accounts).toEqual([{ id: 'work', label: 'work' }])
+  })
+
+  test('prime drops account with non-finite nextDueAt and keeps null', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [{ id: 'main', label: 'main', nextDueAt: 'soon' }],
+      },
+    })
+    expect(out.prime?.accounts?.[0]?.nextDueAt).toBeUndefined()
+  })
+
+  test('prime drops invalid lastPrimedAt / lastResult / usage / cost', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          {
+            id: 'main',
+            label: 'main',
+            lastPrimedAt: 'never',
+            lastResult: 'unknown',
+            usage: { count: -1, inputTokens: 0, outputTokens: 0, since: -5 },
+            estimatedCostUsd: 'cheap',
+          },
+        ],
+      },
+    })
+    const acct = out.prime?.accounts?.[0]
+    expect(acct?.lastPrimedAt).toBeUndefined()
+    expect(acct?.lastResult).toBeUndefined()
+    expect(acct?.usage).toBeUndefined()
+    expect(acct?.estimatedCostUsd).toBeUndefined()
+  })
+
   test('route defaults when non-string', () => {
     const out = normalizeSidebarState({ route: 42 })
     expect(out.route).toBe(DEFAULT_SIDEBAR_STATE.route)

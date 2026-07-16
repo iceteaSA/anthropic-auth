@@ -1131,6 +1131,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             : undefined,
         trackedSessions: cacheKeepManager.trackedCount(),
       },
+      // Prime section is omitted from the wire when the feature is disabled
+      // so the sidebar reads a clean `prime === undefined` and the expanded
+      // view renders nothing (declutter rule). Enabled writes include
+      // per-account status (next-due / last-primed / cumulative usage).
+      prime: isPrimePersistentlyEnabled(storage)
+        ? {
+            enabled: true,
+            accounts: primeManager.stats(storage),
+          }
+        : undefined,
       fableRecoveries:
         fableRecoveryNotices.size > 0
           ? [...fableRecoveryNotices.values()]
