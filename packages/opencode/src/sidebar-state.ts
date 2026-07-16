@@ -255,7 +255,10 @@ export interface SidebarStateWriteOptions {
   routingAuthoritative?: boolean
   resolvePreservedRouting?: (
     current: SidebarState,
-  ) => Pick<SidebarState, 'activeId' | 'route'> | undefined
+  ) =>
+    | Pick<SidebarState, 'activeId' | 'route'>
+    | undefined
+    | Promise<Pick<SidebarState, 'activeId' | 'route'> | undefined>
   onRoutingResolved?: (
     routing: Pick<SidebarState, 'activeId' | 'route'>,
   ) => void
@@ -271,7 +274,8 @@ export async function setSidebarState(
       let stateToWrite = state
       if (options.routingAuthoritative === false) {
         const current = await readSidebarState(stateFile)
-        const preservedRouting = options.resolvePreservedRouting?.(current)
+        const preservedRouting =
+          await options.resolvePreservedRouting?.(current)
         if (preservedRouting) {
           stateToWrite = {
             ...state,

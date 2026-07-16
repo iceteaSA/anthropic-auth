@@ -164,37 +164,55 @@ const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
 
-function resolveFreshSidebarRouting(
+function hasEnabledOAuthAccount(
+  storage: AccountStorage | null,
+  activeId: string,
+) {
+  return (storage?.accounts ?? []).some(
+    (account) =>
+      account.id === activeId &&
+      account.enabled !== false &&
+      isOAuthAccount(account),
+  )
+}
+
+async function resolveFreshSidebarRouting(
   storage: AccountStorage | null,
   existing: SidebarState,
-): { activeId: string | undefined; route: string } | undefined {
-  const enabledOAuthAccounts = (storage?.accounts ?? []).filter(
-    (account): account is OAuthAccount =>
-      account.enabled !== false && isOAuthAccount(account),
-  )
+  loadFreshStorage: () => Promise<AccountStorage | null>,
+): Promise<{ activeId: string | undefined; route: string } | undefined> {
   const existingAge = Date.now() - existing.lastUpdated
-  const existingActiveIdIsValid =
-    existing.activeId === 'main' ||
-    enabledOAuthAccounts.some((account) => account.id === existing.activeId)
+  if (
+    !existing.activeId ||
+    existingAge < 0 ||
+    existingAge > SIDEBAR_ROUTING_FRESH_MS
+  )
+    return undefined
 
   if (
-    existing.activeId &&
-    existingAge >= 0 &&
-    existingAge <= SIDEBAR_ROUTING_FRESH_MS &&
-    existingActiveIdIsValid
-  ) {
+    existing.activeId === 'main' ||
+    hasEnabledOAuthAccount(storage, existing.activeId)
+  )
     return { activeId: existing.activeId, route: existing.route }
-  }
+
+  try {
+    const freshStorage = await loadFreshStorage()
+    if (hasEnabledOAuthAccount(freshStorage, existing.activeId)) {
+      return { activeId: existing.activeId, route: existing.route }
+    }
+  } catch {}
 
   return undefined
 }
 
 async function resolveInitialSidebarRouting(
   storage: AccountStorage | null,
+  accountStoragePath: string,
 ): Promise<{ activeId: string | undefined; route: string }> {
-  const existingRouting = resolveFreshSidebarRouting(
+  const existingRouting = await resolveFreshSidebarRouting(
     storage,
     await getSidebarState(),
+    () => loadAccounts(accountStoragePath),
   )
   if (existingRouting) return existingRouting
 
@@ -1005,7 +1023,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       routingAuthoritative,
       resolvePreservedRouting: routingAuthoritative
         ? undefined
-        : (current) => resolveFreshSidebarRouting(storage, current),
+        : (current) =>
+            resolveFreshSidebarRouting(storage, current, () =>
+              loadAccounts(accountStoragePath),
+            ),
       onRoutingResolved: routingAuthoritative
         ? undefined
         : (routing) => {
@@ -2360,8 +2381,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           quotaManager.seedFallbacksFromAccounts(
             (initialStorage?.accounts ?? []).filter(isOAuthAccount),
           )
-          const initialSidebarRouting =
-            await resolveInitialSidebarRouting(initialStorage)
+          const initialSidebarRouting = await resolveInitialSidebarRouting(
+            initialStorage,
+            accountStoragePath,
+          )
           await writeSidebarState(initialStorage, {
             activeId: initialSidebarRouting.activeId,
             route: initialSidebarRouting.route,

@@ -775,6 +775,41 @@ describe('auth.loader', () => {
     expect(state.lastUpdated).toBe(foreignUpdatedAt)
   })
 
+  test('boot preserves fresh routing for an account added after plugin creation', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const plugin = await getPlugin()
+    await saveAccounts(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-2',
+            type: 'oauth',
+            access: 'work-2-access',
+            refresh: 'work-2-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    await seedSidebarRouting('work-2', 'fallback-first', Date.now())
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-2')
+    expect(state.route).toBe('fallback-first')
+  })
+
   test('boot ignores stale sidebar routing and derives fallback-first routing', async () => {
     await useTempAccountFile(
       createFallbackStorage({ routing: { mode: 'fallback-first' } }),
