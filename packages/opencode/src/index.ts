@@ -654,8 +654,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       cause: error instanceof Error ? error : undefined,
     })
   }
-  const initialSidebarRouting =
-    await resolveInitialSidebarRouting(initialStorage)
   const fableFallbackManager = new FableFallbackManager()
   const quotaManager = new QuotaManager({
     storage: initialStorage,
@@ -884,7 +882,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   // Remembers the last explicit routing decision so quota-only sidebar refreshes
   // (background main/fallback quota landing) do not reset the active account.
-  let lastSidebarRouting = initialSidebarRouting
+  let lastSidebarRouting: { activeId: string | undefined; route: string } = {
+    activeId: 'main',
+    route: 'main',
+  }
   const sidebarStateFile = getSidebarStateFile()
   const fableRecoveryNotices = new Map<
     string,
@@ -2322,6 +2323,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           quotaManager.seedFallbacksFromAccounts(
             (initialStorage?.accounts ?? []).filter(isOAuthAccount),
           )
+          const initialSidebarRouting =
+            await resolveInitialSidebarRouting(initialStorage)
+          lastSidebarRouting = initialSidebarRouting
           writeSidebarState(initialStorage, {
             activeId: lastSidebarRouting.activeId,
             route: lastSidebarRouting.route,

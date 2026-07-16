@@ -704,6 +704,40 @@ describe('auth.loader', () => {
     expect(state.route).toBe('fallback-first')
   })
 
+  test('boot re-reads sidebar routing written after plugin creation', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+
+    const plugin = await getPlugin()
+    await seedSidebarRouting('work-alt', 'fallback-first', Date.now())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-alt')
+    expect(state.route).toBe('fallback-first')
+  })
+
   test('boot ignores stale sidebar routing and derives fallback-first routing', async () => {
     await useTempAccountFile(
       createFallbackStorage({ routing: { mode: 'fallback-first' } }),
