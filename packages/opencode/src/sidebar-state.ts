@@ -406,6 +406,31 @@ export function formatPrimeCost(value: number): string {
   return value.toFixed(Math.min(6, Math.max(0, 4)))
 }
 
+export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
+  text: string
+  hasError: boolean
+} {
+  if (account.lastResult === 'error') {
+    return { text: 'err', hasError: true }
+  }
+  if (account.nextDueAt && account.nextDueAt > Date.now()) {
+    return { text: formatPrimeTime(account.nextDueAt), hasError: false }
+  }
+  if (account.lastPrimedAt) {
+    return {
+      text: `primed ${formatPrimeTime(account.lastPrimedAt)} \u2713`,
+      hasError: false,
+    }
+  }
+  if (account.usage?.count) {
+    return {
+      text: `\u2713 ${account.usage.count} \u2248 $${formatPrimeCost(account.estimatedCostUsd ?? 0)}`,
+      hasError: false,
+    }
+  }
+  return { text: '\u2014', hasError: false }
+}
+
 export function getFableRecoverySummary(
   state: SidebarState,
   sessionId: string,
