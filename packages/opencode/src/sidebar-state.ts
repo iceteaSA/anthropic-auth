@@ -15,6 +15,15 @@ export interface AccountQuota {
   five_hour?: QuotaWindow
   seven_day?: QuotaWindow
   scoped?: ScopedQuotaWindow[]
+  extraUsage?: {
+    used: { amountMinor: number; currency: string; exponent: number }
+    limit: { amountMinor: number; currency: string; exponent: number }
+    utilizationPercent?: number
+    severity?: string
+    exhausted: boolean
+  }
+  bindingWindow?: string
+  fallbackAdvised?: boolean
 }
 
 export interface SidebarAccountState {
@@ -25,6 +34,7 @@ export interface SidebarAccountState {
   // True when the account's refresh token is permanently dead (400
   // invalid_grant) and it needs a re-login — distinct from a transient backoff.
   needsReauth: boolean
+  tierLabel?: string
 }
 
 export interface FableRecoverySidebarState {
@@ -37,6 +47,7 @@ export interface FableRecoverySidebarState {
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    tierLabel?: string
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
     refreshBackedOff?: boolean
@@ -136,7 +147,49 @@ function normalizeAccountQuota(value: unknown): AccountQuota | null {
     quota.scoped = scoped
   }
 
+  if (isRecord(value.extraUsage)) {
+    const used = normalizeQuotaMoney(value.extraUsage.used)
+    const limit = normalizeQuotaMoney(value.extraUsage.limit)
+    if (used && limit && typeof value.extraUsage.exhausted === 'boolean') {
+      quota.extraUsage = {
+        used,
+        limit,
+        ...(typeof value.extraUsage.utilizationPercent === 'number' &&
+          Number.isFinite(value.extraUsage.utilizationPercent) && {
+            utilizationPercent: value.extraUsage.utilizationPercent,
+          }),
+        ...(typeof value.extraUsage.severity === 'string' && {
+          severity: value.extraUsage.severity,
+        }),
+        exhausted: value.extraUsage.exhausted,
+      }
+    }
+  }
+  if (typeof value.bindingWindow === 'string' && value.bindingWindow.trim()) {
+    quota.bindingWindow = value.bindingWindow.trim()
+  }
+  if (typeof value.fallbackAdvised === 'boolean') {
+    quota.fallbackAdvised = value.fallbackAdvised
+  }
+
   return Object.keys(quota).length ? quota : null
+}
+
+function normalizeQuotaMoney(value: unknown) {
+  if (!isRecord(value)) return undefined
+  if (
+    !Number.isInteger(value.amountMinor) ||
+    typeof value.currency !== 'string' ||
+    !value.currency.trim() ||
+    !Number.isInteger(value.exponent)
+  ) {
+    return undefined
+  }
+  return {
+    amountMinor: value.amountMinor as number,
+    currency: value.currency.trim(),
+    exponent: value.exponent as number,
+  }
 }
 
 export function normalizeSidebarState(raw: unknown): SidebarState {
@@ -146,6 +199,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   if (isRecord(raw.main)) {
     const m = raw.main
     main.quota = normalizeAccountQuota(m.quota)
+    if (typeof m.tierLabel === 'string' && m.tierLabel.trim()) {
+      main.tierLabel = m.tierLabel.trim()
+    }
     if (typeof m.quotaBackedOff === 'boolean')
       main.quotaBackedOff = m.quotaBackedOff
     if (typeof m.quotaBackoffUntil === 'number')
@@ -167,6 +223,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
+          tierLabel:
+            typeof entry.tierLabel === 'string' && entry.tierLabel.trim()
+              ? entry.tierLabel.trim()
+              : undefined,
         }))
     : []
 

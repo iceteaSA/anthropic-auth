@@ -5526,6 +5526,39 @@ describe('auth.loader', () => {
       expect(state.main?.quota?.source).not.toBe('headers')
     })
 
+    test('sidebar state reflects header-pushed freshness and served fallback attribution', async () => {
+      await useTempAccountFile(harvestStorage(createFallbackStorage().accounts))
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForSidebarState(
+        (value) =>
+          value.activeId === 'fallback-1' &&
+          value.fallbacks[0]?.quota?.five_hour?.usedPercent === 78,
+      )
+
+      expect(state.main.quota?.five_hour?.usedPercent).not.toBe(78)
+      expect(state.fallbacks[0]?.id).toBe('fallback-1')
+      expect(state.lastUpdated).toBeGreaterThan(0)
+    })
+
     test('non-quota response does not push or persist quota', async () => {
       await useTempAccountFile(harvestStorage())
       globalThis.fetch = mock(() =>

@@ -195,6 +195,22 @@ describe('getFableRecoverySummary', () => {
 })
 
 describe('getCollapsedQuotaSummary', () => {
+  test('collapsed quota summary ignores credits binding marker and fallback advice', () => {
+    expect(
+      getCollapsedQuotaSummary({
+        five_hour: { usedPercent: 78, remainingPercent: 22 },
+        seven_day: { usedPercent: 40, remainingPercent: 60 },
+        extraUsage: {
+          used: { amountMinor: 10035, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+          exhausted: true,
+        },
+        bindingWindow: 'five_hour',
+        fallbackAdvised: true,
+      }).text,
+    ).toBe('5h: 78% 7d: 40%')
+  })
+
   test('formats both active-account quota windows', () => {
     expect(getCollapsedQuotaSummary(quota(13)).text).toBe('5h: 13% 7d: 13%')
   })
@@ -275,6 +291,81 @@ describe('getCollapsedQuotaSummary', () => {
 })
 
 describe('normalizeSidebarState', () => {
+  test('normalizes valid optional quota metadata and tier labels', () => {
+    const normalized = normalizeSidebarState({
+      main: {
+        tierLabel: 'Max 20x',
+        quota: {
+          extraUsage: {
+            used: { amountMinor: 10035, currency: 'USD', exponent: 2 },
+            limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+            severity: 'critical',
+            exhausted: true,
+          },
+          bindingWindow: 'five_hour',
+          fallbackAdvised: true,
+        },
+      },
+      fallbacks: [
+        {
+          id: 'work',
+          tierLabel: 'Team · Max 5x',
+          quota: null,
+          enabled: true,
+          needsReauth: false,
+        },
+      ],
+    })
+
+    expect(normalized.main.tierLabel).toBe('Max 20x')
+    expect(normalized.main.quota?.extraUsage?.used.amountMinor).toBe(10035)
+    expect(normalized.main.quota?.bindingWindow).toBe('five_hour')
+    expect(normalized.main.quota?.fallbackAdvised).toBe(true)
+    expect(normalized.fallbacks[0]?.tierLabel).toBe('Team · Max 5x')
+  })
+
+  test('drops malformed extraUsage bindingWindow fallbackAdvised and tierLabel independently', () => {
+    const normalized = normalizeSidebarState({
+      main: {
+        tierLabel: 42,
+        quota: {
+          five_hour: { usedPercent: 78, remainingPercent: 22 },
+          extraUsage: {
+            used: { amountMinor: 1.5, currency: '', exponent: 2 },
+            limit: { amountMinor: 100, currency: 'USD', exponent: 2 },
+            exhausted: 'yes',
+          },
+          bindingWindow: 42,
+          fallbackAdvised: 'yes',
+        },
+      },
+      fallbacks: [],
+    })
+
+    expect(normalized.main.quota?.five_hour?.usedPercent).toBe(78)
+    expect(normalized.main.quota?.extraUsage).toBeUndefined()
+    expect(normalized.main.quota?.bindingWindow).toBeUndefined()
+    expect(normalized.main.quota?.fallbackAdvised).toBeUndefined()
+    expect(normalized.main.tierLabel).toBeUndefined()
+  })
+
+  test('preserves empty scoped array with optional metadata present', () => {
+    const normalized = normalizeSidebarState({
+      main: {
+        quota: {
+          scoped: [],
+          bindingWindow: 'five_hour',
+          fallbackAdvised: false,
+        },
+      },
+      fallbacks: [],
+    })
+
+    expect(normalized.main.quota?.scoped).toEqual([])
+    expect(normalized.main.quota?.bindingWindow).toBe('five_hour')
+    expect(normalized.main.quota?.fallbackAdvised).toBe(false)
+  })
+
   test('preserves valid scoped quota windows and drops malformed ones', () => {
     const normalized = normalizeSidebarState({
       main: {

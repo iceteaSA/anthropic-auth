@@ -1014,6 +1014,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const state: SidebarState = {
       main: {
         quota: mainEntry?.quota ?? null,
+        tierLabel: formatOAuthAccountTier(storage?.main?.profile),
         quotaBackedOff: quotaManager.isBackedOff(),
         quotaBackoffUntil: lastApiError?.nextRetryAt,
         refreshBackedOff: mainRefreshError
@@ -1033,6 +1034,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         .map((account) => ({
           id: account.id,
           label: account.label,
+          tierLabel: formatOAuthAccountTier(account.profile),
           // Token-aware read: if a fallback account was re-logged with the same
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
