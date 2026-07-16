@@ -65,6 +65,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
+  isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -73,6 +74,7 @@ import {
   log,
   logger,
   mergeAnthropicBetas,
+  normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
@@ -84,6 +86,7 @@ import {
   parseLoggingCommandAction,
   parseRoutingCommandAction,
   type QuotaAccountSummary,
+  type QuotaEntry,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -111,6 +114,7 @@ import {
   setLogLevelPersistent,
   setRoutingMode,
   shouldFallbackStatus,
+  tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import {
@@ -670,6 +674,87 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     },
   })
+  const warnedQuotaNormalizeErrors = new Set<string>()
+
+  async function persistPushedQuota(
+    served: { accountId: 'main' | string; accessToken: string },
+    entry: QuotaEntry,
+  ) {
+    const storage =
+      (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+    if (served.accountId === 'main') {
+      storage.quota = storage.quota ?? {}
+      storage.quota.mainQuota = entry.quota
+      storage.quota.mainQuotaCheckedAt = entry.checkedAt
+      storage.quota.mainQuotaToken = tokenFingerprint(served.accessToken)
+      storage.quota.mainLastQuotaApiError = undefined
+      await saveAccountState(storage, accountStoragePath, { mainQuota: true })
+      return
+    }
+    const account = storage.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === served.accountId &&
+        isOAuthAccount(candidate) &&
+        candidate.access === served.accessToken,
+    )
+    if (!account) return
+    account.quota = entry.quota
+    account.lastQuotaRefreshError = undefined
+    await saveAccountState(storage, accountStoragePath, {
+      accounts: [served.accountId],
+    })
+  }
+
+  function logPersistFailure(error: unknown) {
+    logger.warn('quota', 'failed to persist harvested response quota', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  function warnQuotaNormalizeOnce(error: unknown) {
+    const name = error instanceof Error ? error.name : typeof error
+    const message = error instanceof Error ? error.message : String(error)
+    const shape = `${name}:${message}`
+    if (warnedQuotaNormalizeErrors.has(shape)) return
+    warnedQuotaNormalizeErrors.add(shape)
+    logger.warn('quota', 'failed to normalize response quota headers', {
+      error: message,
+    })
+  }
+
+  function harvestQuotaHeaders(
+    response: Response,
+    served: { accountId: 'main' | string; accessToken: string },
+  ): void {
+    try {
+      if (!isQuotaBearingHeaderFrame(response.headers)) {
+        logger.trace('quota', 'skipped non-quota response headers', {
+          account: served.accountId,
+        })
+        return
+      }
+      const incoming = normalizeQuotaHeaders(response.headers)
+      const entry =
+        served.accountId === 'main'
+          ? quotaManager.pushMainFromHeaders(served.accessToken, incoming)
+          : quotaManager.pushFallbackFromHeaders(
+              served.accountId,
+              served.accessToken,
+              incoming,
+            )
+      void persistPushedQuota(served, entry).catch(logPersistFailure)
+      void refreshSidebarQuota().catch(() => {})
+      logger.debug('quota', 'harvested response quota', {
+        account: served.accountId,
+        fiveHourPercent: entry.quota.five_hour?.usedPercent,
+        sevenDayPercent: entry.quota.seven_day?.usedPercent,
+        source: 'headers',
+      })
+    } catch (error) {
+      warnQuotaNormalizeOnce(error)
+    }
+  }
+
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
     onFallbackStorageChanged: () => {
@@ -2790,6 +2875,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               totalSendWithAccessMs: roundMs(nowMs() - start),
             })
 
+            harvestQuotaHeaders(response, {
+              accountId: oauthAccountId,
+              accessToken,
+            })
             return response
           }
 

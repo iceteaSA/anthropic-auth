@@ -3,11 +3,13 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setLogTestSink,
   type AccountStorage,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   getAccountStatePath,
   hashRefreshToken,
+  type LogTestRecord,
   loadAccounts,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   resetCache1hState,
@@ -15,6 +17,7 @@ import {
   resetFastModeState,
   saveAccountState,
   saveAccounts,
+  setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
@@ -5154,6 +5157,207 @@ describe('auth.loader', () => {
         candidate.fallbacks[0]?.quota?.five_hour?.usedPercent === 0.42,
     )
     expect(state.fallbacks[0]?.id).toBe('fallback-1')
+  })
+
+  describe('quota header harvest', () => {
+    const quotaHeaders = {
+      'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+      'anthropic-ratelimit-unified-5h-utilization': '0.78',
+      'anthropic-ratelimit-unified-5h-reset': '1784246400',
+      'anthropic-ratelimit-unified-7d-utilization': '0.4',
+      'anthropic-ratelimit-unified-7d-reset': '1784628000',
+    }
+
+    const harvestStorage = (accounts: AccountStorage['accounts'] = []) =>
+      createFallbackStorage({
+        accounts,
+        quota: { enabled: false },
+      })
+
+    async function loadFetch() {
+      const plugin = await getPlugin()
+      return plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+    }
+
+    async function waitForState(predicate: (state: any) => boolean) {
+      let lastState: unknown
+      for (let attempt = 0; attempt < 50; attempt++) {
+        try {
+          const state = JSON.parse(
+            await readFile(
+              getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE),
+              'utf8',
+            ),
+          )
+          lastState = state
+          if (predicate(state)) return state
+        } catch {}
+        await Bun.sleep(10)
+      }
+      throw new Error(
+        `quota state did not persist: ${JSON.stringify(lastState)}`,
+      )
+    }
+
+    test('main 200 response pushes unified headers before returning the response', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('main-ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(await response.text()).toBe('main-ok')
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+    })
+
+    test('fallback-served response updates that fallback and not main', async () => {
+      await useTempAccountFile(harvestStorage(createFallbackStorage().accounts))
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'fallback-ok',
+      )
+      const state = await waitForState(
+        (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
+      )
+      expect(state.main?.quota?.source).not.toBe('headers')
+    })
+
+    test('non-quota response does not push or persist quota', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('ok')),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await Bun.sleep(30)
+
+      expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
+    })
+
+    test('malformed quota headers never reject or replace the original response', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('original', {
+            status: 202,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.5',
+              'anthropic-ratelimit-unified-5h-reset': '1e308',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(202)
+      expect(await response.text()).toBe('original')
+    })
+
+    test('header push persists source headers and refreshes sidebar checkedAt without a usage poll', async () => {
+      await useTempAccountFile(harvestStorage())
+      let usageCalls = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
+        return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForSidebarState(
+        (value) => value.main.quota?.five_hour?.usedPercent === 78,
+      )
+
+      expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
+      expect(state.lastUpdated).toBeGreaterThan(0)
+      expect(usageCalls).toBe(0)
+    })
+
+    test('successful harvest emits one quota debug record without raw headers', async () => {
+      await useTempAccountFile(harvestStorage())
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      const harvested = records.filter(
+        (record) =>
+          record.channel === 'quota' &&
+          record.message === 'harvested response quota',
+      )
+      expect(harvested).toHaveLength(1)
+      expect(JSON.stringify(harvested[0])).not.toContain('anthropic-ratelimit')
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
+    test('repeated normalize error shape warns once per process', async () => {
+      await useTempAccountFile(harvestStorage())
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('ok', {
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.5',
+              'anthropic-ratelimit-unified-5h-reset': '1e308',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(
+        records.filter(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'failed to normalize response quota headers',
+        ),
+      ).toHaveLength(1)
+      __setLogTestSink(null)
+    })
   })
 })
 
