@@ -337,6 +337,14 @@ production-only regression (env-override bypass) — first-hand DIFF review caug
 
 ---
 
+## 8. Relay Worker unified quota-header passthrough — FOLLOW-UP
+
+The 2026-07-16 Miniflare transport gate found mixed behavior: WebSocket `response_start`
+preserves `anthropic-ratelimit-unified-*`, while the HTTP Worker path strips those upstream
+headers. Quota harvest therefore remains direct-only until both transports preserve the same
+header family. Fix the Worker HTTP response path, then remove the relay guard only after HTTP and
+WebSocket assertions pass together. Do not add a quota side channel.
+
 ## Implementation phase (operator directive)
 
 When implementation begins, create a **fresh parity branch off `upstream/main`** — NOT off `dev`,

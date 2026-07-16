@@ -2815,7 +2815,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
             }
 
+            let usedDirectFetch = false
             const directFetch = async () => {
+              usedDirectFetch = true
               try {
                 const response = await fetch(rewritten.input, {
                   ...init,
@@ -2875,10 +2877,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               totalSendWithAccessMs: roundMs(nowMs() - start),
             })
 
-            harvestQuotaHeaders(response, {
-              accountId: oauthAccountId,
-              accessToken,
-            })
+            if (!relayConfig || usedDirectFetch) {
+              harvestQuotaHeaders(response, {
+                accountId: oauthAccountId,
+                accessToken,
+              })
+            } else {
+              logger.trace('quota', 'skipped relay response quota headers', {
+                account: oauthAccountId,
+                transport: relayConfig.transport,
+              })
+            }
             return response
           }
 
