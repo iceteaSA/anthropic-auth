@@ -370,7 +370,7 @@ function AccountBlock(props: {
           )}
         </For>
         <Show when={props.quota?.extraUsage}>
-          {(extraUsage) => (
+          {(extraUsage: () => NonNullable<AccountQuota['extraUsage']>) => (
             <text
               fg={toneColor(
                 props.theme,

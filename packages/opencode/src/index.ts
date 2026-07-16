@@ -1238,7 +1238,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const { storage, errors } =
       await fallbackManager.refreshQuotaForAllAccounts({ force: true })
     const displayStorage = await ensureProfilesForQuotaDisplay(
-      storage,
+      storage ?? createEmptyStorage(),
       mainAccessToken,
     )
     const mainSummary = accounts.find((account) => account.role === 'main')

@@ -117,7 +117,9 @@ export function buildFallbackQuotaSummaries(
       role: 'fallback' as const,
       enabled: account.enabled !== false,
       quota: account.quota,
-      tierLabel: formatOAuthAccountTier(account.profile),
+      ...(formatOAuthAccountTier(account.profile) && {
+        tierLabel: formatOAuthAccountTier(account.profile),
+      }),
       lastRefreshedAt: account.lastRefreshedAt,
       ...(error && { error }),
     }
