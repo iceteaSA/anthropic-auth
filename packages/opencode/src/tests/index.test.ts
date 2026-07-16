@@ -5554,3 +5554,466 @@ describe('killswitch fetch gate', () => {
     expect(mainServed).toBe(false)
   })
 })
+
+// -- /claude-prime: direct OAuth sender + quota refresh + accounting ------
+
+describe('claude-prime direct request', () => {
+  const originalFetch = globalThis.fetch
+  const originalSetInterval = globalThis.setInterval
+
+  beforeEach(() => {
+    globalThis.fetch = originalFetch
+    globalThis.setInterval = mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    ) as unknown as typeof setInterval
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    globalThis.setInterval = originalSetInterval
+  })
+
+  test('main prime fires a direct messages request with the documented body shape', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    const primeCalls: Array<{
+      url: string
+      init: RequestInit | undefined
+    }> = []
+    let quotaCalls = 0
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        primeCalls.push({ url, init })
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 'msg-test',
+              usage: { input_tokens: 20, output_tokens: 1 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        quotaCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(now - 1_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    // Reach into the plugin's internal manager via the auth closure wiring
+    // already in place: the manager has been constructed with sendPrime wired
+    // to a closure that calls the auth loader. Trigger an explicit tick via
+    // the manager factory on `plugin`.
+    const mgr = (
+      plugin as unknown as {
+        __primeManager?: { tick: () => Promise<void> }
+      }
+    ).__primeManager
+    expect(mgr).toBeDefined()
+    await mgr!.tick()
+
+    expect(primeCalls).toHaveLength(1)
+    expect(primeCalls[0]?.url).toBe(MESSAGES_URL)
+    const init = primeCalls[0]?.init
+    const bodyText =
+      typeof init?.body === 'string'
+        ? init.body
+        : init?.body instanceof Uint8Array
+          ? new TextDecoder().decode(init.body)
+          : ''
+    const body = JSON.parse(bodyText)
+    expect(body).toEqual({
+      model: 'claude-haiku-4-5',
+      max_tokens: 1,
+      system: 'Reply with 1 when you receive 0.',
+      messages: [{ role: 'user', content: '0' }],
+    })
+    expect(body.stream).toBeUndefined()
+    expect(body.thinking).toBeUndefined()
+    expect(body.tools).toBeUndefined()
+    expect(bodyText).not.toContain('cache_control')
+
+    // Quota fresh-check fired before the request
+    expect(quotaCalls).toBeGreaterThanOrEqual(1)
+  })
+
+  test('main prime uses main OAuth token + Anthropic identity headers', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    let observedAuth: string | undefined
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        const headers = new Headers(init?.headers ?? {})
+        observedAuth = headers.get('authorization') ?? undefined
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              usage: { input_tokens: 20, output_tokens: 1 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(now - 1_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const mgr = (
+      plugin as unknown as {
+        __primeManager?: { tick: () => Promise<void> }
+      }
+    ).__primeManager
+    await mgr!.tick()
+
+    expect(observedAuth).toBeDefined()
+    expect(observedAuth).toContain('main-access')
+  })
+
+  test('fallback prime uses fallback OAuth token', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'fb-access',
+            refresh: 'fb-refresh',
+            // expires must exceed the refresh-before-expiry window (4h default)
+            // so the token is NOT marked as needing refresh and the prime
+            // request flows through without the OAuth refresh fetch.
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
+            },
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    const calls: Array<{ url: string; auth?: string }> = []
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      const headers = new Headers(init?.headers ?? {})
+      calls.push({ url, auth: headers.get('authorization') ?? undefined })
+      if (url.includes('/v1/messages')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              usage: { input_tokens: 20, output_tokens: 1 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(now - 1_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const mgr = (
+      plugin as unknown as {
+        __primeManager?: { tick: () => Promise<void> }
+      }
+    ).__primeManager
+    await mgr!.tick()
+
+    const primeCall = calls.find(
+      (c) => c.url === MESSAGES_URL && c.auth?.includes('fb-access'),
+    )
+    expect(primeCall).toBeDefined()
+    expect(primeCall?.auth).toContain('fb-access')
+  })
+
+  test('send failure does not increment prime counters; no retry in same cycle', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    let messageCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        messageCalls += 1
+        return Promise.resolve(new Response('boom', { status: 500 }))
+      }
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(now - 1_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const mgr = (
+      plugin as unknown as {
+        __primeManager?: { tick: () => Promise<void> }
+      }
+    ).__primeManager
+    await mgr!.tick()
+    await mgr!.tick()
+
+    // Two ticks in the same reset cycle: marker claimed → second tick skips
+    expect(messageCalls).toBe(1)
+
+    // No counter incremented (state file has no main.prime)
+    const statePath = getAccountStatePath(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+    )
+    const raw = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(raw.main?.prime).toBeUndefined()
+  })
+
+  test('successful send increments main prime counters', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              usage: { input_tokens: 20, output_tokens: 1 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(now - 1_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const mgr = (
+      plugin as unknown as {
+        __primeManager?: { tick: () => Promise<void> }
+      }
+    ).__primeManager
+    await mgr!.tick()
+
+    const statePath = getAccountStatePath(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+    )
+    const raw = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(raw.main.prime).toEqual({
+      count: 1,
+      inputTokens: 20,
+      outputTokens: 1,
+      since: expect.any(Number),
+    })
+  })
+})

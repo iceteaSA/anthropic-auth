@@ -8,6 +8,7 @@ import {
   buildAccountList,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  buildPrimeRequestBody,
   buildRefreshOperationError,
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
@@ -21,6 +22,7 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
+  CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
@@ -51,6 +53,7 @@ import {
   getRoutingMode,
   getScopedQuotaWindowForModel,
   hashRefreshToken,
+  incrementPrimeUsagePersistent,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -65,6 +68,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
+  isPrimePersistentlyEnabled,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -76,6 +80,8 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  PrimeManager,
+  type PrimeSendResult,
   parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
@@ -154,6 +160,7 @@ const HTTP_SERVER_RESPONSE_TYPE_ID = '~effect/http/HttpServerResponse'
 const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
 const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
+const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
@@ -749,6 +756,184 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       return headers
     },
   })
+
+  // -- /claude-prime manager: direct OAuth request to start each account's
+  // five-hour quota window ~60s after reset, exactly once across concurrent
+  // OpenCode processes via atomic marker claim. In-process manager mirrors the
+  // cacheKeep singleton shape; cross-process exclusivity is the marker's job.
+  async function refreshPrimeMainQuota(): Promise<OAuthQuotaSnapshot> {
+    if (!latestGetAuth) {
+      throw new Error('prime: main auth loader is not available')
+    }
+    const auth = await latestGetAuth()
+    if (auth.type !== 'oauth' || !auth.access) {
+      throw new Error('prime: main account is not an OAuth account')
+    }
+    const quota = await quotaManager.refreshMain(auth.access)
+    return quota
+  }
+
+  async function refreshPrimeFallbackQuota(
+    accountId: string,
+  ): Promise<OAuthQuotaSnapshot> {
+    const storage = await loadAccounts(accountStoragePath)
+    const account = storage?.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === accountId &&
+        candidate.enabled !== false &&
+        isOAuthAccount(candidate),
+    )
+    if (!account || !storage || !account.access) {
+      throw new Error(`prime: OAuth account ${accountId} is unavailable`)
+    }
+    // Reuse the same fallback-manager refresh path used by the cachekeep
+    // sender so the rotation/refresh bookkeeping stays consistent.
+    let current = account
+    try {
+      current = await fallbackManager.refreshAccount(account, storage)
+    } catch (error) {
+      logger.warn('prime', 'fallback token refresh failed', {
+        accountId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    if (!current.access) {
+      throw new Error(`prime: OAuth account ${accountId} has no access token`)
+    }
+    const quota = await quotaManager.refreshFallback(accountId, current.access)
+    return quota
+  }
+
+  async function sendPrime(
+    accountId: 'main' | string,
+  ): Promise<PrimeSendResult> {
+    const start = performance.now()
+    let accessToken: string | undefined
+    let resolvedModel: string | undefined
+    try {
+      if (accountId === 'main') {
+        if (!latestGetAuth) {
+          return {
+            ok: false,
+            error: 'prime: main auth loader is not available',
+          }
+        }
+        const auth = await latestGetAuth()
+        if (auth.type !== 'oauth' || !auth.access) {
+          return {
+            ok: false,
+            error: 'prime: main account is not an OAuth account',
+          }
+        }
+        if (!auth.access || (auth.expires && auth.expires < Date.now())) {
+          if (!latestRefreshMainAccessToken) {
+            return { ok: false, error: 'prime: main token refresh unavailable' }
+          }
+          auth.access = await latestRefreshMainAccessToken()
+        }
+        accessToken = auth.access
+        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
+      } else {
+        const storage = await loadAccounts(accountStoragePath)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId &&
+            candidate.enabled !== false &&
+            isOAuthAccount(candidate),
+        )
+        if (!account || !storage) {
+          return {
+            ok: false,
+            error: `prime: OAuth account ${accountId} is unavailable`,
+          }
+        }
+        let current = account
+        try {
+          current = await fallbackManager.refreshAccount(account, storage)
+        } catch (error) {
+          logger.warn('prime', 'fallback token refresh failed', {
+            accountId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+        accessToken = current.access
+        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
+      }
+
+      if (!accessToken) {
+        return { ok: false, error: 'prime: no access token available' }
+      }
+
+      const body = buildPrimeRequestBody()
+      const identity = await resolveClaudeCodeIdentity(
+        accessToken,
+        resolvedModel,
+      )
+      const headers = new Headers({
+        'content-type': 'application/json',
+      })
+      setOAuthHeaders(headers, accessToken, { body, identity })
+      headers.delete('content-length')
+      headers.delete('transfer-encoding')
+      const response = await fetch(PRIME_MESSAGES_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      })
+      const ms = Math.round(performance.now() - start)
+      if (!response.ok) {
+        const reason =
+          (await response.text().catch(() => '')) || `HTTP ${response.status}`
+        return { ok: false, status: response.status, ms, error: reason }
+      }
+      const data = (await response.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null
+      const usageRaw = data?.usage as
+        | { input_tokens?: number; output_tokens?: number }
+        | undefined
+      const usage =
+        usageRaw &&
+        (Number.isFinite(usageRaw.input_tokens) ||
+          Number.isFinite(usageRaw.output_tokens))
+          ? {
+              inputTokens: Number.isFinite(usageRaw.input_tokens)
+                ? usageRaw.input_tokens
+                : undefined,
+              outputTokens: Number.isFinite(usageRaw.output_tokens)
+                ? usageRaw.output_tokens
+                : undefined,
+            }
+          : undefined
+      return { ok: true, status: response.status, ms, ...(usage && { usage }) }
+    } catch (error) {
+      return {
+        ok: false,
+        ms: Math.round(performance.now() - start),
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  const primeManager = new PrimeManager({
+    loadStorage: () => loadAccounts(accountStoragePath),
+    refreshQuota: async (accountId) => {
+      if (accountId === 'main') return refreshPrimeMainQuota()
+      return refreshPrimeFallbackQuota(accountId)
+    },
+    sendPrime,
+    recordSuccess: (accountId, usage) =>
+      incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
+  })
+  if (isPrimePersistentlyEnabled(initialStorage)) {
+    primeManager.start()
+  }
 
   const fableWarmChains = new Map<string, Promise<void>>()
 
@@ -3782,6 +3967,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         },
       ],
     },
+    __primeManager: primeManager,
+    __primeManagerPublic: primeManager,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }
