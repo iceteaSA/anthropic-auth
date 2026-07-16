@@ -12,11 +12,6 @@ import {
   type OAuthQuotaSnapshot,
   type PrimeUsageCounters,
 } from './accounts.ts'
-// Logger import is via the public package alias so the singleton instance
-// shared by downstream tests (which load through the dist main entry) is the
-// same object this module writes to. Importing from './logger.ts' directly
-// would yield a distinct module instance under Bun's workspace + symlink
-// resolution and silently swallow sink captures from cross-package tests.
 import { logger } from './logger.ts'
 import {
   CLAUDE_HAIKU_4_5_MODEL_ID,
@@ -51,7 +46,7 @@ export type PrimeCommandAction =
 export type PrimeAccountStatus = {
   id: string
   label: string
-  nextDueAt?: number | null
+  nextDueAt?: number
   lastPrimedAt?: number | null
   lastResult?: 'ok' | 'error'
   usage?: import('./accounts.ts').PrimeUsageCounters
@@ -158,12 +153,10 @@ export function buildPrimeAccountStatuses(
   return [mainStatus, ...fallbacks]
 }
 
-function primeNextDueAt(
-  window?: AccountQuotaWindow,
-): number | null | undefined {
-  if (!window?.resetsAt) return null
+function primeNextDueAt(window?: AccountQuotaWindow): number | undefined {
+  if (!window?.resetsAt) return undefined
   const ms = Date.parse(window.resetsAt)
-  if (!Number.isFinite(ms)) return null
+  if (!Number.isFinite(ms)) return undefined
   return ms + PRIME_DUE_OFFSET_MS
 }
 
@@ -288,10 +281,32 @@ export function executePrimeCommand(input: {
 }
 
 /**
- * Eligibility check shared by the manager tick and the dialog preview. Returns
- * false when the account is a non-OAuth API-key account, explicitly disabled,
- * has a permanent refresh error, or fails the killswitch policy (without a
- * modelId — a killed account is blocked from spending at all).
+ * Which gate of the eligibility check failed. The manager logs the human
+ * reason string on every ineligible account (including API-key and
+ * disabled), per the spec's Logging table.
+ */
+export type PrimeEligibilityReason =
+  | 'not-oauth'
+  | 'disabled'
+  | 'needs-reauth'
+  | 'killswitch'
+
+export type PrimeEligibilityResult =
+  | { eligible: true }
+  | { eligible: false; reason: PrimeEligibilityReason }
+
+const ELIGIBILITY_REASON_LABEL: Record<PrimeEligibilityReason, string> = {
+  'not-oauth': 'API-key account',
+  disabled: 'disabled',
+  'needs-reauth': 'needs re-login',
+  killswitch: 'killswitch',
+}
+
+/**
+ * Eligibility check shared by the manager tick and the dialog preview.
+ * Returns a discriminated result so the manager can log a specific reason
+ * per the spec's Logging table. A killed account is blocked from spending
+ * at all — `killswitchPassesPolicy` is called WITHOUT a modelId.
  */
 export function primeIsEligible(input: {
   storage: AccountStorage | null
@@ -300,14 +315,21 @@ export function primeIsEligible(input: {
   isEnabled: boolean
   hasPermanentRefreshError: boolean
   quota?: OAuthQuotaSnapshot
-}): boolean {
-  if (!input.isOAuth) return false
-  if (!input.isEnabled) return false
-  if (input.hasPermanentRefreshError) return false
+}): PrimeEligibilityResult {
+  if (!input.isOAuth) return { eligible: false, reason: 'not-oauth' }
+  if (!input.isEnabled) return { eligible: false, reason: 'disabled' }
+  if (input.hasPermanentRefreshError)
+    return { eligible: false, reason: 'needs-reauth' }
   if (!killswitchPassesPolicy(input.quota, input.storage, input.accountId)) {
-    return false
+    return { eligible: false, reason: 'killswitch' }
   }
-  return true
+  return { eligible: true }
+}
+
+export function primeEligibilityReasonLabel(
+  reason: PrimeEligibilityReason,
+): string {
+  return ELIGIBILITY_REASON_LABEL[reason]
 }
 
 export const PRIME_REQUEST_BODY = {
@@ -328,6 +350,19 @@ export function buildPrimeRequestBody(): {
 }
 
 // -- PrimeManager -----------------------------------------------------------
+
+/**
+ * Refresh result from a fresh-check. `fresh=false` means the adapter
+ * returned a cached snapshot (e.g. quota API in 429-backoff, or another
+ * process holds the quota file lock). PrimeManager treats a stale
+ * result as "do not claim, retry next tick" so a cached past
+ * `resetsAt` can never cause a duplicate prime against an
+ * already-started window.
+ */
+export type PrimeRefreshResult = {
+  quota: OAuthQuotaSnapshot
+  fresh: boolean
+}
 
 type AccountEvaluation = {
   id: 'main' | string
@@ -354,27 +389,44 @@ function primeAccountLabel(
   return id
 }
 
+/**
+ * Build the list of accounts the manager should evaluate EVERY tick.
+ * Includes disabled and API-key accounts so the eligibility log fires
+ * for them too (the spec Logging table mandates the debug log for
+ * every non-eligible case so operators can troubleshoot). Filter for
+ * the actual fire decision happens via `primeIsEligible`.
+ */
 function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
   const evaluations: AccountEvaluation[] = []
+  const mainRefreshError = storage.refresh?.mainLastRefreshError
   evaluations.push({
     id: 'main',
     label: 'main',
     isOAuth: true,
     isEnabled: true,
-    hasPermanentRefreshError: isPermanentRefreshError(
-      storage.refresh?.mainLastRefreshError,
-    ),
+    hasPermanentRefreshError: isPermanentRefreshError(mainRefreshError),
     storedQuota: storage.quota?.mainQuota,
     storedFiveHour: storage.quota?.mainQuota?.five_hour,
   })
   for (const account of storage.accounts ?? []) {
-    if (!isOAuthAccount(account)) continue
-    if (account.enabled === false) continue
+    if (!isOAuthAccount(account)) {
+      // API-key accounts are surfaced here so the eligibility-skip debug
+      // log fires once per tick and an operator can confirm the
+      // account won't prime. The check itself is in `primeIsEligible`.
+      evaluations.push({
+        id: account.id,
+        label: primeAccountLabel(account.id, account),
+        isOAuth: false,
+        isEnabled: account.enabled !== false,
+        hasPermanentRefreshError: false,
+      })
+      continue
+    }
     evaluations.push({
       id: account.id,
       label: primeAccountLabel(account.id, account),
       isOAuth: true,
-      isEnabled: true,
+      isEnabled: account.enabled !== false,
       hasPermanentRefreshError: isPermanentRefreshError(
         account.lastRefreshError,
       ),
@@ -402,9 +454,17 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
  */
 export class PrimeManager {
   private timer: ReturnType<typeof setInterval> | null = null
-  private readonly options: {
+  // Set true by `stop()` so a tick already in flight can short-circuit
+  // before claim/send, preventing a stale in-flight cycle from firing
+  // after `/claude-prime off` or after a newer plugin invocation has
+  // replaced this instance (M3b).
+  private stopped = false
+  // `options` is exposed as a public-readonly view so the existing test
+  // seam can swap a single dependency (the refresh adapter) between
+  // ticks. Do not mutate `options` in production code.
+  public readonly options: {
     loadStorage: () => Promise<AccountStorage | null>
-    refreshQuota: (accountId: 'main' | string) => Promise<OAuthQuotaSnapshot>
+    refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
     sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
     recordSuccess: (
       accountId: 'main' | string,
@@ -413,9 +473,13 @@ export class PrimeManager {
     now?: () => number
     markerDir?: string
   }
-  // Per-account transient state from the last attempt — overlays persisted
+  // Per-account transient state from the last ATTEMPT — overlays persisted
   // counters in `stats()` so the sidebar/dialog can show "just attempted"
   // without waiting for the next save. NOT persisted.
+  //
+  // Crucially, fresh-check skips do NOT touch this map. Only an actual
+  // claim+fire attempt mutates it. See `runForAccount` for the invariant
+  // (M4): skip is not the same as a successful prime.
   private transient = new Map<
     string,
     { lastPrimedAt: number; lastResult: 'ok' | 'error' }
@@ -423,10 +487,14 @@ export class PrimeManager {
   // Latest cumulative counters returned by recordSuccess. Overlays the
   // persisted counters in stats() before the next load persists them.
   private counters = new Map<'main' | string, PrimeUsageCounters>()
+  // Per-account "window active" observation from the most recent fresh
+  // check (M4). Surfaced in the status as the rendered "— window active"
+  // text; independent of lastPrimedAt/lastResult.
+  private windowActive = new Map<'main' | string, number>()
 
   constructor(options: {
     loadStorage: () => Promise<AccountStorage | null>
-    refreshQuota: (accountId: 'main' | string) => Promise<OAuthQuotaSnapshot>
+    refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
     sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
     recordSuccess: (
       accountId: 'main' | string,
@@ -440,6 +508,7 @@ export class PrimeManager {
 
   start(): void {
     if (this.timer) return
+    this.stopped = false
     logger.trace('prime', 'manager started')
     this.timer = setInterval(() => {
       void this.tick().catch((error) => {
@@ -454,21 +523,43 @@ export class PrimeManager {
   }
 
   stop(): void {
-    if (!this.timer) return
+    if (!this.timer && !this.stopped) {
+      this.stopped = true
+      return
+    }
+    this.stopped = true
+    if (this.timer) {
+      clearInterval(this.timer)
+      this.timer = null
+    }
     logger.trace('prime', 'manager stopped')
-    clearInterval(this.timer)
-    this.timer = null
+  }
+
+  isStopped(): boolean {
+    return this.stopped
   }
 
   async tick(): Promise<void> {
     const now = this.options.now?.() ?? Date.now()
     logger.trace('prime', 'tick start', { now })
     await this.sweepMarkers(now)
+    if (this.stopped) {
+      logger.trace('prime', 'tick: stopped, aborting')
+      return
+    }
+    // Re-load persisted state at the start of every tick. The previous
+    // read may pre-date an `/claude-prime off` from another process or
+    // a settings edit (M3b).
     const storage = await this.options.loadStorage()
     if (!storage) {
       logger.trace('prime', 'tick: no storage, skipping')
       return
     }
+    if (storage.prime?.enabled !== true) {
+      logger.trace('prime', 'tick: feature disabled, skipping')
+      return
+    }
+    this.lastFallbackRefreshFailureKey = null
     const evaluations = evaluateAccounts(storage)
     await Promise.all(
       evaluations.map((evaluation) =>
@@ -502,23 +593,37 @@ export class PrimeManager {
     })
   }
 
+  /** True if the most recent fresh-check observed the window as already running. */
+  isWindowActive(accountId: 'main' | string): boolean {
+    return this.windowActive.has(accountId)
+  }
+
   private async runForAccount(
     evaluation: AccountEvaluation,
     storage: AccountStorage,
     now: number,
   ): Promise<void> {
     try {
-      if (
-        !primeIsEligible({
-          storage,
-          accountId: evaluation.id,
-          isOAuth: evaluation.isOAuth,
-          isEnabled: evaluation.isEnabled,
-          hasPermanentRefreshError: evaluation.hasPermanentRefreshError,
-          quota: evaluation.storedQuota,
+      if (this.stopped) return
+
+      const eligibility = primeIsEligible({
+        storage,
+        accountId: evaluation.id,
+        isOAuth: evaluation.isOAuth,
+        isEnabled: evaluation.isEnabled,
+        hasPermanentRefreshError: evaluation.hasPermanentRefreshError,
+        quota: evaluation.storedQuota,
+      })
+      if (!eligibility.eligible) {
+        // Per spec Logging table: every ineligible case (disabled /
+        // needs-reauth / killswitch / API-key) emits a debug log carrying
+        // the account's display label and the specific reason. `trace`
+        // would hide this from operators troubleshooting "why isn't prime
+        // firing for my X account".
+        logger.debug('prime', 'ineligible', {
+          account: evaluation.label,
+          reason: primeEligibilityReasonLabel(eligibility.reason),
         })
-      ) {
-        logger.trace('prime', 'ineligible', { account: evaluation.id })
         return
       }
 
@@ -527,50 +632,75 @@ export class PrimeManager {
         storedResetEpoch === undefined ||
         now < storedResetEpoch + PRIME_DUE_OFFSET_MS
       ) {
-        logger.debug('prime', 'not due', { account: evaluation.id })
+        // "Not due" is a routine tick outcome, not an operator-visible
+        // diagnostic. Per the spec's `trace` row for tick evaluation.
+        logger.trace('prime', 'not due', { account: evaluation.label })
         return
       }
 
-      let fresh: OAuthQuotaSnapshot
+      let refreshed: PrimeRefreshResult
       try {
-        fresh = await this.options.refreshQuota(evaluation.id)
+        refreshed = await this.options.refreshQuota(evaluation.id)
       } catch (error) {
         // Quota fresh-check failure: skip this tick without consuming a claim.
         logger.warn('prime', 'refresh failed', {
-          account: evaluation.id,
+          account: evaluation.label,
           error: error instanceof Error ? error.message : String(error),
+        })
+        return
+      }
+      // Re-check stop + persist opt-in after every await boundary so
+      // an `/claude-prime off` (or a newer plugin instance's stop())
+      // aborts the cycle BEFORE claim or send (M3b).
+      if (this.stopped) return
+      const reloaded = await this.options.loadStorage()
+      if (reloaded?.prime?.enabled !== true) return
+
+      const fresh = refreshed.quota
+      // Stale fresh-check: the adapter returned a cached snapshot (quota
+      // API 429-backoff, another process owns the file lock, or the
+      // account was just refreshed by someone else). Skip without
+      // claiming — a cached past `resetsAt` would otherwise let us
+      // prime against an already-started window. Retry next tick.
+      if (!refreshed.fresh) {
+        logger.debug('prime', 'stale fresh-check', {
+          account: evaluation.label,
         })
         return
       }
 
       const freshResetEpoch = storedResetMs(fresh?.five_hour)
       if (freshResetEpoch !== undefined && freshResetEpoch > now) {
-        // Window already started by a real request. Record + skip; do not claim.
+        // Window already started by a real request. Track the active-
+        // window observation separately (M4) so the status renderer can
+        // show "— window active" without conflating it with a successful
+        // prime. Do NOT touch lastPrimedAt / lastResult.
         logger.debug('prime', 'window active', {
-          account: evaluation.id,
-          nextReset: fresh.five_hour?.resetsAt,
+          account: evaluation.label,
+          resetsAt: fresh.five_hour?.resetsAt,
         })
-        this.transient.set(evaluation.id, {
-          lastPrimedAt: now,
-          lastResult: 'ok',
-        })
+        this.windowActive.set(evaluation.id, now)
         return
       }
+      this.windowActive.delete(evaluation.id)
 
-      // Use the FRESH snapshot's reset epoch if available; fall back to the
-      // stored one. The marker key must stay stable per cycle, so picking
-      // the older value when the fresh snapshot omits five_hour is correct.
+      // Use the FRESH snapshot's reset epoch if available; fall back to
+      // the stored one. The marker key must stay stable per cycle.
       const markerEpoch = freshResetEpoch ?? storedResetEpoch ?? Math.floor(now)
       const claimed = await this.tryClaim(evaluation.id, markerEpoch)
+      if (this.stopped) return
       if (!claimed) {
-        logger.debug('prime', 'claim lost', { account: evaluation.id })
+        logger.debug('prime', 'claim lost', {
+          account: evaluation.label,
+          marker: `${evaluation.id}-${markerEpoch}`,
+        })
         return
       }
 
-      await this.fire(evaluation, now)
+      await this.fire(evaluation, now, reloaded)
     } catch (error) {
       logger.warn('prime', 'account evaluation failed', {
-        account: evaluation.id,
+        account: evaluation.label,
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -600,15 +730,15 @@ export class PrimeManager {
   private async fire(
     evaluation: AccountEvaluation,
     now: number,
+    _storage: AccountStorage,
   ): Promise<void> {
     let result: PrimeSendResult
     try {
       result = await this.options.sendPrime(evaluation.id)
     } catch (error) {
-      // Send threw unexpectedly — treat as a failure and keep the marker.
       const message = error instanceof Error ? error.message : String(error)
       logger.warn('prime', 'prime fire threw', {
-        account: evaluation.id,
+        account: evaluation.label,
         error: message,
       })
       this.transient.set(evaluation.id, {
@@ -617,10 +747,17 @@ export class PrimeManager {
       })
       return
     }
+    if (this.stopped) return
 
     if (!result.ok) {
+      // Token refresh failure during sendPrime is a distinct canonical
+      // event (warn · prime · { account, error }); the adapter's
+      // `logger.warn('prime', 'fallback token refresh failed', ...)` for
+      // the pre-send refresh is the matching main-refresh path. Both
+      // surface here as the fire-failed warn; the adapter's pre-send
+      // message has already documented the underlying token issue.
       logger.warn('prime', 'prime fire failed', {
-        account: evaluation.id,
+        account: evaluation.label,
         status: result.status,
         error: result.error,
       })
@@ -637,24 +774,32 @@ export class PrimeManager {
     }
     try {
       const counters = await this.options.recordSuccess(evaluation.id, usage)
+      if (this.stopped) {
+        // If stopped mid-fire, roll back the transient so a later
+        // `stats()` does not report a phantom success.
+        this.transient.delete(evaluation.id)
+        this.counters.delete(evaluation.id)
+        return
+      }
       this.counters.set(evaluation.id, counters)
       this.transient.set(evaluation.id, {
         lastPrimedAt: now,
         lastResult: 'ok',
       })
       logger.info('prime', 'prime fired', {
-        account: evaluation.id,
+        account: evaluation.label,
         status: result.status,
         ms: result.ms,
-        count: counters.count,
-        inputTokens: counters.inputTokens,
-        outputTokens: counters.outputTokens,
+        usage: {
+          inputTokens: counters.inputTokens,
+          outputTokens: counters.outputTokens,
+        },
       })
     } catch (error) {
       // Persisting counters failed; surface the error but keep the marker so
       // the cycle counts as attempted. Operator can retry next reset epoch.
       logger.warn('prime', 'recordSuccess failed', {
-        account: evaluation.id,
+        account: evaluation.label,
         error: error instanceof Error ? error.message : String(error),
       })
       this.transient.set(evaluation.id, {

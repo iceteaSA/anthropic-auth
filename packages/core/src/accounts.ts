@@ -1473,6 +1473,17 @@ export async function setPrimePersistentEnabled(
  * are intentionally NOT triggered so prime counters cannot leak into
  * `anthropic-auth.json`. Callers should not depend on this function to mutate
  * the caller's storage object.
+ *
+ * KNOWN LIMITATION: cross-process RMW race. The in-process `enqueueSave`
+ * mutex serializes calls within one Node process, but two processes can
+ * both win their marker claim in the same reset window and race their
+ * `load → mutate → writeJsonAtomic` cycles. The later rename drops the
+ * earlier process's new counters. This is bounded to a cosmetic counter
+ * increment (prime is idempotent at the API level — only the cumulative
+ * displayed total may briefly under-count). The durable fix is the
+ * project-wide cross-process RMW lock around runtime state writes (a
+ * `mutateAccounts` helper held under the same file lock that
+ * refreshAccount uses). Tracked separately; not implemented here.
  */
 export async function incrementPrimeUsagePersistent(
   accountId: 'main' | string,

@@ -20,6 +20,7 @@ import {
   getLogLevel,
   setLogLevel as setLogLevelSource,
 } from '../logger.ts'
+import type { PrimeRefreshResult } from '../prime.ts'
 import {
   buildPrimeAccountStatuses,
   buildPrimeStatusSummary,
@@ -161,12 +162,12 @@ describe('buildPrimeAccountStatuses', () => {
     expect(fb.lastResult).toBe('error')
   })
 
-  test('null nextDueAt when no resetsAt', () => {
+  test('undefined nextDueAt when no resetsAt', () => {
     const s = storage()
     s.accounts = []
     const statuses = buildPrimeAccountStatuses(s, { now: STORAGE_TS })
     const main = statuses.find((s) => s.id === 'main') as PrimeAccountStatus
-    expect(main.nextDueAt).toBeNull()
+    expect(main.nextDueAt).toBeUndefined()
   })
 })
 
@@ -321,7 +322,7 @@ function makePrimeFixture(opts?: {
         }
       : undefined,
     killswitch: opts?.killswitch,
-    prime: { enabled: opts?.enabled === true },
+    prime: { enabled: true },
     accounts,
   }
   return { storage, accountId }
@@ -346,6 +347,7 @@ async function makeHarness(opts: {
   markerDir: string
   now: number
   quotaFresh: OAuthQuotaSnapshot
+  quotaFreshIsStale?: boolean
   send?: (id: 'main' | string) => PrimeSendResult | Promise<PrimeSendResult>
   recordSuccessReturn?: PrimeUsageCounters
   refreshError?: Error
@@ -359,7 +361,11 @@ async function makeHarness(opts: {
     refreshQuota: async (id) => {
       refreshCalls.push(id)
       if (opts.refreshError) throw opts.refreshError
-      return opts.quotaFresh
+      const result: PrimeRefreshResult = {
+        quota: opts.quotaFresh,
+        fresh: opts.quotaFreshIsStale !== true,
+      }
+      return result
     },
     sendPrime: async (id) => {
       const result = opts.send
@@ -842,7 +848,10 @@ describe('PrimeManager — refresh failure', () => {
         checkedAt: 1,
       },
     }
-    h.manager.options.refreshQuota = async () => refreshed
+    h.manager.options.refreshQuota = async () => ({
+      quota: refreshed,
+      fresh: true,
+    })
     await h.manager.tick()
     expect(h.sendCalls).toHaveLength(1)
     await h.cleanup()
@@ -1010,7 +1019,7 @@ describe('PrimeManager — logging', () => {
     })
     const futureReset = 500 + 5 * 60_000
     // A second fallback whose reset is in the future — eligible, but not yet
-    // due, so the manager emits a debug skip record (covers the debug branch
+    // due, so the manager emits a trace skip record (covers the trace branch
     // of the canonical log table).
     fixture.storage.accounts.push({
       id: 'work-future',
@@ -1024,6 +1033,12 @@ describe('PrimeManager — logging', () => {
           checkedAt: 1,
         },
       },
+    })
+    // An API-key account — surfaces the `not-oauth` debug eligibility skip.
+    fixture.storage.accounts.push({
+      id: 'apikey-acc',
+      type: 'api',
+      baseURL: 'https://example.com',
     })
     const now = 500 + 120_000
     const h = await makeHarness({
@@ -1040,7 +1055,7 @@ describe('PrimeManager — logging', () => {
       },
       send: (id) => {
         if (id === 'work-alt') {
-          return { ok: false, error: 'sk-fail', status: 500 }
+          return { ok: false, error: 'fire_failure', status: 500 }
         }
         return {
           ok: true,
@@ -1051,19 +1066,82 @@ describe('PrimeManager — logging', () => {
       },
     })
     await h.manager.tick()
-    const primeRecords = capturedPrimeSink.filter((r) => r.channel === 'prime')
+    const prime = (m: string) =>
+      capturedPrimeSink.filter((r) => r.channel === 'prime' && r.message === m)
+    const pick = (
+      records: LogTestRecord[],
+      account: string,
+    ): Record<string, unknown> | undefined => {
+      for (const r of records) {
+        const accountValue = (r.payload as { account?: unknown })?.account
+        if (accountValue === account) {
+          return r.payload as Record<string, unknown>
+        }
+      }
+      return undefined
+    }
+
+    // -- main: fire success → info, label, status, ms, usage (nested object) --
+    const fired = prime('prime fired')
+    expect(fired).toHaveLength(1)
+    const mainFire = pick(fired, 'main') as
+      | {
+          account: string
+          status: number
+          ms: number
+          usage: { inputTokens: number; outputTokens: number }
+        }
+      | undefined
+    expect(mainFire).toBeDefined()
+    expect(mainFire?.status).toBe(200)
+    expect(typeof mainFire?.ms).toBe('number')
+    expect(mainFire?.usage).toBeDefined()
+    expect(mainFire?.usage?.inputTokens).toBe(20)
+    expect(mainFire?.usage?.outputTokens).toBe(1)
+
+    // -- work-alt: fire failed → warn, label, status, error --
+    const failed = prime('prime fire failed')
+    expect(failed).toHaveLength(1)
+    const fbFail = pick(failed, 'work-alt') as
+      | { account: string; status?: number; error: string }
+      | undefined
+    expect(fbFail).toBeDefined()
+    expect(fbFail?.status).toBe(500)
+    expect(fbFail?.error).toBe('fire_failure')
+
+    // -- apikey-acc: eligibility skip → debug, label, reason --
+    const ineligible = prime('ineligible')
+    expect(ineligible.length).toBeGreaterThanOrEqual(1)
+    const apiSkip = pick(ineligible, 'apikey-acc') as
+      | { account: string; reason: string }
+      | undefined
+    expect(apiSkip).toBeDefined()
+    expect(apiSkip?.reason).toBe('API-key account')
+
+    // -- work-future: not due → trace, label --
+    const notDue = prime('not due')
+    expect(notDue).toHaveLength(1)
+    const futureSkip = pick(notDue, 'work-future') as
+      | { account: string }
+      | undefined
+    expect(futureSkip).toBeDefined()
+
+    // -- Lifecycle: manager started → trace, manager stopped → trace --
+    h.manager.start()
     expect(
-      primeRecords.some(
-        (r) =>
-          r.level === 'info' &&
-          r.message === 'prime fired' &&
-          (r.payload as { status?: number })?.status === 200,
+      capturedPrimeSink.some(
+        (r) => r.channel === 'prime' && r.message === 'manager started',
       ),
     ).toBe(true)
-    expect(primeRecords.some((r) => r.level === 'warn')).toBe(true)
-    expect(primeRecords.some((r) => r.level === 'debug')).toBe(true)
-    expect(primeRecords.some((r) => r.level === 'trace')).toBe(true)
-    const serialized = JSON.stringify(primeRecords)
+    h.manager.stop()
+    expect(
+      capturedPrimeSink.some(
+        (r) => r.channel === 'prime' && r.message === 'manager stopped',
+      ),
+    ).toBe(true)
+
+    // No secret strings in any captured record.
+    const serialized = JSON.stringify(capturedPrimeSink)
     expect(serialized).not.toContain('sk-ant-')
     expect(serialized).not.toContain('Bearer ')
     expect(serialized).not.toContain('eyJ')
