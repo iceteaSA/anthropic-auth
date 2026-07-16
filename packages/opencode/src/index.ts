@@ -164,14 +164,14 @@ const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
 
-async function resolveInitialSidebarRouting(
+function resolveFreshSidebarRouting(
   storage: AccountStorage | null,
-): Promise<{ activeId: string | undefined; route: string }> {
+  existing: SidebarState,
+): { activeId: string | undefined; route: string } | undefined {
   const enabledOAuthAccounts = (storage?.accounts ?? []).filter(
     (account): account is OAuthAccount =>
       account.enabled !== false && isOAuthAccount(account),
   )
-  const existing = await getSidebarState()
   const existingAge = Date.now() - existing.lastUpdated
   const existingActiveIdIsValid =
     existing.activeId === 'main' ||
@@ -185,6 +185,23 @@ async function resolveInitialSidebarRouting(
   ) {
     return { activeId: existing.activeId, route: existing.route }
   }
+
+  return undefined
+}
+
+async function resolveInitialSidebarRouting(
+  storage: AccountStorage | null,
+): Promise<{ activeId: string | undefined; route: string }> {
+  const existingRouting = resolveFreshSidebarRouting(
+    storage,
+    await getSidebarState(),
+  )
+  if (existingRouting) return existingRouting
+
+  const enabledOAuthAccounts = (storage?.accounts ?? []).filter(
+    (account): account is OAuthAccount =>
+      account.enabled !== false && isOAuthAccount(account),
+  )
 
   const firstFallback = enabledOAuthAccounts[0]
   if (getRoutingMode(storage) === 'fallback-first' && firstFallback) {
@@ -899,9 +916,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       route: string
       mainAccessToken?: string
       mainRefreshToken?: string
+      routingAuthoritative?: boolean
     },
   ) {
-    lastSidebarRouting = { activeId: options.activeId, route: options.route }
+    const routingAuthoritative = options.routingAuthoritative !== false
+    if (routingAuthoritative) {
+      lastSidebarRouting = { activeId: options.activeId, route: options.route }
+    }
     quotaManager.updateStorage(storage)
     quotaManager.seedMainFromStorage(storage, options.mainAccessToken)
     quotaManager.seedFallbacksFromAccounts(
@@ -980,7 +1001,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           : undefined,
       lastUpdated: Date.now(),
     }
-    return setSidebarState(state, sidebarStateFile).catch((error) =>
+    return setSidebarState(state, sidebarStateFile, {
+      routingAuthoritative,
+      resolvePreservedRouting: routingAuthoritative
+        ? undefined
+        : (current) => resolveFreshSidebarRouting(storage, current),
+      onRoutingResolved: routingAuthoritative
+        ? undefined
+        : (routing) => {
+            lastSidebarRouting = routing
+          },
+    }).catch((error) =>
       logger.warn('sidebar', 'state write failed', {
         error: error instanceof Error ? error.message : String(error),
       }),
@@ -1008,6 +1039,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       route: lastSidebarRouting.route,
       mainAccessToken: access,
       mainRefreshToken: refresh,
+      routingAuthoritative: false,
     })
   }
 
@@ -1157,6 +1189,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           route: lastSidebarRouting.route,
           mainAccessToken: auth.access,
           mainRefreshToken: auth.refresh,
+          routingAuthoritative: false,
         })
       } catch {
         // auth not yet available — sidebar will refresh on next request
@@ -1187,6 +1220,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
       mainRefreshToken: auth.refresh,
+      routingAuthoritative: false,
     })
 
     if (!desktopText || isTuiConnected(notice.sessionId)) return
@@ -1216,6 +1250,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
       mainRefreshToken: auth.refresh,
+      routingAuthoritative: false,
     })
   }
 
@@ -1547,6 +1582,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             route: lastSidebarRouting.route,
             mainAccessToken: auth.access,
             mainRefreshToken: auth.refresh,
+            routingAuthoritative: false,
           })
         } catch {
           // auth not yet available — sidebar will refresh on next request
@@ -1908,6 +1944,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           route: lastSidebarRouting.route,
           mainAccessToken: cmdAuth?.access,
           mainRefreshToken: cmdAuth?.refresh,
+          routingAuthoritative: false,
         })
       }
       if (isTuiConnected(input.sessionID)) {
@@ -2325,12 +2362,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           )
           const initialSidebarRouting =
             await resolveInitialSidebarRouting(initialStorage)
-          lastSidebarRouting = initialSidebarRouting
-          writeSidebarState(initialStorage, {
-            activeId: lastSidebarRouting.activeId,
-            route: lastSidebarRouting.route,
+          await writeSidebarState(initialStorage, {
+            activeId: initialSidebarRouting.activeId,
+            route: initialSidebarRouting.route,
             mainAccessToken: auth.access,
             mainRefreshToken: auth.refresh,
+            routingAuthoritative: false,
           })
 
           function isReplayableRequest(

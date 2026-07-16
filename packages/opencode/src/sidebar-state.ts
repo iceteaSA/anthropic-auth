@@ -238,23 +238,54 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
 
 let writeChain: Promise<void> = Promise.resolve()
 
-export async function getSidebarState(): Promise<SidebarState> {
+async function readSidebarState(stateFile: string): Promise<SidebarState> {
   try {
-    const raw = await readFile(getSidebarStateFile(), 'utf8')
+    const raw = await readFile(stateFile, 'utf8')
     return normalizeSidebarState(JSON.parse(raw))
   } catch {
     return DEFAULT_SIDEBAR_STATE
   }
 }
 
+export async function getSidebarState(): Promise<SidebarState> {
+  return readSidebarState(getSidebarStateFile())
+}
+
+export interface SidebarStateWriteOptions {
+  routingAuthoritative?: boolean
+  resolvePreservedRouting?: (
+    current: SidebarState,
+  ) => Pick<SidebarState, 'activeId' | 'route'> | undefined
+  onRoutingResolved?: (
+    routing: Pick<SidebarState, 'activeId' | 'route'>,
+  ) => void
+}
+
 export async function setSidebarState(
   state: SidebarState,
   stateFile = getSidebarStateFile(),
+  options: SidebarStateWriteOptions = {},
 ): Promise<void> {
   writeChain = writeChain
     .then(async () => {
+      let stateToWrite = state
+      if (options.routingAuthoritative === false) {
+        const current = await readSidebarState(stateFile)
+        const preservedRouting = options.resolvePreservedRouting?.(current)
+        if (preservedRouting) {
+          stateToWrite = {
+            ...state,
+            ...preservedRouting,
+            lastUpdated: Math.max(state.lastUpdated, current.lastUpdated),
+          }
+        }
+      }
       await mkdir(dirname(stateFile), { recursive: true })
-      await writeFile(stateFile, JSON.stringify(state), 'utf8')
+      await writeFile(stateFile, JSON.stringify(stateToWrite), 'utf8')
+      options.onRoutingResolved?.({
+        activeId: stateToWrite.activeId,
+        route: stateToWrite.route,
+      })
     })
     .catch(() => {
       // Best-effort — sidebar is non-critical
