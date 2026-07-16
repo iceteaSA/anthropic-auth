@@ -114,10 +114,35 @@ export type AccountScopedQuotaWindow = AccountQuotaWindow & {
   modelName: string
 }
 
+export type QuotaMoney = {
+  amountMinor: number
+  currency: string
+  exponent: number
+}
+
+export type OAuthExtraUsageSnapshot = {
+  used: QuotaMoney
+  limit: QuotaMoney
+  utilizationPercent?: number
+  severity?: string
+  exhausted: boolean
+}
+
+export type OAuthAccountProfile = {
+  tier: string
+  orgType: string
+  checkedAt: number
+}
+
 export type OAuthQuotaSnapshot = Partial<
   Record<QuotaWindowName, AccountQuotaWindow>
 > & {
   scoped?: AccountScopedQuotaWindow[]
+  extraUsage?: OAuthExtraUsageSnapshot
+  bindingWindow?: string
+  bindingWindowSource?: 'poll' | 'headers'
+  fallbackAdvised?: boolean
+  source?: 'poll' | 'headers'
   // Top-level freshness stamp for the whole snapshot. mergeAccountRuntimeState
   // uses this when the snapshot has no per-window checkedAt (e.g. a windowless
   // empty-scoped snapshot) — without it, a windowless refresh gets read as
@@ -269,6 +294,7 @@ type OAuthUsageLimit = {
   group?: string
   percent?: number
   resets_at?: string
+  is_active?: boolean
   scope?: {
     model?: {
       id?: string | null
@@ -282,6 +308,20 @@ type OAuthUsageResponse = {
   five_hour?: OAuthUsageWindow
   seven_day?: OAuthUsageWindow
   limits?: OAuthUsageLimit[]
+  extra_usage?: {
+    is_enabled?: boolean
+    monthly_limit?: number | null
+    used_credits?: number | null
+    utilization?: number | null
+  } | null
+  spend?: {
+    severity?: string | null
+    limit?: {
+      amount_minor?: number
+      currency?: string
+      exponent?: number
+    } | null
+  } | null
 }
 
 export type AccountManagerOptions = {
@@ -499,7 +539,61 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     quota.scoped = scoped
   }
 
+  if (isRecord(value.extraUsage)) {
+    const used = normalizeQuotaMoney(value.extraUsage.used)
+    const limit = normalizeQuotaMoney(value.extraUsage.limit)
+    if (used && limit && typeof value.extraUsage.exhausted === 'boolean') {
+      quota.extraUsage = {
+        used,
+        limit,
+        ...(typeof value.extraUsage.utilizationPercent === 'number' &&
+          Number.isFinite(value.extraUsage.utilizationPercent) && {
+            utilizationPercent: value.extraUsage.utilizationPercent,
+          }),
+        ...(typeof value.extraUsage.severity === 'string' && {
+          severity: value.extraUsage.severity,
+        }),
+        exhausted: value.extraUsage.exhausted,
+      }
+    }
+  }
+
+  if (typeof value.bindingWindow === 'string' && value.bindingWindow.trim()) {
+    quota.bindingWindow = value.bindingWindow.trim()
+  }
+  if (
+    value.bindingWindowSource === 'poll' ||
+    value.bindingWindowSource === 'headers'
+  ) {
+    quota.bindingWindowSource = value.bindingWindowSource
+  }
+  if (typeof value.fallbackAdvised === 'boolean') {
+    quota.fallbackAdvised = value.fallbackAdvised
+  }
+  if (value.source === 'poll' || value.source === 'headers') {
+    quota.source = value.source
+  }
+
   return Object.keys(quota).length ? quota : undefined
+}
+
+function normalizeQuotaMoney(value: unknown): QuotaMoney | undefined {
+  if (!isRecord(value)) return undefined
+  if (
+    typeof value.amountMinor !== 'number' ||
+    !Number.isFinite(value.amountMinor) ||
+    typeof value.currency !== 'string' ||
+    !value.currency.trim() ||
+    typeof value.exponent !== 'number' ||
+    !Number.isFinite(value.exponent)
+  ) {
+    return undefined
+  }
+  return {
+    amountMinor: value.amountMinor,
+    currency: value.currency.trim(),
+    exponent: value.exponent,
+  }
 }
 
 // Fresh empty storage shell — main OpenCode OAuth account, no fallback
@@ -2046,6 +2140,54 @@ function mapScopedWeeklyLimits(
   return scoped
 }
 
+function mapExtraUsage(
+  usage: OAuthUsageResponse,
+): OAuthExtraUsageSnapshot | undefined {
+  if (usage.extra_usage?.is_enabled !== true) return undefined
+  const usedAmount = usage.extra_usage.used_credits
+  const limitAmount = usage.extra_usage.monthly_limit
+  if (
+    typeof usedAmount !== 'number' ||
+    !Number.isFinite(usedAmount) ||
+    typeof limitAmount !== 'number' ||
+    !Number.isFinite(limitAmount)
+  ) {
+    return undefined
+  }
+  const currency = nonEmptyString(usage.spend?.limit?.currency) ?? 'USD'
+  const exponent = usage.spend?.limit?.exponent
+  const moneyExponent =
+    typeof exponent === 'number' && Number.isFinite(exponent) ? exponent : 2
+  return {
+    used: { amountMinor: usedAmount, currency, exponent: moneyExponent },
+    limit: { amountMinor: limitAmount, currency, exponent: moneyExponent },
+    ...(typeof usage.extra_usage.utilization === 'number' &&
+      Number.isFinite(usage.extra_usage.utilization) && {
+        utilizationPercent: usage.extra_usage.utilization,
+      }),
+    ...(nonEmptyString(usage.spend?.severity) && {
+      severity: nonEmptyString(usage.spend?.severity),
+    }),
+    exhausted: usedAmount >= limitAmount,
+  }
+}
+
+function mapBindingWindow(limits: OAuthUsageLimit[] | undefined) {
+  if (!Array.isArray(limits)) return undefined
+  const active = limits.find((limit) => limit?.is_active === true)
+  if (!active) return undefined
+  if (active.kind === 'session') return 'five_hour'
+  if (active.kind === 'weekly_all') return 'seven_day'
+  if (active.kind !== 'weekly_scoped' || active.group !== 'weekly') {
+    return undefined
+  }
+  const modelName = nonEmptyString(active.scope?.model?.display_name)
+  if (!modelName) return undefined
+  const identity = nonEmptyString(active.scope?.model?.id) ?? modelName
+  const slug = slugForQuotaIdentity(identity)
+  return slug ? `claude-weekly-scoped-${slug}` : undefined
+}
+
 function mapUsageWindow(
   window: OAuthUsageWindow | undefined,
   checkedAt: number,
@@ -2092,10 +2234,17 @@ export async function fetchOAuthQuotaSnapshot(input: {
 
   const checkedAt = input.now?.() ?? Date.now()
   const usage = (await response.json()) as OAuthUsageResponse
+  const bindingWindow = mapBindingWindow(usage.limits)
   return {
     five_hour: mapUsageWindow(usage.five_hour, checkedAt),
     seven_day: mapUsageWindow(usage.seven_day, checkedAt),
     scoped: mapScopedWeeklyLimits(usage.limits, checkedAt),
+    extraUsage: mapExtraUsage(usage),
+    ...(bindingWindow && {
+      bindingWindow,
+      bindingWindowSource: 'poll' as const,
+    }),
+    source: 'poll',
     checkedAt,
   } satisfies OAuthQuotaSnapshot
 }
