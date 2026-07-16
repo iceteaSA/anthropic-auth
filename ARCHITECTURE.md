@@ -135,12 +135,8 @@
 **TUI Sidebar Widget:**
 - Location: source in `packages/opencode/src/tui.tsx`; package loader in `packages/opencode/src/tui/entry.mjs`
 - Triggers: OpenCode TUI loads the plugin from `tui.json`
-<<<<<<< HEAD
 - Packaging: build-time Solid/OpenTUI transformation emits `src/tui-compiled/` with host-runtime virtual imports; the loader selects that compiled tree on OpenTUI 0.4.x and retains raw TSX only for older hosts/development checkouts
-- Responsibilities: Render quota/reporting sidebar, open command modal dialogs on `/claude-*` commands, honor TUI preferences from `tui-preferences.jsonc`
-=======
-- Responsibilities: Render quota/reporting sidebar, open command modal dialogs on `/claude-*` commands, honor TUI preferences from `tui-preferences.jsonc`. Per-account status words are `active` / `idle` / `blocked` / `re-login` (killswitched accounts render as `blocked` in red tone); the expanded sidebar surfaces a dedicated `Killswitch` row listing blocked account names, and the collapsed view appends a red `⊘` to the active account when it is killswitched. Quota toast (`showQuotaToastFromCache` in `packages/opencode/src/index.ts`) uses the same killswitch-aware `isKilled` predicate so `/claude-quota` toasts mark killed accounts as `blocked`.
->>>>>>> 4681b39 (docs: note killswitch sidebar indicators + relay plan-gating in ARCHITECTURE)
+- Responsibilities: Render quota/reporting sidebar, open command modal dialogs on `/claude-*` commands, honor TUI preferences from `tui-preferences.jsonc`. Per-account status words are `active` / `idle` / `blocked` / `re-login` (killswitched accounts render as `blocked` in red tone); the expanded sidebar surfaces a dedicated `Killswitch` row listing blocked account names, and the collapsed view appends a red `⊘` to the active account when it is killswitched. Quota toast (`showQuotaToastFromCache` in `packages/opencode/src/index.ts`) uses the same killswitch-aware `isKilled` predicate so `/claude-quota` toasts mark killed accounts as `blocked`. The expanded sidebar also renders a `Prime` row when `/claude-prime` is enabled (next-due time, primed ✓, cumulative count/cost, `err` tone on failure); the collapsed view shows nothing for prime.
 
 ## Error Handling
 
