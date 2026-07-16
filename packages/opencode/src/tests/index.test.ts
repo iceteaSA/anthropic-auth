@@ -11,6 +11,7 @@ import {
   hashRefreshToken,
   type LogTestRecord,
   loadAccounts,
+  type OAuthAccount,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   resetCache1hState,
   resetDumpState,
@@ -5428,7 +5429,7 @@ describe('auth.loader', () => {
 
     async function waitForState(predicate: (state: any) => boolean) {
       let lastState: unknown
-      for (let attempt = 0; attempt < 50; attempt++) {
+      for (let attempt = 0; attempt < 200; attempt++) {
         try {
           const state = JSON.parse(
             await readFile(
@@ -5460,6 +5461,39 @@ describe('auth.loader', () => {
         (value) => value.main?.quota?.source === 'headers',
       )
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
+    })
+
+    test('main header push preserves persisted poll backoff across reload', async () => {
+      const pollBackoff = {
+        message: 'Claude quota check failed: 429 — rate limited',
+        checkedAt: Date.now(),
+        nextRetryAt: Date.now() + 60_000,
+        retryCount: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainLastQuotaApiError: pollBackoff,
+          },
+        }),
+      )
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('main-ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      const reloaded = await loadAccounts()
+
+      expect(state.main.lastQuotaApiError).toEqual(pollBackoff)
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(reloaded?.quota?.mainLastQuotaApiError).toEqual(pollBackoff)
+      expect(reloaded?.quota?.mainQuota?.source).toBe('headers')
     })
 
     test('primary adapter harvests one response frame and makes no corroborating usage request', async () => {
@@ -5524,6 +5558,57 @@ describe('auth.loader', () => {
         (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
       )
       expect(state.main?.quota?.source).not.toBe('headers')
+    })
+
+    test('fallback header push preserves persisted poll backoff across reload', async () => {
+      const pollBackoff = {
+        message: 'Claude quota check failed: 429 — rate limited',
+        checkedAt: Date.now(),
+        nextRetryAt: Date.now() + 60_000,
+        retryCount: 1,
+      }
+      const fallback = createFallbackStorage().accounts[0]
+      if (fallback?.type !== 'oauth') {
+        throw new Error('expected OAuth fallback fixture')
+      }
+      await useTempAccountFile(
+        harvestStorage([{ ...fallback, lastQuotaRefreshError: pollBackoff }]),
+      )
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForState(
+        (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
+      )
+      const reloaded = await loadAccounts()
+      const reloadedFallback = reloaded?.accounts.find(
+        (account): account is OAuthAccount =>
+          account.id === 'fallback-1' && account.type === 'oauth',
+      )
+
+      expect(state.accounts['fallback-1'].lastQuotaRefreshError).toEqual(
+        pollBackoff,
+      )
+      expect(state.accounts['fallback-1'].quota.five_hour.usedPercent).toBe(78)
+      expect(reloadedFallback?.lastQuotaRefreshError).toEqual(pollBackoff)
+      expect(reloadedFallback?.quota?.source).toBe('headers')
     })
 
     test('sidebar state reflects header-pushed freshness and served fallback attribution', async () => {

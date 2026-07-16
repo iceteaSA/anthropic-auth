@@ -735,7 +735,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       storage.quota.mainQuota = entry.quota
       storage.quota.mainQuotaCheckedAt = entry.checkedAt
       storage.quota.mainQuotaToken = tokenFingerprint(served.accessToken)
-      storage.quota.mainLastQuotaApiError = undefined
       await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       return
     }
@@ -747,7 +746,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     )
     if (!account) return
     account.quota = entry.quota
-    account.lastQuotaRefreshError = undefined
     await saveAccountState(storage, accountStoragePath, {
       accounts: [served.accountId],
     })
