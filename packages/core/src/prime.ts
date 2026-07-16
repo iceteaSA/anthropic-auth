@@ -1,10 +1,23 @@
+import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 import {
   type AccountQuotaWindow,
   type AccountStorage,
+  type FallbackAccount,
   isOAuthAccount,
+  isPermanentRefreshError,
   killswitchPassesPolicy,
   type OAuthQuotaSnapshot,
+  type PrimeUsageCounters,
 } from './accounts.ts'
+// Logger import is via the public package alias so the singleton instance
+// shared by downstream tests (which load through the dist main entry) is the
+// same object this module writes to. Importing from './logger.ts' directly
+// would yield a distinct module instance under Bun's workspace + symlink
+// resolution and silently swallow sink captures from cross-package tests.
+import { logger } from './logger.ts'
 import {
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_HAIKU_4_5_PRICING,
@@ -312,4 +325,367 @@ export function buildPrimeRequestBody(): {
 } {
   // Copy to keep callers from accidentally mutating the canonical frozen body.
   return JSON.parse(JSON.stringify(PRIME_REQUEST_BODY))
+}
+
+// -- PrimeManager -----------------------------------------------------------
+
+type AccountEvaluation = {
+  id: 'main' | string
+  label: string
+  isOAuth: boolean
+  isEnabled: boolean
+  hasPermanentRefreshError: boolean
+  storedQuota?: OAuthQuotaSnapshot
+  storedFiveHour?: AccountQuotaWindow
+}
+
+function defaultMarkerDir(): string {
+  return join(tmpdir(), 'opencode-anthropic-auth', 'prime')
+}
+
+function primeAccountLabel(
+  id: 'main' | string,
+  fallback?: FallbackAccount,
+): string {
+  if (id === 'main') return 'main'
+  if (fallback && 'label' in fallback && fallback.label?.trim()) {
+    return fallback.label
+  }
+  return id
+}
+
+function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
+  const evaluations: AccountEvaluation[] = []
+  evaluations.push({
+    id: 'main',
+    label: 'main',
+    isOAuth: true,
+    isEnabled: true,
+    hasPermanentRefreshError: isPermanentRefreshError(
+      storage.refresh?.mainLastRefreshError,
+    ),
+    storedQuota: storage.quota?.mainQuota,
+    storedFiveHour: storage.quota?.mainQuota?.five_hour,
+  })
+  for (const account of storage.accounts ?? []) {
+    if (!isOAuthAccount(account)) continue
+    if (account.enabled === false) continue
+    evaluations.push({
+      id: account.id,
+      label: primeAccountLabel(account.id, account),
+      isOAuth: true,
+      isEnabled: true,
+      hasPermanentRefreshError: isPermanentRefreshError(
+        account.lastRefreshError,
+      ),
+      storedQuota: account.quota,
+      storedFiveHour: account.quota?.five_hour,
+    })
+  }
+  return evaluations
+}
+
+function storedResetMs(window?: AccountQuotaWindow): number | undefined {
+  if (!window?.resetsAt) return undefined
+  const ms = Date.parse(window.resetsAt)
+  return Number.isFinite(ms) ? ms : undefined
+}
+
+/**
+ * Scheduler for `/claude-prime`. Mirrors `CacheKeepManager` lifecycle (unref'd
+ * 60s interval, idempotent start/stop, swallowed tick errors) but adds the
+ * cross-process atomic marker claim before firing — exactly one OpenCode
+ * process fires per reset epoch even with N concurrent instances.
+ *
+ * Dependencies are injected so the manager can be exercised deterministically
+ * without filesystem, network, or live OAuth state.
+ */
+export class PrimeManager {
+  private timer: ReturnType<typeof setInterval> | null = null
+  private readonly options: {
+    loadStorage: () => Promise<AccountStorage | null>
+    refreshQuota: (accountId: 'main' | string) => Promise<OAuthQuotaSnapshot>
+    sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
+    recordSuccess: (
+      accountId: 'main' | string,
+      usage: { inputTokens?: number; outputTokens?: number },
+    ) => Promise<PrimeUsageCounters>
+    now?: () => number
+    markerDir?: string
+  }
+  // Per-account transient state from the last attempt — overlays persisted
+  // counters in `stats()` so the sidebar/dialog can show "just attempted"
+  // without waiting for the next save. NOT persisted.
+  private transient = new Map<
+    string,
+    { lastPrimedAt: number; lastResult: 'ok' | 'error' }
+  >()
+  // Latest cumulative counters returned by recordSuccess. Overlays the
+  // persisted counters in stats() before the next load persists them.
+  private counters = new Map<'main' | string, PrimeUsageCounters>()
+
+  constructor(options: {
+    loadStorage: () => Promise<AccountStorage | null>
+    refreshQuota: (accountId: 'main' | string) => Promise<OAuthQuotaSnapshot>
+    sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
+    recordSuccess: (
+      accountId: 'main' | string,
+      usage: { inputTokens?: number; outputTokens?: number },
+    ) => Promise<PrimeUsageCounters>
+    now?: () => number
+    markerDir?: string
+  }) {
+    this.options = options
+  }
+
+  start(): void {
+    if (this.timer) return
+    logger.trace('prime', 'manager started')
+    this.timer = setInterval(() => {
+      void this.tick().catch((error) => {
+        logger.warn('prime', 'tick failed', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    }, PRIME_TICK_MS)
+    if (typeof this.timer === 'object' && 'unref' in this.timer) {
+      ;(this.timer as { unref?: () => void }).unref?.()
+    }
+  }
+
+  stop(): void {
+    if (!this.timer) return
+    logger.trace('prime', 'manager stopped')
+    clearInterval(this.timer)
+    this.timer = null
+  }
+
+  async tick(): Promise<void> {
+    const now = this.options.now?.() ?? Date.now()
+    logger.trace('prime', 'tick start', { now })
+    await this.sweepMarkers(now)
+    const storage = await this.options.loadStorage()
+    if (!storage) {
+      logger.trace('prime', 'tick: no storage, skipping')
+      return
+    }
+    const evaluations = evaluateAccounts(storage)
+    await Promise.all(
+      evaluations.map((evaluation) =>
+        this.runForAccount(evaluation, storage, now),
+      ),
+    )
+    logger.trace('prime', 'tick end')
+  }
+
+  /**
+   * Project cumulative per-account status for the sidebar and dialog. Machine
+   * values only — formatting belongs in the TUI/sidebar/Pi layer.
+   */
+  stats(
+    storage?: AccountStorage | null,
+    nowArg?: number,
+  ): PrimeAccountStatus[] {
+    const baseStatuses = buildPrimeAccountStatuses(storage ?? null, {
+      now: nowArg,
+      transient: this.transient,
+    })
+    if (this.counters.size === 0) return baseStatuses
+    return baseStatuses.map((status) => {
+      const overlay = this.counters.get(status.id)
+      if (!overlay) return status
+      return {
+        ...status,
+        usage: overlay,
+        estimatedCostUsd: estimatePrimeCostUsd(overlay),
+      }
+    })
+  }
+
+  private async runForAccount(
+    evaluation: AccountEvaluation,
+    storage: AccountStorage,
+    now: number,
+  ): Promise<void> {
+    try {
+      if (
+        !primeIsEligible({
+          storage,
+          accountId: evaluation.id,
+          isOAuth: evaluation.isOAuth,
+          isEnabled: evaluation.isEnabled,
+          hasPermanentRefreshError: evaluation.hasPermanentRefreshError,
+          quota: evaluation.storedQuota,
+        })
+      ) {
+        logger.trace('prime', 'ineligible', { account: evaluation.id })
+        return
+      }
+
+      const storedResetEpoch = storedResetMs(evaluation.storedFiveHour)
+      if (
+        storedResetEpoch === undefined ||
+        now < storedResetEpoch + PRIME_DUE_OFFSET_MS
+      ) {
+        logger.debug('prime', 'not due', { account: evaluation.id })
+        return
+      }
+
+      let fresh: OAuthQuotaSnapshot
+      try {
+        fresh = await this.options.refreshQuota(evaluation.id)
+      } catch (error) {
+        // Quota fresh-check failure: skip this tick without consuming a claim.
+        logger.warn('prime', 'refresh failed', {
+          account: evaluation.id,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return
+      }
+
+      const freshResetEpoch = storedResetMs(fresh?.five_hour)
+      if (freshResetEpoch !== undefined && freshResetEpoch > now) {
+        // Window already started by a real request. Record + skip; do not claim.
+        logger.debug('prime', 'window active', {
+          account: evaluation.id,
+          nextReset: fresh.five_hour?.resetsAt,
+        })
+        this.transient.set(evaluation.id, {
+          lastPrimedAt: now,
+          lastResult: 'ok',
+        })
+        return
+      }
+
+      // Use the FRESH snapshot's reset epoch if available; fall back to the
+      // stored one. The marker key must stay stable per cycle, so picking
+      // the older value when the fresh snapshot omits five_hour is correct.
+      const markerEpoch = freshResetEpoch ?? storedResetEpoch ?? Math.floor(now)
+      const claimed = await this.tryClaim(evaluation.id, markerEpoch)
+      if (!claimed) {
+        logger.debug('prime', 'claim lost', { account: evaluation.id })
+        return
+      }
+
+      await this.fire(evaluation, now)
+    } catch (error) {
+      logger.warn('prime', 'account evaluation failed', {
+        account: evaluation.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  private async tryClaim(
+    accountId: 'main' | string,
+    resetsAtEpochMs: number,
+  ): Promise<boolean> {
+    const dir = this.options.markerDir ?? defaultMarkerDir()
+    const markerPath = join(dir, `${accountId}-${resetsAtEpochMs}`)
+    try {
+      await mkdir(dir, { recursive: true })
+    } catch {
+      // Directory-create failures are propagated by the writeFile attempt below.
+    }
+    try {
+      await writeFile(markerPath, '', { encoding: 'utf8', flag: 'wx' })
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') return false
+      throw error
+    }
+  }
+
+  private async fire(
+    evaluation: AccountEvaluation,
+    now: number,
+  ): Promise<void> {
+    let result: PrimeSendResult
+    try {
+      result = await this.options.sendPrime(evaluation.id)
+    } catch (error) {
+      // Send threw unexpectedly — treat as a failure and keep the marker.
+      const message = error instanceof Error ? error.message : String(error)
+      logger.warn('prime', 'prime fire threw', {
+        account: evaluation.id,
+        error: message,
+      })
+      this.transient.set(evaluation.id, {
+        lastPrimedAt: now,
+        lastResult: 'error',
+      })
+      return
+    }
+
+    if (!result.ok) {
+      logger.warn('prime', 'prime fire failed', {
+        account: evaluation.id,
+        status: result.status,
+        error: result.error,
+      })
+      this.transient.set(evaluation.id, {
+        lastPrimedAt: now,
+        lastResult: 'error',
+      })
+      return
+    }
+
+    const usage = {
+      inputTokens: result.usage?.inputTokens,
+      outputTokens: result.usage?.outputTokens,
+    }
+    try {
+      const counters = await this.options.recordSuccess(evaluation.id, usage)
+      this.counters.set(evaluation.id, counters)
+      this.transient.set(evaluation.id, {
+        lastPrimedAt: now,
+        lastResult: 'ok',
+      })
+      logger.info('prime', 'prime fired', {
+        account: evaluation.id,
+        status: result.status,
+        ms: result.ms,
+        count: counters.count,
+        inputTokens: counters.inputTokens,
+        outputTokens: counters.outputTokens,
+      })
+    } catch (error) {
+      // Persisting counters failed; surface the error but keep the marker so
+      // the cycle counts as attempted. Operator can retry next reset epoch.
+      logger.warn('prime', 'recordSuccess failed', {
+        account: evaluation.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      this.transient.set(evaluation.id, {
+        lastPrimedAt: now,
+        lastResult: 'error',
+      })
+    }
+  }
+
+  private async sweepMarkers(now: number): Promise<void> {
+    const dir = this.options.markerDir ?? defaultMarkerDir()
+    let entries: string[]
+    try {
+      entries = await readdir(dir)
+    } catch {
+      return
+    }
+    let swept = 0
+    for (const entry of entries) {
+      try {
+        const s = await stat(join(dir, entry))
+        if (now - s.mtimeMs > PRIME_MARKER_MAX_AGE_MS) {
+          await rm(join(dir, entry), { force: true })
+          swept += 1
+        }
+      } catch {
+        // Markers can vanish between readdir and stat; skip silently.
+      }
+    }
+    if (swept > 0) {
+      logger.trace('prime', 'swept stale markers', { swept })
+    }
+  }
 }
