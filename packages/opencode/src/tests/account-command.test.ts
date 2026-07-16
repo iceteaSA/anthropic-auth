@@ -200,6 +200,31 @@ describe('buildAccountList', () => {
     const list = buildAccountList(storage)
     expect(list[1]!.label).toBe('abc')
   })
+
+  test('buildAccountList adds tierLabel only when profile exists', () => {
+    const storage = baseStorage()
+    storage.main = {
+      ...storage.main!,
+      profile: {
+        tier: 'default_claude_max_20x',
+        orgType: 'claude_max',
+        checkedAt: 100,
+      },
+    }
+    Object.assign(storage.accounts[0]!, {
+      profile: {
+        tier: 'default_claude_max_5x',
+        orgType: 'claude_team',
+        checkedAt: 100,
+      },
+    })
+
+    const list = buildAccountList(storage)
+
+    expect(list[0]!.tierLabel).toBe('Max 20x')
+    expect(list[1]!.tierLabel).toBe('Team · Max 5x')
+    expect(list[2]!.tierLabel).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import type { AccountStorage, FallbackAccount } from '../accounts.ts'
+import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
 export const CLAUDE_ACCOUNT_COMMAND_NAME = 'claude-account'
 
@@ -115,6 +116,7 @@ export interface AccountListItem {
   role: 'main' | 'fallback'
   enabled: boolean
   quotaPercent: number | null
+  tierLabel?: string
 }
 
 export function buildAccountList(storage: AccountStorage): AccountListItem[] {
@@ -128,6 +130,7 @@ export function buildAccountList(storage: AccountStorage): AccountListItem[] {
     role: 'main',
     enabled: true,
     quotaPercent: fiveHour?.usedPercent ?? null,
+    tierLabel: formatOAuthAccountTier(storage.main?.profile),
   })
 
   for (const account of storage.accounts) {
@@ -140,6 +143,10 @@ export function buildAccountList(storage: AccountStorage): AccountListItem[] {
       role: 'fallback',
       enabled: account.enabled !== false,
       quotaPercent: fiveHourQuota?.usedPercent ?? null,
+      tierLabel:
+        account.type === 'oauth'
+          ? formatOAuthAccountTier(account.profile)
+          : undefined,
     })
   }
 

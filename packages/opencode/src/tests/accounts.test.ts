@@ -19,7 +19,9 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
+  fetchOAuthAccountProfile,
   fetchOAuthQuotaSnapshot,
+  formatOAuthAccountTier,
   getAccountStatePath,
   getCache1hPersistentMode,
   getLogLevel,
@@ -33,7 +35,10 @@ import {
   killswitchPassesPolicy,
   loadAccounts,
   type OAuthAccount,
+  type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
+  oauthProfileIsFresh,
+  PROFILE_TTL_MS,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -146,6 +151,133 @@ afterEach(async () => {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   await rm(tempDir, { recursive: true, force: true })
   mock.restore()
+})
+
+describe('OAuth account profiles', () => {
+  const mainCapture = {
+    account: { has_claude_max: true },
+    organization: {
+      organization_type: 'claude_max',
+      rate_limit_tier: 'default_claude_max_20x',
+    },
+  }
+  const teamCapture = {
+    account: { has_claude_max: false },
+    organization: {
+      organization_type: 'claude_team',
+      rate_limit_tier: 'default_claude_max_5x',
+      seat_tier: 'team_tier_1',
+    },
+  }
+
+  async function fetchProfile(capture: unknown) {
+    return fetchOAuthAccountProfile({
+      accessToken: 'token',
+      now: () => 1234,
+      fetchImpl: (async () =>
+        Response.json(capture)) as unknown as typeof fetch,
+    })
+  }
+
+  test('fetchOAuthAccountProfile normalizes the personal Max 20x capture', async () => {
+    const profile = await fetchProfile(mainCapture)
+
+    expect(profile).toEqual({
+      tier: 'default_claude_max_20x',
+      orgType: 'claude_max',
+      checkedAt: 1234,
+    })
+    expect(formatOAuthAccountTier(profile)).toBe('Max 20x')
+  })
+
+  test('fetchOAuthAccountProfile normalizes the Team Max-5x capture', async () => {
+    const profile = await fetchProfile(teamCapture)
+
+    expect(profile).toEqual({
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 1234,
+    })
+    expect(formatOAuthAccountTier(profile)).toBe('Team · Max 5x')
+  })
+
+  test('profile freshness expires at seven days', () => {
+    const profile: OAuthAccountProfile = {
+      tier: 'default_claude_max_20x',
+      orgType: 'claude_max',
+      checkedAt: 100,
+    }
+
+    expect(
+      oauthProfileIsFresh(profile, profile.checkedAt + PROFILE_TTL_MS - 1),
+    ).toBe(true)
+    expect(
+      oauthProfileIsFresh(profile, profile.checkedAt + PROFILE_TTL_MS),
+    ).toBe(false)
+  })
+
+  test('profile survives sidecar save and load for main and fallback accounts', async () => {
+    const storage = baseStorage()
+    const mainProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_20x',
+      orgType: 'claude_max',
+      checkedAt: 100,
+    }
+    const fallbackProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 200,
+    }
+    storage.main = { ...storage.main!, profile: mainProfile }
+    storage.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      refresh: 'refresh',
+      profile: fallbackProfile,
+    })
+
+    await saveAccounts(storage, accountPath)
+    const loaded = await loadAccounts(accountPath)
+
+    expect(loaded?.main?.profile).toEqual(mainProfile)
+    expect(expectOAuthAccount(loaded?.accounts[0]).profile).toEqual(
+      fallbackProfile,
+    )
+  })
+
+  test('profile runtime fields are omitted from anthropic-auth.json', async () => {
+    const storage = baseStorage()
+    storage.main = {
+      ...storage.main!,
+      profile: { tier: 'tier', orgType: 'org', checkedAt: 100 },
+    }
+    storage.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      refresh: 'refresh',
+      profile: { tier: 'tier', orgType: 'org', checkedAt: 100 },
+    })
+
+    await saveAccounts(storage, accountPath)
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+
+    expect(config.main.profile).toBeUndefined()
+    expect(config.accounts[0].profile).toBeUndefined()
+  })
+
+  test('re-login does not retain a previous account profile', () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      refresh: 'old',
+      profile: { tier: 'old', orgType: 'old', checkedAt: 100 },
+    })
+
+    upsertAccount(storage, { id: 'work', type: 'oauth', refresh: 'new' })
+
+    expect(expectOAuthAccount(storage.accounts[0]).profile).toBeUndefined()
+  })
 })
 
 describe('isCostZeroingEnabled', () => {

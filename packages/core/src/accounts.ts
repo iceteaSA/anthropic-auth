@@ -38,6 +38,7 @@ export type OAuthAccount = AccountBase & {
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
   quota?: OAuthQuotaSnapshot
+  profile?: OAuthAccountProfile
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -170,6 +171,7 @@ export type AccountStorage = {
   main?: {
     type: 'opencode'
     provider: 'anthropic'
+    profile?: OAuthAccountProfile
   }
   routing?: {
     mode?: RoutingMode
@@ -259,6 +261,7 @@ export type AccountRuntimeEntry = Partial<
     | 'lastRefreshError'
     | 'lastQuotaRefreshError'
     | 'quota'
+    | 'profile'
   > &
     Pick<ApiKeyAccount, 'apiKey' | 'lastUsed'>
 >
@@ -266,6 +269,7 @@ export type AccountRuntimeEntry = Partial<
 export type AccountRuntimeState = {
   version: 1
   main?: {
+    profile?: OAuthAccountProfile
     quota?: OAuthQuotaSnapshot
     quotaCheckedAt?: number
     quotaToken?: string
@@ -279,6 +283,7 @@ export type AccountRuntimeState = {
 }
 
 export type AccountStateSaveScope = {
+  mainProfile?: boolean
   mainQuota?: boolean
   mainRefresh?: boolean
   accounts?: true | string[]
@@ -439,6 +444,28 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     lastRefreshError: normalizeOperationError(value.lastRefreshError),
     lastQuotaRefreshError: normalizeOperationError(value.lastQuotaRefreshError),
     quota: normalizeQuota(value.quota),
+    profile: normalizeOAuthAccountProfile(value.profile),
+  }
+}
+
+function normalizeOAuthAccountProfile(
+  value: unknown,
+): OAuthAccountProfile | undefined {
+  if (!isRecord(value)) return undefined
+  if (
+    typeof value.tier !== 'string' ||
+    !value.tier.trim() ||
+    typeof value.orgType !== 'string' ||
+    !value.orgType.trim() ||
+    typeof value.checkedAt !== 'number' ||
+    !Number.isFinite(value.checkedAt)
+  ) {
+    return undefined
+  }
+  return {
+    tier: value.tier.trim(),
+    orgType: value.orgType.trim(),
+    checkedAt: value.checkedAt,
   }
 }
 
@@ -610,7 +637,13 @@ function normalizeStorage(value: unknown): AccountStorage | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null
   return {
     version: 1,
-    main: { type: 'opencode', provider: 'anthropic' },
+    main: {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: normalizeOAuthAccountProfile(
+        isRecord(value.main) ? value.main.profile : undefined,
+      ),
+    },
     routing: isRecord(value.routing) ? value.routing : undefined,
     fallbackOn: Array.isArray(value.fallbackOn)
       ? value.fallbackOn.filter((status) => Number.isInteger(status))
@@ -734,6 +767,11 @@ function mergeConfigAndState(
 
   return {
     ...configValue,
+    main: {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: normalizeOAuthAccountProfile(mainState?.profile),
+    },
     refresh: objectWithDefinedEntries({
       ...refreshConfig,
       mainLastRefreshError: mainRefreshSource.lastRefreshError,
@@ -802,6 +840,7 @@ function accountRuntimeState(account: FallbackAccount) {
     lastRefreshError: account.lastRefreshError,
     lastQuotaRefreshError: account.lastQuotaRefreshError,
     quota: account.quota,
+    profile: account.profile,
   })
 }
 
@@ -900,7 +939,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
 
   return omitUndefinedTopLevel({
     version: 1,
-    main: storage.main,
+    main: { type: 'opencode', provider: 'anthropic' },
     routing: storage.routing,
     fallbackOn: storage.fallbackOn,
     refresh,
@@ -961,10 +1000,19 @@ async function saveAccountsLocked(storage: AccountStorage, path: string) {
   const nextConfig = { ...existing, ...configFromStorage(storage) }
   await writeJsonAtomic(path, nextConfig)
   await saveAccountStateUnlocked(storage, path, {
+    mainProfile: true,
     mainQuota: true,
     mainRefresh: true,
     accounts: true,
   })
+}
+
+function applyMainProfileStatePatch(
+  state: AccountRuntimeState,
+  storage: AccountStorage,
+) {
+  state.main = state.main ?? {}
+  state.main.profile = storage.main?.profile
 }
 
 function applyMainQuotaStatePatch(
@@ -1013,6 +1061,7 @@ export function saveAccountState(
   storage: AccountStorage,
   path = getAccountStoragePath(),
   scope: AccountStateSaveScope = {
+    mainProfile: true,
     mainQuota: true,
     mainRefresh: true,
     accounts: true,
@@ -1035,6 +1084,7 @@ async function saveAccountStateUnlocked(
     ? ({ ...existing, version: 1 } as AccountRuntimeState)
     : { version: 1 }
 
+  if (scope.mainProfile) applyMainProfileStatePatch(next, storage)
   if (scope.mainQuota) applyMainQuotaStatePatch(next, storage)
   if (scope.mainRefresh) applyMainRefreshStatePatch(next, storage)
 
@@ -2275,6 +2325,7 @@ export function upsertAccount(
       addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
       ...(account.type === 'oauth' && {
         quota: account.quota,
+        profile: account.profile,
         lastRefreshedAt: account.lastRefreshedAt,
         lastRefreshError: account.lastRefreshError,
         lastQuotaRefreshError: account.lastQuotaRefreshError,
