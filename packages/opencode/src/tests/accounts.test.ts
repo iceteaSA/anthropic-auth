@@ -25,15 +25,18 @@ import {
   getLogLevel,
   getPersistedLogLevel,
   getScopedQuotaWindowForModel,
+  incrementPrimeUsagePersistent,
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
   isPermanentRefreshError,
+  isPrimePersistentlyEnabled,
   type KillswitchThresholds,
   killswitchPassesPolicy,
   loadAccounts,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  type PrimeUsageCounters,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -54,6 +57,7 @@ import {
   setFastModePersistentEnabled,
   setLogLevel,
   setLogLevelPersistent,
+  setPrimePersistentEnabled,
   shouldFallbackStatus,
   upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
@@ -3657,5 +3661,231 @@ describe('setLogLevelPersistent', () => {
     } finally {
       setLogLevel(originalLevel)
     }
+  })
+})
+
+// -- prime opt-in flag + scoped counters ------------------------------------
+
+describe('isPrimePersistentlyEnabled', () => {
+  test('defaults to false when prime is absent', () => {
+    expect(isPrimePersistentlyEnabled(baseStorage())).toBe(false)
+  })
+
+  test('returns false when prime.enabled is not true', () => {
+    expect(isPrimePersistentlyEnabled({ prime: { enabled: false } })).toBe(
+      false,
+    )
+  })
+
+  test('returns true when prime.enabled is true', () => {
+    expect(isPrimePersistentlyEnabled({ prime: { enabled: true } })).toBe(true)
+  })
+
+  test('survives save/load round-trip', async () => {
+    const storage = baseStorage()
+    await setPrimePersistentEnabled(true, accountPath)
+    const loaded = await loadAccounts()
+    expect(isPrimePersistentlyEnabled(loaded)).toBe(true)
+  })
+})
+
+describe('setPrimePersistentEnabled', () => {
+  test('writes only enabled to the config; runtime counters never enter the config', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'work-alt',
+      type: 'oauth',
+      refresh: 'r',
+    })
+    await saveAccounts(storage)
+    await setPrimePersistentEnabled(true, accountPath)
+
+    const rawConfig = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(rawConfig.prime).toEqual({ enabled: true })
+  })
+
+  test('clears enabled when toggled off', async () => {
+    await setPrimePersistentEnabled(true, accountPath)
+    await setPrimePersistentEnabled(false, accountPath)
+    const loaded = await loadAccounts()
+    expect(isPrimePersistentlyEnabled(loaded)).toBe(false)
+    const rawConfig = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(rawConfig.prime).toEqual({ enabled: false })
+  })
+})
+
+describe('incrementPrimeUsagePersistent', () => {
+  test('initializes main counters on first success and accumulates tokens', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage)
+
+    const counters = await incrementPrimeUsagePersistent(
+      'main',
+      { inputTokens: 20, outputTokens: 1 },
+      accountPath,
+      1_721_111_111_000,
+    )
+    expect(counters).toEqual({
+      count: 1,
+      inputTokens: 20,
+      outputTokens: 1,
+      since: 1_721_111_111_000,
+    })
+
+    const next = await incrementPrimeUsagePersistent(
+      'main',
+      { inputTokens: 20, outputTokens: 1 },
+      accountPath,
+      1_721_111_112_000,
+    )
+    expect(next).toEqual({
+      count: 2,
+      inputTokens: 40,
+      outputTokens: 2,
+      since: 1_721_111_111_000,
+    })
+
+    // Counters live in the runtime-state file, not the config file
+    const rawConfig = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(rawConfig.prime).toBeUndefined()
+
+    const rawState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(rawState.main.prime).toEqual({
+      count: 2,
+      inputTokens: 40,
+      outputTokens: 2,
+      since: 1_721_111_111_000,
+    })
+  })
+
+  test('falls back to fallback account scoped counter', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'work-alt',
+      type: 'oauth',
+      refresh: 'r',
+    })
+    await saveAccounts(storage)
+
+    const counters = await incrementPrimeUsagePersistent(
+      'work-alt',
+      { inputTokens: 20, outputTokens: 1 },
+      accountPath,
+      1_721_111_112_000,
+    )
+    expect(counters).toEqual({
+      count: 1,
+      inputTokens: 20,
+      outputTokens: 1,
+      since: 1_721_111_112_000,
+    })
+
+    const rawState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(rawState.accounts['work-alt'].prime).toEqual({
+      count: 1,
+      inputTokens: 20,
+      outputTokens: 1,
+      since: 1_721_111_112_000,
+    })
+  })
+
+  test('clamps missing or non-finite usage to zero', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage)
+
+    const counters = await incrementPrimeUsagePersistent(
+      'main',
+      { inputTokens: Number.NaN, outputTokens: Number.POSITIVE_INFINITY },
+      accountPath,
+      1,
+    )
+    expect(counters.count).toBe(1)
+    expect(counters.inputTokens).toBe(0)
+    expect(counters.outputTokens).toBe(0)
+  })
+
+  test('a scoped fallback increment preserves an unrelated account state', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'work-alt',
+      type: 'oauth',
+      refresh: 'r',
+      access: 'a',
+    })
+    storage.accounts.push({
+      id: 'main-extra',
+      type: 'oauth',
+      refresh: 'r2',
+      access: 'b',
+    })
+    await saveAccounts(storage)
+
+    // Seed an unrelated runtime entry on the second account
+    await saveAccountState(
+      {
+        ...storage,
+        accounts: storage.accounts.map((acc) =>
+          acc.id === 'main-extra'
+            ? ({
+                ...acc,
+                access: 'pre-existing',
+                lastRefreshedAt: 999,
+              } as OAuthAccount)
+            : acc,
+        ),
+      },
+      accountPath,
+      { accounts: ['main-extra'] },
+    )
+
+    await incrementPrimeUsagePersistent(
+      'work-alt',
+      { inputTokens: 20, outputTokens: 1 },
+      accountPath,
+      1_721_111_112_000,
+    )
+
+    const loaded = await loadAccounts()
+    const workAlt = loaded?.accounts.find((acc) => acc.id === 'work-alt') as
+      | OAuthAccount
+      | undefined
+    const mainExtra = loaded?.accounts.find((acc) => acc.id === 'main-extra') as
+      | OAuthAccount
+      | undefined
+    expect(workAlt?.prime?.count).toBe(1)
+    expect(mainExtra?.access).toBe('pre-existing')
+    expect(mainExtra?.lastRefreshedAt).toBe(999)
+  })
+
+  test('a main prime increment preserves fallback state', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'work-alt',
+      type: 'oauth',
+      refresh: 'r',
+      access: 'a',
+    })
+    await saveAccounts(storage)
+
+    await incrementPrimeUsagePersistent(
+      'work-alt',
+      { inputTokens: 20, outputTokens: 1 },
+      accountPath,
+      1,
+    )
+
+    await incrementPrimeUsagePersistent(
+      'main',
+      { inputTokens: 20, outputTokens: 1 },
+      accountPath,
+      2,
+    )
+
+    const loaded = await loadAccounts()
+    const workAlt = loaded?.accounts.find((acc) => acc.id === 'work-alt') as
+      | OAuthAccount
+      | undefined
+    expect(workAlt?.prime?.count).toBe(1)
+    expect(loaded?.prime?.main?.count).toBe(1)
   })
 })

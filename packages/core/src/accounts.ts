@@ -38,6 +38,11 @@ export type OAuthAccount = AccountBase & {
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
   quota?: OAuthQuotaSnapshot
+  /**
+   * Per-fallback cumulative prime counters. Lives in the runtime-state file
+   * (scoped under `accounts[id].prime`) and never in `anthropic-auth.json`.
+   */
+  prime?: PrimeUsageCounters
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -126,6 +131,28 @@ export type OAuthQuotaSnapshot = Partial<
   checkedAt?: number
 }
 
+export type PrimeUsageCounters = {
+  count: number
+  inputTokens: number
+  outputTokens: number
+  since: number
+}
+
+export type PrimeUsageDelta = {
+  inputTokens?: number
+  outputTokens?: number
+}
+
+export type PrimeRuntimeState = {
+  enabled?: boolean
+  /**
+   * Main account prime counters. Persisted only on the main side of the
+   * runtime-state file — `configFromStorage()` never writes them to the config
+   * file so they cannot leak into `anthropic-auth.json`.
+   */
+  main?: PrimeUsageCounters
+}
+
 export type RoutingMode = 'main-first' | 'fallback-first'
 
 export type KillswitchThresholds = Partial<
@@ -201,6 +228,13 @@ export type AccountStorage = {
     endHour?: number
     subagents?: boolean
   }
+  /**
+   * Opt-in flag and runtime counters for `/claude-prime`. The `enabled` flag
+   * belongs on the config side; runtime counters (`main`) live in the
+   * state file and must never appear in `anthropic-auth.json`. See
+   * `configFromStorage()` for the write-side filter.
+   */
+  prime?: PrimeRuntimeState
   relay?: {
     enabled?: boolean
     url?: string
@@ -234,6 +268,7 @@ export type AccountRuntimeEntry = Partial<
     | 'lastRefreshError'
     | 'lastQuotaRefreshError'
     | 'quota'
+    | 'prime'
   > &
     Pick<ApiKeyAccount, 'apiKey' | 'lastUsed'>
 >
@@ -249,6 +284,7 @@ export type AccountRuntimeState = {
     refreshLeaseId?: string
     refreshLeaseUntil?: number
     refreshLeaseTokenHash?: string
+    prime?: PrimeUsageCounters
   }
   accounts?: Record<string, AccountRuntimeEntry>
 }
@@ -256,6 +292,7 @@ export type AccountRuntimeState = {
 export type AccountStateSaveScope = {
   mainQuota?: boolean
   mainRefresh?: boolean
+  mainPrime?: boolean
   accounts?: true | string[]
 }
 
@@ -399,6 +436,7 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     lastRefreshError: normalizeOperationError(value.lastRefreshError),
     lastQuotaRefreshError: normalizeOperationError(value.lastQuotaRefreshError),
     quota: normalizeQuota(value.quota),
+    prime: normalizePrimeUsageCounters(value.prime),
   }
 }
 
@@ -446,6 +484,31 @@ function normalizeQuotaWindow(value: unknown): AccountQuotaWindow | undefined {
     remainingPercent,
     checkedAt,
     resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
+  }
+}
+
+function normalizePrimeUsageCounters(
+  value: unknown,
+): PrimeUsageCounters | undefined {
+  if (!isRecord(value)) return undefined
+  const count = Number(value.count)
+  const inputTokens = Number(value.inputTokens)
+  const outputTokens = Number(value.outputTokens)
+  const since = Number(value.since)
+  if (
+    ![count, inputTokens, outputTokens, since].every(Number.isFinite) ||
+    count < 0 ||
+    inputTokens < 0 ||
+    outputTokens < 0 ||
+    since < 0
+  ) {
+    return undefined
+  }
+  return {
+    count: Math.floor(count),
+    inputTokens: Math.floor(inputTokens),
+    outputTokens: Math.floor(outputTokens),
+    since: Math.floor(since),
   }
 }
 
@@ -531,6 +594,19 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     relay: isRecord(value.relay) ? value.relay : undefined,
     logging: isRecord(value.logging) ? value.logging : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
+    prime: (() => {
+      if (!isRecord(value.prime)) return undefined
+      const enabled =
+        typeof value.prime.enabled === 'boolean'
+          ? value.prime.enabled
+          : undefined
+      const main = normalizePrimeUsageCounters(value.prime.main)
+      if (enabled === undefined && !main) return undefined
+      return {
+        ...(enabled !== undefined && { enabled }),
+        ...(main && { main }),
+      }
+    })(),
     accounts: value.accounts
       .map(normalizeAccount)
       .filter((account): account is FallbackAccount => account != null),
@@ -654,6 +730,24 @@ function mergeConfigAndState(
       mainQuotaToken: mainQuotaSource.quotaToken,
       mainLastQuotaApiError: mainQuotaSource.lastQuotaApiError,
     }),
+    // Carry the main-side prime counters from the state file back into the
+    // merged storage so a subsequent read sees the cumulative counters. The
+    // `enabled` flag stays sourced from the config side; main-side counters
+    // live exclusively on the state file.
+    prime: (() => {
+      const configPrime = isRecord(configValue.prime)
+        ? configValue.prime
+        : undefined
+      const mainCounters = normalizePrimeUsageCounters(mainState?.prime)
+      if (!configPrime && !mainCounters) return undefined
+      return {
+        ...(configPrime &&
+          typeof configPrime.enabled === 'boolean' && {
+            enabled: configPrime.enabled,
+          }),
+        ...(mainCounters && { main: mainCounters }),
+      }
+    })(),
     accounts,
   }
 }
@@ -708,6 +802,7 @@ function accountRuntimeState(account: FallbackAccount) {
     lastRefreshError: account.lastRefreshError,
     lastQuotaRefreshError: account.lastQuotaRefreshError,
     quota: account.quota,
+    prime: account.prime,
   })
 }
 
@@ -819,6 +914,14 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     cacheKeep: storage.cacheKeep,
     relay: storage.relay,
     killswitch: storage.killswitch,
+    prime: (() => {
+      // Config side carries ONLY the `enabled` flag — runtime counters stay on
+      // the state file. Write `enabled` whenever it was explicitly set so a
+      // toggle off persists `{ enabled: false }` and is visible to a stale
+      // reader that only inspects the config.
+      if (typeof storage.prime?.enabled !== 'boolean') return undefined
+      return { enabled: storage.prime.enabled }
+    })(),
     accounts: storage.accounts.map(accountConfig),
   })
 }
@@ -905,6 +1008,20 @@ function applyMainRefreshStatePatch(
   state.main.refreshLeaseTokenHash = storage.refresh?.mainRefreshLeaseTokenHash
 }
 
+function applyMainPrimeStatePatch(
+  state: AccountRuntimeState,
+  storage: AccountStorage,
+) {
+  const incoming = storage.prime?.main
+  if (!incoming) return
+  state.main = state.main ?? {}
+  // Last-writer-wins on prime counters — the only writer is the prime manager
+  // itself, monotonically accumulating per success, so there is no race for an
+  // older write to overwrite a newer one within this process. Across processes
+  // the cross-process claim marker (#1247) keeps the fire exclusive.
+  state.main.prime = incoming
+}
+
 function pruneUndefined(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(pruneUndefined)
   if (!isRecord(value)) return value
@@ -943,6 +1060,7 @@ async function saveAccountStateUnlocked(
 
   if (scope.mainQuota) applyMainQuotaStatePatch(next, storage)
   if (scope.mainRefresh) applyMainRefreshStatePatch(next, storage)
+  if (scope.mainPrime) applyMainPrimeStatePatch(next, storage)
 
   if (scope.accounts) {
     const ids = scope.accounts === true ? null : new Set(scope.accounts)
@@ -1329,6 +1447,80 @@ export async function setCacheKeepSubagentsEnabled(
   }
   await saveAccounts(storage, path)
   return storage
+}
+
+export function isPrimePersistentlyEnabled(storage: AccountStorage | null) {
+  return storage?.prime?.enabled === true
+}
+
+export async function setPrimePersistentEnabled(
+  enabled: boolean,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+  storage.prime = {
+    ...(storage.prime ?? {}),
+    enabled,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+/**
+ * Atomically increment an account's cumulative prime counters and persist via
+ * the scoped runtime-state path. The `main` account lives at state.main.prime;
+ * every other account lives at state.accounts[id].prime. Config-side writes
+ * are intentionally NOT triggered so prime counters cannot leak into
+ * `anthropic-auth.json`. Callers should not depend on this function to mutate
+ * the caller's storage object.
+ */
+export async function incrementPrimeUsagePersistent(
+  accountId: 'main' | string,
+  usage: PrimeUsageDelta,
+  path = getAccountStoragePath(),
+  now = Date.now(),
+): Promise<PrimeUsageCounters> {
+  const inputTokens = Number.isFinite(usage?.inputTokens)
+    ? Math.max(0, Math.floor(usage.inputTokens as number))
+    : 0
+  const outputTokens = Number.isFinite(usage?.outputTokens)
+    ? Math.max(0, Math.floor(usage.outputTokens as number))
+    : 0
+
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+
+  if (accountId === 'main') {
+    const existing = storage.prime?.main
+    const next: PrimeUsageCounters = {
+      count: (existing?.count ?? 0) + 1,
+      inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
+      outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
+      since: existing?.since ?? Math.floor(now),
+    }
+    storage.prime = { ...(storage.prime ?? {}), main: next }
+    await saveAccountState(storage, path, { mainPrime: true })
+    return next
+  }
+
+  const index = storage.accounts.findIndex(
+    (account) => account.id === accountId,
+  )
+  if (index < 0) {
+    throw new Error(
+      `incrementPrimeUsagePersistent: account "${accountId}" not found`,
+    )
+  }
+  const account = storage.accounts[index] as OAuthAccount
+  const existing = account.prime
+  const next: PrimeUsageCounters = {
+    count: (existing?.count ?? 0) + 1,
+    inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
+    outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
+    since: existing?.since ?? Math.floor(now),
+  }
+  storage.accounts[index] = { ...account, prime: next }
+  await saveAccountState(storage, path, { accounts: [accountId] })
+  return next
 }
 
 function getFallbackStatuses(storage: AccountStorage | null) {
