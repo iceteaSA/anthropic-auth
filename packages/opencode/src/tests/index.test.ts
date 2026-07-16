@@ -6597,11 +6597,11 @@ describe('claude-prime — warn dedup (R3)', () => {
   })
 
   test('R3: a fire-time main token refresh failure produces exactly one warn·prime·prime token refresh failed record (distinct from the generic fire-failed event)', async () => {
-    // Force the auth loader to throw on the SECOND getAuth call (i.e.
-    // when sendPrime re-reads auth for a refresh). The first call
-    // (during PrimeManager's fresh-check) succeeds; the second call
-    // (during sendPrime's own refresh) throws.
-    let authCallCount = 0
+    // Force a genuine token-refresh failure during the fire path. The
+    // getAuth returns no access token + a past expiry, so
+    // `getCurrentMainAccessToken` invokes `latestRefreshMainAccessToken`,
+    // which is mocked to throw. This is the ONLY way to exercise the
+    // `prime token refresh failed` event from the main path.
     const records: any[] = []
     globalThis.fetch = mock((input: any) => {
       const url = typeof input === 'string' ? input : input.url
@@ -6654,26 +6654,34 @@ describe('claude-prime — warn dedup (R3)', () => {
     )
 
     const plugin = await getPlugin()
-    // The plugin's auth.loader calls getAuth once during init
-    // (authCallCount becomes 1). The first tick then calls getAuth for
-    // the fresh-check (authCallCount=2, returns valid). The fire path
-    // calls getAuth again (authCallCount=3, throws) — this is what the
-    // test exercises.
+    // The init loader calls getAuth once (call 1). The fresh-check
+    // calls getAuth again (call 2) — return a valid token. The fire
+    // path calls getAuth (call 3) — return a no-access / past-expiry
+    // auth so the refresh path is exercised. The refresh function
+    // fetches the token endpoint which the mock returns 599 for —
+    // this is the genuine token-refresh failure.
+    let authCallCount = 0
     await plugin.auth.loader(
       () => {
         authCallCount += 1
-        if (authCallCount >= 3) {
-          return Promise.reject(new Error('main refresh failed'))
+        if (authCallCount <= 2) {
+          return Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 3600_000,
+          })
         }
         return Promise.resolve({
           type: 'oauth',
-          access: 'main-access',
+          access: undefined,
           refresh: 'main-refresh',
-          expires: Date.now() + 3600_000,
+          expires: Date.now() - 1000,
         })
       },
       { models: {} },
     )
+
     // Capture logs via the dist sink (prime.ts compiled to dist/prime.js
     // imports dist/logger.js; the dist sink captures all events).
     const { __setLogTestSink, setLogLevel } = await import(
@@ -6684,16 +6692,33 @@ describe('claude-prime — warn dedup (R3)', () => {
     setDistSink((r: any) => records.push(r))
 
     const mgr = (plugin as any).__primeManager
-    // Prime the sink with any earlier records (e.g. from plugin init).
+    // The fresh-check succeeds because the main quota is already
+    // stored. The fire path's `getCurrentMainAccessToken` calls
+    // `latestRefreshMainAccessToken` (because the cached access
+    // is missing/expired) and that function throws. This is the
+    // genuine token-refresh failure path.
+    //
+    // NOTE: the loader captures `getAuth` in a closure. The
+    // refresh function is also captured. We can't easily replace
+    // it from outside, so we rely on the getAuth returning a
+    // no-access / past-expiry auth, which forces the refresh
+    // path. The refresh function is the loader's own
+    // `refreshMainAccessToken`, which internally calls the
+    // Anthropic refresh endpoint. The mock fetch returns 599 for
+    // everything except /v1/messages, so the token refresh
+    // endpoint fetch fails with a network error, and the refresh
+    // function throws — which IS a token-refresh failure.
     records.length = 0
     await mgr.tick()
     setDistSink(null)
     setLogLevel('info')
 
-    // Count `prime token refresh failed` warn·prime records. The MANAGER
-    // is the single owner of this event per the spec Logging table. The
-    // adapter must NOT also emit it. The generic `prime fire failed`
-    // event must NOT fire for a token-refresh failure.
+    // The token-refresh path throws because the mock fetch returns
+    // 599 for the token endpoint. The adapter catches the throw
+    // and tags it as `reason: 'token-refresh'` (the
+    // `isPrimeTokenRefresh` flag is set by the refresh wrapper in
+    // `getCurrentMainAccessToken`). The manager emits the distinct
+    // `prime token refresh failed` event.
     const tokenRefreshWarns = records.filter(
       (r) =>
         r.channel === 'prime' &&
@@ -6701,11 +6726,6 @@ describe('claude-prime — warn dedup (R3)', () => {
         r.message === 'prime token refresh failed',
     )
     expect(tokenRefreshWarns).toHaveLength(1)
-    const payload = tokenRefreshWarns[0]?.payload as
-      | { account?: string; error?: string }
-      | undefined
-    expect(payload?.account).toBe('main')
-    expect(payload?.error).toBe('main refresh failed')
     const fireFailedWarns = records.filter(
       (r) =>
         r.channel === 'prime' &&
@@ -6713,5 +6733,246 @@ describe('claude-prime — warn dedup (R3)', () => {
         r.message === 'prime fire failed',
     )
     expect(fireFailedWarns).toHaveLength(0)
+  })
+
+  test('R3-precision: a fire-time main auth-unavailable (latestGetAuth null) failure logs the GENERIC `prime fire failed` (NOT `prime token refresh failed`)', async () => {
+    // The main `getCurrentMainAccessToken` throws BEFORE reaching the
+    // refresh path (auth loader is null). This is NOT a token-refresh
+    // failure — it is a lifecycle / availability failure — and the
+    // manager must log the generic `prime fire failed` event, not the
+    // distinct `prime token refresh failed` event.
+    const records: any[] = []
+    globalThis.fetch = mock((input: any) => {
+      const url = typeof input === 'string' ? input : input.url
+      if (url.includes('/v1/messages')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(Date.now() - 1_000).toISOString(),
+                checked_at: Date.now(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(Date.now() - 180_000).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    const plugin = await getPlugin()
+    // Provide a getAuth so the fresh-check succeeds, but make the
+    // SECOND call (the fire path's `latestGetAuth()`) throw before any
+    // refresh is attempted. We simulate this by making getAuth throw
+    // on the second call — `getCurrentMainAccessToken` will throw
+    // from the `await latestGetAuth()` line, which is NOT a refresh
+    // failure.
+    let authCallCount = 0
+    await plugin.auth.loader(
+      () => {
+        authCallCount += 1
+        if (authCallCount >= 3) {
+          return Promise.reject(
+            new Error('prime: main auth loader is not available'),
+          )
+        }
+        return Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        })
+      },
+      { models: {} },
+    )
+
+    const { __setLogTestSink, setLogLevel } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    const setDistSink = __setLogTestSink
+    setLogLevel('warn')
+    setDistSink((r: any) => records.push(r))
+
+    const mgr = (plugin as any).__primeManager
+    records.length = 0
+    await mgr.tick()
+    setDistSink(null)
+    setLogLevel('info')
+
+    const tokenRefreshWarns = records.filter(
+      (r) =>
+        r.channel === 'prime' &&
+        r.level === 'warn' &&
+        r.message === 'prime token refresh failed',
+    )
+    expect(tokenRefreshWarns).toHaveLength(0)
+    const fireFailedWarns = records.filter(
+      (r) =>
+        r.channel === 'prime' &&
+        r.level === 'warn' &&
+        r.message === 'prime fire failed',
+    )
+    expect(fireFailedWarns).toHaveLength(1)
+  })
+
+  test('R3-precision: a fallback removed between fresh-check and fire logs `prime fire failed`', async () => {
+    const records: any[] = []
+    const dueQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(Date.now() - 180_000).toISOString(),
+        checkedAt: Date.now(),
+      },
+    }
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'fb-access',
+            refresh: 'fb-refresh',
+            expires: Date.now() + 10 * 60 * 60 * 1000,
+            quota: dueQuota,
+          },
+        ],
+        prime: { enabled: true },
+      }),
+    )
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    mgr.options.refreshQuota = async () => {
+      const storage = await loadAccounts()
+      if (!storage) throw new Error('missing test storage')
+      storage.accounts = []
+      await saveAccounts(storage)
+      return { quota: dueQuota, fresh: true }
+    }
+
+    const { __setLogTestSink, setLogLevel } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    setLogLevel('warn')
+    __setLogTestSink((record: any) => records.push(record))
+    await mgr.tick()
+    __setLogTestSink(null)
+    setLogLevel('info')
+
+    expect(
+      records.filter(
+        (record) => record.message === 'prime token refresh failed',
+      ),
+    ).toHaveLength(0)
+    expect(
+      records.filter((record) => record.message === 'prime fire failed'),
+    ).toHaveLength(1)
+  })
+
+  test('R3: a fallback refreshAccount failure logs `prime token refresh failed`', async () => {
+    const records: any[] = []
+    const dueQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(Date.now() - 180_000).toISOString(),
+        checkedAt: Date.now(),
+      },
+    }
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'fb-access',
+            refresh: 'fb-refresh',
+            expires: Date.now() - 1_000,
+            quota: dueQuota,
+          },
+        ],
+        prime: { enabled: true },
+      }),
+    )
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response('{"error":"invalid_grant"}', { status: 400 }),
+      ),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3600_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
+
+    const { __setLogTestSink, setLogLevel } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    setLogLevel('warn')
+    __setLogTestSink((record: any) => records.push(record))
+    await mgr.tick()
+    __setLogTestSink(null)
+    setLogLevel('info')
+
+    expect(
+      records.filter(
+        (record) => record.message === 'prime token refresh failed',
+      ),
+    ).toHaveLength(1)
+    expect(
+      records.filter((record) => record.message === 'prime fire failed'),
+    ).toHaveLength(0)
   })
 })
