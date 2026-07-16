@@ -345,6 +345,13 @@ headers. Quota harvest therefore remains direct-only until both transports prese
 header family. Fix the Worker HTTP response path, then remove the relay guard only after HTTP and
 WebSocket assertions pass together. Do not add a quota side channel.
 
+## 9. Pi quota-header harvest parity — FOLLOW-UP
+
+Pi uses the distinct `packages/pi/src/stream.ts` response path. Header harvest, served-account
+attribution, sidecar persistence, and quota display parity remain out of scope for v1. Port the
+OpenCode direct-path behavior without sharing request-path state implicitly, then gate Pi's own
+streaming response headers and malformed-header handling.
+
 ## Implementation phase (operator directive)
 
 When implementation begins, create a **fresh parity branch off `upstream/main`** — NOT off `dev`,

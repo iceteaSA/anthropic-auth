@@ -143,7 +143,7 @@ Conditional headers (absent on main, present on work-alt): `fallback` appears on
 | Scoped per-model windows | `limits[]` `weekly_scoped` | n/a |
 | Representative/binding marker | `representative-claim` header + `is_active` (inferred) | `x-codex-…-over-…` style flags |
 
-openai-auth is therefore push-based by necessity (QuotaManager fed via `setMain`/`setFallback`); anthropic-auth is pull-based by choice with push available as an optimization.
+openai-auth is push-based by necessity (QuotaManager fed via `setMain`/`setFallback`); anthropic-auth now combines the usage poll with passive header pushes on direct requests.
 
 ---
 
@@ -167,13 +167,22 @@ Identity + plan metadata; the only surface exposing account KIND. Observed key f
 | `organization.billing_type` | `stripe_subscription` | `stripe_subscription` | |
 | `application.slug` | `claude-code` | `claude-code` | OAuth app identity |
 
-Also returned: account/org uuids, email, subscription status/created, `enabled_plugins`. Not consumed by the plugin today — candidate uses: killswitch defaults per rate-limit tier, account-list labels (`Max 20x` / `Team 5x`), and explaining why the same utilization percent represents very different absolute capacity across accounts.
+Also returned: account/org uuids, email, subscription status/created, `enabled_plugins`. The plugin stores only `organization_type`, `rate_limit_tier`, and the check time. Profile reads are lazy: quota and account display paths fetch them at most once per account per process, persist them in the sidecar, and reuse them for seven days. Model requests never call the profile endpoint.
 
-## Gaps / opportunities (not built)
+## Implemented behavior
 
-- **Header harvest**: scrape `unified-*` headers off every real response to keep main's 5h/7d fresh for free → fewer usage-API polls; prime's fresh-check could corroborate against the last response's headers. Supplements the poll (scoped windows + idle fallbacks still need it), never replaces it.
-- **Extra-usage surfacing**: work-alt's credits are exhausted ($100.35/$100.00, severity critical) — invisible in the sidebar today.
-- **`is_active`/`representative-claim`**: could drive "which limit binds now" UI instead of client-side max().
+- Direct `/v1/messages` responses harvest the unified 5h and 7d windows. Utilization fractions are multiplied by 100, then rounded; reset values are epoch seconds converted to ISO timestamps.
+- Header pushes merge into the last poll snapshot. They preserve poll-owned `scoped`, including meaningful empty `[]`, and `extraUsage` credit data.
+- Poll `limits[].is_active` owns `bindingWindow` when present. The header `representative-claim` fills the marker only when the poll did not supply one.
+- Money stays in integer minor units with an explicit currency exponent. Formatting happens at the display boundary.
+- `fallback: available` becomes `fallbackAdvised`; it appears only in expanded quota views and does not change routing.
+- Profile metadata is sidecar-persisted, uses a seven-day TTL, and is absent from the request path.
+- Relay transport is direct-only in v1. The WebSocket relay preserves unified headers, but the HTTP Worker strips them; harvesting is skipped for relay responses until both paths pass the same transport gate. See the relay parity item in `docs/parity-backlog.md`.
+
+## Gaps / opportunities
+
+- Relay HTTP response-header passthrough remains the blocker for relay-side harvest.
+- Pi has a separate streaming response path and does not harvest quota headers in v1.
 
 ## Probe recipes
 
