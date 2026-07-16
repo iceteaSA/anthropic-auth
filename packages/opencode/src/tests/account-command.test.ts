@@ -225,6 +225,22 @@ describe('buildAccountList', () => {
     expect(list[1]!.tierLabel).toBe('Team · Max 5x')
     expect(list[2]!.tierLabel).toBeUndefined()
   })
+
+  test('account modal includes optional tier label', () => {
+    const storage = baseStorage()
+    storage.main = {
+      ...storage.main!,
+      profile: {
+        tier: 'default_claude_max_20x',
+        orgType: 'claude_max',
+        checkedAt: 100,
+      },
+    }
+
+    const result = executeAccountCommand({ argumentsText: '', storage })
+
+    expect(result.text).toContain('Max 20x')
+  })
 })
 
 // ---------------------------------------------------------------------------

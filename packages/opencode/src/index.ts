@@ -36,6 +36,8 @@ import {
   executeLoggingCommand,
   executeRoutingCommand,
   FallbackAccountManager,
+  fetchOAuthAccountProfile,
+  formatOAuthAccountTier,
   formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
   getAccountStoragePath,
@@ -77,6 +79,7 @@ import {
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  oauthProfileIsFresh,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   parseAccountCommandAction,
   parseCache1hCommandAction,
@@ -674,6 +677,51 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     },
   })
+  const attemptedProfileAccounts = new Set<string>()
+
+  async function ensureProfilesForQuotaDisplay(
+    storage: AccountStorage,
+    mainAccessToken?: string,
+  ): Promise<AccountStorage> {
+    const now = Date.now()
+    if (
+      mainAccessToken &&
+      !oauthProfileIsFresh(storage.main?.profile, now) &&
+      !attemptedProfileAccounts.has('main')
+    ) {
+      attemptedProfileAccounts.add('main')
+      try {
+        const profile = await fetchOAuthAccountProfile({
+          accessToken: mainAccessToken,
+        })
+        storage.main = {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile,
+        }
+        await saveAccountState(storage, accountStoragePath, {
+          mainProfile: true,
+        })
+      } catch {}
+    }
+
+    for (const account of storage.accounts) {
+      if (!isOAuthAccount(account) || !account.access) continue
+      if (oauthProfileIsFresh(account.profile, now)) continue
+      if (attemptedProfileAccounts.has(account.id)) continue
+      attemptedProfileAccounts.add(account.id)
+      try {
+        account.profile = await fetchOAuthAccountProfile({
+          accessToken: account.access,
+        })
+        await saveAccountState(storage, accountStoragePath, {
+          accounts: [account.id],
+        })
+      } catch {}
+    }
+    return storage
+  }
+
   const warnedQuotaNormalizeErrors = new Set<string>()
 
   async function persistPushedQuota(
@@ -1146,10 +1194,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   async function buildQuotaCommandSummary() {
     const accounts: QuotaAccountSummary[] = []
+    let mainAccessToken: string | undefined
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
         if (auth.type === 'oauth' && auth.access) {
+          mainAccessToken = auth.access
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
           // returns the last cached snapshot when the API is backed off.
@@ -1185,8 +1235,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     // per-account), saves refreshed snapshots, and clears stale errors.
     const { storage, errors } =
       await fallbackManager.refreshQuotaForAllAccounts({ force: true })
+    const displayStorage = await ensureProfilesForQuotaDisplay(
+      storage,
+      mainAccessToken,
+    )
+    const mainSummary = accounts.find((account) => account.role === 'main')
+    if (mainSummary) {
+      mainSummary.tierLabel = formatOAuthAccountTier(
+        displayStorage.main?.profile,
+      )
+    }
     const errorMap = new Map(errors.map((e) => [e.accountId, e.message]))
-    accounts.push(...buildFallbackQuotaSummaries(storage, errorMap))
+    accounts.push(...buildFallbackQuotaSummaries(displayStorage, errorMap))
 
     if (!latestGetAuth) {
       accounts.unshift({
@@ -1546,7 +1606,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
 
     // -- existing flows ----------------------------------------------------
-    const storage = await loadAccounts(accountStoragePath)
+    let storage = await loadAccounts(accountStoragePath)
+    if (action.type === 'status' && storage) {
+      let mainAccessToken: string | undefined
+      if (latestGetAuth) {
+        try {
+          const auth = await latestGetAuth()
+          if (auth.type === 'oauth') mainAccessToken = auth.access
+        } catch {}
+      }
+      storage = await ensureProfilesForQuotaDisplay(storage, mainAccessToken)
+    }
     const result = executeAccountCommand({
       argumentsText,
       storage: storage ?? { version: 1, accounts: [] },

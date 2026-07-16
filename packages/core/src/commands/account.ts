@@ -190,7 +190,8 @@ export function executeAccountCommand(input: {
       const pct =
         a.quotaPercent != null ? ` ${Math.round(a.quotaPercent)}%` : ''
       const status = !a.enabled ? ' (disabled)' : ''
-      lines.push(`- **${a.label}** [${a.role}]${status}${pct}`)
+      const tier = a.tierLabel ? ` · ${a.tierLabel}` : ''
+      lines.push(`- **${a.label}** [${a.role}]${tier}${status}${pct}`)
     }
     lines.push('', USAGE_TEXT)
     return { text: lines.join('\n') }

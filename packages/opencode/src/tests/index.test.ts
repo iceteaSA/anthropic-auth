@@ -2742,6 +2742,244 @@ describe('auth.loader', () => {
     expect(text).toContain('1w: 50% remaining')
   })
 
+  test('profile fetch runs once per account per boot and persists the result', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const mockClient = createMockClient()
+    const profileCalls: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        const auth = new Headers(init?.headers).get('authorization') ?? ''
+        if (url.includes('/api/oauth/profile')) {
+          profileCalls.push(auth)
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: auth.includes('fallback')
+                  ? 'claude_team'
+                  : 'claude_max',
+                rate_limit_tier: auth.includes('fallback')
+                  ? 'default_claude_max_5x'
+                  : 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    for (let call = 0; call < 2; call++) {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    }
+
+    expect(profileCalls).toEqual([
+      'Bearer main-access',
+      'Bearer fallback-access',
+    ])
+    const loaded = await loadAccounts()
+    expect(loaded?.main?.profile?.tier).toBe('default_claude_max_20x')
+    expect((loaded?.accounts[0] as any)?.profile?.tier).toBe(
+      'default_claude_max_5x',
+    )
+  })
+
+  test('fresh profile under seven days skips fetch', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(
+        Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 20 },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('stale profile refreshes on display', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'old',
+            orgType: 'claude_max',
+            checkedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(
+        Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 20 },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(1)
+    expect((await loadAccounts())?.main?.profile?.tier).toBe(
+      'default_claude_max_20x',
+    )
+  })
+
+  test('profile fetch failure is silent and label is omitted', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? new Response('failed', { status: 500 })
+          : Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text
+
+    expect(text).not.toContain('Max 20x')
+  })
+
+  test('ordinary model request never calls the profile endpoint', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(profileCalls).toBe(0)
+  })
+
   test('persistent claudeFast setting makes fetch wrapper request fast mode', async () => {
     await useTempAccountFile(
       createFallbackStorage({
