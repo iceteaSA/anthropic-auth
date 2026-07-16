@@ -36,7 +36,6 @@ import {
   loadAccounts,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
-  type PrimeUsageCounters,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -3672,17 +3671,25 @@ describe('isPrimePersistentlyEnabled', () => {
   })
 
   test('returns false when prime.enabled is not true', () => {
-    expect(isPrimePersistentlyEnabled({ prime: { enabled: false } })).toBe(
-      false,
-    )
+    expect(
+      isPrimePersistentlyEnabled({
+        ...baseStorage(),
+        prime: { enabled: false },
+      }),
+    ).toBe(false)
   })
 
   test('returns true when prime.enabled is true', () => {
-    expect(isPrimePersistentlyEnabled({ prime: { enabled: true } })).toBe(true)
+    expect(
+      isPrimePersistentlyEnabled({
+        ...baseStorage(),
+        prime: { enabled: true },
+      }),
+    ).toBe(true)
   })
 
   test('survives save/load round-trip', async () => {
-    const storage = baseStorage()
+    const _storage = baseStorage()
     await setPrimePersistentEnabled(true, accountPath)
     const loaded = await loadAccounts()
     expect(isPrimePersistentlyEnabled(loaded)).toBe(true)

@@ -222,7 +222,7 @@ export function openCommandDialog(
   }
 
   if (payload.command === 'claude-prime') {
-    let accounts: PrimeAccountStatus[] =
+    const accounts: PrimeAccountStatus[] =
       (payload.knobs.accounts as PrimeAccountStatus[] | undefined) ?? []
     let enabled = payload.knobs.enabled === true
     const current = enabled ? 'on' : 'off'

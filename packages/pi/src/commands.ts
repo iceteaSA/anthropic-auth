@@ -309,7 +309,7 @@ export function registerCommands(pi: ExtensionAPI) {
           argumentsText: 'status',
           enabled: isPrimePersistentlyEnabled(storage),
           accounts,
-        }),
+        }).text,
       )
     },
   })
