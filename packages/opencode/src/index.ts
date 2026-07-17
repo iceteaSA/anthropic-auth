@@ -744,6 +744,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     mainAccessToken?: string,
     signal?: AbortSignal,
   ): Promise<AccountStorage> {
+    if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1') {
+      return storage
+    }
     const now = Date.now()
     if (
       mainAccessToken &&
@@ -2562,8 +2565,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               initialStorage ?? createEmptyStorage(),
               auth.access,
             )
-              .then((profiledStorage) => {
-                writeSidebarState(profiledStorage, {
+              .then(async () => {
+                const currentStorage =
+                  (await loadAccounts(accountStoragePath)) ??
+                  createEmptyStorage()
+                writeSidebarState(currentStorage, {
                   activeId: 'main',
                   route: 'main',
                   mainAccessToken: auth.access,

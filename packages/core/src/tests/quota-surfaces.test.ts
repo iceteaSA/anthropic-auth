@@ -211,6 +211,7 @@ describe('quota surface normalization', () => {
     })
     expect(normalizeQuotaHeaders(headers).five_hour).toBeUndefined()
     expect(normalizeQuotaHeaders(headers).seven_day).toBeUndefined()
+    expect(isQuotaBearingHeaderFrame(headers)).toBe(false)
   })
 
   test('keeps valid windows when reset values exceed the JavaScript date range', () => {

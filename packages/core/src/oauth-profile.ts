@@ -31,7 +31,12 @@ export async function fetchOAuthAccountProfile(input: {
   }
   const tier = value.organization?.rate_limit_tier
   const orgType = value.organization?.organization_type
-  if (typeof tier !== 'string' || typeof orgType !== 'string') {
+  if (
+    typeof tier !== 'string' ||
+    tier.trim() === '' ||
+    typeof orgType !== 'string' ||
+    orgType.trim() === ''
+  ) {
     throw new Error('Claude profile response is missing account metadata')
   }
   return {
