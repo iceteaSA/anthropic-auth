@@ -56,9 +56,11 @@ export interface SidebarState {
   lastUpdated: number
 }
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { logger } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
@@ -238,6 +240,110 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
 
 let writeChain: Promise<void> = Promise.resolve()
 
+const SIDEBAR_LOCK_BUDGET_MS = 250
+const SIDEBAR_LOCK_STALE_MS = 2_000
+const SIDEBAR_LOCK_RETRY_MIN_MS = 5
+const SIDEBAR_LOCK_RETRY_MAX_MS = 15
+
+interface SidebarStateWriteTestHooks {
+  afterMergeRead?: (stateFile: string) => void | Promise<void>
+  beforeRename?: (stateFile: string, tempFile: string) => void | Promise<void>
+  lockBudgetMs?: number
+  lockRetryMinMs?: number
+  lockRetryMaxMs?: number
+}
+
+let sidebarStateWriteTestHooks: SidebarStateWriteTestHooks | null = null
+
+export function __setSidebarStateWriteTestHooks(
+  hooks: SidebarStateWriteTestHooks | null,
+): void {
+  sidebarStateWriteTestHooks = hooks
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function acquireSidebarStateLock(
+  stateFile: string,
+): Promise<(() => Promise<void>) | null> {
+  const lockDir = `${stateFile}.lock`
+  const budgetMs =
+    sidebarStateWriteTestHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
+  const retryMinMs =
+    sidebarStateWriteTestHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
+  const retryMaxMs =
+    sidebarStateWriteTestHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
+  const deadline = Date.now() + budgetMs
+
+  while (true) {
+    try {
+      await mkdir(lockDir)
+      return async () => {
+        await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        logger.trace('sidebar', 'state lock unavailable; writing unlocked', {
+          stateFile,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return null
+      }
+    }
+
+    try {
+      const lockStat = await stat(lockDir)
+      if (Date.now() - lockStat.mtimeMs > SIDEBAR_LOCK_STALE_MS) {
+        await rm(lockDir, { recursive: true, force: true })
+        continue
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      logger.trace(
+        'sidebar',
+        'state lock inspection failed; writing unlocked',
+        {
+          stateFile,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      )
+      return null
+    }
+
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      logger.trace('sidebar', 'state lock budget exhausted; writing unlocked', {
+        stateFile,
+        budgetMs,
+      })
+      return null
+    }
+    const jitterMs =
+      retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
+    await sleep(Math.min(jitterMs, remainingMs))
+  }
+}
+
+async function writeSidebarStateAtomic(
+  stateFile: string,
+  state: SidebarState,
+): Promise<void> {
+  const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(tempFile, JSON.stringify(state), {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
+  try {
+    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
+    await rename(tempFile, stateFile)
+  } catch (error) {
+    await rm(tempFile, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
 async function readSidebarState(stateFile: string): Promise<SidebarState> {
   try {
     const raw = await readFile(stateFile, 'utf8')
@@ -271,25 +377,31 @@ export async function setSidebarState(
 ): Promise<void> {
   writeChain = writeChain
     .then(async () => {
-      let stateToWrite = state
-      if (options.routingAuthoritative === false) {
-        const current = await readSidebarState(stateFile)
-        const preservedRouting =
-          await options.resolvePreservedRouting?.(current)
-        if (preservedRouting) {
-          stateToWrite = {
-            ...state,
-            ...preservedRouting,
-            lastUpdated: Math.max(state.lastUpdated, current.lastUpdated),
-          }
-        }
-      }
       await mkdir(dirname(stateFile), { recursive: true })
-      await writeFile(stateFile, JSON.stringify(stateToWrite), 'utf8')
-      options.onRoutingResolved?.({
-        activeId: stateToWrite.activeId,
-        route: stateToWrite.route,
-      })
+      const releaseLock = await acquireSidebarStateLock(stateFile)
+      try {
+        let stateToWrite = state
+        if (options.routingAuthoritative === false) {
+          const current = await readSidebarState(stateFile)
+          const preservedRouting =
+            await options.resolvePreservedRouting?.(current)
+          if (preservedRouting) {
+            stateToWrite = {
+              ...state,
+              ...preservedRouting,
+              lastUpdated: Math.max(state.lastUpdated, current.lastUpdated),
+            }
+          }
+          await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+        }
+        await writeSidebarStateAtomic(stateFile, stateToWrite)
+        options.onRoutingResolved?.({
+          activeId: stateToWrite.activeId,
+          route: stateToWrite.route,
+        })
+      } finally {
+        await releaseLock?.()
+      }
     })
     .catch(() => {
       // Best-effort — sidebar is non-critical

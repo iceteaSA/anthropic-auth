@@ -1,8 +1,17 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setSidebarStateWriteTestHooks,
   type AccountQuota,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
@@ -14,7 +23,16 @@ import {
   resolveActiveAccount,
   SEVEN_DAY_MS,
   type SidebarState,
+  setSidebarState,
 } from '../sidebar-state'
+
+function sidebarTestPath(name: string): string {
+  return join(
+    tmpdir(),
+    `opencode-auth-sidebar-${name}-${process.pid}-${randomUUID()}`,
+    'sidebar-state.json',
+  )
+}
 
 const quota = (used: number): AccountQuota => ({
   five_hour: { usedPercent: used, remainingPercent: 100 - used },
@@ -776,5 +794,158 @@ describe('getSidebarState malformed file round-trip', () => {
     await writeFile(testFile, JSON.stringify(valid))
     const state = await getSidebarState()
     expect(state).toEqual(valid)
+  })
+})
+
+describe('setSidebarState cross-process writes', () => {
+  test('preserves an authoritative write from another process during a non-authoritative merge', async () => {
+    const stateFile = sidebarTestPath('race')
+    const stateDir = join(stateFile, '..')
+    const initial = make({
+      activeId: 'old-routing',
+      route: 'old-route',
+      lastUpdated: 100,
+    })
+    const foreign = make({
+      activeId: 'foreign-routing',
+      route: 'foreign-route',
+      lastUpdated: 300,
+    })
+    const nonAuthoritative = make({
+      activeId: 'stale-routing',
+      route: 'stale-route',
+      lastUpdated: 200,
+    })
+    await mkdir(stateDir, { recursive: true })
+    await writeFile(stateFile, JSON.stringify(initial))
+
+    let child: ReturnType<typeof Bun.spawn> | undefined
+    __setSidebarStateWriteTestHooks({
+      afterMergeRead: async () => {
+        const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
+        const script = `
+          import { setSidebarState } from ${JSON.stringify(moduleUrl)}
+          await setSidebarState(${JSON.stringify(foreign)}, ${JSON.stringify(stateFile)})
+        `
+        child = Bun.spawn([process.execPath, '--eval', script], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+        })
+        await Promise.race([
+          child.exited,
+          new Promise((resolve) => setTimeout(resolve, 50)),
+        ])
+      },
+    })
+
+    try {
+      await setSidebarState(nonAuthoritative, stateFile, {
+        routingAuthoritative: false,
+        resolvePreservedRouting: (current) => ({
+          activeId: current.activeId,
+          route: current.route,
+        }),
+      })
+      expect(child).toBeDefined()
+      expect(await child!.exited).toBe(0)
+      const written = JSON.parse(await readFile(stateFile, 'utf8'))
+      expect(written.activeId).toBe('foreign-routing')
+      expect(written.route).toBe('foreign-route')
+    } finally {
+      __setSidebarStateWriteTestHooks(null)
+      child?.kill()
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('evicts a stale lock and writes the state', async () => {
+    const stateFile = sidebarTestPath('stale-lock')
+    const stateDir = join(stateFile, '..')
+    const lockDir = `${stateFile}.lock`
+    await mkdir(lockDir, { recursive: true })
+    const stale = new Date(Date.now() - 3_000)
+    await utimes(lockDir, stale, stale)
+
+    try {
+      await setSidebarState(
+        make({ activeId: 'fresh', route: 'fresh' }),
+        stateFile,
+      )
+      const written = JSON.parse(await readFile(stateFile, 'utf8'))
+      expect(written.activeId).toBe('fresh')
+      expect(await readdir(stateDir)).not.toContain('sidebar-state.json.lock')
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('writes without the lock when the acquisition budget is exhausted', async () => {
+    const stateFile = sidebarTestPath('lock-budget')
+    const stateDir = join(stateFile, '..')
+    await mkdir(`${stateFile}.lock`, { recursive: true })
+    __setSidebarStateWriteTestHooks({
+      lockBudgetMs: 20,
+      lockRetryMinMs: 5,
+      lockRetryMaxMs: 5,
+    })
+
+    try {
+      await setSidebarState(
+        make({ activeId: 'degraded', route: 'degraded' }),
+        stateFile,
+      )
+      const written = JSON.parse(await readFile(stateFile, 'utf8'))
+      expect(written.activeId).toBe('degraded')
+    } finally {
+      __setSidebarStateWriteTestHooks(null)
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps the visible file complete until an atomic rename publishes the new state', async () => {
+    const stateFile = sidebarTestPath('atomic')
+    const stateDir = join(stateFile, '..')
+    const initial = make({ activeId: 'initial', route: 'initial' })
+    const next = make({ activeId: 'next', route: 'next' })
+    await mkdir(stateDir, { recursive: true })
+    await writeFile(stateFile, JSON.stringify(initial))
+
+    let enteredRename!: () => void
+    const renameReady = new Promise<void>((resolve) => {
+      enteredRename = resolve
+    })
+    let releaseRename!: () => void
+    const renameReleased = new Promise<void>((resolve) => {
+      releaseRename = resolve
+    })
+    __setSidebarStateWriteTestHooks({
+      beforeRename: async () => {
+        enteredRename()
+        await renameReleased
+      },
+    })
+
+    try {
+      const write = setSidebarState(next, stateFile)
+      await renameReady
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const visible = JSON.parse(await readFile(stateFile, 'utf8'))
+        expect(visible.activeId).toBe('initial')
+      }
+      const tempName = (await readdir(stateDir)).find((name) =>
+        name.endsWith('.tmp'),
+      )
+      expect(tempName).toBeDefined()
+      const tempContents = await readFile(join(stateDir, tempName!), 'utf8')
+      expect(() => JSON.parse(tempContents)).not.toThrow()
+      releaseRename()
+      await write
+      const visible = JSON.parse(await readFile(stateFile, 'utf8'))
+      expect(visible.activeId).toBe('next')
+    } finally {
+      releaseRename()
+      __setSidebarStateWriteTestHooks(null)
+      await rm(stateDir, { recursive: true, force: true })
+    }
   })
 })
