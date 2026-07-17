@@ -12,7 +12,9 @@ const WINDOW_KEYS: Record<string, QuotaWindowName> = {
 
 export function isQuotaBearingHeaderFrame(headers: Headers): boolean {
   return Object.keys(WINDOW_KEYS).some((suffix) =>
-    headers.has(`${PREFIX}${suffix}-utilization`),
+    Number.isFinite(
+      finiteHeaderNumber(headers, `${PREFIX}${suffix}-utilization`),
+    ),
   )
 }
 

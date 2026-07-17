@@ -936,6 +936,49 @@ describe('QuotaManager', () => {
       expect(pushed.quota.bindingWindowSource).toBe('poll')
     })
 
+    test('poll completion preserves newer header windows while adding scoped limits', async () => {
+      let resolvePoll!: (response: Response) => void
+      let markPollStarted!: () => void
+      const pollStarted = new Promise<void>((resolve) => {
+        markPollStarted = resolve
+      })
+      const fetchMock = mock(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolvePoll = resolve
+            markPollStarted()
+          }),
+      ) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      const refresh = qm.refreshMain('token')
+
+      await pollStarted
+      qm.pushMainFromHeaders('token', headerSnapshot(now + 1_000))
+      resolvePoll(
+        Response.json({
+          five_hour: { utilization: 25 },
+          seven_day: { utilization: 50 },
+          limits: [
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: 15,
+              scope: { model: { id: null, display_name: 'Fable' } },
+            },
+          ],
+        }),
+      )
+      await refresh
+
+      const quota = qm.getMain('token')?.quota
+      expect(quota?.five_hour?.usedPercent).toBe(78)
+      expect(quota?.seven_day?.usedPercent).toBe(40)
+      expect(quota?.scoped?.[0]).toMatchObject({
+        modelName: 'Fable',
+        usedPercent: 15,
+      })
+    })
+
     test('fallback header push updates only the named account', () => {
       const qm = createQM()
       qm.setFallback('other', {
