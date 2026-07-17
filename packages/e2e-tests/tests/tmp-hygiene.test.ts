@@ -36,6 +36,20 @@ async function createRoot() {
   return root
 }
 
+function unresponsiveChild(pid?: number) {
+  const child = new EventEmitter() as EventEmitter & {
+    exitCode: number | null
+    signalCode: NodeJS.Signals | null
+    pid?: number
+    kill: () => boolean
+  }
+  child.exitCode = null
+  child.signalCode = null
+  child.pid = pid
+  child.kill = () => true
+  return child as unknown as ChildProcess
+}
+
 describe('e2e temporary directory hygiene', () => {
   it('removes only stale sibling run directories without following symlinks', async () => {
     const root = await createRoot()
@@ -239,6 +253,58 @@ describe('e2e temporary directory hygiene', () => {
 
     expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
     await removeE2ETempDir(env.tempDir, { root })
+  })
+
+  it('reclaims an unconfirmed-exit directory after the child is dead', async () => {
+    const root = await createRoot()
+    const env = createIsolatedEnv(root)
+    const child = Bun.spawn(['true'])
+    const deadPid = child.pid
+    await child.exited
+
+    expect(
+      await cleanupE2ERun({
+        child: unresponsiveChild(deadPid),
+        tempDir: env.tempDir,
+        root,
+        terminationOptions: { termTimeoutMs: 5, killExitTimeoutMs: 5 },
+      }),
+    ).toBe(false)
+    const staleTime = new Date('2026-07-15T00:00:00.000Z')
+    const now = new Date('2026-07-17T00:00:00.000Z')
+    await utimes(env.tempDir, staleTime, staleTime)
+
+    await sweepStaleE2ETempDirs({ root, now: now.getTime() })
+
+    expect(await readdir(root)).toEqual([])
+  })
+
+  it('protects an unconfirmed-exit directory while the child is alive', async () => {
+    const root = await createRoot()
+    const env = createIsolatedEnv(root)
+    const child = Bun.spawn(['sleep', '30'])
+
+    try {
+      expect(
+        await cleanupE2ERun({
+          child: unresponsiveChild(child.pid),
+          tempDir: env.tempDir,
+          root,
+          terminationOptions: { termTimeoutMs: 5, killExitTimeoutMs: 5 },
+        }),
+      ).toBe(false)
+      const staleTime = new Date('2026-07-15T00:00:00.000Z')
+      const now = new Date('2026-07-17T00:00:00.000Z')
+      await utimes(env.tempDir, staleTime, staleTime)
+
+      await sweepStaleE2ETempDirs({ root, now: now.getTime() })
+
+      expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
+    } finally {
+      child.kill()
+      await child.exited
+      await removeE2ETempDir(env.tempDir, { root })
+    }
   })
 
   it('removes the temp directory when setup fails before spawning a child', async () => {

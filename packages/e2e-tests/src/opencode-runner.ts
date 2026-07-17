@@ -284,7 +284,22 @@ export async function cleanupE2ERun(options: {
   const exitConfirmed = options.child
     ? await terminateChildProcess(options.child, options.terminationOptions)
     : true
-  if (!exitConfirmed) return false
+  if (!exitConfirmed) {
+    const childPid = options.child?.pid
+    if (
+      typeof childPid === 'number' &&
+      Number.isInteger(childPid) &&
+      childPid > 0
+    ) {
+      try {
+        writeFileSync(join(options.tempDir, RUN_PID_FILE), String(childPid))
+        activeRunDirs.delete(resolve(options.tempDir))
+      } catch {
+        // Retain the active marker when child ownership cannot be persisted safely.
+      }
+    }
+    return false
+  }
   activeRunDirs.delete(resolve(options.tempDir))
   return removeE2ETempDir(options.tempDir, {
     root: options.root,
