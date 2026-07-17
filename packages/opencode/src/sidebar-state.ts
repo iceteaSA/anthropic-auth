@@ -283,8 +283,22 @@ async function acquireSidebarStateLock(
   while (true) {
     try {
       await mkdir(lockDir)
+      const ownerId = randomUUID()
+      const ownerFile = join(lockDir, 'owner')
+      await writeFile(ownerFile, `${ownerId}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+        flag: 'wx',
+      })
       await sidebarStateWriteTestHooks?.onLockAcquired?.(lockDir)
       return async () => {
+        // A >2s holder may resume after eviction handed the path to a successor.
+        // Its finally block must not delete that replacement lock.
+        try {
+          if ((await readFile(ownerFile, 'utf8')).trim() !== ownerId) return
+        } catch {
+          return
+        }
         await rm(lockDir, { recursive: true, force: true }).catch(() => {})
       }
     } catch (error) {

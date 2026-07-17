@@ -5,6 +5,7 @@ import {
   readdir,
   readFile,
   rm,
+  stat,
   utimes,
   writeFile,
 } from 'node:fs/promises'
@@ -33,6 +34,15 @@ function sidebarTestPath(name: string): string {
     `opencode-auth-sidebar-${name}-${process.pid}-${randomUUID()}`,
     'sidebar-state.json',
   )
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 const quota = (used: number): AccountQuota => ({
@@ -913,6 +923,64 @@ describe('setSidebarState cross-process writes', () => {
       await firstRelease?.()
       await secondRelease?.()
       __setSidebarStateWriteTestHooks(null)
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('an evicted owner cannot release its replacement lock', async () => {
+    const stateFile = sidebarTestPath('release-handoff')
+    const stateDir = join(stateFile, '..')
+    const lockDir = `${stateFile}.lock`
+    await mkdir(stateDir, { recursive: true })
+
+    const firstRelease = await __acquireSidebarStateLockForTest(stateFile)
+    expect(firstRelease).toBeFunction()
+    const stale = new Date(Date.now() - 3_000)
+    await utimes(lockDir, stale, stale)
+    const secondRelease = await __acquireSidebarStateLockForTest(stateFile)
+    expect(secondRelease).toBeFunction()
+
+    try {
+      await firstRelease?.()
+      expect(await pathExists(lockDir)).toBe(true)
+      await secondRelease?.()
+      expect(await pathExists(lockDir)).toBe(false)
+    } finally {
+      await secondRelease?.()
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('release removes the lock owned by its acquisition token', async () => {
+    const stateFile = sidebarTestPath('release-owned')
+    const stateDir = join(stateFile, '..')
+    const lockDir = `${stateFile}.lock`
+    await mkdir(stateDir, { recursive: true })
+    const release = await __acquireSidebarStateLockForTest(stateFile)
+
+    try {
+      expect(release).toBeFunction()
+      expect(await readdir(lockDir)).toContain('owner')
+      await release?.()
+      expect(await pathExists(lockDir)).toBe(false)
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('release leaves the lock untouched when its owner file is missing', async () => {
+    const stateFile = sidebarTestPath('release-missing-owner')
+    const stateDir = join(stateFile, '..')
+    const lockDir = `${stateFile}.lock`
+    await mkdir(stateDir, { recursive: true })
+    const release = await __acquireSidebarStateLockForTest(stateFile)
+    expect(release).toBeFunction()
+    await rm(join(lockDir, 'owner'), { force: true })
+
+    try {
+      await release?.()
+      expect(await pathExists(lockDir)).toBe(true)
+    } finally {
       await rm(stateDir, { recursive: true, force: true })
     }
   })
