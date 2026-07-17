@@ -885,6 +885,23 @@ function mergeHeaderScopedQuota(
   return [...merged.values()]
 }
 
+function mergeHeaderOwnedWindow(
+  existingSnapshot: OAuthQuotaSnapshot,
+  incomingSnapshot: OAuthQuotaSnapshot,
+  key: QuotaWindowName,
+) {
+  const existing = existingSnapshot[key]
+  const incoming = incomingSnapshot[key]
+  if (!incoming) return existing
+  if (!existing) return incoming
+  if (incoming.checkedAt > existing.checkedAt) return incoming
+  if (incoming.checkedAt < existing.checkedAt) return existing
+  return quotaSourcePrecedence(existingSnapshot) >
+    quotaSourcePrecedence(incomingSnapshot)
+    ? existing
+    : incoming
+}
+
 function mergeHeaderQuotaForPersistence(
   existing: OAuthQuotaSnapshot | undefined,
   incoming: OAuthQuotaSnapshot,
@@ -894,6 +911,8 @@ function mergeHeaderQuotaForPersistence(
   return {
     ...existing,
     ...incoming,
+    five_hour: mergeHeaderOwnedWindow(existing, incoming, 'five_hour'),
+    seven_day: mergeHeaderOwnedWindow(existing, incoming, 'seven_day'),
     scoped: mergeHeaderScopedQuota(existing, incoming),
     extraUsage: existing.extraUsage ?? incoming.extraUsage,
     bindingWindow: preservePollBinding
@@ -919,8 +938,11 @@ function mergeAccountRuntimeState(
         incoming.refresh &&
         existingEntry.refresh !== incoming.refresh),
   )
+  const mergesHeaderQuota = Boolean(
+    !tokenChanged && incoming.quota?.source === 'headers',
+  )
   const effectiveIncoming =
-    !tokenChanged && incoming.quota?.source === 'headers'
+    mergesHeaderQuota && incoming.quota
       ? {
           ...incoming,
           quota: mergeHeaderQuotaForPersistence(
@@ -938,8 +960,9 @@ function mergeAccountRuntimeState(
   )
 
   if (
-    existingQuotaCheckedAt > incomingQuotaCheckedAt ||
-    existingQuotaWinsEqualTimestamp
+    !mergesHeaderQuota &&
+    (existingQuotaCheckedAt > incomingQuotaCheckedAt ||
+      existingQuotaWinsEqualTimestamp)
   ) {
     const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
     const incomingRefreshAt = effectiveIncoming.lastRefreshedAt ?? 0
@@ -1110,6 +1133,9 @@ function applyMainQuotaStatePatch(
     sameToken && incomingQuota?.source === 'headers'
       ? mergeHeaderQuotaForPersistence(state.main.quota, incomingQuota)
       : incomingQuota
+  const mergesHeaderQuota = Boolean(
+    sameToken && incomingQuota?.source === 'headers',
+  )
   const existingCheckedAt =
     typeof state.main.quotaCheckedAt === 'number'
       ? state.main.quotaCheckedAt
@@ -1119,16 +1145,19 @@ function applyMainQuotaStatePatch(
       ? storage.quota.mainQuotaCheckedAt
       : quotaSnapshotCheckedAt(effectiveIncomingQuota)
   if (
-    existingCheckedAt > incomingCheckedAt ||
-    (existingCheckedAt === incomingCheckedAt &&
-      quotaSourcePrecedence(state.main.quota) >
-        quotaSourcePrecedence(effectiveIncomingQuota))
+    !mergesHeaderQuota &&
+    (existingCheckedAt > incomingCheckedAt ||
+      (existingCheckedAt === incomingCheckedAt &&
+        quotaSourcePrecedence(state.main.quota) >
+          quotaSourcePrecedence(effectiveIncomingQuota)))
   ) {
     return
   }
 
   state.main.quota = effectiveIncomingQuota
-  state.main.quotaCheckedAt = storage.quota?.mainQuotaCheckedAt
+  state.main.quotaCheckedAt = mergesHeaderQuota
+    ? Math.max(existingCheckedAt, incomingCheckedAt)
+    : storage.quota?.mainQuotaCheckedAt
   state.main.quotaToken = storage.quota?.mainQuotaToken
   state.main.lastQuotaApiError = storage.quota?.mainLastQuotaApiError
 }

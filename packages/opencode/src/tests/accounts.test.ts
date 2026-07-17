@@ -920,7 +920,7 @@ describe('account storage', () => {
             modelName: 'Fable',
             usedPercent: 40,
             remainingPercent: 60,
-            checkedAt: 600,
+            checkedAt: 900,
           },
         ],
         extraUsage: {
@@ -987,7 +987,7 @@ describe('account storage', () => {
             modelName: 'Fable',
             usedPercent: 40,
             remainingPercent: 60,
-            checkedAt: 600,
+            checkedAt: 900,
           },
         ],
         extraUsage: {
@@ -1000,7 +1000,6 @@ describe('account storage', () => {
         source: 'poll',
         checkedAt: 600,
       },
-      mainQuotaCheckedAt: 600,
       mainQuotaToken: 'same-token',
     }
     await saveAccounts(storage)
@@ -1067,6 +1066,7 @@ describe('account storage', () => {
       source: 'headers',
       checkedAt: 100,
     }
+    expect(rotated.access).not.toBe('old-access')
 
     await saveAccountState(rotatedView as AccountStorage, accountPath, {
       accounts: ['fallback-1'],
@@ -1114,6 +1114,10 @@ describe('account storage', () => {
         },
       },
     }
+    expect(
+      expectOAuthAccount((refreshedRuntimeView as AccountStorage).accounts[0])
+        .access,
+    ).not.toBe('old-access')
 
     await saveAccountState(
       refreshedRuntimeView as AccountStorage,
