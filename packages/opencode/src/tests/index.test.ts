@@ -5817,11 +5817,90 @@ describe('auth.loader', () => {
       'anthropic-ratelimit-unified-7d-reset': '1784628000',
     }
 
-    const harvestStorage = (accounts: AccountStorage['accounts'] = []) =>
+    const harvestStorage = (
+      accounts: AccountStorage['accounts'] = [],
+      overrides: Partial<AccountStorage> = {},
+    ) =>
       createFallbackStorage({
         accounts,
         quota: { enabled: false },
+        ...overrides,
       })
+
+    function installRelayWebSocket(responseHeaders: Record<string, string>) {
+      const originalWebSocket = globalThis.WebSocket
+
+      class RelayWebSocket extends EventTarget {
+        binaryType = 'arraybuffer'
+
+        constructor() {
+          super()
+          queueMicrotask(() => {
+            this.dispatchEvent(new Event('open'))
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'ready',
+                  state: null,
+                }),
+              }),
+            )
+          })
+        }
+
+        send(data: string) {
+          const payload = JSON.parse(data)
+          queueMicrotask(() => {
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'accepted',
+                  id: payload.id,
+                  hash: payload.next_hash,
+                  revision: payload.revision,
+                }),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'response_start',
+                  id: payload.id,
+                  status: 200,
+                  headers: responseHeaders,
+                }),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: Buffer.from('event: message_stop\n\n'),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'done',
+                  id: payload.id,
+                }),
+              }),
+            )
+          })
+        }
+
+        close() {
+          this.dispatchEvent(new Event('close'))
+        }
+      }
+
+      globalThis.WebSocket = RelayWebSocket as unknown as typeof WebSocket
+      return () => {
+        globalThis.WebSocket = originalWebSocket
+      }
+    }
 
     async function loadFetch(
       getAccessToken: () => string = () => 'main-access',
@@ -5874,6 +5953,123 @@ describe('auth.loader', () => {
       )
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
       expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('websocket relay response_start pushes unified headers for the served account', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'websocket',
+          },
+        }),
+      )
+      const restoreWebSocket = installRelayWebSocket(quotaHeaders)
+      const result = await loadFetch()
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-websocket' },
+        })
+        expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
+          'true',
+        )
+        await response.text()
+      } finally {
+        restoreWebSocket()
+      }
+
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('relay fallback to direct harvests quota headers exactly once', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'http',
+          },
+        }),
+      )
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        const url = extractUrl(input)
+        if (url === 'https://relay.example.test') {
+          return Promise.resolve(
+            new Response('relay unavailable', { status: 503 }),
+          )
+        }
+        return Promise.resolve(
+          new Response('direct', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-direct-fallback' },
+        })
+        expect(await response.text()).toBe('direct')
+        await waitForState((value) => value.main?.quota?.source === 'headers')
+        expect(
+          records.filter(
+            (record) =>
+              record.channel === 'quota' &&
+              record.message === 'harvested response quota',
+          ),
+        ).toHaveLength(1)
+      } finally {
+        __setLogTestSink(null)
+        setLogLevel('info')
+      }
+    })
+
+    test('websocket optimistic response headers without quota data do not persist', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'websocket',
+          },
+        }),
+      )
+      const restoreWebSocket = installRelayWebSocket({
+        'content-type': 'text/event-stream',
+      })
+      const result = await loadFetch()
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-synthetic-only' },
+        })
+        expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
+          'true',
+        )
+        await response.text()
+      } finally {
+        restoreWebSocket()
+      }
+
+      await Bun.sleep(30)
+      expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
     })
 
     test('main header push skips persistence after access-token rotation', async () => {
