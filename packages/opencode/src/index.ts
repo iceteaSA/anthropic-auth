@@ -180,7 +180,14 @@ async function resolveFreshSidebarRouting(
   storage: AccountStorage | null,
   existing: SidebarState,
   loadFreshStorage: () => Promise<AccountStorage | null>,
-): Promise<{ activeId: string | undefined; route: string } | undefined> {
+): Promise<
+  | {
+      activeId: string | undefined
+      route: string
+      freshStorage?: AccountStorage
+    }
+  | undefined
+> {
   const existingAge = Date.now() - existing.lastUpdated
   if (
     !existing.activeId ||
@@ -198,7 +205,11 @@ async function resolveFreshSidebarRouting(
   try {
     const freshStorage = await loadFreshStorage()
     if (hasEnabledOAuthAccount(freshStorage, existing.activeId)) {
-      return { activeId: existing.activeId, route: existing.route }
+      return {
+        activeId: existing.activeId,
+        route: existing.route,
+        freshStorage: freshStorage ?? undefined,
+      }
     }
   } catch {}
 
@@ -208,7 +219,11 @@ async function resolveFreshSidebarRouting(
 async function resolveInitialSidebarRouting(
   storage: AccountStorage | null,
   accountStoragePath: string,
-): Promise<{ activeId: string | undefined; route: string }> {
+): Promise<{
+  activeId: string | undefined
+  route: string
+  freshStorage?: AccountStorage
+}> {
   const existingRouting = await resolveFreshSidebarRouting(
     storage,
     await getSidebarState(),
@@ -927,20 +942,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     NonNullable<SidebarState['fableRecoveries']>[number]
   >()
 
-  function writeSidebarState(
+  interface SidebarStateInput {
+    activeId?: string
+    route: string
+    mainAccessToken?: string
+    mainRefreshToken?: string
+    routingAuthoritative?: boolean
+  }
+
+  function buildSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
-    options: {
-      activeId?: string
-      route: string
-      mainAccessToken?: string
-      mainRefreshToken?: string
-      routingAuthoritative?: boolean
-    },
-  ) {
-    const routingAuthoritative = options.routingAuthoritative !== false
-    if (routingAuthoritative) {
-      lastSidebarRouting = { activeId: options.activeId, route: options.route }
-    }
+    options: SidebarStateInput,
+  ): SidebarState {
     quotaManager.updateStorage(storage)
     quotaManager.seedMainFromStorage(storage, options.mainAccessToken)
     quotaManager.seedFallbacksFromAccounts(
@@ -949,7 +962,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const mainEntry = quotaManager.getMain(options.mainAccessToken)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
-    const state: SidebarState = {
+    return {
       main: {
         quota: mainEntry?.quota ?? null,
         quotaBackedOff: quotaManager.isBackedOff(),
@@ -1019,14 +1032,40 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           : undefined,
       lastUpdated: Date.now(),
     }
+  }
+
+  function writeSidebarState(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    options: SidebarStateInput,
+  ) {
+    const routingAuthoritative = options.routingAuthoritative !== false
+    if (routingAuthoritative) {
+      lastSidebarRouting = { activeId: options.activeId, route: options.route }
+    }
+    const state = buildSidebarState(storage, options)
     return setSidebarState(state, sidebarStateFile, {
       routingAuthoritative,
       resolvePreservedRouting: routingAuthoritative
         ? undefined
-        : (current) =>
-            resolveFreshSidebarRouting(storage, current, () =>
-              loadAccounts(accountStoragePath),
-            ),
+        : async (current) => {
+            const preservedRouting = await resolveFreshSidebarRouting(
+              storage,
+              current,
+              () => loadAccounts(accountStoragePath),
+            )
+            if (!preservedRouting) return undefined
+            return {
+              activeId: preservedRouting.activeId,
+              route: preservedRouting.route,
+              state: preservedRouting.freshStorage
+                ? buildSidebarState(preservedRouting.freshStorage, {
+                    ...options,
+                    activeId: preservedRouting.activeId,
+                    route: preservedRouting.route,
+                  })
+                : undefined,
+            }
+          },
       onRoutingResolved: routingAuthoritative
         ? undefined
         : (routing) => {
@@ -2385,13 +2424,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             initialStorage,
             accountStoragePath,
           )
-          await writeSidebarState(initialStorage, {
-            activeId: initialSidebarRouting.activeId,
-            route: initialSidebarRouting.route,
-            mainAccessToken: auth.access,
-            mainRefreshToken: auth.refresh,
-            routingAuthoritative: false,
-          })
+          await writeSidebarState(
+            initialSidebarRouting.freshStorage ?? initialStorage,
+            {
+              activeId: initialSidebarRouting.activeId,
+              route: initialSidebarRouting.route,
+              mainAccessToken: auth.access,
+              mainRefreshToken: auth.refresh,
+              routingAuthoritative: false,
+            },
+          )
 
           function isReplayableRequest(
             input: string | URL | Request,

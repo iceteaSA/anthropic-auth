@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __acquireSidebarStateLockForTest,
   __setSidebarStateWriteTestHooks,
   type AccountQuota,
   computeQuotaPacing,
@@ -854,6 +855,64 @@ describe('setSidebarState cross-process writes', () => {
     } finally {
       __setSidebarStateWriteTestHooks(null)
       child?.kill()
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('allows only one waiter to evict and replace a stale lock', async () => {
+    type RaceHooks = Parameters<typeof __setSidebarStateWriteTestHooks>[0] & {
+      afterStaleLockStat?: () => void | Promise<void>
+      onStaleLockClaimed?: () => void | Promise<void>
+      onLockAcquired?: () => void | Promise<void>
+    }
+    const stateFile = sidebarTestPath('stale-lock-race')
+    const stateDir = join(stateFile, '..')
+    const lockDir = `${stateFile}.lock`
+    await mkdir(lockDir, { recursive: true })
+    const stale = new Date(Date.now() - 3_000)
+    await utimes(lockDir, stale, stale)
+
+    let staleStats = 0
+    let releaseStaleStats!: () => void
+    const bothSawStale = new Promise<void>((resolve) => {
+      releaseStaleStats = resolve
+    })
+    let staleClaims = 0
+    let acquisitions = 0
+    const hooks: RaceHooks = {
+      lockBudgetMs: 30,
+      lockRetryMinMs: 1,
+      lockRetryMaxMs: 1,
+      afterStaleLockStat: async () => {
+        staleStats++
+        if (staleStats === 2) releaseStaleStats()
+        await bothSawStale
+      },
+      onStaleLockClaimed: () => {
+        staleClaims++
+      },
+      onLockAcquired: () => {
+        acquisitions++
+      },
+    }
+    ;(__setSidebarStateWriteTestHooks as (hooks: RaceHooks | null) => void)(
+      hooks,
+    )
+
+    let firstRelease: (() => Promise<void>) | null = null
+    let secondRelease: (() => Promise<void>) | null = null
+    try {
+      ;[firstRelease, secondRelease] = await Promise.all([
+        __acquireSidebarStateLockForTest(stateFile),
+        __acquireSidebarStateLockForTest(stateFile),
+      ])
+      expect(staleClaims).toBe(1)
+      expect(acquisitions).toBe(1)
+      expect([firstRelease, secondRelease].filter(Boolean)).toHaveLength(1)
+    } finally {
+      await firstRelease?.()
+      await secondRelease?.()
+      __setSidebarStateWriteTestHooks(null)
       await rm(stateDir, { recursive: true, force: true })
     }
   })

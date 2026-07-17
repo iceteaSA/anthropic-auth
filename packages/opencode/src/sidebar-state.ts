@@ -248,6 +248,9 @@ const SIDEBAR_LOCK_RETRY_MAX_MS = 15
 interface SidebarStateWriteTestHooks {
   afterMergeRead?: (stateFile: string) => void | Promise<void>
   beforeRename?: (stateFile: string, tempFile: string) => void | Promise<void>
+  afterStaleLockStat?: (lockDir: string) => void | Promise<void>
+  onStaleLockClaimed?: (lockDir: string) => void | Promise<void>
+  onLockAcquired?: (lockDir: string) => void | Promise<void>
   lockBudgetMs?: number
   lockRetryMinMs?: number
   lockRetryMaxMs?: number
@@ -280,6 +283,7 @@ async function acquireSidebarStateLock(
   while (true) {
     try {
       await mkdir(lockDir)
+      await sidebarStateWriteTestHooks?.onLockAcquired?.(lockDir)
       return async () => {
         await rm(lockDir, { recursive: true, force: true }).catch(() => {})
       }
@@ -296,7 +300,16 @@ async function acquireSidebarStateLock(
     try {
       const lockStat = await stat(lockDir)
       if (Date.now() - lockStat.mtimeMs > SIDEBAR_LOCK_STALE_MS) {
-        await rm(lockDir, { recursive: true, force: true })
+        await sidebarStateWriteTestHooks?.afterStaleLockStat?.(lockDir)
+        const evictedLockDir = `${lockDir}.evict-${process.pid}-${randomUUID()}`
+        try {
+          await rename(lockDir, evictedLockDir)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+          throw error
+        }
+        await sidebarStateWriteTestHooks?.onStaleLockClaimed?.(lockDir)
+        await rm(evictedLockDir, { recursive: true, force: true })
         continue
       }
     } catch (error) {
@@ -324,6 +337,12 @@ async function acquireSidebarStateLock(
       retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
     await sleep(Math.min(jitterMs, remainingMs))
   }
+}
+
+export async function __acquireSidebarStateLockForTest(
+  stateFile: string,
+): Promise<(() => Promise<void>) | null> {
+  return acquireSidebarStateLock(stateFile)
 }
 
 async function writeSidebarStateAtomic(
@@ -359,12 +378,17 @@ export async function getSidebarState(): Promise<SidebarState> {
 
 export interface SidebarStateWriteOptions {
   routingAuthoritative?: boolean
-  resolvePreservedRouting?: (
-    current: SidebarState,
-  ) =>
-    | Pick<SidebarState, 'activeId' | 'route'>
+  resolvePreservedRouting?: (current: SidebarState) =>
+    | (Pick<SidebarState, 'activeId' | 'route'> & {
+        state?: SidebarState
+      })
     | undefined
-    | Promise<Pick<SidebarState, 'activeId' | 'route'> | undefined>
+    | Promise<
+        | (Pick<SidebarState, 'activeId' | 'route'> & {
+            state?: SidebarState
+          })
+        | undefined
+      >
   onRoutingResolved?: (
     routing: Pick<SidebarState, 'activeId' | 'route'>,
   ) => void
@@ -386,10 +410,15 @@ export async function setSidebarState(
           const preservedRouting =
             await options.resolvePreservedRouting?.(current)
           if (preservedRouting) {
+            const preservedState = preservedRouting.state ?? state
             stateToWrite = {
-              ...state,
-              ...preservedRouting,
-              lastUpdated: Math.max(state.lastUpdated, current.lastUpdated),
+              ...preservedState,
+              activeId: preservedRouting.activeId,
+              route: preservedRouting.route,
+              lastUpdated: Math.max(
+                preservedState.lastUpdated,
+                current.lastUpdated,
+              ),
             }
           }
           await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
