@@ -28,9 +28,11 @@ const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
 const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
 const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
+const DUMP_PARTIAL_STALE_MS = 10 * 60 * 1000
 const DUMP_ARTIFACT_SUFFIX_PATTERN = /\.(body|meta|relay|request)\.json$/
+// Earlier builds emitted five-digit counters; current counters grow without truncation.
 const DUMP_ARTIFACT_ID_PATTERN =
-  /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-\d{5}-(.+)$/
+  /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-\d{5,}-(.+)$/
 const DUMP_SEGMENT_PATTERN = '[a-zA-Z0-9._-]'
 const DIRECT_DUMP_PATTERN = new RegExp(
   `^${DUMP_SEGMENT_PATTERN}{1,80}-direct(?:-${DUMP_SEGMENT_PATTERN}{1,80})?$`,
@@ -94,6 +96,10 @@ function isDumpArtifactFileName(name: string) {
   )
 }
 
+function isDumpPartialFileName(name: string) {
+  return name.endsWith('.partial') && isDumpArtifactFileName(name.slice(0, -8))
+}
+
 async function writeDumpFile(path: string, contents: string) {
   const partialPath = `${path}.partial`
   try {
@@ -108,8 +114,9 @@ async function writeDumpFile(path: string, contents: string) {
 /**
  * Caps completed dump artifacts in the configured directory. A zero-byte cap
  * disables sweeping. Custom directories may contain unrelated files: only
- * recognized final artifact names are eligible, while symlinks, partial
- * writes, and files younger than the newness floor remain protected.
+ * recognized final artifact names and stale partials are eligible. Symlinks,
+ * fresh partial writes, and files younger than the newness floor remain
+ * protected.
  */
 export async function sweepDumpDirectory(options: {
   dumpDir?: string
@@ -117,11 +124,13 @@ export async function sweepDumpDirectory(options: {
   protectedPaths?: readonly string[]
   now?: number
   minAgeMs?: number
+  partialStaleMs?: number
 }) {
   const dumpDir = options.dumpDir ?? getDumpDirectory()
   const maxBytes = options.maxBytes ?? getDumpMaxBytes()
   const now = options.now ?? Date.now()
   const minAgeMs = options.minAgeMs ?? DUMP_SWEEP_NEWNESS_FLOOR_MS
+  const partialStaleMs = options.partialStaleMs ?? DUMP_PARTIAL_STALE_MS
   const emptyResult = { removed: 0, freedBytes: 0 }
   if (!isConfiguredDumpDirectory(dumpDir) || maxBytes <= 0) return emptyResult
 
@@ -132,16 +141,28 @@ export async function sweepDumpDirectory(options: {
       (options.protectedPaths ?? []).map((path) => resolve(path)),
     )
     const entries = await readdir(dumpDir, { withFileTypes: true })
-    const files: { path: string; size: number; mtimeMs: number }[] = []
+    const files: {
+      path: string
+      size: number
+      mtimeMs: number
+      partial: boolean
+    }[] = []
 
     await Promise.all(
       entries.map(async (entry) => {
-        if (!entry.isFile() || !isDumpArtifactFileName(entry.name)) return
+        if (!entry.isFile()) return
+        const partial = isDumpPartialFileName(entry.name)
+        if (!partial && !isDumpArtifactFileName(entry.name)) return
         const path = join(dumpDir, entry.name)
         try {
           const stats = await lstat(path)
           if (!stats.isFile() || stats.isSymbolicLink()) return
-          files.push({ path, size: stats.size, mtimeMs: stats.mtimeMs })
+          files.push({
+            path,
+            size: stats.size,
+            mtimeMs: stats.mtimeMs,
+            partial,
+          })
         } catch {
           // Files can disappear while concurrent dump requests finish.
         }
@@ -149,7 +170,6 @@ export async function sweepDumpDirectory(options: {
     )
 
     let totalBytes = files.reduce((total, file) => total + file.size, 0)
-    if (totalBytes <= maxBytes) return emptyResult
     files.sort(
       (left, right) =>
         left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path),
@@ -158,9 +178,11 @@ export async function sweepDumpDirectory(options: {
     let removed = 0
     let freedBytes = 0
     for (const file of files) {
-      if (totalBytes <= maxBytes) break
       if (protectedPaths.has(resolve(file.path))) continue
-      if (now - file.mtimeMs < minAgeMs) continue
+      const ageMs = now - file.mtimeMs
+      const stalePartial = file.partial && ageMs >= partialStaleMs
+      if (!stalePartial && totalBytes <= maxBytes) continue
+      if (file.partial ? !stalePartial : ageMs < minAgeMs) continue
       try {
         await unlink(file.path)
         totalBytes -= file.size
@@ -437,7 +459,7 @@ async function dumpRequest(input: {
   if (!dumpEnabled) return
   nextDumpId += 1
   const affinity = input.affinity?.trim() || 'session-unknown'
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${dumpFileSessionSegment(affinity)}-${dumpRequestSegment(input)}`
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(6, '0')}-${dumpFileSessionSegment(affinity)}-${dumpRequestSegment(input)}`
   const dumpDir = getDumpDirectory()
   const prefix = join(dumpDir, id)
   const files: {
