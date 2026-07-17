@@ -859,6 +859,7 @@ describe('auth.loader', () => {
 
     const state = await getSidebarState()
     expect(state.activeId).toBe('main')
+    expect(state.route).toBe('main')
     expect(state.fallbacks.map((account) => account.id)).toContain('work-fresh')
   })
 
