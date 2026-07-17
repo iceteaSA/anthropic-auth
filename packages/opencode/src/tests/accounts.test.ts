@@ -207,6 +207,17 @@ describe('OAuth account profiles', () => {
     expect(formatOAuthAccountTier(profile)).toBe('Team · Max 5x')
   })
 
+  test('fetchOAuthAccountProfile rejects blank account metadata', async () => {
+    await expect(
+      fetchProfile({
+        organization: {
+          organization_type: '   ',
+          rate_limit_tier: '',
+        },
+      }),
+    ).rejects.toThrow('missing account metadata')
+  })
+
   test('profile freshness expires at seven days', () => {
     const profile: OAuthAccountProfile = {
       tier: 'default_claude_max_20x',

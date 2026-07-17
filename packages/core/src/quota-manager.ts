@@ -62,6 +62,37 @@ export type QuotaManagerOptions = {
   onApiError?: (error: AccountOperationError) => void
 }
 
+function mergePollCompletionWithNewerHeaders(
+  current: OAuthQuotaSnapshot | undefined,
+  polled: OAuthQuotaSnapshot,
+): OAuthQuotaSnapshot {
+  if (current?.source !== 'headers') return polled
+  const fiveHourIsNewer = Boolean(
+    current.five_hour &&
+      current.five_hour.checkedAt > (polled.five_hour?.checkedAt ?? 0),
+  )
+  const sevenDayIsNewer = Boolean(
+    current.seven_day &&
+      current.seven_day.checkedAt > (polled.seven_day?.checkedAt ?? 0),
+  )
+  if (!fiveHourIsNewer && !sevenDayIsNewer) return polled
+
+  return mergeHeaderQuotaSnapshot(polled, {
+    ...(fiveHourIsNewer && { five_hour: current.five_hour }),
+    ...(sevenDayIsNewer && { seven_day: current.seven_day }),
+    fallbackAdvised: current.fallbackAdvised,
+    ...(current.bindingWindowSource === 'headers' && {
+      bindingWindow: current.bindingWindow,
+      bindingWindowSource: current.bindingWindowSource,
+    }),
+    source: 'headers',
+    checkedAt: Math.max(
+      fiveHourIsNewer ? (current.five_hour?.checkedAt ?? 0) : 0,
+      sevenDayIsNewer ? (current.seven_day?.checkedAt ?? 0) : 0,
+    ),
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Class
 // ---------------------------------------------------------------------------
@@ -512,20 +543,28 @@ export class QuotaManager {
             now: this.now,
           })
           const now = this.now()
+          const completedQuota = mergePollCompletionWithNewerHeaders(
+            this.mainTokenFp === thisFetchFp ? this.main?.quota : undefined,
+            quota,
+          )
           this.mainTokenFp = tokenFingerprint(accessToken)
           this.main = {
-            quota,
-            refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
-            checkedAt: now,
+            quota: completedQuota,
+            refreshAfter: getQuotaNextRefreshAt(
+              completedQuota,
+              this.storage,
+              now,
+            ),
+            checkedAt: completedQuota.checkedAt ?? now,
           }
           this.mainLastApiError = undefined
           this.onMainQuotaFetched?.(
-            quota,
+            completedQuota,
             now,
             this.mainTokenFp,
             fetchStartedAt,
           )
-          return quota
+          return completedQuota
         } catch (error) {
           this._handleMainFetchError(error)
           throw error
@@ -569,18 +608,26 @@ export class QuotaManager {
             now: this.now,
           })
           const now = this.now()
+          const completedQuota = mergePollCompletionWithNewerHeaders(
+            this.getFallback(accountId, accessToken)?.quota,
+            quota,
+          )
           this.setFallback(
             accountId,
             {
-              quota,
-              refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
-              checkedAt: now,
+              quota: completedQuota,
+              refreshAfter: getQuotaNextRefreshAt(
+                completedQuota,
+                this.storage,
+                now,
+              ),
+              checkedAt: completedQuota.checkedAt ?? now,
             },
             accessToken,
           )
           this.fallbackApiErrors.delete(accountId)
           this.fallbackErrorTokenFps.delete(accountId)
-          return quota
+          return completedQuota
         } finally {
           await fileLock.release()
         }

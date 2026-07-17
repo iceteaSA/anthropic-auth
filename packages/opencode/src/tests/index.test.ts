@@ -3279,6 +3279,65 @@ describe('auth.loader', () => {
     expect(text).toContain('1w: 50% remaining')
   })
 
+  test('/claude-quota bounds stalled profile hydration without hiding quota output', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let profileSignal: AbortSignal | undefined
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/profile')) {
+          profileSignal = init?.signal ?? undefined
+          return new Promise<Response>((_resolve, reject) => {
+            profileSignal?.addEventListener(
+              'abort',
+              () => reject(profileSignal?.reason),
+              { once: true },
+            )
+          })
+        }
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 25 },
+              seven_day: { utilization: 50 },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+
+    const startedAt = performance.now()
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(performance.now() - startedAt).toBeLessThan(4_000)
+    expect(profileSignal?.aborted).toBe(true)
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+    expect(text).toContain('## Claude Quotas')
+    expect(text).toContain('5h: 75% remaining')
+    expect(text).not.toContain('Max 20x')
+  }, 5_000)
+
   test('profile fetch runs once per account per boot and persists the result', async () => {
     await useTempAccountFile(createFallbackStorage())
     const mockClient = createMockClient()
@@ -3324,6 +3383,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
 
     for (let call = 0; call < 2; call++) {
       await expect(
@@ -3344,6 +3404,10 @@ describe('auth.loader', () => {
     expect((loaded?.accounts[0] as any)?.profile?.tier).toBe(
       'default_claude_max_5x',
     )
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+    expect(text).toContain('Max 20x')
+    expect(text).toContain('Max 5x')
   })
 
   test('fresh profile under seven days skips fetch', async () => {
@@ -3383,6 +3447,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
 
     await expect(
       plugin['command.execute.before']({
@@ -3430,6 +3495,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
 
     await expect(
       plugin['command.execute.before']({
@@ -3477,6 +3543,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
 
     await expect(
       plugin['command.execute.before']({
@@ -3554,6 +3621,104 @@ describe('auth.loader', () => {
     expect(profileCalls).toBe(0)
   })
 
+  test('mock-environment opt-out prevents command profile network calls', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          Response.json({
+            five_hour: { utilization: 10 },
+            seven_day: { utilization: 20 },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('boot hydration publishes storage reloaded after the profile await', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let resolveProfile!: (response: Response) => void
+    let markProfileStarted!: () => void
+    const profileStarted = new Promise<void>((resolve) => {
+      markProfileStarted = resolve
+    })
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        markProfileStarted()
+        return new Promise<Response>((resolve) => {
+          resolveProfile = resolve
+        })
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await profileStarted
+
+    const storage = await loadAccounts()
+    if (!storage?.quota) throw new Error('expected quota storage')
+    const backoff = {
+      message: 'Claude quota check failed: 429 — rate limited',
+      checkedAt: Date.now(),
+      nextRetryAt: Date.now() + 60_000,
+      retryCount: 1,
+    }
+    storage.quota.mainLastQuotaApiError = backoff
+    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
+      mainQuota: true,
+    })
+    resolveProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      }),
+    )
+
+    const state = await waitForSidebarState(
+      (value) => value.main.tierLabel === 'Max 20x',
+    )
+    expect(state.main.quotaBackedOff).toBe(true)
+    expect((await loadAccounts())?.quota?.mainLastQuotaApiError).toEqual(
+      backoff,
+    )
+  })
+
   test('token rotation hydrates the new profile once and restores its tier label', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
@@ -3590,6 +3755,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     const showAccounts = async () => {
       await expect(
         plugin['command.execute.before']({
@@ -3646,6 +3812,7 @@ describe('auth.loader', () => {
           }),
         { models: {} },
       )
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
       const showAccounts = async () => {
         await expect(
           plugin['command.execute.before']({
@@ -3697,6 +3864,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     const showAccounts = async () => {
       await expect(
         plugin['command.execute.before']({
@@ -3763,6 +3931,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
 
     await expect(
       plugin['command.execute.before']({
@@ -3802,6 +3971,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     const records: LogTestRecord[] = []
     __setLogTestSink((record) => records.push(record))
     setLogLevel('debug')
@@ -3859,6 +4029,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     const statePath = getAccountStatePath(
       process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
     )
@@ -6350,11 +6521,90 @@ describe('auth.loader', () => {
       'anthropic-ratelimit-unified-7d-reset': '1784628000',
     }
 
-    const harvestStorage = (accounts: AccountStorage['accounts'] = []) =>
+    const harvestStorage = (
+      accounts: AccountStorage['accounts'] = [],
+      overrides: Partial<AccountStorage> = {},
+    ) =>
       createFallbackStorage({
         accounts,
         quota: { enabled: false },
+        ...overrides,
       })
+
+    function installRelayWebSocket(responseHeaders: Record<string, string>) {
+      const originalWebSocket = globalThis.WebSocket
+
+      class RelayWebSocket extends EventTarget {
+        binaryType = 'arraybuffer'
+
+        constructor() {
+          super()
+          queueMicrotask(() => {
+            this.dispatchEvent(new Event('open'))
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'ready',
+                  state: null,
+                }),
+              }),
+            )
+          })
+        }
+
+        send(data: string) {
+          const payload = JSON.parse(data)
+          queueMicrotask(() => {
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'accepted',
+                  id: payload.id,
+                  hash: payload.next_hash,
+                  revision: payload.revision,
+                }),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'response_start',
+                  id: payload.id,
+                  status: 200,
+                  headers: responseHeaders,
+                }),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: Buffer.from('event: message_stop\n\n'),
+              }),
+            )
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'done',
+                  id: payload.id,
+                }),
+              }),
+            )
+          })
+        }
+
+        close() {
+          this.dispatchEvent(new Event('close'))
+        }
+      }
+
+      globalThis.WebSocket = RelayWebSocket as unknown as typeof WebSocket
+      return () => {
+        globalThis.WebSocket = originalWebSocket
+      }
+    }
 
     async function loadFetch(
       getAccessToken: () => string = () => 'main-access',
@@ -6407,6 +6657,123 @@ describe('auth.loader', () => {
       )
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
       expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('websocket relay response_start pushes unified headers for the served account', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'websocket',
+          },
+        }),
+      )
+      const restoreWebSocket = installRelayWebSocket(quotaHeaders)
+      const result = await loadFetch()
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-websocket' },
+        })
+        expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
+          'true',
+        )
+        await response.text()
+      } finally {
+        restoreWebSocket()
+      }
+
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('relay fallback to direct harvests quota headers exactly once', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'http',
+          },
+        }),
+      )
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        const url = extractUrl(input)
+        if (url === 'https://relay.example.test') {
+          return Promise.resolve(
+            new Response('relay unavailable', { status: 503 }),
+          )
+        }
+        return Promise.resolve(
+          new Response('direct', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-direct-fallback' },
+        })
+        expect(await response.text()).toBe('direct')
+        await waitForState((value) => value.main?.quota?.source === 'headers')
+        expect(
+          records.filter(
+            (record) =>
+              record.channel === 'quota' &&
+              record.message === 'harvested response quota',
+          ),
+        ).toHaveLength(1)
+      } finally {
+        __setLogTestSink(null)
+        setLogLevel('info')
+      }
+    })
+
+    test('websocket optimistic response headers without quota data do not persist', async () => {
+      await useTempAccountFile(
+        harvestStorage([], {
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'websocket',
+          },
+        }),
+      )
+      const restoreWebSocket = installRelayWebSocket({
+        'content-type': 'text/event-stream',
+      })
+      const result = await loadFetch()
+
+      try {
+        const response = await result.fetch(MESSAGES_URL, {
+          ...EMPTY_POST,
+          headers: { 'x-session-affinity': 'quota-relay-synthetic-only' },
+        })
+        expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
+          'true',
+        )
+        await response.text()
+      } finally {
+        restoreWebSocket()
+      }
+
+      await Bun.sleep(30)
+      expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
     })
 
     test('main header push skips persistence after access-token rotation', async () => {
@@ -6680,6 +7047,46 @@ describe('auth.loader', () => {
       await Bun.sleep(30)
 
       expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
+    })
+
+    test('non-finite utilization headers leave stored quota untouched', async () => {
+      const existingQuota = {
+        five_hour: {
+          usedPercent: 11,
+          remainingPercent: 89,
+          checkedAt: 1,
+        },
+        fallbackAdvised: true,
+        source: 'poll' as const,
+        checkedAt: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainQuota: existingQuota,
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: tokenFingerprint('main-access'),
+          },
+        }),
+      )
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('ok', {
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': 'garbage',
+              'anthropic-ratelimit-unified-7d-utilization': 'NaN',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await Bun.sleep(30)
+
+      expect((await loadAccounts())?.quota?.mainQuota).toEqual(existingQuota)
     })
 
     test('malformed quota headers never reject or replace the original response', async () => {

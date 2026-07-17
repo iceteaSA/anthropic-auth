@@ -4,6 +4,7 @@ import type {
   AccountStorage,
   OAuthAccount,
   OAuthQuotaSnapshot,
+  QuotaMoney,
   QuotaWindowName,
 } from './accounts.ts'
 import { isOAuthAccount } from './accounts.ts'
@@ -78,16 +79,16 @@ function formatWindow(
   return bindingWindow === key ? `${line} •` : line
 }
 
-function formatMoney(amountMinor: number, currency: string, exponent: number) {
+export function formatQuotaMoney(money: QuotaMoney) {
   try {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
-      currency,
-      minimumFractionDigits: exponent,
-      maximumFractionDigits: exponent,
-    }).format(amountMinor / 10 ** exponent)
+      currency: money.currency,
+      minimumFractionDigits: money.exponent,
+      maximumFractionDigits: money.exponent,
+    }).format(money.amountMinor / 10 ** money.exponent)
   } catch {
-    return `${amountMinor} ${currency}`
+    return `${money.amountMinor} ${money.currency}`
   }
 }
 
@@ -184,16 +185,8 @@ export function buildClaudeQuotaSummary(input: {
     }
     const extraUsage = account.quota?.extraUsage
     if (extraUsage) {
-      const used = formatMoney(
-        extraUsage.used.amountMinor,
-        extraUsage.used.currency,
-        extraUsage.used.exponent,
-      )
-      const limit = formatMoney(
-        extraUsage.limit.amountMinor,
-        extraUsage.limit.currency,
-        extraUsage.limit.exponent,
-      )
+      const used = formatQuotaMoney(extraUsage.used)
+      const limit = formatQuotaMoney(extraUsage.limit)
       lines.push(
         `  - credits ${used}/${limit}${extraUsage.exhausted ? ' · exhausted' : ''}`,
       )

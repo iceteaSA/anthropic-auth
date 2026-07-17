@@ -9,9 +9,11 @@ export async function fetchOAuthAccountProfile(input: {
   accessToken: string
   fetchImpl?: typeof fetch
   now?: () => number
+  signal?: AbortSignal
 }): Promise<OAuthAccountProfile> {
   const response = await (input.fetchImpl ?? fetch)(PROFILE_URL, {
     method: 'GET',
+    signal: input.signal,
     headers: {
       Authorization: `Bearer ${input.accessToken}`,
       Accept: 'application/json',
@@ -29,7 +31,12 @@ export async function fetchOAuthAccountProfile(input: {
   }
   const tier = value.organization?.rate_limit_tier
   const orgType = value.organization?.organization_type
-  if (typeof tier !== 'string' || typeof orgType !== 'string') {
+  if (
+    typeof tier !== 'string' ||
+    tier.trim() === '' ||
+    typeof orgType !== 'string' ||
+    orgType.trim() === ''
+  ) {
     throw new Error('Claude profile response is missing account metadata')
   }
   return {

@@ -497,6 +497,8 @@ type PendingWebSocketRequest = {
   streamByteCount: number
   retryAttempts: number
   retryingBeforeResponse: boolean
+  onResponseHeaders?: (headers: Headers) => void
+  responseHeadersDelivered: boolean
 }
 
 class PersistentRelaySession {
@@ -535,13 +537,20 @@ class PersistentRelaySession {
     payload: RelayPayload,
     bodyText: string,
     optimisticResponse = false,
+    onResponseHeaders?: (headers: Headers) => void,
   ): Promise<RelaySendResult> {
     this.touch()
     const enqueuedAt = perfNowMs()
     const start = this.queue
       .catch(() => {})
       .then(() =>
-        this.startQueued(payload, bodyText, enqueuedAt, optimisticResponse),
+        this.startQueued(
+          payload,
+          bodyText,
+          enqueuedAt,
+          optimisticResponse,
+          onResponseHeaders,
+        ),
       )
     const result = start.then(async ({ response, getPayload }) => ({
       response: await response,
@@ -562,6 +571,7 @@ class PersistentRelaySession {
     bodyText: string,
     enqueuedAt: number,
     optimisticResponse: boolean,
+    onResponseHeaders?: (headers: Headers) => void,
   ) {
     const connectStart = perfNowMs()
     await this.ensureConnected()
@@ -593,7 +603,12 @@ class PersistentRelaySession {
     )
 
     let activePayload = requestPayload
-    const first = this.sendPayload(requestPayload, bodyText, optimisticResponse)
+    const first = this.sendPayload(
+      requestPayload,
+      bodyText,
+      optimisticResponse,
+      onResponseHeaders,
+    )
     void first.done.catch(() => {})
     let activeDone = first.done
     const response = first.response.catch((error) => {
@@ -608,7 +623,12 @@ class PersistentRelaySession {
       fullSync.id = createRequestId()
       fullSync.revision = (this.serverState?.revision ?? 0) + 1
       activePayload = fullSync
-      const retry = this.sendPayload(fullSync, bodyText, optimisticResponse)
+      const retry = this.sendPayload(
+        fullSync,
+        bodyText,
+        optimisticResponse,
+        onResponseHeaders,
+      )
       void retry.done.catch(() => {})
       activeDone = retry.done
       return retry.response
@@ -711,6 +731,7 @@ class PersistentRelaySession {
     payload: RelayPayload,
     bodyText: string,
     optimisticResponse: boolean,
+    onResponseHeaders?: (headers: Headers) => void,
   ) {
     const socket = this.socket
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -741,6 +762,8 @@ class PersistentRelaySession {
         streamByteCount: 0,
         retryAttempts: 0,
         retryingBeforeResponse: false,
+        onResponseHeaders,
+        responseHeadersDelivered: false,
       }
       this.pending = pending
       this.resetPendingTimeout(pending)
@@ -805,6 +828,7 @@ class PersistentRelaySession {
         pending.accepted = false
         pending.acceptedAt = undefined
         pending.responseStartedAt = undefined
+        pending.responseHeadersDelivered = false
         pending.sentAt = perfNowMs()
         pending.retryingBeforeResponse = false
 
@@ -900,6 +924,12 @@ class PersistentRelaySession {
         `perf websocket response_start session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(responseStartedAt - pending.sentAt)} upstreamMs=${pending.acceptedAt == null ? 'unknown' : formatMs(responseStartedAt - pending.acceptedAt)} status=${message.status}`,
       )
       clearTimeout(pending.timeout)
+      if (message.headers && !pending.responseHeadersDelivered) {
+        pending.responseHeadersDelivered = true
+        try {
+          pending.onResponseHeaders?.(new Headers(message.headers))
+        } catch {}
+      }
       this.resolvePendingResponse(
         pending,
         message.status,
@@ -1046,6 +1076,7 @@ export async function sendViaRelay(options: {
   fallback: () => Promise<Response>
   affinity?: string | null
   optimisticResponse?: boolean
+  onResponseHeaders?: (headers: Headers) => void
 }): Promise<Response> {
   const {
     config,
@@ -1056,6 +1087,7 @@ export async function sendViaRelay(options: {
     fallback,
     affinity: explicitAffinity,
     optimisticResponse,
+    onResponseHeaders,
   } = options
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
 
@@ -1104,6 +1136,7 @@ export async function sendViaRelay(options: {
           payload,
           bodyText,
           optimisticResponse === true,
+          onResponseHeaders,
         )
       } catch (error) {
         relayLog(
@@ -1138,6 +1171,12 @@ export async function sendViaRelay(options: {
     })
 
     if (!result.usedRelay) return result.response
+
+    if (result.transport === 'http') {
+      try {
+        onResponseHeaders?.(result.response.headers)
+      } catch {}
+    }
 
     if (result.transport === 'http') {
       updateLocalRelayState(

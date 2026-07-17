@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { formatQuotaMoney } from '@cortexkit/anthropic-auth-core'
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -402,22 +403,7 @@ function AccountBlock(props: {
   )
 }
 
-export function formatQuotaMoney(money: {
-  amountMinor: number
-  currency: string
-  exponent: number
-}) {
-  try {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: money.currency,
-      minimumFractionDigits: money.exponent,
-      maximumFractionDigits: money.exponent,
-    }).format(money.amountMinor / 10 ** money.exponent)
-  } catch {
-    return `${money.amountMinor} ${money.currency}`
-  }
-}
+export { formatQuotaMoney }
 
 // --- Quota dialog content ---------------------------------------------------
 
