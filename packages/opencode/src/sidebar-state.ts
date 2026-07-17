@@ -417,6 +417,7 @@ const SIDEBAR_LOCK_RETRY_MAX_MS = 15
 interface SidebarStateWriteTestHooks {
   afterMergeRead?: (stateFile: string) => void | Promise<void>
   beforeRename?: (stateFile: string, tempFile: string) => void | Promise<void>
+  afterRename?: (stateFile: string) => void | Promise<void>
   afterStaleLockStat?: (lockDir: string) => void | Promise<void>
   onStaleLockClaimed?: (lockDir: string) => void | Promise<void>
   onLockAcquired?: (lockDir: string) => void | Promise<void>
@@ -544,24 +545,36 @@ export async function __acquireSidebarStateLockForTest(
 async function writeSidebarStateAtomic(
   stateFile: string,
   state: SidebarState,
-  ownsLock?: () => Promise<boolean>,
-): Promise<boolean> {
+  ownsLock: () => Promise<boolean>,
+): Promise<'written' | 'lock-lost-before-rename' | 'lock-lost-after-rename'> {
   const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
   await writeFile(tempFile, JSON.stringify(state), {
     encoding: 'utf8',
     mode: 0o600,
   })
   try {
-    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
-    if (ownsLock && !(await ownsLock())) {
+    if (!(await ownsLock())) {
       logger.trace('sidebar', 'state lock lost before rename; write aborted', {
         stateFile,
       })
       await rm(tempFile, { force: true }).catch(() => {})
-      return false
+      return 'lock-lost-before-rename'
+    }
+    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
+    // No production await separates this ownership fence from rename. A process
+    // freeze between the adjacent syscalls remains possible, so rename is also
+    // fenced from the other side below.
+    if (!(await ownsLock())) {
+      logger.trace('sidebar', 'state lock lost before rename; write aborted', {
+        stateFile,
+      })
+      await rm(tempFile, { force: true }).catch(() => {})
+      return 'lock-lost-before-rename'
     }
     await rename(tempFile, stateFile)
-    return true
+    await sidebarStateWriteTestHooks?.afterRename?.(stateFile)
+    if (!(await ownsLock())) return 'lock-lost-after-rename'
+    return 'written'
   } catch (error) {
     await rm(tempFile, { force: true }).catch(() => {})
     throw error
@@ -607,43 +620,83 @@ export async function setSidebarState(
   writeChain = writeChain
     .then(async () => {
       await mkdir(dirname(stateFile), { recursive: true })
-      const lock = await acquireSidebarStateLock(stateFile)
-      // Sidebar frames are display-only and refresh within seconds; dropping one
-      // is safer than clobbering routing state that may stay authoritative until
-      // another process handles its next request.
-      if (!lock) return
-      try {
-        let stateToWrite = state
-        if (options.routingAuthoritative === false) {
-          const current = await readSidebarState(stateFile)
-          const preservedRouting =
-            await options.resolvePreservedRouting?.(current)
-          if (preservedRouting) {
-            const preservedState = preservedRouting.state ?? state
-            stateToWrite = {
-              ...preservedState,
-              activeId: preservedRouting.activeId,
-              route: preservedRouting.route,
-              lastUpdated: Math.max(
-                preservedState.lastUpdated,
-                current.lastUpdated,
-              ),
-            }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const repairingPostRenameLoss = attempt === 1
+        const lock = await acquireSidebarStateLock(stateFile)
+        // Sidebar frames are display-only and refresh within seconds; dropping one
+        // is safer than clobbering routing state that may stay authoritative until
+        // another process handles its next request.
+        if (!lock) {
+          if (repairingPostRenameLoss) {
+            logger.warn(
+              'sidebar',
+              'post-rename repair lock unavailable; write skipped',
+              { stateFile },
+            )
           }
-          await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+          return
         }
-        const wroteState = await writeSidebarStateAtomic(
-          stateFile,
-          stateToWrite,
-          lock.ownsLock,
-        )
-        if (!wroteState) return
+
+        let stateToWrite = state
+        let result:
+          | 'written'
+          | 'lock-lost-before-rename'
+          | 'lock-lost-after-rename'
+        try {
+          if (options.routingAuthoritative === false) {
+            const current = await readSidebarState(stateFile)
+            const preservedRouting =
+              await options.resolvePreservedRouting?.(current)
+            if (preservedRouting) {
+              const preservedState = preservedRouting.state ?? state
+              stateToWrite = {
+                ...preservedState,
+                activeId: preservedRouting.activeId,
+                route: preservedRouting.route,
+                lastUpdated: Math.max(
+                  preservedState.lastUpdated,
+                  current.lastUpdated,
+                ),
+              }
+            }
+            await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+          } else if (repairingPostRenameLoss) {
+            const current = await readSidebarState(stateFile)
+            stateToWrite = { ...current, ...state }
+          }
+          result = await writeSidebarStateAtomic(
+            stateFile,
+            stateToWrite,
+            lock.ownsLock,
+          )
+        } finally {
+          await lock.release()
+        }
+
+        if (result === 'lock-lost-after-rename') {
+          if (repairingPostRenameLoss) {
+            logger.warn(
+              'sidebar',
+              'post-rename repair lost lock; write skipped',
+              { stateFile },
+            )
+            return
+          }
+          logger.warn(
+            'sidebar',
+            'state lock lost after rename; repairing write',
+            {
+              stateFile,
+            },
+          )
+          continue
+        }
+        if (result === 'lock-lost-before-rename') return
         options.onRoutingResolved?.({
           activeId: stateToWrite.activeId,
           route: stateToWrite.route,
         })
-      } finally {
-        await lock.release()
+        return
       }
     })
     .catch(() => {
