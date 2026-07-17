@@ -858,6 +858,12 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   )
 }
 
+function quotaSourcePrecedence(quota: OAuthQuotaSnapshot | undefined) {
+  if (quota?.source === 'poll') return 2
+  if (quota?.source === 'headers') return 1
+  return 0
+}
+
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
@@ -866,10 +872,10 @@ function mergeAccountRuntimeState(
   const existingEntry = existing as AccountRuntimeEntry
   const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
   const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
-  const existingHeaderWinsEqualTimestamp = Boolean(
+  const existingQuotaWinsEqualTimestamp = Boolean(
     existingQuotaCheckedAt === incomingQuotaCheckedAt &&
-      existingEntry.quota?.source === 'headers' &&
-      incoming.quota?.source !== 'headers',
+      quotaSourcePrecedence(existingEntry.quota) >
+        quotaSourcePrecedence(incoming.quota),
   )
   const tokenChanged = Boolean(
     (existingEntry.access &&
@@ -882,7 +888,7 @@ function mergeAccountRuntimeState(
 
   if (
     existingQuotaCheckedAt > incomingQuotaCheckedAt ||
-    existingHeaderWinsEqualTimestamp
+    existingQuotaWinsEqualTimestamp
   ) {
     const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
     const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
@@ -1043,7 +1049,14 @@ function applyMainQuotaStatePatch(
     typeof storage.quota?.mainQuotaCheckedAt === 'number'
       ? storage.quota.mainQuotaCheckedAt
       : quotaSnapshotCheckedAt(storage.quota?.mainQuota)
-  if (existingCheckedAt > incomingCheckedAt) return
+  if (
+    existingCheckedAt > incomingCheckedAt ||
+    (existingCheckedAt === incomingCheckedAt &&
+      quotaSourcePrecedence(state.main.quota) >
+        quotaSourcePrecedence(storage.quota?.mainQuota))
+  ) {
+    return
+  }
 
   state.main.quota = storage.quota?.mainQuota
   state.main.quotaCheckedAt = storage.quota?.mainQuotaCheckedAt

@@ -746,6 +746,159 @@ describe('account storage', () => {
     expect(account.lastUsed).toBe(501)
   })
 
+  test('equal-time poll replaces headers and keeps scoped quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: 500,
+        },
+        source: 'headers',
+        checkedAt: 500,
+      },
+    })
+    await saveAccounts(storage)
+    const pollView = await loadAccounts()
+    const pollAccount = expectOAuthAccount(pollView?.accounts[0])
+    pollAccount.quota = {
+      five_hour: {
+        usedPercent: 79,
+        remainingPercent: 21,
+        checkedAt: 500,
+      },
+      scoped: [
+        {
+          id: 'weekly-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 500,
+        },
+      ],
+      source: 'poll',
+      checkedAt: 500,
+    }
+
+    await saveAccountState(pollView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota?.source).toBe('poll')
+    expect(account.quota?.scoped?.[0]?.id).toBe('weekly-fable')
+  })
+
+  test('equal-time header snapshot can replace another header snapshot', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: 500,
+        },
+        source: 'headers',
+        checkedAt: 500,
+      },
+    })
+    await saveAccounts(storage)
+    const nextHeaderView = await loadAccounts()
+    const nextHeader = expectOAuthAccount(nextHeaderView?.accounts[0])
+    nextHeader.quota = {
+      five_hour: {
+        usedPercent: 80,
+        remainingPercent: 20,
+        checkedAt: 500,
+      },
+      source: 'headers',
+      checkedAt: 500,
+    }
+
+    await saveAccountState(nextHeaderView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    expect(
+      expectOAuthAccount(loaded?.accounts[0]).quota?.five_hour?.usedPercent,
+    ).toBe(80)
+  })
+
+  test('main equal-time poll beats headers and source-less saves', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: 500,
+        },
+        source: 'headers',
+        checkedAt: 500,
+      },
+      mainQuotaCheckedAt: 500,
+      mainQuotaToken: 'token',
+    }
+    await saveAccounts(storage)
+    const pollView = await loadAccounts()
+    const sourceLessView = await loadAccounts()
+    expect(pollView).not.toBeNull()
+    expect(sourceLessView).not.toBeNull()
+    ;(pollView as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 79,
+        remainingPercent: 21,
+        checkedAt: 500,
+      },
+      scoped: [
+        {
+          id: 'weekly-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 500,
+        },
+      ],
+      source: 'poll',
+      checkedAt: 500,
+    }
+    ;(sourceLessView as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 1,
+        remainingPercent: 99,
+        checkedAt: 500,
+      },
+      checkedAt: 500,
+    }
+
+    await saveAccountState(pollView as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+    await saveAccountState(sourceLessView as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+
+    const loaded = await loadAccounts()
+    expect(loaded?.quota?.mainQuota?.source).toBe('poll')
+    expect(loaded?.quota?.mainQuota?.scoped?.[0]?.id).toBe('weekly-fable')
+  })
+
   test('runtime state saves can update refreshed tokens without downgrading quota', async () => {
     const storage = baseStorage()
     storage.accounts.push({
