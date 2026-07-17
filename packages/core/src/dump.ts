@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
@@ -20,6 +20,7 @@ const DUMP_MAX_BYTES_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES'
 const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
 const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
 const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
+const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
 const DUMP_DIR_PREFIX = 'opencode-anthropic-auth-dumps'
 
 let dumpEnabled = false
@@ -56,7 +57,7 @@ export function getDumpDirectory() {
 
 function getDumpMaxBytes() {
   const configured = Number(process.env[DUMP_MAX_BYTES_ENV])
-  return Number.isFinite(configured) && configured > 0
+  return Number.isFinite(configured) && configured >= 0
     ? Math.floor(configured)
     : DEFAULT_DUMP_MAX_BYTES
 }
@@ -73,13 +74,19 @@ export async function sweepDumpDirectory(options: {
   dumpDir?: string
   maxBytes?: number
   protectedPaths?: readonly string[]
+  now?: number
+  minAgeMs?: number
 }) {
   const dumpDir = options.dumpDir ?? getDumpDirectory()
   const maxBytes = options.maxBytes ?? getDumpMaxBytes()
+  const now = options.now ?? Date.now()
+  const minAgeMs = options.minAgeMs ?? DUMP_SWEEP_NEWNESS_FLOOR_MS
   const emptyResult = { removed: 0, freedBytes: 0 }
   if (!isExpectedDumpDirectory(dumpDir) || maxBytes < 0) return emptyResult
 
   try {
+    const dumpDirStats = await lstat(dumpDir)
+    if (dumpDirStats.isSymbolicLink()) return emptyResult
     const protectedPaths = new Set(
       (options.protectedPaths ?? []).map((path) => resolve(path)),
     )
@@ -112,8 +119,9 @@ export async function sweepDumpDirectory(options: {
     for (const file of files) {
       if (totalBytes <= maxBytes) break
       if (protectedPaths.has(resolve(file.path))) continue
+      if (now - file.mtimeMs < minAgeMs) continue
       try {
-        await rm(file.path, { force: true })
+        await unlink(file.path)
         totalBytes -= file.size
         freedBytes += file.size
         removed += 1
