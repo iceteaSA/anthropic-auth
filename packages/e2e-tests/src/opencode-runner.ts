@@ -2,7 +2,7 @@
 
 import { type ChildProcess, spawn } from 'node:child_process'
 import { type Dirent, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
-import { lstat, readdir, rm } from 'node:fs/promises'
+import { lstat, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 
@@ -10,6 +10,7 @@ const REPO_ROOT = resolve(import.meta.dir, '../../..')
 const PLUGIN_ENTRY = join(REPO_ROOT, 'packages/opencode/src/index.ts')
 const E2E_TEMP_PREFIX = 'anthropic-auth-e2e-'
 const DEFAULT_STALE_AGE_MS = 24 * 60 * 60 * 1000
+const RUN_PID_FILE = 'run.pid'
 
 export type IsolatedEnv = {
   tempDir: string
@@ -68,12 +69,29 @@ export async function sweepStaleE2ETempDirs(
       try {
         const stats = await lstat(path)
         if (stats.isSymbolicLink() || now - stats.mtimeMs <= maxAgeMs) return
+        if (await hasLiveRunOwner(path)) return
         await removeE2ETempDir(path, { root })
       } catch {
         // A crashed-run sweep must not prevent a new harness from starting.
       }
     }),
   )
+}
+
+async function hasLiveRunOwner(path: string) {
+  try {
+    const value = await readFile(join(path, RUN_PID_FILE), 'utf8')
+    const pid = Number(value.trim())
+    if (!Number.isInteger(pid) || pid <= 0) return false
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM'
+    }
+  } catch {
+    return false
+  }
 }
 
 export type SpawnedOpencode = {
@@ -117,6 +135,7 @@ function createIsolatedEnv(): IsolatedEnv {
     workdir: join(base, 'work'),
   }
   for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true })
+  writeFileSync(join(base, RUN_PID_FILE), String(process.pid))
   env.workdir = realpathSync(env.workdir)
   writeFileSync(join(env.workdir, 'sample.txt'), 'hello from sample file\n')
   return env
@@ -205,18 +224,33 @@ async function waitForReady(
   throw new Error(`opencode serve did not become ready: ${String(lastError)}`)
 }
 
-export async function terminateChildProcess(child: ChildProcess) {
+export async function terminateChildProcess(
+  child: ChildProcess,
+  options: { termTimeoutMs?: number; killExitTimeoutMs?: number } = {},
+) {
   if (child.exitCode !== null || child.signalCode !== null) return
   await new Promise<void>((resolve) => {
+    let termTimer: ReturnType<typeof setTimeout> | undefined
+    let killExitTimer: ReturnType<typeof setTimeout> | undefined
+    let settled = false
     const finish = () => {
-      clearTimeout(timer)
+      if (settled) return
+      settled = true
+      if (termTimer) clearTimeout(termTimer)
+      if (killExitTimer) clearTimeout(killExitTimer)
+      child.off('exit', finish)
       resolve()
     }
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL')
-      resolve()
-    }, 3000)
     child.once('exit', finish)
+    termTimer = setTimeout(() => {
+      killExitTimer = setTimeout(() => {
+        console.warn(
+          'opencode child did not exit after SIGKILL; continuing cleanup',
+        )
+        finish()
+      }, options.killExitTimeoutMs ?? 2000)
+      child.kill('SIGKILL')
+    }, options.termTimeoutMs ?? 3000)
     child.kill('SIGTERM')
   })
 }

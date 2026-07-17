@@ -11,6 +11,7 @@ import {
   rm,
   symlink,
   utimes,
+  writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -58,6 +59,37 @@ describe('e2e temporary directory hygiene', () => {
       'symlink-target',
     ])
     expect((await lstat(symlinkTarget)).isDirectory()).toBe(true)
+  })
+
+  it('keeps an old run directory owned by a live process', async () => {
+    const root = await createRoot()
+    const liveDir = join(root, 'anthropic-auth-e2e-live')
+    const staleTime = new Date('2026-07-15T00:00:00.000Z')
+    const now = new Date('2026-07-17T00:00:00.000Z')
+    await mkdir(liveDir)
+    await writeFile(join(liveDir, 'run.pid'), String(process.pid))
+    await utimes(liveDir, staleTime, staleTime)
+
+    await sweepStaleE2ETempDirs({ root, now: now.getTime() })
+
+    expect(await readdir(root)).toEqual(['anthropic-auth-e2e-live'])
+  })
+
+  it('removes an old run directory owned by an exited process', async () => {
+    const root = await createRoot()
+    const deadDir = join(root, 'anthropic-auth-e2e-dead')
+    const staleTime = new Date('2026-07-15T00:00:00.000Z')
+    const now = new Date('2026-07-17T00:00:00.000Z')
+    const child = Bun.spawn(['true'])
+    const deadPid = child.pid
+    await child.exited
+    await mkdir(deadDir)
+    await writeFile(join(deadDir, 'run.pid'), String(deadPid))
+    await utimes(deadDir, staleTime, staleTime)
+
+    await sweepStaleE2ETempDirs({ root, now: now.getTime() })
+
+    expect(await readdir(root)).toEqual([])
   })
 
   it('removes a verified run directory unless the keep escape hatch is enabled', async () => {
@@ -109,6 +141,38 @@ describe('e2e temporary directory hygiene', () => {
     expect(resolved).toBe(false)
     child.exitCode = 0
     child.emit('exit', 0, null)
+    await termination
+    expect(resolved).toBe(true)
+  })
+
+  it('waits for exit after escalating termination to SIGKILL', async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      exitCode: number | null
+      signalCode: NodeJS.Signals | null
+      killSignals: NodeJS.Signals[]
+      kill: (signal: NodeJS.Signals) => boolean
+    }
+    child.exitCode = null
+    child.signalCode = null
+    child.killSignals = []
+    child.kill = (signal) => {
+      child.killSignals.push(signal)
+      return true
+    }
+    let resolved = false
+
+    const termination = terminateChildProcess(child as unknown as ChildProcess, {
+      termTimeoutMs: 5,
+      killExitTimeoutMs: 100,
+    }).then(() => {
+      resolved = true
+    })
+    await Bun.sleep(20)
+
+    expect(child.killSignals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(resolved).toBe(false)
+    child.signalCode = 'SIGKILL'
+    child.emit('exit', null, 'SIGKILL')
     await termination
     expect(resolved).toBe(true)
   })
