@@ -70,7 +70,7 @@ Entry fields:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `percent` | int | utilization |
-| `severity` | `normal` \| `warning` \| … | observed `warning` at 77%; plugin treats `critical` as red |
+| `severity` | `normal` \| `warning` \| … | observed `warning` at 77%; captured but not used for plugin tone |
 | `resets_at` | ISO 8601 | per-limit reset |
 | `scope.model.id` | string \| null | **null observed even for Fable** — only `display_name` present ("Fable"); this is why `scopedQuotaModelKey` normalizes display names |
 | `is_active` | bool | **inferred:** marks the currently *binding* limit — on both accounts the entry with the highest percent carried `is_active: true` (main: Fable 15% > 7d 13% > 5h 4%; work-alt: session 77% > Fable 51% > weekly 40%). Not documented by Anthropic; treat as heuristic |
