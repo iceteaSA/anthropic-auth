@@ -88,9 +88,20 @@ export interface SidebarState {
   lastUpdated: number
 }
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import {
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { logger } from '@cortexkit/anthropic-auth-core'
 
 import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
 
@@ -397,23 +408,243 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
 
 let writeChain: Promise<void> = Promise.resolve()
 
-export async function getSidebarState(): Promise<SidebarState> {
+// Wait through ordinary contention while staying below the 2s stale-eviction window.
+const SIDEBAR_LOCK_BUDGET_MS = 1_000
+const SIDEBAR_LOCK_STALE_MS = 2_000
+const SIDEBAR_LOCK_RETRY_MIN_MS = 5
+const SIDEBAR_LOCK_RETRY_MAX_MS = 15
+
+interface SidebarStateWriteTestHooks {
+  afterMergeRead?: (stateFile: string) => void | Promise<void>
+  beforeRename?: (stateFile: string, tempFile: string) => void | Promise<void>
+  afterStaleLockStat?: (lockDir: string) => void | Promise<void>
+  onStaleLockClaimed?: (lockDir: string) => void | Promise<void>
+  onLockAcquired?: (lockDir: string) => void | Promise<void>
+  beforeReleaseDirectoryRemoval?: (lockDir: string) => void | Promise<void>
+  lockBudgetMs?: number
+  lockRetryMinMs?: number
+  lockRetryMaxMs?: number
+}
+
+let sidebarStateWriteTestHooks: SidebarStateWriteTestHooks | null = null
+
+export function __setSidebarStateWriteTestHooks(
+  hooks: SidebarStateWriteTestHooks | null,
+): void {
+  sidebarStateWriteTestHooks = hooks
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function acquireSidebarStateLock(stateFile: string): Promise<{
+  release: () => Promise<void>
+  ownsLock: () => Promise<boolean>
+} | null> {
+  const lockDir = `${stateFile}.lock`
+  const budgetMs =
+    sidebarStateWriteTestHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
+  const retryMinMs =
+    sidebarStateWriteTestHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
+  const retryMaxMs =
+    sidebarStateWriteTestHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
+  const deadline = Date.now() + budgetMs
+
+  while (true) {
+    try {
+      await mkdir(lockDir)
+      const ownerId = randomUUID()
+      const ownerFile = join(lockDir, ownerId)
+      await writeFile(ownerFile, '', {
+        encoding: 'utf8',
+        mode: 0o600,
+        flag: 'wx',
+      })
+      await sidebarStateWriteTestHooks?.onLockAcquired?.(lockDir)
+      return {
+        ownsLock: async () => {
+          try {
+            await stat(ownerFile)
+            return true
+          } catch {
+            return false
+          }
+        },
+        release: async () => {
+          // Unlinking this acquisition's unique file makes the filesystem reject
+          // a stale release after eviction handed the path to a successor.
+          try {
+            await unlink(ownerFile)
+          } catch {
+            return
+          }
+          await sidebarStateWriteTestHooks?.beforeReleaseDirectoryRemoval?.(
+            lockDir,
+          )
+          await rmdir(lockDir).catch(() => {})
+        },
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        logger.trace('sidebar', 'state lock unavailable; writing unlocked', {
+          stateFile,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return null
+      }
+    }
+
+    try {
+      const lockStat = await stat(lockDir)
+      if (Date.now() - lockStat.mtimeMs > SIDEBAR_LOCK_STALE_MS) {
+        await sidebarStateWriteTestHooks?.afterStaleLockStat?.(lockDir)
+        const evictedLockDir = `${lockDir}.evict-${process.pid}-${randomUUID()}`
+        try {
+          await rename(lockDir, evictedLockDir)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+          throw error
+        }
+        await sidebarStateWriteTestHooks?.onStaleLockClaimed?.(lockDir)
+        await rm(evictedLockDir, { recursive: true, force: true }).catch(
+          () => {},
+        )
+        continue
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      logger.trace(
+        'sidebar',
+        'state lock inspection failed; writing unlocked',
+        {
+          stateFile,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      )
+      return null
+    }
+
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      logger.trace('sidebar', 'state lock budget exhausted; writing unlocked', {
+        stateFile,
+        budgetMs,
+      })
+      return null
+    }
+    const jitterMs =
+      retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
+    await sleep(Math.min(jitterMs, remainingMs))
+  }
+}
+
+export async function __acquireSidebarStateLockForTest(
+  stateFile: string,
+): Promise<(() => Promise<void>) | null> {
+  return (await acquireSidebarStateLock(stateFile))?.release ?? null
+}
+
+async function writeSidebarStateAtomic(
+  stateFile: string,
+  state: SidebarState,
+  ownsLock?: () => Promise<boolean>,
+): Promise<boolean> {
+  const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(tempFile, JSON.stringify(state), {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
   try {
-    const raw = await readFile(getSidebarStateFile(), 'utf8')
+    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
+    if (ownsLock && !(await ownsLock())) {
+      logger.trace('sidebar', 'state lock lost before rename; write aborted', {
+        stateFile,
+      })
+      await rm(tempFile, { force: true }).catch(() => {})
+      return false
+    }
+    await rename(tempFile, stateFile)
+    return true
+  } catch (error) {
+    await rm(tempFile, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+async function readSidebarState(stateFile: string): Promise<SidebarState> {
+  try {
+    const raw = await readFile(stateFile, 'utf8')
     return normalizeSidebarState(JSON.parse(raw))
   } catch {
     return DEFAULT_SIDEBAR_STATE
   }
 }
 
+export async function getSidebarState(): Promise<SidebarState> {
+  return readSidebarState(getSidebarStateFile())
+}
+
+export interface SidebarStateWriteOptions {
+  routingAuthoritative?: boolean
+  resolvePreservedRouting?: (current: SidebarState) =>
+    | (Pick<SidebarState, 'activeId' | 'route'> & {
+        state?: SidebarState
+      })
+    | undefined
+    | Promise<
+        | (Pick<SidebarState, 'activeId' | 'route'> & {
+            state?: SidebarState
+          })
+        | undefined
+      >
+  onRoutingResolved?: (
+    routing: Pick<SidebarState, 'activeId' | 'route'>,
+  ) => void
+}
+
 export async function setSidebarState(
   state: SidebarState,
   stateFile = getSidebarStateFile(),
+  options: SidebarStateWriteOptions = {},
 ): Promise<void> {
   writeChain = writeChain
     .then(async () => {
       await mkdir(dirname(stateFile), { recursive: true })
-      await writeFile(stateFile, JSON.stringify(state), 'utf8')
+      const lock = await acquireSidebarStateLock(stateFile)
+      try {
+        let stateToWrite = state
+        if (options.routingAuthoritative === false) {
+          const current = await readSidebarState(stateFile)
+          const preservedRouting =
+            await options.resolvePreservedRouting?.(current)
+          if (preservedRouting) {
+            const preservedState = preservedRouting.state ?? state
+            stateToWrite = {
+              ...preservedState,
+              activeId: preservedRouting.activeId,
+              route: preservedRouting.route,
+              lastUpdated: Math.max(
+                preservedState.lastUpdated,
+                current.lastUpdated,
+              ),
+            }
+          }
+          await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+        }
+        const wroteState = await writeSidebarStateAtomic(
+          stateFile,
+          stateToWrite,
+          lock?.ownsLock,
+        )
+        if (!wroteState) return
+        options.onRoutingResolved?.({
+          activeId: stateToWrite.activeId,
+          route: stateToWrite.route,
+        })
+      } finally {
+        await lock?.release()
+      }
     })
     .catch(() => {
       // Best-effort — sidebar is non-critical

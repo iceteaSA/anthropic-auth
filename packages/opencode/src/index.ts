@@ -153,6 +153,7 @@ import type {
 import { getRpcDir } from './rpc/rpc-dir.ts'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
 import {
+  getSidebarState,
   getSidebarStateFile,
   type SidebarState,
   setSidebarState,
@@ -182,6 +183,93 @@ const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
 const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
+const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
+
+function hasEnabledOAuthAccount(
+  storage: AccountStorage | null,
+  activeId: string,
+) {
+  return (storage?.accounts ?? []).some(
+    (account) =>
+      account.id === activeId &&
+      account.enabled !== false &&
+      isOAuthAccount(account),
+  )
+}
+
+function deriveSidebarRouting(
+  storage: AccountStorage | null,
+): Pick<SidebarState, 'activeId' | 'route'> {
+  const firstFallback = (storage?.accounts ?? []).find(
+    (account): account is OAuthAccount =>
+      account.enabled !== false && isOAuthAccount(account),
+  )
+  if (getRoutingMode(storage) === 'fallback-first' && firstFallback) {
+    return { activeId: firstFallback.id, route: 'fallback-first' }
+  }
+  return { activeId: 'main', route: 'main' }
+}
+
+function validateSidebarRouting(
+  routing: Pick<SidebarState, 'activeId' | 'route'> | undefined,
+  storage: AccountStorage | null,
+): Pick<SidebarState, 'activeId' | 'route'> {
+  if (
+    routing?.activeId === 'main' ||
+    (routing?.activeId && hasEnabledOAuthAccount(storage, routing.activeId))
+  ) {
+    return routing
+  }
+  return deriveSidebarRouting(storage)
+}
+
+async function resolveFreshSidebarRouting(
+  existing: SidebarState,
+  loadFreshStorage: () => Promise<AccountStorage | null>,
+  fallbackRouting?: Pick<SidebarState, 'activeId' | 'route'>,
+): Promise<{
+  activeId: string | undefined
+  route: string
+  freshStorage: AccountStorage | null
+}> {
+  let freshStorage: AccountStorage | null
+  try {
+    freshStorage = await loadFreshStorage()
+  } catch {
+    return { activeId: 'main', route: 'main', freshStorage: null }
+  }
+
+  const existingAge = Date.now() - existing.lastUpdated
+  if (
+    !existing.activeId ||
+    existingAge < 0 ||
+    existingAge > SIDEBAR_ROUTING_FRESH_MS
+  ) {
+    return {
+      ...validateSidebarRouting(fallbackRouting, freshStorage),
+      freshStorage,
+    }
+  }
+
+  return {
+    ...validateSidebarRouting(existing, freshStorage),
+    freshStorage,
+  }
+}
+
+async function resolveInitialSidebarRouting(
+  accountStoragePath: string,
+): Promise<{
+  activeId: string | undefined
+  route: string
+  freshStorage: AccountStorage | null
+}> {
+  const existingRouting = await resolveFreshSidebarRouting(
+    await getSidebarState(),
+    () => loadAccounts(accountStoragePath),
+  )
+  return existingRouting
+}
 
 /**
  * Format the user-facing 429 message for a killswitch block. When the block
@@ -1316,16 +1404,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     NonNullable<SidebarState['fableRecoveries']>[number]
   >()
 
-  function writeSidebarState(
+  interface SidebarStateInput {
+    activeId?: string
+    route: string
+    mainAccessToken?: string
+    mainRefreshToken?: string
+    routingAuthoritative?: boolean
+  }
+
+  function buildSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
-    options: {
-      activeId?: string
-      route: string
-      mainAccessToken?: string
-      mainRefreshToken?: string
-    },
-  ) {
-    lastSidebarRouting = { activeId: options.activeId, route: options.route }
+    options: SidebarStateInput,
+  ): SidebarState {
     quotaManager.updateStorage(storage)
     quotaManager.seedMainFromStorage(storage, options.mainAccessToken)
     quotaManager.seedFallbacksFromAccounts(
@@ -1335,7 +1425,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const ksEnabled = isKillswitchEnabled(storage)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
-    const state: SidebarState = {
+    return {
       main: {
         quota: mainEntry?.quota ?? null,
         // No `quota != null` guard: under failClosedOnUnknownQuota the
@@ -1432,7 +1522,43 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           : undefined,
       lastUpdated: Date.now(),
     }
-    return setSidebarState(state, sidebarStateFile).catch((error) =>
+  }
+
+  function writeSidebarState(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    options: SidebarStateInput,
+  ) {
+    const routingAuthoritative = options.routingAuthoritative !== false
+    if (routingAuthoritative) {
+      lastSidebarRouting = { activeId: options.activeId, route: options.route }
+    }
+    const state = buildSidebarState(storage, options)
+    return setSidebarState(state, sidebarStateFile, {
+      routingAuthoritative,
+      resolvePreservedRouting: routingAuthoritative
+        ? undefined
+        : async (current) => {
+            const preservedRouting = await resolveFreshSidebarRouting(
+              current,
+              () => loadAccounts(accountStoragePath),
+              { activeId: state.activeId, route: state.route },
+            )
+            return {
+              activeId: preservedRouting.activeId,
+              route: preservedRouting.route,
+              state: buildSidebarState(preservedRouting.freshStorage, {
+                ...options,
+                activeId: preservedRouting.activeId,
+                route: preservedRouting.route,
+              }),
+            }
+          },
+      onRoutingResolved: routingAuthoritative
+        ? undefined
+        : (routing) => {
+            lastSidebarRouting = routing
+          },
+    }).catch((error) =>
       logger.warn('sidebar', 'state write failed', {
         error: error instanceof Error ? error.message : String(error),
       }),
@@ -1460,6 +1586,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       route: lastSidebarRouting.route,
       mainAccessToken: access,
       mainRefreshToken: refresh,
+      routingAuthoritative: false,
     })
   }
 
@@ -1621,6 +1748,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           route: lastSidebarRouting.route,
           mainAccessToken: auth.access,
           mainRefreshToken: auth.refresh,
+          routingAuthoritative: false,
         })
       } catch {
         // auth not yet available — sidebar will refresh on next request
@@ -1651,6 +1779,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
       mainRefreshToken: auth.refresh,
+      routingAuthoritative: false,
     })
 
     if (!desktopText || isTuiConnected(notice.sessionId)) return
@@ -1680,6 +1809,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
       mainRefreshToken: auth.refresh,
+      routingAuthoritative: false,
     })
   }
 
@@ -2075,6 +2205,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             route: lastSidebarRouting.route,
             mainAccessToken: auth.access,
             mainRefreshToken: auth.refresh,
+            routingAuthoritative: false,
           })
         } catch {
           // auth not yet available — sidebar will refresh on next request
@@ -2457,10 +2588,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ? await latestGetAuth().catch(() => undefined)
           : undefined
         writeSidebarState(cmdStorage, {
-          activeId: 'main',
-          route: 'main',
+          activeId: lastSidebarRouting.activeId,
+          route: lastSidebarRouting.route,
           mainAccessToken: cmdAuth?.access,
           mainRefreshToken: cmdAuth?.refresh,
+          routingAuthoritative: false,
         })
       }
       if (isTuiConnected(input.sessionID)) {
@@ -2876,11 +3008,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           quotaManager.seedFallbacksFromAccounts(
             (initialStorage?.accounts ?? []).filter(isOAuthAccount),
           )
-          writeSidebarState(initialStorage, {
-            activeId: 'main',
-            route: 'main',
+          const initialSidebarRouting =
+            await resolveInitialSidebarRouting(accountStoragePath)
+          await writeSidebarState(initialSidebarRouting.freshStorage, {
+            activeId: initialSidebarRouting.activeId,
+            route: initialSidebarRouting.route,
             mainAccessToken: auth.access,
             mainRefreshToken: auth.refresh,
+            routingAuthoritative: false,
           })
           if (
             process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION !==
