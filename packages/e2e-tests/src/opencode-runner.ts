@@ -284,8 +284,8 @@ export async function cleanupE2ERun(options: {
   const exitConfirmed = options.child
     ? await terminateChildProcess(options.child, options.terminationOptions)
     : true
-  activeRunDirs.delete(resolve(options.tempDir))
   if (!exitConfirmed) return false
+  activeRunDirs.delete(resolve(options.tempDir))
   return removeE2ETempDir(options.tempDir, {
     root: options.root,
     keep: options.keep,
@@ -298,6 +298,7 @@ export async function spawnOpencode(
   await sweepStaleE2ETempDirs()
   const env = createIsolatedEnv()
   let child: ChildProcess | undefined
+  let spawnError: Error | undefined
   let stdout = ''
   let stderr = ''
   try {
@@ -337,6 +338,12 @@ export async function spawnOpencode(
       ['serve', '--port', String(port), '--hostname', '127.0.0.1'],
       { cwd: env.workdir, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] },
     )
+    const spawnFailure = new Promise<never>((_, reject) => {
+      child?.once('error', (error) => {
+        spawnError = error
+        reject(error)
+      })
+    })
     child.stdout?.on('data', (chunk: Buffer) => {
       stdout += chunk.toString()
     })
@@ -345,7 +352,10 @@ export async function spawnOpencode(
     })
 
     const url = `http://127.0.0.1:${port}`
-    await waitForReady(url, () => ({ stdout, stderr }))
+    await Promise.race([
+      waitForReady(url, () => ({ stdout, stderr })),
+      spawnFailure,
+    ])
     return {
       url,
       port,
@@ -362,7 +372,7 @@ export async function spawnOpencode(
     }
   } catch (error) {
     await cleanupE2ERun({
-      child,
+      child: spawnError ? undefined : child,
       tempDir: env.tempDir,
       keep: process.env.ANTHROPIC_AUTH_E2E_KEEP_TMP === '1',
     })
