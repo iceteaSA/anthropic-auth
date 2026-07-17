@@ -8536,6 +8536,16 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
           checkIntervalMinutes: 5,
           minimumRemaining: { five_hour: 10, seven_day: 20 },
           failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(),
+              checkedAt: Date.now(),
+            },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: 'main-access',
         },
         prime: { enabled: true },
       }),
@@ -8884,6 +8894,20 @@ describe('claude-prime — warn dedup (R3)', () => {
             quota: dueQuota,
           },
         ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(),
+              checkedAt: Date.now(),
+            },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: 'main-access',
+        },
         prime: { enabled: true },
       }),
     )
@@ -8949,6 +8973,20 @@ describe('claude-prime — warn dedup (R3)', () => {
             quota: dueQuota,
           },
         ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(),
+              checkedAt: Date.now(),
+            },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: 'main-access',
+        },
         prime: { enabled: true },
       }),
     )
