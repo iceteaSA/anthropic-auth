@@ -565,6 +565,133 @@ describe('PrimeManager — bootstrap', () => {
     expect(await readdir(markerRoot)).toEqual([])
     await h.cleanup()
   })
+
+  test('killswitch-blocked bootstrap checks quota at most once per five minutes', async () => {
+    const fixture = makePrimeFixture({
+      killswitch: { enabled: true, main: { five_hour: 5 } },
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    const initialNow = 7_200_000
+    let now = initialNow
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: null as unknown as string,
+          checkedAt: 2,
+        },
+      },
+    })
+    h.manager.options.now = () => now
+
+    await h.manager.tick()
+    now = initialNow + 60_000
+    await h.manager.tick()
+    now = initialNow + 4 * 60_000
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(h.sendCalls).toEqual([])
+
+    now = initialNow + 5 * 60_000
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main', 'main'])
+    await h.cleanup()
+  })
+
+  test('an existing bootstrap marker suppresses a fresh-check in another manager', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 7_234_567
+    const fresh: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: 2,
+      },
+    }
+    const firing = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: fresh,
+    })
+    await firing.manager.tick()
+    expect(firing.sendCalls).toHaveLength(1)
+
+    const observing = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: fresh,
+    })
+    await observing.manager.tick()
+    await observing.manager.tick()
+
+    expect(observing.refreshCalls).toEqual([])
+    expect(observing.sendCalls).toEqual([])
+    await firing.cleanup()
+    await observing.cleanup()
+  })
+
+  test('an hour-straddling bootstrap fires at most once in the next bucket', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    const firstBucketEnd = 14_400_000
+    let now = firstBucketEnd - 30_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 2,
+        },
+      },
+    })
+    h.manager.options.now = () => now
+
+    await h.manager.tick()
+    now += 5 * 60_000
+    await h.manager.tick()
+    now += 60_000
+    await h.manager.tick()
+
+    expect(h.sendCalls).toHaveLength(2)
+    expect(h.refreshCalls).toEqual(['main', 'main'])
+    expect((await readdir(markerRoot)).sort()).toEqual([
+      'main-10800000',
+      'main-14400000',
+    ])
+    await h.cleanup()
+  })
 })
 
 describe('PrimeManager — fresh-check', () => {

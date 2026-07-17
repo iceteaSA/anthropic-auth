@@ -37,6 +37,8 @@ export const PRIME_TICK_MS = 60_000
 export const PRIME_DUE_OFFSET_MS = 60_000
 export const PRIME_MARKER_MAX_AGE_MS = 6 * 60 * 60_000
 export const PRIME_POST_FIRE_REFRESH_MS = 90_000
+/** Minimum interval between forced bootstrap quota checks per account/process. */
+export const PRIME_BOOTSTRAP_CHECK_INTERVAL_MS = 5 * 60_000
 
 export type PrimeCommandAction =
   | { type: 'status' }
@@ -481,6 +483,7 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
 export class PrimeManager {
   private timer: ReturnType<typeof setInterval> | null = null
   private postFireRefreshTimers = new Set<ReturnType<typeof setTimeout>>()
+  private lastBootstrapCheckAt = new Map<'main' | string, number>()
   // Set true by `stop()` so a tick already in flight can short-circuit
   // before claim/send, preventing a stale in-flight cycle from firing
   // after `/claude-prime off` or after a newer plugin invocation has
@@ -559,6 +562,7 @@ export class PrimeManager {
     }
     for (const timer of this.postFireRefreshTimers) clearTimeout(timer)
     this.postFireRefreshTimers.clear()
+    this.lastBootstrapCheckAt.clear()
     if (!hadTimer && !hadPostFireRefresh) return
     logger.trace('prime', 'manager stopped')
   }
@@ -663,6 +667,37 @@ export class PrimeManager {
         // diagnostic. Per the spec's `trace` row for tick evaluation.
         logger.trace('prime', 'not due', { account: evaluation.label })
         return
+      }
+
+      const expectedMarker =
+        storedResetEpoch ?? Math.floor(now / 3_600_000) * 3_600_000
+      const markerDir = this.options.markerDir ?? defaultMarkerDir()
+      const expectedMarkerPath = primeMarkerPath(
+        markerDir,
+        evaluation.id,
+        expectedMarker,
+      )
+      try {
+        await stat(expectedMarkerPath)
+        // A completed claim makes another forced poll redundant; the normal
+        // background refresh will persist the reset when the usage API catches up.
+        return
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      if (this.stopped) return
+
+      if (storedResetEpoch === undefined) {
+        const lastBootstrapCheckAt = this.lastBootstrapCheckAt.get(
+          evaluation.id,
+        )
+        if (
+          lastBootstrapCheckAt !== undefined &&
+          now < lastBootstrapCheckAt + PRIME_BOOTSTRAP_CHECK_INTERVAL_MS
+        ) {
+          return
+        }
+        this.lastBootstrapCheckAt.set(evaluation.id, now)
       }
 
       let refreshed: PrimeRefreshResult
