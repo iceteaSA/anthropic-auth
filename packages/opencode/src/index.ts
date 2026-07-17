@@ -566,12 +566,6 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
-let bootProfileHydrationEnabled = true
-
-export function __setBootProfileHydrationForTest(enabled: boolean) {
-  bootProfileHydrationEnabled = enabled
-}
-
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
@@ -684,18 +678,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     },
   })
-  const profileHydrationAttempts = new Map<string, Promise<void>>()
+  const MAX_PROFILE_HYDRATION_ATTEMPTS = 64
+  const profileHydrationAttempts = new Map<
+    string,
+    Promise<Awaited<ReturnType<typeof fetchOAuthAccountProfile>> | undefined>
+  >()
 
-  async function hydrateProfileOnce(
-    accountId: string,
-    hydrate: () => Promise<void>,
-  ) {
-    let attempt = profileHydrationAttempts.get(accountId)
+  async function hydrateProfileOnce(accountId: string, accessToken: string) {
+    const attemptKey = `${accountId}:${tokenFingerprint(accessToken)}`
+    let attempt = profileHydrationAttempts.get(attemptKey)
     if (!attempt) {
-      attempt = hydrate().catch(() => {})
-      profileHydrationAttempts.set(accountId, attempt)
+      if (profileHydrationAttempts.size >= MAX_PROFILE_HYDRATION_ATTEMPTS) {
+        const oldestKey = profileHydrationAttempts.keys().next().value
+        if (oldestKey) profileHydrationAttempts.delete(oldestKey)
+      }
+      attempt = fetchOAuthAccountProfile({ accessToken }).catch(() => undefined)
+      profileHydrationAttempts.set(attemptKey, attempt)
     }
-    await attempt
+    return attempt
   }
 
   async function ensureProfilesForQuotaDisplay(
@@ -714,10 +714,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       })
     }
     if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
-      await hydrateProfileOnce('main', async () => {
-        const profile = await fetchOAuthAccountProfile({
-          accessToken: mainAccessToken,
-        })
+      const profile = await hydrateProfileOnce('main', mainAccessToken)
+      if (profile) {
         storage.main = {
           type: 'opencode',
           provider: 'anthropic',
@@ -726,7 +724,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         await saveAccountState(storage, accountStoragePath, {
           mainProfile: true,
         })
-      })
+      }
     }
 
     for (const account of storage.accounts) {
@@ -742,14 +740,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         })
       }
       if (oauthProfileIsFresh(account.profile, now)) continue
-      await hydrateProfileOnce(account.id, async () => {
-        account.profile = await fetchOAuthAccountProfile({
-          accessToken,
-        })
+      const profile = await hydrateProfileOnce(account.id, accessToken)
+      if (profile) {
+        account.profile = profile
         await saveAccountState(storage, accountStoragePath, {
           accounts: [account.id],
         })
-      })
+      }
     }
     return storage
   }
@@ -2493,7 +2490,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             mainAccessToken: auth.access,
             mainRefreshToken: auth.refresh,
           })
-          if (bootProfileHydrationEnabled) {
+          if (
+            process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION !==
+            '1'
+          ) {
             void ensureProfilesForQuotaDisplay(
               initialStorage ?? createEmptyStorage(),
               auth.access,

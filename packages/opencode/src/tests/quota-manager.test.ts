@@ -1005,6 +1005,37 @@ describe('QuotaManager', () => {
       expect(pushed.refreshAfter).toBe(now + 1_000)
     })
 
+    test('header pushes stay due at the oldest preserved scoped window staleness point', () => {
+      const intervalMs = 5 * 60_000
+      const qm = new QuotaManager({
+        storage: { version: 1, accounts: [], quota: { enabled: true } },
+        now: () => now,
+      })
+      qm.setMain('token', {
+        quota: {
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 70,
+              remainingPercent: 30,
+              checkedAt: now - intervalMs + 1_000,
+            },
+          ],
+          source: 'poll',
+          checkedAt: now - intervalMs + 1_000,
+        },
+        checkedAt: now - intervalMs + 1_000,
+        refreshAfter: now + 1_000,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+
+      expect(pushed.quota.scoped?.[0]?.checkedAt).toBe(now - intervalMs + 1_000)
+      expect(pushed.refreshAfter).toBe(now + 1_000)
+    })
+
     test('legacy unbound main quota is not merged into a newly bound header push', () => {
       const qm = new QuotaManager({
         storage: {

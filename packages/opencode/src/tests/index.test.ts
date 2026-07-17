@@ -21,7 +21,7 @@ import {
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import { __setBootProfileHydrationForTest, AnthropicAuthPlugin } from '../index'
+import { AnthropicAuthPlugin } from '../index'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -594,7 +594,7 @@ describe('auth.loader', () => {
     resetDumpState()
     resetFastModeState()
     resetNotificationsForTest()
-    __setBootProfileHydrationForTest(false)
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -605,7 +605,7 @@ describe('auth.loader', () => {
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
     resetNotificationsForTest()
-    __setBootProfileHydrationForTest(false)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -2959,7 +2959,7 @@ describe('auth.loader', () => {
   })
 
   test('boot profile hydration publishes tier labels to the sidebar', async () => {
-    __setBootProfileHydrationForTest(true)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     let profileCalls = 0
     globalThis.fetch = mock((input: string | URL | Request) => {
@@ -2994,6 +2994,139 @@ describe('auth.loader', () => {
 
     expect(state.main.tierLabel).toBe('Max 20x')
     expect(profileCalls).toBe(1)
+  })
+
+  test('mock-environment opt-out prevents boot profile network calls', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await Bun.sleep(20)
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('token rotation hydrates the new profile once and restores its tier label', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const profileCalls: string[] = []
+    let liveAccess = 'token-a'
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (extractUrl(input).includes('/api/oauth/profile')) {
+          const authorization = new Headers(init?.headers).get('authorization')
+          profileCalls.push(authorization ?? '')
+          const firstToken = authorization?.includes('token-a')
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: firstToken ? 'claude_team' : 'claude_max',
+                rate_limit_tier: firstToken
+                  ? 'default_claude_max_5x'
+                  : 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const showAccounts = async () => {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      return (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+        ?.body.parts[0]?.text as string
+    }
+
+    expect(await showAccounts()).toContain('Team · Max 5x')
+    liveAccess = 'token-b'
+    expect(await showAccounts()).toContain('Max 20x')
+    expect(await showAccounts()).toContain('Max 20x')
+
+    expect(profileCalls).toEqual(['Bearer token-a', 'Bearer token-b'])
+    expect((await loadAccounts())?.main?.profile?.tokenFingerprint).toBe(
+      tokenFingerprint('token-b'),
+    )
+  })
+
+  test('profile hydration attempt cache evicts old token generations', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let profileCalls = 0
+    let liveAccess = 'token-0'
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const showAccounts = async () => {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    }
+
+    for (let generation = 0; generation < 66; generation++) {
+      liveAccess = `token-${generation}`
+      await showAccounts()
+    }
+    liveAccess = 'token-0'
+    await showAccounts()
+
+    expect(profileCalls).toBe(67)
   })
 
   test('stale profile refreshes on display', async () => {
@@ -5978,6 +6111,7 @@ describe('killswitch fetch gate', () => {
 
   beforeEach(() => {
     globalThis.fetch = originalFetch
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     // Prevent the plugin's background quota-refresh interval from leaking a
     // real timer that fires during later tests (test-isolation flake).
     globalThis.setInterval = mock(
@@ -5988,6 +6122,7 @@ describe('killswitch fetch gate', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch
     globalThis.setInterval = originalSetInterval
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
   })
 
   const oauthLoader = () =>

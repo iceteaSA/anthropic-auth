@@ -163,6 +163,7 @@ export async function spawnOpencode(
     env.configDir,
     'anthropic-auth.json',
   )
+  childEnv.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
   childEnv.XDG_CONFIG_HOME = env.configDir
   childEnv.XDG_DATA_HOME = env.dataDir
   childEnv.XDG_CACHE_HOME = env.cacheDir

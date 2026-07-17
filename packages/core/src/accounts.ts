@@ -2036,8 +2036,12 @@ export function getQuotaNextRefreshAt(
   if (!quotaEnabled(storage)) return now + intervalMs
 
   const windowFreshnessDeadline = Math.min(
-    ...(['five_hour', 'seven_day'] as const)
-      .map((key) => quota?.[key]?.checkedAt)
+    ...[
+      ...(['five_hour', 'seven_day'] as const).map(
+        (key) => quota?.[key]?.checkedAt,
+      ),
+      ...(quota?.scoped ?? []).map((window) => window.checkedAt),
+    ]
       .filter((checkedAt): checkedAt is number => Number.isFinite(checkedAt))
       .map((checkedAt) => checkedAt + intervalMs),
   )
