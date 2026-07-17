@@ -699,6 +699,53 @@ describe('account storage', () => {
     expect(account.lastQuotaRefreshError).toBeUndefined()
   })
 
+  test('equal-time stale saves do not overwrite a harvested header snapshot', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: 500,
+        },
+      },
+    })
+    await saveAccounts(storage)
+    const harvestedView = await loadAccounts()
+    const staleMarkUsedView = await loadAccounts()
+    expect(harvestedView).not.toBeNull()
+    expect(staleMarkUsedView).not.toBeNull()
+    const harvested = expectOAuthAccount(harvestedView?.accounts[0])
+    harvested.quota = {
+      five_hour: {
+        usedPercent: 78,
+        remainingPercent: 22,
+        checkedAt: 500,
+      },
+      source: 'headers',
+      checkedAt: 500,
+    }
+    expectOAuthAccount(staleMarkUsedView?.accounts[0]).lastUsed = 501
+
+    await saveAccountState(harvestedView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+    await saveAccountState(staleMarkUsedView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.quota?.source).toBe('headers')
+    expect(account.quota?.five_hour?.usedPercent).toBe(78)
+    expect(account.lastUsed).toBe(501)
+  })
+
   test('runtime state saves can update refreshed tokens without downgrading quota', async () => {
     const storage = baseStorage()
     storage.accounts.push({

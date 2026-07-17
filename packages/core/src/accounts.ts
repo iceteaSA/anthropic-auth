@@ -866,6 +866,11 @@ function mergeAccountRuntimeState(
   const existingEntry = existing as AccountRuntimeEntry
   const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
   const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
+  const existingHeaderWinsEqualTimestamp = Boolean(
+    existingQuotaCheckedAt === incomingQuotaCheckedAt &&
+      existingEntry.quota?.source === 'headers' &&
+      incoming.quota?.source !== 'headers',
+  )
   const tokenChanged = Boolean(
     (existingEntry.access &&
       incoming.access &&
@@ -875,7 +880,10 @@ function mergeAccountRuntimeState(
         existingEntry.refresh !== incoming.refresh),
   )
 
-  if (existingQuotaCheckedAt > incomingQuotaCheckedAt) {
+  if (
+    existingQuotaCheckedAt > incomingQuotaCheckedAt ||
+    existingHeaderWinsEqualTimestamp
+  ) {
     const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
     const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
     if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
