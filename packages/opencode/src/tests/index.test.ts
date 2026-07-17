@@ -8545,12 +8545,6 @@ describe('claude-prime — warn dedup (R3)', () => {
         prime: { enabled: true },
       }),
     )
-    globalThis.fetch = mock(() =>
-      Promise.resolve(
-        new Response('{"error":"invalid_grant"}', { status: 400 }),
-      ),
-    ) as unknown as typeof fetch
-
     const plugin = await getPlugin()
     await plugin.auth.loader(
       () =>
@@ -8562,6 +8556,11 @@ describe('claude-prime — warn dedup (R3)', () => {
         }),
       { models: {} },
     )
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response('{"error":"invalid_grant"}', { status: 400 }),
+      ),
+    ) as unknown as typeof fetch
     const mgr = (plugin as any).__primeManager
     mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
 

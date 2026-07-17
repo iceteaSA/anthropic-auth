@@ -1966,7 +1966,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       if (reloaded && latestGetAuth) {
         try {
           const cmdAuth = await latestGetAuth().catch(() => undefined)
-          writeSidebarState(reloaded, {
+          await writeSidebarState(reloaded, {
             activeId: 'main',
             route: 'main',
             mainAccessToken: cmdAuth?.access,
