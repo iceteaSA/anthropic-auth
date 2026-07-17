@@ -826,6 +826,94 @@ describe('auth.loader', () => {
     expect(resolveActiveAccount(state).id).toBe('work-2')
   })
 
+  test('stale main routing write carries forward accounts added after plugin creation', async () => {
+    const capturedStorage = createFallbackStorage({ accounts: [] })
+    await useTempAccountFile(capturedStorage)
+    const plugin = await getPlugin()
+    await saveAccounts(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-fresh',
+            type: 'oauth',
+            access: 'work-fresh-access',
+            refresh: 'work-fresh-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    await seedSidebarRouting('main', 'main', Date.now())
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('main')
+    expect(state.fallbacks.map((account) => account.id)).toContain('work-fresh')
+  })
+
+  test('stale writer does not resurrect a deleted active account', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'work-deleted',
+            type: 'oauth',
+            access: 'work-deleted-access',
+            refresh: 'work-deleted-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    const plugin = await getPlugin()
+    await saveAccounts(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'work-current',
+            type: 'oauth',
+            access: 'work-current-access',
+            refresh: 'work-current-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+    await seedSidebarRouting('work-deleted', 'fallback-first', Date.now())
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-current')
+    expect(state.route).toBe('fallback-first')
+    expect(state.fallbacks.map((account) => account.id)).toEqual([
+      'work-current',
+    ])
+  })
+
   test('boot ignores stale sidebar routing and derives fallback-first routing', async () => {
     await useTempAccountFile(
       createFallbackStorage({ routing: { mode: 'fallback-first' } }),

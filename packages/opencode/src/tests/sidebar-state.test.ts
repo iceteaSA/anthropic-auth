@@ -951,6 +951,79 @@ describe('setSidebarState cross-process writes', () => {
     }
   })
 
+  test('a suspended release cannot remove a replacement lock', async () => {
+    type ReleaseHooks = Parameters<
+      typeof __setSidebarStateWriteTestHooks
+    >[0] & {
+      beforeReleaseDirectoryRemoval?: () => void | Promise<void>
+    }
+    const stateFile = sidebarTestPath('release-three-writer-handoff')
+    const stateDir = join(stateFile, '..')
+    const lockDir = `${stateFile}.lock`
+    await mkdir(stateDir, { recursive: true })
+
+    let releasePaused!: () => void
+    const paused = new Promise<void>((resolve) => {
+      releasePaused = resolve
+    })
+    let resumeRelease!: () => void
+    const resumed = new Promise<void>((resolve) => {
+      resumeRelease = resolve
+    })
+    const hooks: ReleaseHooks = {
+      beforeReleaseDirectoryRemoval: async () => {
+        releasePaused()
+        await resumed
+      },
+    }
+    ;(__setSidebarStateWriteTestHooks as (hooks: ReleaseHooks | null) => void)(
+      hooks,
+    )
+
+    let firstRelease: (() => Promise<void>) | null = null
+    let secondRelease: (() => Promise<void>) | null = null
+    let thirdRelease: (() => Promise<void>) | null = null
+    try {
+      firstRelease = await __acquireSidebarStateLockForTest(stateFile)
+      expect(firstRelease).toBeFunction()
+      const firstReleaseResult = firstRelease!()
+      const didPause = await Promise.race([
+        paused.then(() => true),
+        Bun.sleep(20).then(() => false),
+      ])
+      expect(didPause).toBe(true)
+      if (!didPause) {
+        resumeRelease()
+        await firstReleaseResult
+        return
+      }
+
+      const stale = new Date(Date.now() - 3_000)
+      await utimes(lockDir, stale, stale)
+      secondRelease = await __acquireSidebarStateLockForTest(stateFile)
+      expect(secondRelease).toBeFunction()
+      resumeRelease()
+      await firstReleaseResult
+
+      ;(
+        __setSidebarStateWriteTestHooks as (hooks: ReleaseHooks | null) => void
+      )({
+        lockBudgetMs: 20,
+        lockRetryMinMs: 5,
+        lockRetryMaxMs: 5,
+      })
+      thirdRelease = await __acquireSidebarStateLockForTest(stateFile)
+      expect(thirdRelease).toBeNull()
+      expect(await pathExists(lockDir)).toBe(true)
+    } finally {
+      resumeRelease()
+      await thirdRelease?.()
+      await secondRelease?.()
+      __setSidebarStateWriteTestHooks(null)
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
   test('release removes the lock owned by its acquisition token', async () => {
     const stateFile = sidebarTestPath('release-owned')
     const stateDir = join(stateFile, '..')
@@ -960,7 +1033,9 @@ describe('setSidebarState cross-process writes', () => {
 
     try {
       expect(release).toBeFunction()
-      expect(await readdir(lockDir)).toContain('owner')
+      const ownerFiles = await readdir(lockDir)
+      expect(ownerFiles).toHaveLength(1)
+      expect(ownerFiles[0]).not.toBe('owner')
       await release?.()
       expect(await pathExists(lockDir)).toBe(false)
     } finally {
@@ -975,7 +1050,9 @@ describe('setSidebarState cross-process writes', () => {
     await mkdir(stateDir, { recursive: true })
     const release = await __acquireSidebarStateLockForTest(stateFile)
     expect(release).toBeFunction()
-    await rm(join(lockDir, 'owner'), { force: true })
+    const [ownerFile] = await readdir(lockDir)
+    expect(ownerFile).toBeDefined()
+    await rm(join(lockDir, ownerFile!), { force: true })
 
     try {
       await release?.()
@@ -1072,6 +1149,40 @@ describe('setSidebarState cross-process writes', () => {
     } finally {
       releaseRename()
       __setSidebarStateWriteTestHooks(null)
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('aborts a write after its lock is evicted before rename', async () => {
+    const stateFile = sidebarTestPath('lost-before-rename')
+    const stateDir = join(stateFile, '..')
+    const lockDir = `${stateFile}.lock`
+    const initial = make({ activeId: 'initial', route: 'initial' })
+    const staleWriter = make({ activeId: 'stale-writer', route: 'stale' })
+    const replacement = make({ activeId: 'replacement', route: 'replacement' })
+    await mkdir(stateDir, { recursive: true })
+    await writeFile(stateFile, JSON.stringify(initial))
+
+    const replacementLock: {
+      release: (() => Promise<void>) | null
+    } = { release: null }
+    __setSidebarStateWriteTestHooks({
+      beforeRename: async () => {
+        const stale = new Date(Date.now() - 3_000)
+        await utimes(lockDir, stale, stale)
+        replacementLock.release =
+          await __acquireSidebarStateLockForTest(stateFile)
+        expect(replacementLock.release).toBeFunction()
+        await writeFile(stateFile, JSON.stringify(replacement))
+      },
+    })
+
+    try {
+      await setSidebarState(staleWriter, stateFile)
+      expect(JSON.parse(await readFile(stateFile, 'utf8'))).toEqual(replacement)
+    } finally {
+      __setSidebarStateWriteTestHooks(null)
+      await replacementLock.release?.()
       await rm(stateDir, { recursive: true, force: true })
     }
   })
