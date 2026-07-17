@@ -45,18 +45,26 @@ function isExpectedE2ETempDir(path: string, root: string) {
   )
 }
 
+async function isSafeE2ETempDir(path: string, root: string) {
+  if (!isExpectedE2ETempDir(path, root)) return false
+  try {
+    const stats = await lstat(path)
+    return stats.isDirectory() && !stats.isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
 export async function removeE2ETempDir(
   path: string,
   options: { root?: string; keep?: boolean } = {},
 ) {
   if (options.keep) return false
   const root = options.root ?? tmpdir()
-  if (!isExpectedE2ETempDir(path, root)) return false
+  if (!(await isSafeE2ETempDir(path, root))) return false
   activeRunDirs.delete(resolve(path))
 
   try {
-    const stats = await lstat(path)
-    if (stats.isSymbolicLink()) return false
     await rm(path, { recursive: true, force: true })
     return true
   } catch {
@@ -117,7 +125,7 @@ async function handoffRunPid(tempDir: string, root: string, childPid: number) {
   const runPidPath = join(tempDir, RUN_PID_FILE)
   if (
     resolve(dirname(runPidPath)) !== resolve(tempDir) ||
-    !isExpectedE2ETempDir(dirname(runPidPath), root)
+    !(await isSafeE2ETempDir(tempDir, root))
   ) {
     return false
   }

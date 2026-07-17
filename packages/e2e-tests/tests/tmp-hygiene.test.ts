@@ -341,6 +341,41 @@ describe('e2e temporary directory hygiene', () => {
     await removeE2ETempDir(env.tempDir, { root })
   })
 
+  it('refuses child pid handoff through a symlinked temp directory', async () => {
+    const root = await createRoot()
+    const env = createIsolatedEnv(root)
+    const externalDir = await mkdtemp(join(tmpdir(), 'e2e-pid-target-'))
+    roots.push(externalDir)
+    const externalRunPid = join(externalDir, 'run.pid')
+    await writeFile(externalRunPid, 'do not overwrite')
+    await rm(env.tempDir, { recursive: true, force: true })
+    await symlink(externalDir, env.tempDir)
+    const child = Bun.spawn(['true'])
+    const deadPid = child.pid
+    await child.exited
+
+    expect(
+      await cleanupE2ERun({
+        child: unresponsiveChild(deadPid),
+        tempDir: env.tempDir,
+        root,
+        terminationOptions: { termTimeoutMs: 5, killExitTimeoutMs: 5 },
+      }),
+    ).toBe(false)
+    expect(await Bun.file(externalRunPid).text()).toBe('do not overwrite')
+
+    await unlink(env.tempDir)
+    await mkdir(env.tempDir)
+    await writeFile(join(env.tempDir, 'run.pid'), String(process.pid))
+    const staleTime = new Date('2026-07-15T00:00:00.000Z')
+    const now = new Date('2026-07-17T00:00:00.000Z')
+    await utimes(env.tempDir, staleTime, staleTime)
+    await sweepStaleE2ETempDirs({ root, now: now.getTime() })
+
+    expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
+    await removeE2ETempDir(env.tempDir, { root })
+  })
+
   it('removes the temp directory when setup fails before spawning a child', async () => {
     let tempDir = ''
 
