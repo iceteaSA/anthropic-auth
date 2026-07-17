@@ -37,8 +37,8 @@ export const PRIME_TICK_MS = 60_000
 export const PRIME_DUE_OFFSET_MS = 60_000
 export const PRIME_MARKER_MAX_AGE_MS = 6 * 60 * 60_000
 export const PRIME_POST_FIRE_REFRESH_MS = 90_000
-/** Minimum interval between forced bootstrap quota checks per account/process. */
-export const PRIME_BOOTSTRAP_CHECK_INTERVAL_MS = 5 * 60_000
+/** Minimum interval between forced quota checks for an unchanged reset epoch. */
+export const PRIME_CHECK_THROTTLE_MS = 5 * 60_000
 
 export type PrimeCommandAction =
   | { type: 'status' }
@@ -483,7 +483,10 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
 export class PrimeManager {
   private timer: ReturnType<typeof setInterval> | null = null
   private postFireRefreshTimers = new Set<ReturnType<typeof setTimeout>>()
-  private lastBootstrapCheckAt = new Map<'main' | string, number>()
+  private lastForcedCheck = new Map<
+    'main' | string,
+    { at: number; resetEpoch: number | undefined }
+  >()
   // Set true by `stop()` so a tick already in flight can short-circuit
   // before claim/send, preventing a stale in-flight cycle from firing
   // after `/claude-prime off` or after a newer plugin invocation has
@@ -562,7 +565,7 @@ export class PrimeManager {
     }
     for (const timer of this.postFireRefreshTimers) clearTimeout(timer)
     this.postFireRefreshTimers.clear()
-    this.lastBootstrapCheckAt.clear()
+    this.lastForcedCheck.clear()
     if (!hadTimer && !hadPostFireRefresh) return
     logger.trace('prime', 'manager stopped')
   }
@@ -687,18 +690,20 @@ export class PrimeManager {
       }
       if (this.stopped) return
 
-      if (storedResetEpoch === undefined) {
-        const lastBootstrapCheckAt = this.lastBootstrapCheckAt.get(
-          evaluation.id,
-        )
-        if (
-          lastBootstrapCheckAt !== undefined &&
-          now < lastBootstrapCheckAt + PRIME_BOOTSTRAP_CHECK_INTERVAL_MS
-        ) {
-          return
-        }
-        this.lastBootstrapCheckAt.set(evaluation.id, now)
+      // Binding the throttle to the observed epoch preserves the immediate
+      // check when a newly passed reset replaces the previous window.
+      const lastForcedCheck = this.lastForcedCheck.get(evaluation.id)
+      if (
+        lastForcedCheck !== undefined &&
+        lastForcedCheck.resetEpoch === storedResetEpoch &&
+        now < lastForcedCheck.at + PRIME_CHECK_THROTTLE_MS
+      ) {
+        return
       }
+      this.lastForcedCheck.set(evaluation.id, {
+        at: now,
+        resetEpoch: storedResetEpoch,
+      })
 
       let refreshed: PrimeRefreshResult
       try {

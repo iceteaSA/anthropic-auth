@@ -28,6 +28,7 @@ import {
   CLAUDE_HAIKU_4_5_PRICING,
   estimatePrimeCostUsd,
   executePrimeCommand,
+  PRIME_CHECK_THROTTLE_MS,
   type PrimeAccountStatus,
   PrimeManager,
   type PrimeSendResult,
@@ -604,6 +605,98 @@ describe('PrimeManager — bootstrap', () => {
     expect(h.sendCalls).toEqual([])
 
     now = initialNow + 5 * 60_000
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main', 'main'])
+    await h.cleanup()
+  })
+
+  test('killswitch-blocked past reset checks quota at most once per five minutes', async () => {
+    const storedReset = 7_000_000
+    const fixture = makePrimeFixture({
+      killswitch: { enabled: true, main: { five_hour: 5 } },
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(storedReset).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const initialNow = storedReset + 120_000
+    let now = initialNow
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: new Date(storedReset).toISOString(),
+          checkedAt: 2,
+        },
+      },
+    })
+    h.manager.options.now = () => now
+
+    await h.manager.tick()
+    now = initialNow + 60_000
+    await h.manager.tick()
+    now = initialNow + 4 * 60_000
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(h.sendCalls).toEqual([])
+
+    now = initialNow + 5 * 60_000
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main', 'main'])
+    await h.cleanup()
+  })
+
+  test('a newly passed stored reset bypasses a recent forced-check throttle', async () => {
+    const initialReset = 9_800_000
+    const initialNow = 10_000_000
+    const fixture = makePrimeFixture({
+      killswitch: { enabled: true, main: { five_hour: 5 } },
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(initialReset).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    let now = initialNow
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: new Date(initialReset).toISOString(),
+          checkedAt: 2,
+        },
+      },
+    })
+    h.manager.options.now = () => now
+
+    await h.manager.tick()
+    now += 60_000
+    await h.manager.tick()
+    expect(h.refreshCalls).toEqual(['main'])
+
+    const newlyPassedReset = initialNow
+    fixture.storage.quota!.mainQuota!.five_hour!.resetsAt = new Date(
+      newlyPassedReset,
+    ).toISOString()
+    now += 60_000
     await h.manager.tick()
 
     expect(h.refreshCalls).toEqual(['main', 'main'])
@@ -1193,7 +1286,7 @@ describe('PrimeManager — catch-up', () => {
 })
 
 describe('PrimeManager — refresh failure', () => {
-  test('refresh failure consumes no marker; next tick can retry', async () => {
+  test('refresh failure consumes no marker; retry resumes after the throttle window', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
         five_hour: {
@@ -1204,7 +1297,7 @@ describe('PrimeManager — refresh failure', () => {
         },
       },
     })
-    const now = 500 + 120_000
+    let now = 500 + 120_000
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -1212,6 +1305,7 @@ describe('PrimeManager — refresh failure', () => {
       quotaFresh: { five_hour: undefined },
       refreshError: new Error('boom'),
     })
+    h.manager.options.now = () => now
     await h.manager.tick()
     expect(h.sendCalls).toEqual([])
     expect((await readdir(markerRoot)).length).toBe(0)
@@ -1228,6 +1322,7 @@ describe('PrimeManager — refresh failure', () => {
       quota: refreshed,
       fresh: true,
     })
+    now += PRIME_CHECK_THROTTLE_MS
     await h.manager.tick()
     expect(h.sendCalls).toHaveLength(1)
     await h.cleanup()
@@ -1737,7 +1832,7 @@ describe('PrimeManager — fresh killswitch policy', () => {
 })
 
 describe('PrimeManager — post-claim abort', () => {
-  test('releases its marker when persisted prime is disabled after claim', async () => {
+  test('releases its marker and retries after the throttle window', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
         five_hour: {
@@ -1748,7 +1843,7 @@ describe('PrimeManager — post-claim abort', () => {
         },
       },
     })
-    const now = 500 + 120_000
+    let now = 500 + 120_000
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -1762,6 +1857,7 @@ describe('PrimeManager — post-claim abort', () => {
         },
       },
     })
+    h.manager.options.now = () => now
     let loadCount = 0
     h.manager.options.loadStorage = async () => {
       loadCount += 1
@@ -1775,6 +1871,7 @@ describe('PrimeManager — post-claim abort', () => {
     expect(h.sendCalls).toEqual([])
     expect(await readdir(markerRoot)).toEqual([])
 
+    now += PRIME_CHECK_THROTTLE_MS
     await h.manager.tick()
     expect(h.sendCalls.map((call) => call.accountId)).toEqual(['main'])
     await h.cleanup()
