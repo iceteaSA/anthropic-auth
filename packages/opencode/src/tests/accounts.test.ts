@@ -60,6 +60,7 @@ import {
   setLogLevel,
   setLogLevelPersistent,
   shouldFallbackStatus,
+  tokenFingerprint,
   upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -186,6 +187,7 @@ describe('OAuth account profiles', () => {
       tier: 'default_claude_max_20x',
       orgType: 'claude_max',
       checkedAt: 1234,
+      tokenFingerprint: tokenFingerprint('token'),
     })
     expect(formatOAuthAccountTier(profile)).toBe('Max 20x')
   })
@@ -197,6 +199,7 @@ describe('OAuth account profiles', () => {
       tier: 'default_claude_max_5x',
       orgType: 'claude_team',
       checkedAt: 1234,
+      tokenFingerprint: tokenFingerprint('token'),
     })
     expect(formatOAuthAccountTier(profile)).toBe('Team · Max 5x')
   })
@@ -277,6 +280,69 @@ describe('OAuth account profiles', () => {
     upsertAccount(storage, { id: 'work', type: 'oauth', refresh: 'new' })
 
     expect(expectOAuthAccount(storage.accounts[0]).profile).toBeUndefined()
+  })
+
+  test('runtime merge clears a fallback profile when OAuth credentials rotate', async () => {
+    const initial = baseStorage()
+    initial.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      profile: {
+        tier: 'old-tier',
+        orgType: 'claude_team',
+        checkedAt: 100,
+        tokenFingerprint: tokenFingerprint('old-access'),
+      },
+    })
+    await saveAccounts(initial, accountPath)
+
+    const rotated = baseStorage()
+    rotated.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'new-access',
+      refresh: 'new-refresh',
+    })
+    await saveAccounts(rotated, accountPath)
+
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
+        .profile,
+    ).toBeUndefined()
+  })
+
+  test('runtime merge keeps a fallback profile when OAuth credentials match', async () => {
+    const profile: OAuthAccountProfile = {
+      tier: 'same-tier',
+      orgType: 'claude_team',
+      checkedAt: 100,
+      tokenFingerprint: tokenFingerprint('same-access'),
+    }
+    const initial = baseStorage()
+    initial.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'same-access',
+      refresh: 'same-refresh',
+      profile,
+    })
+    await saveAccounts(initial, accountPath)
+
+    const sameCredentials = baseStorage()
+    sameCredentials.accounts.push({
+      id: 'work',
+      type: 'oauth',
+      access: 'same-access',
+      refresh: 'same-refresh',
+    })
+    await saveAccounts(sameCredentials, accountPath)
+
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
+        .profile,
+    ).toEqual(profile)
   })
 })
 

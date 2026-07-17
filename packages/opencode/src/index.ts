@@ -80,6 +80,7 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
+  oauthProfileMatchesToken,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   parseAccountCommandAction,
   parseCache1hCommandAction,
@@ -565,6 +566,12 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
+let bootProfileHydrationEnabled = true
+
+export function __setBootProfileHydrationForTest(enabled: boolean) {
+  bootProfileHydrationEnabled = enabled
+}
+
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
@@ -677,7 +684,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     },
   })
-  const attemptedProfileAccounts = new Set<string>()
+  const profileHydrationAttempts = new Map<string, Promise<void>>()
+
+  async function hydrateProfileOnce(
+    accountId: string,
+    hydrate: () => Promise<void>,
+  ) {
+    let attempt = profileHydrationAttempts.get(accountId)
+    if (!attempt) {
+      attempt = hydrate().catch(() => {})
+      profileHydrationAttempts.set(accountId, attempt)
+    }
+    await attempt
+  }
 
   async function ensureProfilesForQuotaDisplay(
     storage: AccountStorage,
@@ -686,11 +705,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const now = Date.now()
     if (
       mainAccessToken &&
-      !oauthProfileIsFresh(storage.main?.profile, now) &&
-      !attemptedProfileAccounts.has('main')
+      storage.main?.profile &&
+      !oauthProfileMatchesToken(storage.main.profile, mainAccessToken)
     ) {
-      attemptedProfileAccounts.add('main')
-      try {
+      storage.main.profile = undefined
+      await saveAccountState(storage, accountStoragePath, {
+        mainProfile: true,
+      })
+    }
+    if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
+      await hydrateProfileOnce('main', async () => {
         const profile = await fetchOAuthAccountProfile({
           accessToken: mainAccessToken,
         })
@@ -702,22 +726,30 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         await saveAccountState(storage, accountStoragePath, {
           mainProfile: true,
         })
-      } catch {}
+      })
     }
 
     for (const account of storage.accounts) {
       if (!isOAuthAccount(account) || !account.access) continue
+      const accessToken = account.access
+      if (
+        account.profile &&
+        !oauthProfileMatchesToken(account.profile, accessToken)
+      ) {
+        account.profile = undefined
+        await saveAccountState(storage, accountStoragePath, {
+          accounts: [account.id],
+        })
+      }
       if (oauthProfileIsFresh(account.profile, now)) continue
-      if (attemptedProfileAccounts.has(account.id)) continue
-      attemptedProfileAccounts.add(account.id)
-      try {
+      await hydrateProfileOnce(account.id, async () => {
         account.profile = await fetchOAuthAccountProfile({
-          accessToken: account.access,
+          accessToken,
         })
         await saveAccountState(storage, accountStoragePath, {
           accounts: [account.id],
         })
-      } catch {}
+      })
     }
     return storage
   }
@@ -2461,6 +2493,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             mainAccessToken: auth.access,
             mainRefreshToken: auth.refresh,
           })
+          if (bootProfileHydrationEnabled) {
+            void ensureProfilesForQuotaDisplay(
+              initialStorage ?? createEmptyStorage(),
+              auth.access,
+            )
+              .then((profiledStorage) => {
+                writeSidebarState(profiledStorage, {
+                  activeId: 'main',
+                  route: 'main',
+                  mainAccessToken: auth.access,
+                  mainRefreshToken: auth.refresh,
+                })
+              })
+              .catch(() => {})
+          }
 
           function isReplayableRequest(
             input: string | URL | Request,

@@ -7,7 +7,7 @@ Three independent surfaces expose Claude plan quota and account identity to OAut
 | Usage API (`GET /api/oauth/usage`) | active poll, per token | on demand | **yes** (`limits[]`) | **yes** — pollable without traffic |
 | `anthropic-ratelimit-unified-*` headers | passive, on every `/v1/messages` response | every request | no | no — only accounts you send through |
 
-The plugin's architecture (background poll via `fetchOAuthQuotaSnapshot` + `QuotaManager`) is built on surface 1; surface 2 is currently **unconsumed** (harvest opportunity, see end).
+The plugin combines surface 1 background polling (`fetchOAuthQuotaSnapshot` + `QuotaManager`) with passive direct-path harvest from surface 2. Relay responses remain gated from harvest.
 
 ---
 
@@ -83,7 +83,7 @@ Observed on work-alt (enabled, **exhausted**): `monthly_limit: 10000` minor unit
 
 Money is `{ amount_minor, currency, exponent }` — e.g. `10035` minor / exponent 2 = $100.35.
 
-Not consumed by the plugin today. Candidate for a sidebar "credits" row if extra usage becomes routing-relevant.
+Consumed for `/claude-quota` and expanded TUI/sidebar credit display. Extra usage remains display-only and does not affect routing.
 
 ### Response headers on the usage API itself
 
@@ -167,7 +167,7 @@ Identity + plan metadata; the only surface exposing account KIND. Observed key f
 | `organization.billing_type` | `stripe_subscription` | `stripe_subscription` | |
 | `application.slug` | `claude-code` | `claude-code` | OAuth app identity |
 
-Also returned: account/org uuids, email, subscription status/created, `enabled_plugins`. The plugin stores only `organization_type`, `rate_limit_tier`, and the check time. Profile reads are lazy: quota and account display paths fetch them at most once per account per process, persist them in the sidecar, and reuse them for seven days. Model requests never call the profile endpoint.
+Also returned: account/org uuids, email, subscription status/created, `enabled_plugins`. The plugin stores only `organization_type`, `rate_limit_tier`, the check time, and an access-token fingerprint. Profile reads run from boot/background sidebar hydration and quota/account display paths at most once per account per process, persist in the sidecar, and reuse matching-token results for seven days. Model request dispatch does not call the profile endpoint.
 
 ## Implemented behavior
 
@@ -177,11 +177,11 @@ Also returned: account/org uuids, email, subscription status/created, `enabled_p
 - Money stays in integer minor units with an explicit currency exponent. Formatting happens at the display boundary.
 - `fallback: available` becomes `fallbackAdvised`; it appears only in expanded quota views and does not change routing.
 - Profile metadata is sidecar-persisted, uses a seven-day TTL, and is absent from the request path.
-- Relay transport is direct-only in v1. The WebSocket relay preserves unified headers, but the HTTP Worker strips them; harvesting is skipped for relay responses until both paths pass the same transport gate. See the relay parity item in `docs/parity-backlog.md`.
+- Relay transport is direct-only for harvest in v1. Both the HTTP Worker (`upstream.headers` copied into its response) and WebSocket `response_start` preserve unified headers, but relay responses remain gated because transport-reconstructed WebSocket headers are not yet treated as canonical harvest evidence. See the relay parity item in `docs/parity-backlog.md`.
 
 ## Gaps / opportunities
 
-- Relay HTTP response-header passthrough remains the blocker for relay-side harvest.
+- Relay-side harvest requires a client eligibility decision and synthetic-header safety gate at the `usedRelay` guard, not an HTTP Worker passthrough fix.
 - Pi has a separate streaming response path and does not harvest quota headers in v1.
 
 ## Probe recipes

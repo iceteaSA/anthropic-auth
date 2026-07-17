@@ -349,6 +349,27 @@ describe('normalizeSidebarState', () => {
     expect(normalized.main.tierLabel).toBeUndefined()
   })
 
+  test('drops invalid money metadata while preserving valid quota windows', () => {
+    const normalized = normalizeSidebarState({
+      main: {
+        quota: {
+          five_hour: { usedPercent: 78, remainingPercent: 22 },
+          seven_day: { usedPercent: 40, remainingPercent: 60 },
+          extraUsage: {
+            used: { amountMinor: 10035, currency: 'ZZZZ', exponent: 50 },
+            limit: { amountMinor: 10000, currency: 'ZZZZ', exponent: 50 },
+            exhausted: false,
+          },
+        },
+      },
+      fallbacks: [],
+    })
+
+    expect(normalized.main.quota?.five_hour?.usedPercent).toBe(78)
+    expect(normalized.main.quota?.seven_day?.usedPercent).toBe(40)
+    expect(normalized.main.quota?.extraUsage).toBeUndefined()
+  })
+
   test('preserves empty scoped array with optional metadata present', () => {
     const normalized = normalizeSidebarState({
       main: {

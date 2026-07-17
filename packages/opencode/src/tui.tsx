@@ -394,17 +394,21 @@ function AccountBlock(props: {
   )
 }
 
-function formatQuotaMoney(money: {
+export function formatQuotaMoney(money: {
   amountMinor: number
   currency: string
   exponent: number
 }) {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: money.currency,
-    minimumFractionDigits: money.exponent,
-    maximumFractionDigits: money.exponent,
-  }).format(money.amountMinor / 10 ** money.exponent)
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: money.currency,
+      minimumFractionDigits: money.exponent,
+      maximumFractionDigits: money.exponent,
+    }).format(money.amountMinor / 10 ** money.exponent)
+  } catch {
+    return `${money.amountMinor} ${money.currency}`
+  }
 }
 
 // --- Quota dialog content ---------------------------------------------------

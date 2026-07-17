@@ -133,6 +133,7 @@ export type OAuthAccountProfile = {
   tier: string
   orgType: string
   checkedAt: number
+  tokenFingerprint?: string
 }
 
 export type OAuthQuotaSnapshot = Partial<
@@ -466,6 +467,10 @@ function normalizeOAuthAccountProfile(
     tier: value.tier.trim(),
     orgType: value.orgType.trim(),
     checkedAt: value.checkedAt,
+    ...(typeof value.tokenFingerprint === 'string' &&
+      value.tokenFingerprint.trim() && {
+        tokenFingerprint: value.tokenFingerprint.trim(),
+      }),
   }
 }
 
@@ -887,6 +892,7 @@ function mergeAccountRuntimeState(
 
     const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
     if (tokenChanged) {
+      if (!('profile' in incoming)) delete merged.profile
       if ('quota' in incoming) {
         merged.quota = existingEntry.quota
         if ('lastQuotaRefreshError' in existingEntry) {
@@ -909,6 +915,7 @@ function mergeAccountRuntimeState(
     }
   }
   const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
+  if (tokenChanged && !('profile' in incoming)) delete merged.profile
   if (!('lastQuotaRefreshError' in incoming)) {
     delete merged.lastQuotaRefreshError
   }
@@ -2025,23 +2032,35 @@ export function getQuotaNextRefreshAt(
   storage: AccountStorage | null,
   now: number,
 ) {
-  if (!quotaEnabled(storage)) return now + getQuotaCheckIntervalMs(storage)
+  const intervalMs = getQuotaCheckIntervalMs(storage)
+  if (!quotaEnabled(storage)) return now + intervalMs
+
+  const windowFreshnessDeadline = Math.min(
+    ...(['five_hour', 'seven_day'] as const)
+      .map((key) => quota?.[key]?.checkedAt)
+      .filter((checkedAt): checkedAt is number => Number.isFinite(checkedAt))
+      .map((checkedAt) => checkedAt + intervalMs),
+  )
+  const capAtOldestWindow = (candidate: number) =>
+    Number.isFinite(windowFreshnessDeadline)
+      ? Math.min(candidate, windowFreshnessDeadline)
+      : candidate
 
   const thresholds = normalizeThresholds(storage)
   const blockedResetTimes: number[] = []
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
-    if (!window) return now + getQuotaCheckIntervalMs(storage)
+    if (!window) return capAtOldestWindow(now + intervalMs)
     if (window.remainingPercent >= thresholds[key]) continue
     const resetTime = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN
     if (!Number.isFinite(resetTime) || resetTime <= now) {
-      return now + getQuotaCheckIntervalMs(storage)
+      return capAtOldestWindow(now + intervalMs)
     }
     blockedResetTimes.push(resetTime)
   }
 
-  if (!blockedResetTimes.length) return now + getQuotaCheckIntervalMs(storage)
-  return Math.min(...blockedResetTimes) + 60_000
+  if (!blockedResetTimes.length) return capAtOldestWindow(now + intervalMs)
+  return capAtOldestWindow(Math.min(...blockedResetTimes) + 60_000)
 }
 
 function tokenNeedsRefresh(
@@ -2204,10 +2223,19 @@ function mapExtraUsage(
   ) {
     return undefined
   }
-  const currency = nonEmptyString(usage.spend?.limit?.currency) ?? 'USD'
-  const exponent = usage.spend?.limit?.exponent
-  const moneyExponent =
-    typeof exponent === 'number' && Number.isFinite(exponent) ? exponent : 2
+  const rawCurrency = usage.spend?.limit?.currency
+  const currency = rawCurrency == null ? 'USD' : nonEmptyString(rawCurrency)
+  const rawExponent = usage.spend?.limit?.exponent
+  const moneyExponent = rawExponent == null ? 2 : rawExponent
+  if (
+    !currency ||
+    !/^[A-Za-z]{3}$/.test(currency) ||
+    !Number.isInteger(moneyExponent) ||
+    moneyExponent < 0 ||
+    moneyExponent > 20
+  ) {
+    return undefined
+  }
   return {
     used: { amountMinor: usedAmount, currency, exponent: moneyExponent },
     limit: { amountMinor: limitAmount, currency, exponent: moneyExponent },

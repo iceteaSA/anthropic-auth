@@ -149,7 +149,7 @@ function sendPayload(socket: WebSocket, payload: Record<string, unknown>) {
 }
 
 describe('relay Worker under Miniflare', () => {
-  test('HTTP relay strips upstream unified quota headers', async () => {
+  test('HTTP relay forwards upstream unified quota headers', async () => {
     const upstream = startUpstream()
     const mf = await startWorker()
 
@@ -164,17 +164,22 @@ describe('relay Worker under Miniflare', () => {
         },
         input: upstream.url,
         init: { method: 'POST' },
-        headers: new Headers({ authorization: 'Bearer test-token' }),
+        headers: new Headers({
+          authorization: 'Bearer test-token',
+          'x-session-affinity': 'miniflare-http-session',
+        }),
         body: '{}',
         fallback: async () => new Response('direct'),
       })
 
       expect(
         response.headers.get('anthropic-ratelimit-unified-5h-utilization'),
-      ).toBeNull()
-      expect(
-        response.headers.get('anthropic-ratelimit-unified-fallback'),
-      ).toBeNull()
+      ).toBe('0.78')
+      expect(response.headers.get('anthropic-ratelimit-unified-fallback')).toBe(
+        'available',
+      )
+      expect(await response.text()).toBe('upstream-ok')
+      expect(upstream.bodies).toEqual(['{}'])
     } finally {
       await mf.dispose()
       upstream.server.stop(true)

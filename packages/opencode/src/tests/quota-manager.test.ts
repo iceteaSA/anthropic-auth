@@ -970,5 +970,71 @@ describe('QuotaManager', () => {
       expect(pushed.checkedAt).toBe(now + 5_000)
       expect(pushed.refreshAfter).toBeGreaterThan(pushed.checkedAt)
     })
+
+    test('partial header push stays due at the oldest preserved window staleness point', () => {
+      const intervalMs = 5 * 60_000
+      const qm = new QuotaManager({
+        storage: { version: 1, accounts: [], quota: { enabled: true } },
+        now: () => now,
+      })
+      qm.setMain('token', {
+        quota: {
+          seven_day: {
+            usedPercent: 40,
+            remainingPercent: 60,
+            checkedAt: now - intervalMs + 1_000,
+          },
+          source: 'poll',
+          checkedAt: now - intervalMs + 1_000,
+        },
+        checkedAt: now - intervalMs + 1_000,
+        refreshAfter: now + 1_000,
+      })
+
+      const pushed = qm.pushMainFromHeaders('token', {
+        five_hour: {
+          usedPercent: 78,
+          remainingPercent: 22,
+          checkedAt: now,
+        },
+        source: 'headers',
+        checkedAt: now,
+      })
+
+      expect(pushed.quota.seven_day?.checkedAt).toBe(now - intervalMs + 1_000)
+      expect(pushed.refreshAfter).toBe(now + 1_000)
+    })
+
+    test('legacy unbound main quota is not merged into a newly bound header push', () => {
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: {
+            mainQuota: {
+              scoped: [
+                {
+                  id: 'legacy-scope',
+                  title: 'Legacy scope',
+                  modelName: 'Legacy',
+                  usedPercent: 90,
+                  remainingPercent: 10,
+                  checkedAt: now - 1_000,
+                },
+              ],
+              source: 'poll',
+              checkedAt: now - 1_000,
+            },
+            mainQuotaCheckedAt: now - 1_000,
+          },
+        },
+        now: () => now,
+      })
+
+      const pushed = qm.pushMainFromHeaders('new-token', headerSnapshot())
+
+      expect(pushed.quota.scoped).toBeUndefined()
+      expect(pushed.quota.five_hour?.usedPercent).toBe(78)
+    })
   })
 })

@@ -180,8 +180,10 @@ function normalizeQuotaMoney(value: unknown) {
   if (
     !Number.isInteger(value.amountMinor) ||
     typeof value.currency !== 'string' ||
-    !value.currency.trim() ||
-    !Number.isInteger(value.exponent)
+    !/^[A-Za-z]{3}$/.test(value.currency.trim()) ||
+    !Number.isInteger(value.exponent) ||
+    (value.exponent as number) < 0 ||
+    (value.exponent as number) > 20
   ) {
     return undefined
   }

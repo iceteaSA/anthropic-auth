@@ -79,12 +79,16 @@ function formatWindow(
 }
 
 function formatMoney(amountMinor: number, currency: string, exponent: number) {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    minimumFractionDigits: exponent,
-    maximumFractionDigits: exponent,
-  }).format(amountMinor / 10 ** exponent)
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: exponent,
+      maximumFractionDigits: exponent,
+    }).format(amountMinor / 10 ** exponent)
+  } catch {
+    return `${amountMinor} ${currency}`
+  }
 }
 
 function formatScopedWindow(window: AccountScopedQuotaWindow, now: number) {

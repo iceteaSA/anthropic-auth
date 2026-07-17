@@ -9,6 +9,26 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 describe('quota summaries', () => {
+  test('malformed money metadata falls back without throwing', () => {
+    const summary = buildClaudeQuotaSummary({
+      accounts: [
+        {
+          name: 'malformed',
+          role: 'main',
+          quota: {
+            extraUsage: {
+              used: { amountMinor: 10035, currency: 'ZZZZ', exponent: 50 },
+              limit: { amountMinor: 10000, currency: 'ZZZZ', exponent: 50 },
+              exhausted: false,
+            },
+          },
+        },
+      ],
+    })
+
+    expect(summary).toContain('credits 10035 ZZZZ/10000 ZZZZ')
+  })
+
   test('claude quota shows Team tier exhausted credits binding marker and fallback advice', () => {
     const summary = buildClaudeQuotaSummary({
       accounts: [

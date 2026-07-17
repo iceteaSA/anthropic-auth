@@ -186,8 +186,9 @@ export class QuotaManager {
     incoming: OAuthQuotaSnapshot,
   ): QuotaEntry {
     const checkedAt = incoming.checkedAt ?? this.now()
+    const accessTokenFp = tokenFingerprint(accessToken)
     const quota = mergeHeaderQuotaSnapshot(
-      this.getMain(accessToken)?.quota,
+      this.mainTokenFp === accessTokenFp ? this.main?.quota : undefined,
       incoming,
     )
     const entry = {

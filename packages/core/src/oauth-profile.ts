@@ -1,4 +1,5 @@
 import type { OAuthAccountProfile } from './accounts.ts'
+import { tokenFingerprint } from './quota-manager.ts'
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 
@@ -31,7 +32,19 @@ export async function fetchOAuthAccountProfile(input: {
   if (typeof tier !== 'string' || typeof orgType !== 'string') {
     throw new Error('Claude profile response is missing account metadata')
   }
-  return { tier, orgType, checkedAt: input.now?.() ?? Date.now() }
+  return {
+    tier,
+    orgType,
+    checkedAt: input.now?.() ?? Date.now(),
+    tokenFingerprint: tokenFingerprint(input.accessToken),
+  }
+}
+
+export function oauthProfileMatchesToken(
+  profile: OAuthAccountProfile | undefined,
+  accessToken: string,
+) {
+  return profile?.tokenFingerprint === tokenFingerprint(accessToken)
 }
 
 export function oauthProfileIsFresh(

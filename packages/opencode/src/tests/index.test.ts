@@ -21,7 +21,7 @@ import {
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import { AnthropicAuthPlugin } from '../index'
+import { __setBootProfileHydrationForTest, AnthropicAuthPlugin } from '../index'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -594,6 +594,7 @@ describe('auth.loader', () => {
     resetDumpState()
     resetFastModeState()
     resetNotificationsForTest()
+    __setBootProfileHydrationForTest(false)
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -604,6 +605,7 @@ describe('auth.loader', () => {
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
     resetNotificationsForTest()
+    __setBootProfileHydrationForTest(false)
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -2821,6 +2823,7 @@ describe('auth.loader', () => {
             tier: 'default_claude_max_20x',
             orgType: 'claude_max',
             checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
           },
         },
       }),
@@ -2856,6 +2859,141 @@ describe('auth.loader', () => {
     ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
 
     expect(profileCalls).toBe(0)
+  })
+
+  test('main token rotation clears a stale bound profile before display', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('old-access'),
+          },
+        },
+      }),
+    )
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? new Response('failed', { status: 500 })
+          : new Response('ok'),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'new-access',
+          refresh: 'new-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text
+
+    expect(text).not.toContain('Max 20x')
+    expect((await loadAccounts())?.main?.profile).toBeUndefined()
+  })
+
+  test('same main token keeps a fresh bound profile without refetching', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+    expect((await loadAccounts())?.main?.profile?.tier).toBe(
+      'default_claude_max_20x',
+    )
+  })
+
+  test('boot profile hydration publishes tier labels to the sidebar', async () => {
+    __setBootProfileHydrationForTest(true)
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const state = await waitForSidebarState(
+      (value) => value.main.tierLabel === 'Max 20x',
+    )
+
+    expect(state.main.tierLabel).toBe('Max 20x')
+    expect(profileCalls).toBe(1)
   })
 
   test('stale profile refreshes on display', async () => {
@@ -5562,7 +5700,9 @@ describe('auth.loader', () => {
       ) as unknown as typeof fetch
       const result = await loadFetch()
 
-      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'main-ok',
+      )
       const state = await waitForState(
         (value) => value.main?.quota?.source === 'headers',
       )
@@ -5671,7 +5811,9 @@ describe('auth.loader', () => {
       }) as unknown as typeof fetch
       const result = await loadFetch()
 
-      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'fallback-ok',
+      )
       const state = await waitForState(
         (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
       )
@@ -5798,7 +5940,7 @@ describe('auth.loader', () => {
       setLogLevel('info')
     })
 
-    test('repeated normalize error shape warns once per process', async () => {
+    test('repeated out-of-range resets do not warn and restore log state', async () => {
       await useTempAccountFile(harvestStorage())
       const records: LogTestRecord[] = []
       __setLogTestSink((record) => records.push(record))
@@ -5823,8 +5965,9 @@ describe('auth.loader', () => {
             record.channel === 'quota' &&
             record.message === 'failed to normalize response quota headers',
         ),
-      ).toHaveLength(1)
+      ).toHaveLength(0)
       __setLogTestSink(null)
+      setLogLevel('info')
     })
   })
 })

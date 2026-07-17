@@ -11,10 +11,9 @@ const WINDOW_KEYS: Record<string, QuotaWindowName> = {
 }
 
 export function isQuotaBearingHeaderFrame(headers: Headers): boolean {
-  for (const [name] of headers) {
-    if (name.startsWith(PREFIX) && name.endsWith('-utilization')) return true
-  }
-  return false
+  return Object.keys(WINDOW_KEYS).some((suffix) =>
+    headers.has(`${PREFIX}${suffix}-utilization`),
+  )
 }
 
 function finiteHeaderNumber(headers: Headers, name: string) {
@@ -36,12 +35,16 @@ function normalizeWindow(
   if (utilization == null) return undefined
   const usedPercent = Math.min(100, Math.max(0, Math.round(utilization * 100)))
   const resetSeconds = finiteHeaderNumber(headers, `${PREFIX}${suffix}-reset`)
+  const resetDate =
+    resetSeconds == null ? undefined : new Date(resetSeconds * 1000)
+  const resetsAt =
+    resetDate && Number.isFinite(resetDate.getTime())
+      ? resetDate.toISOString()
+      : undefined
   return {
     usedPercent,
     remainingPercent: 100 - usedPercent,
-    ...(resetSeconds != null && {
-      resetsAt: new Date(resetSeconds * 1000).toISOString(),
-    }),
+    ...(resetsAt && { resetsAt }),
     checkedAt,
   }
 }

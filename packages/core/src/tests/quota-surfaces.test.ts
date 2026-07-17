@@ -111,6 +111,26 @@ describe('quota surface normalization', () => {
     expect(main.extraUsage).toBeUndefined()
   })
 
+  test('rejects extra usage with invalid currency or exponent metadata', async () => {
+    const invalidCurrency = await snapshotFor({
+      ...TEAM_USAGE_CAPTURE,
+      spend: {
+        ...TEAM_USAGE_CAPTURE.spend,
+        limit: { amount_minor: 10000, currency: 'ZZZZ', exponent: 2 },
+      },
+    })
+    const invalidExponent = await snapshotFor({
+      ...TEAM_USAGE_CAPTURE,
+      spend: {
+        ...TEAM_USAGE_CAPTURE.spend,
+        limit: { amount_minor: 10000, currency: 'USD', exponent: 50 },
+      },
+    })
+
+    expect(invalidCurrency.extraUsage).toBeUndefined()
+    expect(invalidExponent.extraUsage).toBeUndefined()
+  })
+
   test('maps the active session limit to bindingWindow five_hour', async () => {
     const team = await snapshotFor(TEAM_USAGE_CAPTURE)
 
@@ -130,6 +150,16 @@ describe('quota surface normalization', () => {
     expect(
       isQuotaBearingHeaderFrame(
         new Headers({ 'anthropic-ratelimit-unified-status': 'allowed' }),
+      ),
+    ).toBe(false)
+  })
+
+  test('rejects overage-only utilization frames', () => {
+    expect(
+      isQuotaBearingHeaderFrame(
+        new Headers({
+          'anthropic-ratelimit-unified-overage-utilization': '0.8',
+        }),
       ),
     ).toBe(false)
   })
@@ -181,5 +211,21 @@ describe('quota surface normalization', () => {
     })
     expect(normalizeQuotaHeaders(headers).five_hour).toBeUndefined()
     expect(normalizeQuotaHeaders(headers).seven_day).toBeUndefined()
+  })
+
+  test('keeps valid windows when reset values exceed the JavaScript date range', () => {
+    const snapshot = normalizeQuotaHeaders(
+      new Headers({
+        'anthropic-ratelimit-unified-5h-utilization': '0.2',
+        'anthropic-ratelimit-unified-5h-reset': '1e308',
+        'anthropic-ratelimit-unified-7d-utilization': '0.4',
+        'anthropic-ratelimit-unified-7d-reset': '1e308',
+      }),
+    )
+
+    expect(snapshot.five_hour?.usedPercent).toBe(20)
+    expect(snapshot.seven_day?.usedPercent).toBe(40)
+    expect(snapshot.five_hour?.resetsAt).toBeUndefined()
+    expect(snapshot.seven_day?.resetsAt).toBeUndefined()
   })
 })

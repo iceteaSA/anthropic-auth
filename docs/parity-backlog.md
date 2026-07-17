@@ -337,13 +337,16 @@ production-only regression (env-override bypass) — first-hand DIFF review caug
 
 ---
 
-## 8. Relay Worker unified quota-header passthrough — FOLLOW-UP
+## 8. Relay response eligibility for quota harvest — FOLLOW-UP
 
-The 2026-07-16 Miniflare transport gate found mixed behavior: WebSocket `response_start`
-preserves `anthropic-ratelimit-unified-*`, while the HTTP Worker path strips those upstream
-headers. Quota harvest therefore remains direct-only until both transports preserve the same
-header family. Fix the Worker HTTP response path, then remove the relay guard only after HTTP and
-WebSocket assertions pass together. Do not add a quota side channel.
+The corrected Miniflare gate confirms both relay transports preserve
+`anthropic-ratelimit-unified-*`: the HTTP Worker copies `upstream.headers` into its response and
+WebSocket sends them in `response_start`. The earlier HTTP-negative test omitted
+`x-session-affinity`, so `sendViaRelay` returned its direct fallback without reaching the Worker.
+Quota harvest remains direct-only at the client `usedRelay` guard because WebSocket response
+headers are transport-reconstructed and are not yet canonical harvest evidence. Resolve that
+eligibility/synthetic-header question at the client guard before enabling relay harvest. Do not add
+a quota side channel.
 
 ## 9. Pi quota-header harvest parity — FOLLOW-UP
 

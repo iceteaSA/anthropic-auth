@@ -32,6 +32,26 @@ export function buildKillswitchThresholdSeed(
   return seedParts.join(' ')
 }
 
+export function buildAccountDialogOption(account: {
+  id: string
+  label: string
+  role: string
+  enabled: boolean
+  quotaPercent: number | null
+  tierLabel?: string
+}) {
+  const pct =
+    account.quotaPercent != null
+      ? ` ${Math.round(account.quotaPercent)}%`
+      : ' \u2013%'
+  const status = !account.enabled ? ' (disabled)' : ''
+  return {
+    title: `${account.label} [${account.role}]${status}${pct}`,
+    value: account.id,
+    ...(account.tierLabel && { description: account.tierLabel }),
+  }
+}
+
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
@@ -242,6 +262,7 @@ export function openCommandDialog(
         role: string
         enabled: boolean
         quotaPercent: number | null
+        tierLabel?: string
       }>) ?? []
 
     const updateAccounts = (r: {
@@ -267,17 +288,7 @@ export function openCommandDialog(
           value: '__add__',
           description: 'Add an API key or OAuth fallback account',
         },
-        ...accounts.map((a) => {
-          const pct =
-            a.quotaPercent != null
-              ? ` ${Math.round(a.quotaPercent)}%`
-              : ' \u2013%'
-          const status = !a.enabled ? ' (disabled)' : ''
-          return {
-            title: `${a.label} [${a.role}]${status}${pct}`,
-            value: a.id,
-          }
-        }),
+        ...accounts.map(buildAccountDialogOption),
       ]
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
