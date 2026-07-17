@@ -9,9 +9,11 @@ export async function fetchOAuthAccountProfile(input: {
   accessToken: string
   fetchImpl?: typeof fetch
   now?: () => number
+  signal?: AbortSignal
 }): Promise<OAuthAccountProfile> {
   const response = await (input.fetchImpl ?? fetch)(PROFILE_URL, {
     method: 'GET',
+    signal: input.signal,
     headers: {
       Authorization: `Bearer ${input.accessToken}`,
       Accept: 'application/json',

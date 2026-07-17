@@ -2746,6 +2746,64 @@ describe('auth.loader', () => {
     expect(text).toContain('1w: 50% remaining')
   })
 
+  test('/claude-quota bounds stalled profile hydration without hiding quota output', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let profileSignal: AbortSignal | undefined
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/profile')) {
+          profileSignal = init?.signal ?? undefined
+          return new Promise<Response>((_resolve, reject) => {
+            profileSignal?.addEventListener(
+              'abort',
+              () => reject(profileSignal?.reason),
+              { once: true },
+            )
+          })
+        }
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 25 },
+              seven_day: { utilization: 50 },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const startedAt = performance.now()
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(performance.now() - startedAt).toBeLessThan(4_000)
+    expect(profileSignal?.aborted).toBe(true)
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+    expect(text).toContain('## Claude Quotas')
+    expect(text).toContain('5h: 75% remaining')
+    expect(text).not.toContain('Max 20x')
+  }, 5_000)
+
   test('profile fetch runs once per account per boot and persists the result', async () => {
     await useTempAccountFile(createFallbackStorage())
     const mockClient = createMockClient()
@@ -2811,6 +2869,10 @@ describe('auth.loader', () => {
     expect((loaded?.accounts[0] as any)?.profile?.tier).toBe(
       'default_claude_max_5x',
     )
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+    expect(text).toContain('Max 20x')
+    expect(text).toContain('Max 5x')
   })
 
   test('fresh profile under seven days skips fetch', async () => {
