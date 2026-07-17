@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   lstat,
   mkdir,
@@ -97,18 +97,35 @@ function isDumpArtifactFileName(name: string) {
 }
 
 function isDumpPartialFileName(name: string) {
-  return name.endsWith('.partial') && isDumpArtifactFileName(name.slice(0, -8))
+  if (!name.endsWith('.partial')) return false
+  const partialStem = name.slice(0, -8)
+  if (isDumpArtifactFileName(partialStem)) return true
+  const separator = partialStem.lastIndexOf('.')
+  if (separator < 0) return false
+  const nonce = partialStem.slice(separator + 1)
+  return (
+    /^[a-f0-9]{24}$/.test(nonce) &&
+    isDumpArtifactFileName(partialStem.slice(0, separator))
+  )
 }
 
-async function writeDumpFile(path: string, contents: string) {
-  const partialPath = `${path}.partial`
-  try {
-    await writeFile(partialPath, contents, 'utf8')
-    await rename(partialPath, path)
-  } catch (error) {
-    await unlink(partialPath).catch(() => {})
-    throw error
+export async function writeDumpFile(path: string, contents: string) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const nonce = randomBytes(12).toString('hex')
+    const partialPath = `${path}.${nonce}.partial`
+    let created = false
+    try {
+      await writeFile(partialPath, contents, { encoding: 'utf8', flag: 'wx' })
+      created = true
+      await rename(partialPath, path)
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue
+      if (created) await unlink(partialPath).catch(() => {})
+      throw error
+    }
   }
+  return false
 }
 
 /**

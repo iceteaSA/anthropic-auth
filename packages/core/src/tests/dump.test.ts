@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
   rm,
   symlink,
   unlink,
@@ -11,7 +13,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { sweepDumpDirectory } from '../dump'
+import { sweepDumpDirectory, writeDumpFile } from '../dump'
 
 const dumpDirs: string[] = []
 const dumpLinks: string[] = []
@@ -204,7 +206,10 @@ test('preserves fresh partials and reclaims stale partials even under the cap', 
   process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
   const now = new Date('2026-07-17T12:00:00.000Z')
   const freshPartial = join(dumpDir, `${dumpArtifactName(1)}.partial`)
-  const stalePartial = join(dumpDir, `${dumpArtifactName(2)}.partial`)
+  const stalePartial = join(
+    dumpDir,
+    `${dumpArtifactName(2)}.0123456789abcdef01234567.partial`,
+  )
   await Promise.all([
     writeFile(freshPartial, '12345678'),
     writeFile(stalePartial, '12345678'),
@@ -227,4 +232,22 @@ test('preserves fresh partials and reclaims stale partials even under the cap', 
     freedBytes: 8,
   })
   expect(await readdir(dumpDir)).toEqual([`${dumpArtifactName(1)}.partial`])
+})
+
+test('does not follow a pre-planted predictable partial symlink', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  const targetDir = await mkdtemp(join(tmpdir(), 'dump-partial-target-'))
+  dumpDirs.push(dumpDir, targetDir)
+  const targetFile = join(targetDir, 'target.txt')
+  const finalFile = join(dumpDir, dumpArtifactName(1))
+  await writeFile(targetFile, 'do not overwrite')
+  await symlink(targetFile, `${finalFile}.partial`)
+
+  await writeDumpFile(finalFile, 'safe dump content')
+
+  expect(await readFile(targetFile, 'utf8')).toBe('do not overwrite')
+  expect(await readFile(finalFile, 'utf8')).toBe('safe dump content')
+  expect((await lstat(finalFile)).isSymbolicLink()).toBe(false)
 })
