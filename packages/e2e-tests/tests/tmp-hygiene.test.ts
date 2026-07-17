@@ -16,7 +16,10 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  cleanupE2ERun,
+  createIsolatedEnv,
   removeE2ETempDir,
+  spawnOpencode,
   sweepStaleE2ETempDirs,
   terminateChildProcess,
 } from '../src/opencode-runner.ts'
@@ -61,18 +64,31 @@ describe('e2e temporary directory hygiene', () => {
     expect((await lstat(symlinkTarget)).isDirectory()).toBe(true)
   })
 
-  it('keeps an old run directory owned by a live process', async () => {
+  it('removes an old same-process run directory that is no longer active', async () => {
     const root = await createRoot()
-    const liveDir = join(root, 'anthropic-auth-e2e-live')
+    const orphanDir = join(root, 'anthropic-auth-e2e-orphan')
     const staleTime = new Date('2026-07-15T00:00:00.000Z')
     const now = new Date('2026-07-17T00:00:00.000Z')
-    await mkdir(liveDir)
-    await writeFile(join(liveDir, 'run.pid'), String(process.pid))
-    await utimes(liveDir, staleTime, staleTime)
+    await mkdir(orphanDir)
+    await writeFile(join(orphanDir, 'run.pid'), String(process.pid))
+    await utimes(orphanDir, staleTime, staleTime)
 
     await sweepStaleE2ETempDirs({ root, now: now.getTime() })
 
-    expect(await readdir(root)).toEqual(['anthropic-auth-e2e-live'])
+    expect(await readdir(root)).toEqual([])
+  })
+
+  it('keeps an old same-process run directory while it is active', async () => {
+    const root = await createRoot()
+    const env = createIsolatedEnv(root)
+    const staleTime = new Date('2026-07-15T00:00:00.000Z')
+    const now = new Date('2026-07-17T00:00:00.000Z')
+    await utimes(env.tempDir, staleTime, staleTime)
+
+    await sweepStaleE2ETempDirs({ root, now: now.getTime() })
+
+    expect(await readdir(root)).toEqual([env.tempDir.split('/').at(-1)])
+    await removeE2ETempDir(env.tempDir, { root })
   })
 
   it('removes an old run directory owned by an exited process', async () => {
@@ -175,5 +191,64 @@ describe('e2e temporary directory hygiene', () => {
     child.emit('exit', null, 'SIGKILL')
     await termination
     expect(resolved).toBe(true)
+  })
+
+  it('reports an unconfirmed exit after the SIGKILL fallback expires', async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      exitCode: number | null
+      signalCode: NodeJS.Signals | null
+      kill: () => boolean
+    }
+    child.exitCode = null
+    child.signalCode = null
+    child.kill = () => true
+
+    const exited = await terminateChildProcess(child as unknown as ChildProcess, {
+      termTimeoutMs: 5,
+      killExitTimeoutMs: 5,
+    })
+
+    expect(exited).toBe(false)
+  })
+
+  it('leaves the temp directory when child exit cannot be confirmed', async () => {
+    const root = await createRoot()
+    const tempDir = join(root, 'anthropic-auth-e2e-unconfirmed')
+    await mkdir(tempDir)
+    const child = new EventEmitter() as EventEmitter & {
+      exitCode: number | null
+      signalCode: NodeJS.Signals | null
+      kill: () => boolean
+    }
+    child.exitCode = null
+    child.signalCode = null
+    child.kill = () => true
+
+    expect(
+      await cleanupE2ERun({
+        child: child as unknown as ChildProcess,
+        tempDir,
+        root,
+        terminationOptions: { termTimeoutMs: 5, killExitTimeoutMs: 5 },
+      }),
+    ).toBe(false)
+    expect(await readdir(root)).toEqual(['anthropic-auth-e2e-unconfirmed'])
+  })
+
+  it('removes the temp directory when setup fails before spawning a child', async () => {
+    let tempDir = ''
+
+    await expect(
+      spawnOpencode({
+        anthropicBaseURL: 'http://127.0.0.1:1',
+        beforeSpawn: (env) => {
+          tempDir = env.tempDir
+          throw new Error('setup failed')
+        },
+      }),
+    ).rejects.toThrow('setup failed')
+
+    expect(tempDir).not.toBe('')
+    expect(await Bun.file(tempDir).exists()).toBe(false)
   })
 })
