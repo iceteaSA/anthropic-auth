@@ -13,6 +13,7 @@ import {
   loadAccounts,
   type OAuthAccount,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  PROFILE_TTL_MS,
   resetCache1hState,
   resetDumpState,
   resetFastModeState,
@@ -3079,7 +3080,61 @@ describe('auth.loader', () => {
     )
   })
 
-  test('profile hydration attempt cache evicts old token generations', async () => {
+  test('expired profile TTL triggers a fresh hydration in the same process', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const originalDateNow = Date.now
+    let now = 1_000_000
+    let profileCalls = 0
+    Date.now = () => now
+    try {
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/profile')) {
+          profileCalls++
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: 'claude_max',
+                rate_limit_tier: 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(mockClient)
+      await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: now + PROFILE_TTL_MS * 3,
+          }),
+        { models: {} },
+      )
+      const showAccounts = async () => {
+        await expect(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: '',
+            sessionID: 'session-1',
+          }),
+        ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      }
+
+      await showAccounts()
+      now += PROFILE_TTL_MS + 1
+      await showAccounts()
+
+      expect(profileCalls).toBe(2)
+      expect((await loadAccounts())?.main?.profile?.checkedAt).toBe(now)
+    } finally {
+      Date.now = originalDateNow
+    }
+  })
+
+  test('completed profile hydrations do not block later token generations', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
     let profileCalls = 0
@@ -3214,18 +3269,35 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    setLogLevel('debug')
 
-    await expect(
-      plugin['command.execute.before']({
-        command: 'claude-quota',
-        arguments: '',
-        sessionID: 'session-1',
-      }),
-    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    try {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel('info')
+    }
     const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
       ?.body.parts[0]?.text
 
     expect(text).not.toContain('Max 20x')
+    expect(
+      records.filter(
+        (record) =>
+          record.level === 'debug' &&
+          record.channel === 'quota' &&
+          record.message === 'failed to hydrate account profile' &&
+          record.payload?.account === 'main',
+      ),
+    ).toHaveLength(1)
   })
 
   test('profile persistence failure does not block account display', async () => {

@@ -864,19 +864,53 @@ function quotaSourcePrecedence(quota: OAuthQuotaSnapshot | undefined) {
   return 0
 }
 
+function mergeHeaderScopedQuota(
+  existing: OAuthQuotaSnapshot,
+  incoming: OAuthQuotaSnapshot,
+) {
+  if (!('scoped' in existing)) return incoming.scoped
+  if (!Array.isArray(existing.scoped) || existing.scoped.length === 0) {
+    return existing.scoped
+  }
+  if (!Array.isArray(incoming.scoped) || incoming.scoped.length === 0) {
+    return existing.scoped
+  }
+  const merged = new Map(incoming.scoped.map((window) => [window.id, window]))
+  for (const window of existing.scoped) {
+    const candidate = merged.get(window.id)
+    if (!candidate || window.checkedAt >= candidate.checkedAt) {
+      merged.set(window.id, window)
+    }
+  }
+  return [...merged.values()]
+}
+
+function mergeHeaderQuotaForPersistence(
+  existing: OAuthQuotaSnapshot | undefined,
+  incoming: OAuthQuotaSnapshot,
+) {
+  if (!existing || incoming.source !== 'headers') return incoming
+  const preservePollBinding = existing.bindingWindowSource === 'poll'
+  return {
+    ...existing,
+    ...incoming,
+    scoped: mergeHeaderScopedQuota(existing, incoming),
+    extraUsage: existing.extraUsage ?? incoming.extraUsage,
+    bindingWindow: preservePollBinding
+      ? existing.bindingWindow
+      : (incoming.bindingWindow ?? existing.bindingWindow),
+    bindingWindowSource: preservePollBinding
+      ? 'poll'
+      : (incoming.bindingWindowSource ?? existing.bindingWindowSource),
+  } satisfies OAuthQuotaSnapshot
+}
+
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
 ): AccountRuntimeEntry {
   if (!isRecord(existing)) return incoming
   const existingEntry = existing as AccountRuntimeEntry
-  const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
-  const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
-  const existingQuotaWinsEqualTimestamp = Boolean(
-    existingQuotaCheckedAt === incomingQuotaCheckedAt &&
-      quotaSourcePrecedence(existingEntry.quota) >
-        quotaSourcePrecedence(incoming.quota),
-  )
   const tokenChanged = Boolean(
     (existingEntry.access &&
       incoming.access &&
@@ -885,40 +919,59 @@ function mergeAccountRuntimeState(
         incoming.refresh &&
         existingEntry.refresh !== incoming.refresh),
   )
+  const effectiveIncoming =
+    !tokenChanged && incoming.quota?.source === 'headers'
+      ? {
+          ...incoming,
+          quota: mergeHeaderQuotaForPersistence(
+            existingEntry.quota,
+            incoming.quota,
+          ),
+        }
+      : incoming
+  const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
+  const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(effectiveIncoming.quota)
+  const existingQuotaWinsEqualTimestamp = Boolean(
+    existingQuotaCheckedAt === incomingQuotaCheckedAt &&
+      quotaSourcePrecedence(existingEntry.quota) >
+        quotaSourcePrecedence(effectiveIncoming.quota),
+  )
 
   if (
     existingQuotaCheckedAt > incomingQuotaCheckedAt ||
     existingQuotaWinsEqualTimestamp
   ) {
     const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
-    const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
+    const incomingRefreshAt = effectiveIncoming.lastRefreshedAt ?? 0
     if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
       const merged: AccountRuntimeEntry = { ...existingEntry }
       if (
-        typeof incoming.lastUsed === 'number' &&
+        typeof effectiveIncoming.lastUsed === 'number' &&
         (!(typeof existingEntry.lastUsed === 'number') ||
-          incoming.lastUsed > existingEntry.lastUsed)
+          effectiveIncoming.lastUsed > existingEntry.lastUsed)
       ) {
-        merged.lastUsed = incoming.lastUsed
+        merged.lastUsed = effectiveIncoming.lastUsed
       }
       return merged
     }
 
-    const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
+    const merged: AccountRuntimeEntry = {
+      ...existingEntry,
+      ...effectiveIncoming,
+    }
     if (tokenChanged) {
-      if (!('profile' in incoming)) delete merged.profile
-      if ('quota' in incoming) {
-        merged.quota = existingEntry.quota
-        if ('lastQuotaRefreshError' in existingEntry) {
-          merged.lastQuotaRefreshError = existingEntry.lastQuotaRefreshError
-        } else {
-          delete merged.lastQuotaRefreshError
-        }
+      if (!('profile' in effectiveIncoming)) delete merged.profile
+      if (effectiveIncoming.quota?.source) {
+        merged.quota = effectiveIncoming.quota
       } else {
         delete merged.quota
+      }
+      if (!('lastQuotaRefreshError' in effectiveIncoming)) {
         delete merged.lastQuotaRefreshError
       }
-      if (!('lastRefreshError' in incoming)) delete merged.lastRefreshError
+      if (!('lastRefreshError' in effectiveIncoming)) {
+        delete merged.lastRefreshError
+      }
       return merged
     }
 
@@ -928,12 +981,18 @@ function mergeAccountRuntimeState(
       lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
     }
   }
-  const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
-  if (tokenChanged && !('profile' in incoming)) delete merged.profile
-  if (!('lastQuotaRefreshError' in incoming)) {
+  const merged: AccountRuntimeEntry = {
+    ...existingEntry,
+    ...effectiveIncoming,
+  }
+  if (tokenChanged) {
+    if (!('profile' in effectiveIncoming)) delete merged.profile
+    if (!effectiveIncoming.quota?.source) delete merged.quota
+  }
+  if (!('lastQuotaRefreshError' in effectiveIncoming)) {
     delete merged.lastQuotaRefreshError
   }
-  if (!('lastRefreshError' in incoming)) {
+  if (!('lastRefreshError' in effectiveIncoming)) {
     delete merged.lastRefreshError
   }
   return merged
@@ -1041,6 +1100,16 @@ function applyMainQuotaStatePatch(
   storage: AccountStorage,
 ) {
   state.main = state.main ?? {}
+  const incomingQuota = storage.quota?.mainQuota
+  const sameToken = Boolean(
+    state.main.quotaToken &&
+      storage.quota?.mainQuotaToken &&
+      state.main.quotaToken === storage.quota.mainQuotaToken,
+  )
+  const effectiveIncomingQuota =
+    sameToken && incomingQuota?.source === 'headers'
+      ? mergeHeaderQuotaForPersistence(state.main.quota, incomingQuota)
+      : incomingQuota
   const existingCheckedAt =
     typeof state.main.quotaCheckedAt === 'number'
       ? state.main.quotaCheckedAt
@@ -1048,17 +1117,17 @@ function applyMainQuotaStatePatch(
   const incomingCheckedAt =
     typeof storage.quota?.mainQuotaCheckedAt === 'number'
       ? storage.quota.mainQuotaCheckedAt
-      : quotaSnapshotCheckedAt(storage.quota?.mainQuota)
+      : quotaSnapshotCheckedAt(effectiveIncomingQuota)
   if (
     existingCheckedAt > incomingCheckedAt ||
     (existingCheckedAt === incomingCheckedAt &&
       quotaSourcePrecedence(state.main.quota) >
-        quotaSourcePrecedence(storage.quota?.mainQuota))
+        quotaSourcePrecedence(effectiveIncomingQuota))
   ) {
     return
   }
 
-  state.main.quota = storage.quota?.mainQuota
+  state.main.quota = effectiveIncomingQuota
   state.main.quotaCheckedAt = storage.quota?.mainQuotaCheckedAt
   state.main.quotaToken = storage.quota?.mainQuotaToken
   state.main.lastQuotaApiError = storage.quota?.mainLastQuotaApiError

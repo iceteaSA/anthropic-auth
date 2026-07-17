@@ -87,6 +87,7 @@ export function mergeHeaderQuotaSnapshot(
       existing?.bindingWindowSource === 'poll'
         ? 'poll'
         : (incoming.bindingWindowSource ?? existing?.bindingWindowSource),
+    // Source tracks 5h/7d freshness; preserved scoped and credit fields remain poll-owned.
     source: 'headers',
   }
 }

@@ -899,7 +899,187 @@ describe('account storage', () => {
     expect(loaded?.quota?.mainQuota?.scoped?.[0]?.id).toBe('weekly-fable')
   })
 
-  test('runtime state saves can update refreshed tokens without downgrading quota', async () => {
+  test('fallback header persistence preserves newer poll-owned fields from disk', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 999,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        scoped: [
+          {
+            id: 'weekly-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 40,
+            remainingPercent: 60,
+            checkedAt: 600,
+          },
+        ],
+        extraUsage: {
+          used: { amountMinor: 500, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 1000, currency: 'USD', exponent: 2 },
+          exhausted: false,
+        },
+        bindingWindow: 'weekly-fable',
+        bindingWindowSource: 'poll',
+        source: 'poll',
+        checkedAt: 600,
+      },
+    })
+    await saveAccounts(storage)
+    const staleHeaderView = await loadAccounts()
+    const account = expectOAuthAccount(staleHeaderView?.accounts[0])
+    account.quota = {
+      five_hour: {
+        usedPercent: 78,
+        remainingPercent: 22,
+        checkedAt: 700,
+      },
+      seven_day: {
+        usedPercent: 40,
+        remainingPercent: 60,
+        checkedAt: 700,
+      },
+      scoped: [],
+      fallbackAdvised: true,
+      bindingWindow: 'five_hour',
+      bindingWindowSource: 'headers',
+      source: 'headers',
+      checkedAt: 700,
+    }
+
+    await saveAccountState(staleHeaderView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const merged = expectOAuthAccount(loaded?.accounts[0]).quota
+    expect(merged?.five_hour?.usedPercent).toBe(78)
+    expect(merged?.seven_day?.usedPercent).toBe(40)
+    expect(merged?.scoped?.[0]?.id).toBe('weekly-fable')
+    expect(merged?.extraUsage?.used.amountMinor).toBe(500)
+    expect(merged?.bindingWindow).toBe('weekly-fable')
+    expect(merged?.bindingWindowSource).toBe('poll')
+  })
+
+  test('main header persistence preserves newer poll-owned fields from disk', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        scoped: [
+          {
+            id: 'weekly-fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 40,
+            remainingPercent: 60,
+            checkedAt: 600,
+          },
+        ],
+        extraUsage: {
+          used: { amountMinor: 500, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 1000, currency: 'USD', exponent: 2 },
+          exhausted: false,
+        },
+        bindingWindow: 'weekly-fable',
+        bindingWindowSource: 'poll',
+        source: 'poll',
+        checkedAt: 600,
+      },
+      mainQuotaCheckedAt: 600,
+      mainQuotaToken: 'same-token',
+    }
+    await saveAccounts(storage)
+    const staleHeaderView = await loadAccounts()
+    ;(staleHeaderView as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 78,
+        remainingPercent: 22,
+        checkedAt: 700,
+      },
+      seven_day: {
+        usedPercent: 40,
+        remainingPercent: 60,
+        checkedAt: 700,
+      },
+      scoped: [],
+      source: 'headers',
+      checkedAt: 700,
+    }
+    ;(staleHeaderView as AccountStorage).quota!.mainQuotaCheckedAt = 700
+
+    await saveAccountState(staleHeaderView as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+
+    const loaded = await loadAccounts()
+    expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(78)
+    expect(loaded?.quota?.mainQuota?.scoped?.[0]?.id).toBe('weekly-fable')
+    expect(loaded?.quota?.mainQuota?.extraUsage?.used.amountMinor).toBe(500)
+    expect(loaded?.quota?.mainQuota?.bindingWindow).toBe('weekly-fable')
+  })
+
+  test('fallback token rotation never rebinds the previous token quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1_000,
+      lastRefreshedAt: 100,
+      quota: {
+        five_hour: {
+          usedPercent: 80,
+          remainingPercent: 20,
+          checkedAt: 500,
+        },
+        source: 'poll',
+        checkedAt: 500,
+      },
+    })
+    await saveAccounts(storage)
+    const rotatedView = await loadAccounts()
+    const rotated = expectOAuthAccount(rotatedView?.accounts[0])
+    rotated.access = 'new-access'
+    rotated.refresh = 'new-refresh'
+    rotated.lastRefreshedAt = 600
+    rotated.quota = {
+      five_hour: {
+        usedPercent: 5,
+        remainingPercent: 95,
+        checkedAt: 100,
+      },
+      source: 'headers',
+      checkedAt: 100,
+    }
+
+    await saveAccountState(rotatedView as AccountStorage, accountPath, {
+      accounts: ['fallback-1'],
+    })
+
+    const loaded = await loadAccounts()
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(account.access).toBe('new-access')
+    expect(account.quota?.five_hour?.usedPercent).toBe(5)
+    expect(account.quota?.source).toBe('headers')
+  })
+
+  test('runtime token updates drop source-less quota passthrough', async () => {
     const storage = baseStorage()
     storage.accounts.push({
       id: 'fallback-1',
@@ -948,7 +1128,7 @@ describe('account storage', () => {
     expect(account.access).toBe('new-access')
     expect(account.refresh).toBe('new-refresh')
     expect(account.lastRefreshedAt).toBe(600)
-    expect(account.quota?.five_hour?.usedPercent).toBe(20)
+    expect(account.quota).toBeUndefined()
   })
 
   test('malformed config file throws a clear error', async () => {

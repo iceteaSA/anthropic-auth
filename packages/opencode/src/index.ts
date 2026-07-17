@@ -678,7 +678,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     },
   })
-  const MAX_PROFILE_HYDRATION_ATTEMPTS = 64
   const profileHydrationAttempts = new Map<
     string,
     Promise<Awaited<ReturnType<typeof fetchOAuthAccountProfile>> | undefined>
@@ -688,11 +687,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const attemptKey = `${accountId}:${tokenFingerprint(accessToken)}`
     let attempt = profileHydrationAttempts.get(attemptKey)
     if (!attempt) {
-      if (profileHydrationAttempts.size >= MAX_PROFILE_HYDRATION_ATTEMPTS) {
-        const oldestKey = profileHydrationAttempts.keys().next().value
-        if (oldestKey) profileHydrationAttempts.delete(oldestKey)
-      }
-      attempt = fetchOAuthAccountProfile({ accessToken }).catch(() => undefined)
+      const fetchAttempt = fetchOAuthAccountProfile({ accessToken })
+        .catch((error) => {
+          logger.debug('quota', 'failed to hydrate account profile', {
+            account: accountId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          return undefined
+        })
+        .finally(() => {
+          if (profileHydrationAttempts.get(attemptKey) === fetchAttempt) {
+            profileHydrationAttempts.delete(attemptKey)
+          }
+        })
+      attempt = fetchAttempt
       profileHydrationAttempts.set(attemptKey, attempt)
     }
     return attempt
