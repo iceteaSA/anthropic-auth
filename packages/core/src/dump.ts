@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
-import { isSecretKey, relayLog } from './logger.ts'
+import { isSecretKey, logger, relayLog } from './logger.ts'
 
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
 
@@ -16,10 +16,15 @@ const DUMP_USAGE_TITLE = '## Claude Dump Usage'
 const DUMP_USAGE =
   'Usage: `/claude-dump`, `/claude-dump on`, or `/claude-dump off`.'
 const DUMP_DIR_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_DIR'
+const DUMP_MAX_BYTES_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES'
 const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
+const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
+const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
+const DUMP_DIR_PREFIX = 'opencode-anthropic-auth-dumps'
 
 let dumpEnabled = false
 let nextDumpId = 0
+let lastDumpSweepAt = 0
 
 const DIRECT_DUMP_PREVIOUS_BODY_LIMIT = 100
 const directDumpPreviousBodies = new Map<string, string>()
@@ -41,11 +46,96 @@ export function setDumpEnabled(enabled: boolean) {
 export function resetDumpState() {
   dumpEnabled = false
   nextDumpId = 0
+  lastDumpSweepAt = 0
   directDumpPreviousBodies.clear()
 }
 
 export function getDumpDirectory() {
   return process.env[DUMP_DIR_ENV] || DEFAULT_DUMP_DIR
+}
+
+function getDumpMaxBytes() {
+  const configured = Number(process.env[DUMP_MAX_BYTES_ENV])
+  return Number.isFinite(configured) && configured > 0
+    ? Math.floor(configured)
+    : DEFAULT_DUMP_MAX_BYTES
+}
+
+function isExpectedDumpDirectory(path: string) {
+  const resolvedPath = resolve(path)
+  return (
+    dirname(resolvedPath) === resolve(tmpdir()) &&
+    basename(resolvedPath).startsWith(DUMP_DIR_PREFIX)
+  )
+}
+
+export async function sweepDumpDirectory(options: {
+  dumpDir?: string
+  maxBytes?: number
+  protectedPaths?: readonly string[]
+}) {
+  const dumpDir = options.dumpDir ?? getDumpDirectory()
+  const maxBytes = options.maxBytes ?? getDumpMaxBytes()
+  const emptyResult = { removed: 0, freedBytes: 0 }
+  if (!isExpectedDumpDirectory(dumpDir) || maxBytes < 0) return emptyResult
+
+  try {
+    const protectedPaths = new Set(
+      (options.protectedPaths ?? []).map((path) => resolve(path)),
+    )
+    const entries = await readdir(dumpDir, { withFileTypes: true })
+    const files: { path: string; size: number; mtimeMs: number }[] = []
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        if (!entry.isFile()) return
+        const path = join(dumpDir, entry.name)
+        try {
+          const stats = await lstat(path)
+          if (!stats.isFile() || stats.isSymbolicLink()) return
+          files.push({ path, size: stats.size, mtimeMs: stats.mtimeMs })
+        } catch {
+          // Files can disappear while concurrent dump requests finish.
+        }
+      }),
+    )
+
+    let totalBytes = files.reduce((total, file) => total + file.size, 0)
+    if (totalBytes <= maxBytes) return emptyResult
+    files.sort(
+      (left, right) =>
+        left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path),
+    )
+
+    let removed = 0
+    let freedBytes = 0
+    for (const file of files) {
+      if (totalBytes <= maxBytes) break
+      if (protectedPaths.has(resolve(file.path))) continue
+      try {
+        await rm(file.path, { force: true })
+        totalBytes -= file.size
+        freedBytes += file.size
+        removed += 1
+      } catch {
+        // Dump cleanup is best-effort and must not affect request handling.
+      }
+    }
+
+    if (removed > 0) {
+      logger.debug('dump', 'removed old dump files', { removed, freedBytes })
+    }
+    return { removed, freedBytes }
+  } catch {
+    return emptyResult
+  }
+}
+
+function scheduleDumpSweep(dumpDir: string, protectedPaths: readonly string[]) {
+  const now = Date.now()
+  if (now - lastDumpSweepAt < DUMP_SWEEP_INTERVAL_MS) return
+  lastDumpSweepAt = now
+  void sweepDumpDirectory({ dumpDir, protectedPaths }).catch(() => {})
 }
 
 export function parseDumpCommandAction(
@@ -370,6 +460,7 @@ async function dumpRequest(input: {
     }
 
     await Promise.all(writes)
+    scheduleDumpSweep(dumpDir, Object.values(files))
 
     relayLog(
       `dumped request id=${id} session=${shortAffinity(affinity)} body=${files.body} meta=${files.metadata}`,
