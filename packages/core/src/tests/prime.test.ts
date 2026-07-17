@@ -29,6 +29,8 @@ import {
   estimatePrimeCostUsd,
   executePrimeCommand,
   PRIME_CHECK_THROTTLE_MS,
+  PRIME_DUE_OFFSET_MS,
+  PRIME_POST_FIRE_REFRESH_MS,
   type PrimeAccountStatus,
   PrimeManager,
   type PrimeSendResult,
@@ -499,7 +501,7 @@ describe('PrimeManager — due boundary', () => {
 })
 
 describe('PrimeManager — bootstrap', () => {
-  test('missing stored reset with an inactive fresh window fires using the hour bucket marker', async () => {
+  test('missing stored reset with an inactive fresh window fires using the stable bootstrap marker', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
         five_hour: {
@@ -529,7 +531,7 @@ describe('PrimeManager — bootstrap', () => {
 
     expect(h.refreshCalls).toEqual(['main'])
     expect(h.sendCalls.map((call) => call.accountId)).toEqual(['main'])
-    expect(await readdir(markerRoot)).toEqual(['main-7200000'])
+    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
     await h.cleanup()
   })
 
@@ -745,7 +747,7 @@ describe('PrimeManager — bootstrap', () => {
     await observing.cleanup()
   })
 
-  test('an hour-straddling bootstrap fires at most once in the next bucket', async () => {
+  test('persistent reset unavailability produces one bootstrap fire across hours', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
         five_hour: {
@@ -755,8 +757,7 @@ describe('PrimeManager — bootstrap', () => {
         },
       },
     })
-    const firstBucketEnd = 14_400_000
-    let now = firstBucketEnd - 30_000
+    let now = 14_400_000 - 30_000
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -774,15 +775,59 @@ describe('PrimeManager — bootstrap', () => {
     await h.manager.tick()
     now += 5 * 60_000
     await h.manager.tick()
-    now += 60_000
+    now += 60 * 60_000
+    await h.manager.tick()
+    now += 60 * 60_000
+    await h.manager.tick()
+
+    expect(h.sendCalls).toHaveLength(1)
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    await h.cleanup()
+  })
+
+  test('observing a real reset clears the bootstrap marker for the next gap', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    let now = 10_000_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: null as unknown as string,
+          checkedAt: 2,
+        },
+      },
+    })
+    h.manager.options.now = () => now
+
+    await h.manager.tick()
+    expect(h.sendCalls).toHaveLength(1)
+    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+
+    const observedReset = 11_000_000
+    fixture.storage.quota!.mainQuota!.five_hour!.resetsAt = new Date(
+      observedReset,
+    ).toISOString()
+    await h.manager.tick()
+    expect(await readdir(markerRoot)).toEqual([])
+
+    now = observedReset + PRIME_DUE_OFFSET_MS + 1
     await h.manager.tick()
 
     expect(h.sendCalls).toHaveLength(2)
-    expect(h.refreshCalls).toEqual(['main', 'main'])
-    expect((await readdir(markerRoot)).sort()).toEqual([
-      'main-10800000',
-      'main-14400000',
-    ])
+    expect(await readdir(markerRoot)).toEqual([`main-${observedReset}`])
     await h.cleanup()
   })
 })
@@ -922,7 +967,7 @@ describe('PrimeManager — claim atomicity', () => {
     await b.cleanup()
   })
 
-  test('two bootstrap managers in the same hour bucket fire exactly once', async () => {
+  test('two bootstrap managers fire exactly once via the stable marker', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
         five_hour: {
@@ -956,7 +1001,7 @@ describe('PrimeManager — claim atomicity', () => {
     await Promise.all([a.manager.tick(), b.manager.tick()])
 
     expect(a.sendCalls.length + b.sendCalls.length).toBe(1)
-    expect(await readdir(markerRoot)).toEqual(['main-7200000'])
+    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
     await a.cleanup()
     await b.cleanup()
   })
@@ -1455,12 +1500,63 @@ describe('PrimeManager — recordSuccess', () => {
     try {
       await h.manager.tick()
       expect(h.refreshCalls).toEqual(['main'])
-      expect(scheduledDelay).toBe(90_000)
+      expect(scheduledDelay).toBe(PRIME_POST_FIRE_REFRESH_MS)
 
       scheduled?.()
       await Promise.resolve()
 
       expect(h.refreshCalls).toEqual(['main', 'main'])
+      await h.cleanup()
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+      globalThis.clearTimeout = originalClearTimeout
+    }
+  })
+
+  test('post-fire refresh skips when another process disables prime', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    let scheduled: (() => void) | undefined
+    globalThis.setTimeout = ((handler: () => void) => {
+      scheduled = handler
+      return 42
+    }) as typeof setTimeout
+    globalThis.clearTimeout = (() => {}) as typeof clearTimeout
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1_000).toISOString(),
+          checkedAt: 2,
+        },
+      },
+    })
+
+    try {
+      await h.manager.tick()
+      expect(h.refreshCalls).toEqual(['main'])
+      fixture.storage.prime = { enabled: false }
+
+      scheduled?.()
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(h.refreshCalls).toEqual(['main'])
       await h.cleanup()
     } finally {
       globalThis.setTimeout = originalSetTimeout
@@ -1473,13 +1569,25 @@ describe('PrimeManager — marker sweep', () => {
   test('markers older than six hours are removed; fresh markers survive', async () => {
     const oldMarker = join(markerRoot, 'main-100000')
     await writeFile(oldMarker, '', 'utf8')
+    const oldBootstrapMarker = join(markerRoot, 'main-bootstrap')
+    await writeFile(oldBootstrapMarker, '', 'utf8')
     const oldTime = new Date(0)
     await utimes(oldMarker, oldTime, oldTime)
+    await utimes(oldBootstrapMarker, oldTime, oldTime)
 
     const freshMarker = join(markerRoot, 'main-200000')
     await writeFile(freshMarker, '', 'utf8')
 
-    const fixture = makePrimeFixture({})
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(1_000_100_000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -1490,6 +1598,7 @@ describe('PrimeManager — marker sweep', () => {
     const remaining = (await readdir(markerRoot)).sort()
     expect(remaining).toContain('main-200000')
     expect(remaining).not.toContain('main-100000')
+    expect(remaining).not.toContain('main-bootstrap')
     await h.cleanup()
   })
 })
