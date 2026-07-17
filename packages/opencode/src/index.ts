@@ -1126,10 +1126,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
     const accessToken = await getCurrentMainAccessToken()
-    const refreshStartedAt = Date.now()
-    const quota = await quotaManager.refreshMain(accessToken)
-    const fresh = primeQuotaSnapshotIsFreshSince(quota, refreshStartedAt)
-    return { quota, fresh }
+    const result = await quotaManager.refreshMainWithMetadata(accessToken)
+    return { quota: result.quota, fresh: result.fetched }
   }
 
   async function refreshPrimeFallbackQuota(
@@ -1150,18 +1148,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     // state file (M1 persist requirement) and is the SINGLE usage-API
     // call per tick for fallback fresh-checks. The redundant
     // `quotaManager.refreshFallback` call was collapsed (R2).
-    const refreshStartedAt = Date.now()
     const refreshed = await fallbackManager.refreshAccountQuota(
       account,
       storage,
     )
     await fallbackManager.save(storage, [accountId])
-    if (!refreshed.access) {
+    if (!refreshed.account.access) {
       throw new Error(`prime: OAuth account ${accountId} has no access token`)
     }
-    const quota = refreshed.quota ?? {}
-    const fresh = primeQuotaSnapshotIsFreshSince(quota, refreshStartedAt)
-    return { quota, fresh }
+    return {
+      quota: refreshed.account.quota ?? {},
+      fresh: refreshed.fetched,
+    }
   }
 
   async function sendPrime(
@@ -4570,6 +4568,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       ],
     },
     __primeManager: primeManager,
+    __quotaManager: quotaManager,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }

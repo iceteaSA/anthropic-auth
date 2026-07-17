@@ -2884,7 +2884,7 @@ export class FallbackAccountManager {
           stale &&
           !quotaBackoffActive(next.lastQuotaRefreshError, this.now())
         ) {
-          next = await this.refreshAccountQuota(next, storage)
+          next = (await this.refreshAccountQuota(next, storage)).account
           changed = true
         }
         // Single source of truth: evaluate quota policy from the unified
@@ -3289,15 +3289,18 @@ export class FallbackAccountManager {
     // to a direct fetch only when no QuotaManager is wired (e.g. in isolation).
     const fetchSnapshot = (accessToken: string) =>
       this.quotaManager
-        ? this.quotaManager.refreshFallback(target.id, accessToken)
+        ? this.quotaManager.refreshFallbackWithMetadata(target.id, accessToken)
         : fetchOAuthQuotaSnapshot({
             accessToken,
             fetchImpl: this.fetchImpl,
             now: this.now,
-          })
+          }).then((quota) => ({ quota, fetched: true }))
     const fetchStartedAt = this.now()
+    let fetched = false
     try {
-      target.quota = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(target.access)
+      target.quota = result.quota
+      fetched = result.fetched
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (!message.includes('Claude quota check failed: 401')) throw error
@@ -3306,7 +3309,9 @@ export class FallbackAccountManager {
       })
       if (!target.access) throw error
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
-      target.quota = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(target.access)
+      target.quota = result.quota
+      fetched = result.fetched
     }
 
     const latestStorage = await this.load()
@@ -3321,7 +3326,7 @@ export class FallbackAccountManager {
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return latestAccount
+      return { account: latestAccount, fetched: false }
     }
     if (
       latestStorage &&
@@ -3332,7 +3337,7 @@ export class FallbackAccountManager {
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return latestAccount
+      return { account: latestAccount, fetched }
     }
 
     target.lastQuotaRefreshError = undefined
@@ -3352,6 +3357,6 @@ export class FallbackAccountManager {
         target.access,
       )
     }
-    return target
+    return { account: target, fetched }
   }
 }

@@ -8601,6 +8601,94 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
     // The fire still happens against the (now-fresh) quota result.
     expect(primeCalls).toBe(1)
   })
+
+  test('R1: fallback 429 backoff classifies a re-stamped cached quota as stale', async () => {
+    const now = Date.now()
+    const past = now - 120_000
+    const cachedQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(past).toISOString(),
+        checkedAt: now + 60_000,
+      },
+    }
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'fb-access',
+            refresh: 'fb-refresh',
+            expires: now + 10 * 60 * 60_000,
+            quota: cachedQuota,
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(now + 5 * 60 * 60_000).toISOString(),
+              checkedAt: now,
+            },
+          },
+          mainQuotaCheckedAt: now,
+          mainQuotaToken: 'main-access',
+        },
+        prime: { enabled: true },
+      }),
+    )
+
+    let primeCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = typeof input === 'string' ? input : input.url
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(new Response('rate limited', { status: 429 }))
+      }
+      if (url.includes('/v1/messages')) {
+        primeCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 20, output_tokens: 1 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: now + 3600_000,
+        }),
+      { models: {} },
+    )
+    const quotaManager = (plugin as any).__quotaManager
+    quotaManager.setFallback(
+      'work-alt',
+      { quota: cachedQuota, refreshAfter: now, checkedAt: now + 60_000 },
+      'fb-access',
+    )
+    await expect(
+      quotaManager.refreshFallback('work-alt', 'fb-access'),
+    ).rejects.toThrow('429')
+
+    const mgr = (plugin as any).__primeManager
+    await mgr.tick()
+
+    expect(primeCalls).toBe(0)
+  })
 })
 
 describe('claude-prime — warn dedup (R3)', () => {
