@@ -828,6 +828,7 @@ class PersistentRelaySession {
         pending.accepted = false
         pending.acceptedAt = undefined
         pending.responseStartedAt = undefined
+        pending.responseHeadersDelivered = false
         pending.sentAt = perfNowMs()
         pending.retryingBeforeResponse = false
 

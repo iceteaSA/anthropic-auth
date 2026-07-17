@@ -727,6 +727,7 @@ describe('relay client', () => {
   test('websocket optimistic response retries when socket closes after response_start before stream bytes', async () => {
     const originalWebSocket = globalThis.WebSocket
     const sentPayloads: Array<{ id: string; mode: string }> = []
+    const receivedHeaders: Headers[] = []
     let socketCount = 0
 
     class ClosingBeforeStreamBytesWebSocket extends EventTarget {
@@ -769,6 +770,10 @@ describe('relay client', () => {
                 type: 'response_start',
                 id: payload.id,
                 status: 200,
+                headers: {
+                  'anthropic-ratelimit-unified-5h-utilization':
+                    this.socketNumber === 1 ? '0.91' : '0.42',
+                },
               }),
             }),
           )
@@ -811,6 +816,7 @@ describe('relay client', () => {
         body: 'body',
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
+        onResponseHeaders: (value) => receivedHeaders.push(value),
       })
       expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
       expect(await response.text()).toBe('event: message_stop\n\n')
@@ -824,6 +830,11 @@ describe('relay client', () => {
       'full_sync',
     ])
     expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
+    expect(
+      receivedHeaders.map((value) =>
+        value.get('anthropic-ratelimit-unified-5h-utilization'),
+      ),
+    ).toEqual(['0.91', '0.42'])
   })
 
   test('websocket optimistic response reports stream close after bytes without retry', async () => {
