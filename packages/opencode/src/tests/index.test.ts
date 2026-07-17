@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
@@ -3226,6 +3226,73 @@ describe('auth.loader', () => {
       ?.body.parts[0]?.text
 
     expect(text).not.toContain('Max 20x')
+  })
+
+  test('profile persistence failure does not block account display', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? Response.json({
+              organization: {
+                organization_type: 'claude_max',
+                rate_limit_tier: 'default_claude_max_20x',
+              },
+            })
+          : new Response('ok'),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const statePath = getAccountStatePath(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
+    )
+    const stateDir = dirname(statePath)
+    await chmod(stateDir, 0o555)
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    setLogLevel('debug')
+
+    let commandError: unknown
+    try {
+      await plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      })
+    } catch (error) {
+      commandError = error
+    } finally {
+      await chmod(stateDir, 0o755)
+      __setLogTestSink(null)
+      setLogLevel('info')
+    }
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+
+    expect(commandError).toBeInstanceOf(Error)
+    expect((commandError as Error).message).toContain(
+      '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__',
+    )
+    expect(text).toContain('Max 20x')
+    expect(
+      records.filter(
+        (record) =>
+          record.level === 'debug' &&
+          record.channel === 'quota' &&
+          record.message === 'failed to persist account profile',
+      ),
+    ).toHaveLength(1)
   })
 
   test('ordinary model request never calls the profile endpoint', async () => {

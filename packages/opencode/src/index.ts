@@ -698,6 +698,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return attempt
   }
 
+  async function persistProfileStateBestEffort(
+    storage: AccountStorage,
+    scope: Parameters<typeof saveAccountState>[2],
+    accountId: string,
+  ) {
+    try {
+      await saveAccountState(storage, accountStoragePath, scope)
+    } catch (error) {
+      logger.debug('quota', 'failed to persist account profile', {
+        account: accountId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
   async function ensureProfilesForQuotaDisplay(
     storage: AccountStorage,
     mainAccessToken?: string,
@@ -709,9 +724,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       !oauthProfileMatchesToken(storage.main.profile, mainAccessToken)
     ) {
       storage.main.profile = undefined
-      await saveAccountState(storage, accountStoragePath, {
-        mainProfile: true,
-      })
+      await persistProfileStateBestEffort(
+        storage,
+        {
+          mainProfile: true,
+        },
+        'main',
+      )
     }
     if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
       const profile = await hydrateProfileOnce('main', mainAccessToken)
@@ -721,9 +740,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           provider: 'anthropic',
           profile,
         }
-        await saveAccountState(storage, accountStoragePath, {
-          mainProfile: true,
-        })
+        await persistProfileStateBestEffort(
+          storage,
+          {
+            mainProfile: true,
+          },
+          'main',
+        )
       }
     }
 
@@ -735,17 +758,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         !oauthProfileMatchesToken(account.profile, accessToken)
       ) {
         account.profile = undefined
-        await saveAccountState(storage, accountStoragePath, {
-          accounts: [account.id],
-        })
+        await persistProfileStateBestEffort(
+          storage,
+          {
+            accounts: [account.id],
+          },
+          account.id,
+        )
       }
       if (oauthProfileIsFresh(account.profile, now)) continue
       const profile = await hydrateProfileOnce(account.id, accessToken)
       if (profile) {
         account.profile = profile
-        await saveAccountState(storage, accountStoragePath, {
-          accounts: [account.id],
-        })
+        await persistProfileStateBestEffort(
+          storage,
+          {
+            accounts: [account.id],
+          },
+          account.id,
+        )
       }
     }
     return storage
