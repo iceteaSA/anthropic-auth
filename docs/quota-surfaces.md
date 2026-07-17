@@ -143,7 +143,7 @@ Conditional headers (absent on main, present on work-alt): `fallback` appears on
 | Scoped per-model windows | `limits[]` `weekly_scoped` | n/a |
 | Representative/binding marker | `representative-claim` header + `is_active` (inferred) | `x-codex-…-over-…` style flags |
 
-openai-auth is push-based by necessity (QuotaManager fed via `setMain`/`setFallback`); anthropic-auth now combines the usage poll with passive header pushes on direct requests.
+openai-auth is push-based by necessity (QuotaManager fed via `setMain`/`setFallback`); anthropic-auth combines the usage poll with passive header pushes on direct and relayed requests.
 
 ---
 
