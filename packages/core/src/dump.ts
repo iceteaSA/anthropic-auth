@@ -86,8 +86,12 @@ function isDumpArtifactFileName(name: string) {
   const stem = name.replace(DUMP_ARTIFACT_SUFFIX_PATTERN, '')
   if (stem === name) return false
   const match = DUMP_ARTIFACT_ID_PATTERN.exec(stem)
-  if (!match) return false
-  return DIRECT_DUMP_PATTERN.test(match[1]) || RELAY_DUMP_PATTERN.test(match[1])
+  const requestPath = match?.[1]
+  if (!requestPath) return false
+  return (
+    DIRECT_DUMP_PATTERN.test(requestPath) ||
+    RELAY_DUMP_PATTERN.test(requestPath)
+  )
 }
 
 async function writeDumpFile(path: string, contents: string) {
