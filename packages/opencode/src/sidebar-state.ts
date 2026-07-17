@@ -487,7 +487,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        logger.trace('sidebar', 'state lock unavailable; writing unlocked', {
+        logger.trace('sidebar', 'state lock unavailable; write skipped', {
           stateFile,
           error: error instanceof Error ? error.message : String(error),
         })
@@ -514,20 +514,16 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
-      logger.trace(
-        'sidebar',
-        'state lock inspection failed; writing unlocked',
-        {
-          stateFile,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      )
+      logger.trace('sidebar', 'state lock inspection failed; write skipped', {
+        stateFile,
+        error: error instanceof Error ? error.message : String(error),
+      })
       return null
     }
 
     const remainingMs = deadline - Date.now()
     if (remainingMs <= 0) {
-      logger.trace('sidebar', 'state lock budget exhausted; writing unlocked', {
+      logger.warn('sidebar', 'lock budget exhausted, write skipped', {
         stateFile,
         budgetMs,
       })
@@ -612,6 +608,10 @@ export async function setSidebarState(
     .then(async () => {
       await mkdir(dirname(stateFile), { recursive: true })
       const lock = await acquireSidebarStateLock(stateFile)
+      // Sidebar frames are display-only and refresh within seconds; dropping one
+      // is safer than clobbering routing state that may stay authoritative until
+      // another process handles its next request.
+      if (!lock) return
       try {
         let stateToWrite = state
         if (options.routingAuthoritative === false) {
@@ -635,7 +635,7 @@ export async function setSidebarState(
         const wroteState = await writeSidebarStateAtomic(
           stateFile,
           stateToWrite,
-          lock?.ownsLock,
+          lock.ownsLock,
         )
         if (!wroteState) return
         options.onRoutingResolved?.({
@@ -643,7 +643,7 @@ export async function setSidebarState(
           route: stateToWrite.route,
         })
       } finally {
-        await lock?.release()
+        await lock.release()
       }
     })
     .catch(() => {

@@ -17,6 +17,7 @@ import {
   type AccountQuota,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
+  drainSidebarWrites,
   FIVE_HOUR_MS,
   formatPrimeAccountValue,
   formatPrimeCost,
@@ -1053,6 +1054,58 @@ describe('getSidebarState malformed file round-trip', () => {
 })
 
 describe('setSidebarState cross-process writes', () => {
+  for (const routingAuthoritative of [true, false]) {
+    test(`skips ${routingAuthoritative ? 'authoritative' : 'non-authoritative'} writes when the lock budget is exhausted`, async () => {
+      const stateFile = sidebarTestPath(
+        routingAuthoritative
+          ? 'lock-budget-authoritative'
+          : 'lock-budget-merge',
+      )
+      const stateDir = join(stateFile, '..')
+      const lockDir = `${stateFile}.lock`
+      const initial = make({
+        activeId: 'foreign-routing',
+        route: 'foreign-route',
+        fastMode: false,
+        lastUpdated: 300,
+      })
+      const staleWriter = make({
+        activeId: 'stale-routing',
+        route: 'stale-route',
+        fastMode: true,
+        lastUpdated: 200,
+      })
+      const originalContents = JSON.stringify(initial)
+      await mkdir(stateDir, { recursive: true })
+      await writeFile(stateFile, originalContents)
+      await mkdir(lockDir)
+      __setSidebarStateWriteTestHooks({
+        lockBudgetMs: 20,
+        lockRetryMinMs: 1,
+        lockRetryMaxMs: 1,
+      })
+
+      try {
+        await setSidebarState(staleWriter, stateFile, {
+          routingAuthoritative,
+          resolvePreservedRouting: (current) => ({
+            activeId: current.activeId,
+            route: current.route,
+          }),
+        })
+        const drained = await Promise.race([
+          drainSidebarWrites().then(() => true),
+          Bun.sleep(100).then(() => false),
+        ])
+        expect(drained).toBe(true)
+        expect(await readFile(stateFile, 'utf8')).toBe(originalContents)
+      } finally {
+        __setSidebarStateWriteTestHooks(null)
+        await rm(stateDir, { recursive: true, force: true })
+      }
+    })
+  }
+
   test('preserves an authoritative write from another process during a non-authoritative merge', async () => {
     const stateFile = sidebarTestPath('race')
     const stateDir = join(stateFile, '..')
@@ -1323,29 +1376,6 @@ describe('setSidebarState cross-process writes', () => {
       expect(written.activeId).toBe('fresh')
       expect(await readdir(stateDir)).not.toContain('sidebar-state.json.lock')
     } finally {
-      await rm(stateDir, { recursive: true, force: true })
-    }
-  })
-
-  test('writes without the lock when the acquisition budget is exhausted', async () => {
-    const stateFile = sidebarTestPath('lock-budget')
-    const stateDir = join(stateFile, '..')
-    await mkdir(`${stateFile}.lock`, { recursive: true })
-    __setSidebarStateWriteTestHooks({
-      lockBudgetMs: 20,
-      lockRetryMinMs: 5,
-      lockRetryMaxMs: 5,
-    })
-
-    try {
-      await setSidebarState(
-        make({ activeId: 'degraded', route: 'degraded' }),
-        stateFile,
-      )
-      const written = JSON.parse(await readFile(stateFile, 'utf8'))
-      expect(written.activeId).toBe('degraded')
-    } finally {
-      __setSidebarStateWriteTestHooks(null)
       await rm(stateDir, { recursive: true, force: true })
     }
   })
