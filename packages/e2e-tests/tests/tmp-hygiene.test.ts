@@ -10,6 +10,7 @@ import {
   readdir,
   rm,
   symlink,
+  unlink,
   utimes,
   writeFile,
 } from 'node:fs/promises'
@@ -305,6 +306,39 @@ describe('e2e temporary directory hygiene', () => {
       await child.exited
       await removeE2ETempDir(env.tempDir, { root })
     }
+  })
+
+  it('refuses child pid handoff through a planted run.pid symlink', async () => {
+    const root = await createRoot()
+    const env = createIsolatedEnv(root)
+    const targetFile = join(root, 'handoff-target.txt')
+    const runPidFile = join(env.tempDir, 'run.pid')
+    await writeFile(targetFile, 'do not overwrite')
+    await unlink(runPidFile)
+    await symlink(targetFile, runPidFile)
+    const child = Bun.spawn(['true'])
+    const deadPid = child.pid
+    await child.exited
+
+    expect(
+      await cleanupE2ERun({
+        child: unresponsiveChild(deadPid),
+        tempDir: env.tempDir,
+        root,
+        terminationOptions: { termTimeoutMs: 5, killExitTimeoutMs: 5 },
+      }),
+    ).toBe(false)
+    expect(await Bun.file(targetFile).text()).toBe('do not overwrite')
+    const staleTime = new Date('2026-07-15T00:00:00.000Z')
+    const now = new Date('2026-07-17T00:00:00.000Z')
+    await utimes(env.tempDir, staleTime, staleTime)
+
+    await sweepStaleE2ETempDirs({ root, now: now.getTime() })
+
+    expect((await readdir(root)).sort()).toEqual(
+      [env.tempDir.split('/').at(-1), 'handoff-target.txt'].sort(),
+    )
+    await removeE2ETempDir(env.tempDir, { root })
   })
 
   it('removes the temp directory when setup fails before spawning a child', async () => {

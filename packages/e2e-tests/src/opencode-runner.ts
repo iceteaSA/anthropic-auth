@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { type ChildProcess, spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import {
   type Dirent,
   mkdirSync,
@@ -8,7 +9,15 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs'
-import { lstat, readdir, readFile, rm } from 'node:fs/promises'
+import {
+  lstat,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 
@@ -87,6 +96,7 @@ export async function sweepStaleE2ETempDirs(
 }
 
 async function hasLiveRunOwner(path: string) {
+  if (activeRunDirs.has(resolve(path))) return true
   try {
     const value = await readFile(join(path, RUN_PID_FILE), 'utf8')
     const pid = Number(value.trim())
@@ -101,6 +111,45 @@ async function hasLiveRunOwner(path: string) {
   } catch {
     return false
   }
+}
+
+async function handoffRunPid(tempDir: string, root: string, childPid: number) {
+  const runPidPath = join(tempDir, RUN_PID_FILE)
+  if (
+    resolve(dirname(runPidPath)) !== resolve(tempDir) ||
+    !isExpectedE2ETempDir(dirname(runPidPath), root)
+  ) {
+    return false
+  }
+
+  try {
+    const stats = await lstat(runPidPath)
+    if (!stats.isFile() || stats.isSymbolicLink()) return false
+  } catch {
+    return false
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const temporaryPath = join(
+      tempDir,
+      `.${RUN_PID_FILE}.${randomBytes(12).toString('hex')}.tmp`,
+    )
+    let created = false
+    try {
+      await writeFile(temporaryPath, String(childPid), {
+        encoding: 'utf8',
+        flag: 'wx',
+      })
+      created = true
+      await rename(temporaryPath, runPidPath)
+      return true
+    } catch (error) {
+      if (created) await unlink(temporaryPath).catch(() => {})
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue
+      return false
+    }
+  }
+  return false
 }
 
 export type SpawnedOpencode = {
@@ -291,11 +340,9 @@ export async function cleanupE2ERun(options: {
       Number.isInteger(childPid) &&
       childPid > 0
     ) {
-      try {
-        writeFileSync(join(options.tempDir, RUN_PID_FILE), String(childPid))
+      const root = options.root ?? tmpdir()
+      if (await handoffRunPid(options.tempDir, root, childPid)) {
         activeRunDirs.delete(resolve(options.tempDir))
-      } catch {
-        // Retain the active marker when child ownership cannot be persisted safely.
       }
     }
     return false
