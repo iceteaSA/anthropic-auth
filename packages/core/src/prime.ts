@@ -399,6 +399,13 @@ export function primeMarkerPath(
   return join(markerDir, `${encodeURIComponent(accountId)}-${resetsAtEpochMs}`)
 }
 
+function primeBootstrapMarkerPath(
+  markerDir: string,
+  accountId: 'main' | string,
+): string {
+  return join(markerDir, `${encodeURIComponent(accountId)}-bootstrap`)
+}
+
 function primeAccountLabel(
   id: 'main' | string,
   fallback?: FallbackAccount,
@@ -662,6 +669,17 @@ export class PrimeManager {
       }
 
       const storedResetEpoch = storedResetMs(evaluation.storedFiveHour)
+      const markerDir = this.options.markerDir ?? defaultMarkerDir()
+      const bootstrapMarkerPath = primeBootstrapMarkerPath(
+        markerDir,
+        evaluation.id,
+      )
+      if (storedResetEpoch !== undefined) {
+        // A real reset epoch moves deduplication back to epoch-keyed claims and
+        // releases the sentinel for a later unobserved window.
+        await rm(bootstrapMarkerPath, { force: true })
+        if (this.stopped) return
+      }
       if (
         storedResetEpoch !== undefined &&
         now < storedResetEpoch + PRIME_DUE_OFFSET_MS
@@ -672,14 +690,10 @@ export class PrimeManager {
         return
       }
 
-      const expectedMarker =
-        storedResetEpoch ?? Math.floor(now / 3_600_000) * 3_600_000
-      const markerDir = this.options.markerDir ?? defaultMarkerDir()
-      const expectedMarkerPath = primeMarkerPath(
-        markerDir,
-        evaluation.id,
-        expectedMarker,
-      )
+      const expectedMarkerPath =
+        storedResetEpoch === undefined
+          ? bootstrapMarkerPath
+          : primeMarkerPath(markerDir, evaluation.id, storedResetEpoch)
       try {
         await stat(expectedMarkerPath)
         // A completed claim makes another forced poll redundant; the normal
@@ -766,17 +780,15 @@ export class PrimeManager {
       }
       this.windowActive.delete(evaluation.id)
 
-      // Bootstrap claims use an hour bucket because cross-process dedup needs
-      // every process to independently compute the same marker epoch.
-      const markerEpoch =
-        freshResetEpoch ??
-        storedResetEpoch ??
-        Math.floor(now / 3_600_000) * 3_600_000
-      const markerPath = await this.tryClaim(evaluation.id, markerEpoch)
+      const markerEpoch = freshResetEpoch ?? storedResetEpoch
+      const markerPath =
+        markerEpoch === undefined
+          ? await this.tryClaimBootstrap(evaluation.id)
+          : await this.tryClaim(evaluation.id, markerEpoch)
       if (!markerPath) {
         logger.debug('prime', 'claim lost', {
           account: evaluation.label,
-          marker: `${evaluation.id}-${markerEpoch}`,
+          marker: `${evaluation.id}-${markerEpoch ?? 'bootstrap'}`,
         })
         return
       }
@@ -802,6 +814,21 @@ export class PrimeManager {
   ): Promise<string | null> {
     const dir = this.options.markerDir ?? defaultMarkerDir()
     const markerPath = primeMarkerPath(dir, accountId, resetsAtEpochMs)
+    return this.tryClaimPath(dir, markerPath)
+  }
+
+  private async tryClaimBootstrap(
+    accountId: 'main' | string,
+  ): Promise<string | null> {
+    const dir = this.options.markerDir ?? defaultMarkerDir()
+    const markerPath = primeBootstrapMarkerPath(dir, accountId)
+    return this.tryClaimPath(dir, markerPath)
+  }
+
+  private async tryClaimPath(
+    dir: string,
+    markerPath: string,
+  ): Promise<string | null> {
     try {
       await mkdir(dir, { recursive: true })
     } catch {
@@ -913,7 +940,11 @@ export class PrimeManager {
     const timer = setTimeout(() => {
       this.postFireRefreshTimers.delete(timer)
       if (this.stopped) return
-      void this.options.refreshQuota(evaluation.id).catch((error) => {
+      void (async () => {
+        const storage = await this.options.loadStorage()
+        if (this.stopped || storage?.prime?.enabled !== true) return
+        await this.options.refreshQuota(evaluation.id)
+      })().catch((error) => {
         logger.debug('prime', 'post-fire refresh failed', {
           account: evaluation.label,
           error: error instanceof Error ? error.message : String(error),
