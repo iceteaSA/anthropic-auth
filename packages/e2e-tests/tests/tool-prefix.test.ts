@@ -15,17 +15,17 @@ afterEach(async () => {
 
 describe('OpenCode Anthropic auth e2e', () => {
   it('keeps sidebar state inside the isolated run directory', async () => {
-    const originalTmpDir = process.env.TMPDIR
     const fakeTmpDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-global-'))
     const globalStateDir = join(fakeTmpDir, 'opencode-anthropic-auth')
     const globalStateFile = join(globalStateDir, 'sidebar-state.json')
     const sentinel = '{"sentinel":"operator-live-state"}\n'
     await mkdir(globalStateDir)
     await writeFile(globalStateFile, sentinel)
-    process.env.TMPDIR = fakeTmpDir
 
     try {
-      harness = await E2EHarness.create()
+      // Only the child sees the fake TMPDIR; harness lifecycle paths stay in the real system tmpdir.
+      harness = await E2EHarness.create({ childTmpDir: fakeTmpDir })
+      expect(harness.opencode.env.tempDir.startsWith(fakeTmpDir)).toBe(false)
       harness.script([{ type: 'text', text: 'isolation checked' }])
       const sessionId = await harness.createSession()
       await harness.sendPrompt(sessionId, 'verify isolated sidebar state')
@@ -43,8 +43,6 @@ describe('OpenCode Anthropic auth e2e', () => {
     } finally {
       await harness?.dispose()
       harness = null
-      if (originalTmpDir === undefined) delete process.env.TMPDIR
-      else process.env.TMPDIR = originalTmpDir
       await rm(fakeTmpDir, { recursive: true, force: true })
     }
   }, 90_000)

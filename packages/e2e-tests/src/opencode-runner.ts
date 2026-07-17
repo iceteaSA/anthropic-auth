@@ -179,6 +179,7 @@ export type SpawnOptions = {
   }
   port?: number
   beforeSpawn?: (env: IsolatedEnv) => void
+  childTmpDir?: string
 }
 
 async function pickFreePort() {
@@ -406,6 +407,7 @@ export async function spawnOpencode(
     childEnv.XDG_CONFIG_HOME = env.configDir
     childEnv.XDG_DATA_HOME = env.dataDir
     childEnv.XDG_CACHE_HOME = env.cacheDir
+    if (options.childTmpDir) childEnv.TMPDIR = options.childTmpDir
     childEnv.OPENCODE_AUTH_CONTENT = JSON.stringify({
       anthropic: {
         type: 'oauth',
