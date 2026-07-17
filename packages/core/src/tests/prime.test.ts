@@ -747,6 +747,62 @@ describe('PrimeManager — bootstrap', () => {
     await observing.cleanup()
   })
 
+  test('observing a reset does not expose a claim gap to a stale manager', async () => {
+    const staleFixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    const observedFixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 7_234_567
+    const fresh: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: 2,
+      },
+    }
+    const observing = await makeHarness({
+      storage: observedFixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: fresh,
+    })
+
+    await observing.manager.tick()
+    expect(observing.sendCalls).toHaveLength(1)
+    observedFixture.storage.quota!.mainQuota!.five_hour!.resetsAt = new Date(
+      now + 60_000,
+    ).toISOString()
+    await observing.manager.tick()
+
+    const stale = await makeHarness({
+      storage: staleFixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: fresh,
+    })
+    await stale.manager.tick()
+
+    expect(stale.refreshCalls).toEqual([])
+    expect(stale.sendCalls).toEqual([])
+    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    await observing.cleanup()
+    await stale.cleanup()
+  })
+
   test('persistent reset unavailability produces one bootstrap fire across hours', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
@@ -786,7 +842,7 @@ describe('PrimeManager — bootstrap', () => {
     await h.cleanup()
   })
 
-  test('observing a real reset clears the bootstrap marker for the next gap', async () => {
+  test('a real reset replaces the bootstrap marker only after its epoch claim', async () => {
     const fixture = makePrimeFixture({
       mainQuota: {
         five_hour: {
@@ -821,7 +877,7 @@ describe('PrimeManager — bootstrap', () => {
       observedReset,
     ).toISOString()
     await h.manager.tick()
-    expect(await readdir(markerRoot)).toEqual([])
+    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
 
     now = observedReset + PRIME_DUE_OFFSET_MS + 1
     await h.manager.tick()

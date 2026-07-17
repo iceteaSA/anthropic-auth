@@ -674,12 +674,6 @@ export class PrimeManager {
         markerDir,
         evaluation.id,
       )
-      if (storedResetEpoch !== undefined) {
-        // A real reset epoch moves deduplication back to epoch-keyed claims and
-        // releases the sentinel for a later unobserved window.
-        await rm(bootstrapMarkerPath, { force: true })
-        if (this.stopped) return
-      }
       if (
         storedResetEpoch !== undefined &&
         now < storedResetEpoch + PRIME_DUE_OFFSET_MS
@@ -701,6 +695,14 @@ export class PrimeManager {
         return
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      if (
+        storedResetEpoch === undefined &&
+        (await this.hasAnyClaimMarker(evaluation.id))
+      ) {
+        // The bootstrap sentinel is replaced only after an epoch claim exists.
+        // A stale process must observe one side of that transition.
+        return
       }
       if (this.stopped) return
 
@@ -799,6 +801,16 @@ export class PrimeManager {
         return
       }
 
+      if (markerEpoch !== undefined) {
+        // Create the epoch claim before releasing the bootstrap sentinel so
+        // concurrent processes never observe an unclaimed transition gap.
+        await rm(bootstrapMarkerPath, { force: true })
+        if (this.stopped) {
+          await rm(markerPath, { force: true })
+          return
+        }
+      }
+
       await this.fire(evaluation, now, postClaimStorage)
     } catch (error) {
       logger.warn('prime', 'account evaluation failed', {
@@ -840,6 +852,19 @@ export class PrimeManager {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'EEXIST') return null
+      throw error
+    }
+  }
+
+  private async hasAnyClaimMarker(
+    accountId: 'main' | string,
+  ): Promise<boolean> {
+    const dir = this.options.markerDir ?? defaultMarkerDir()
+    const prefix = `${encodeURIComponent(accountId)}-`
+    try {
+      return (await readdir(dir)).some((entry) => entry.startsWith(prefix))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
       throw error
     }
   }
