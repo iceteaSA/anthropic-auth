@@ -1,5 +1,12 @@
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readdir, unlink, writeFile } from 'node:fs/promises'
+import {
+  lstat,
+  mkdir,
+  readdir,
+  rename,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
@@ -21,6 +28,16 @@ const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
 const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
 const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
+const DUMP_ARTIFACT_SUFFIX_PATTERN = /\.(body|meta|relay|request)\.json$/
+const DUMP_ARTIFACT_ID_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-\d{5}-(.+)$/
+const DUMP_SEGMENT_PATTERN = '[a-zA-Z0-9._-]'
+const DIRECT_DUMP_PATTERN = new RegExp(
+  `^${DUMP_SEGMENT_PATTERN}{1,80}-direct(?:-${DUMP_SEGMENT_PATTERN}{1,80})?$`,
+)
+const RELAY_DUMP_PATTERN = new RegExp(
+  `^${DUMP_SEGMENT_PATTERN}{1,80}-(?:http|websocket)-p[12]-(?:full_sync|patch)$`,
+)
 
 let dumpEnabled = false
 let nextDumpId = 0
@@ -65,10 +82,30 @@ function isConfiguredDumpDirectory(path: string) {
   return resolve(path) === resolve(getDumpDirectory())
 }
 
+function isDumpArtifactFileName(name: string) {
+  const stem = name.replace(DUMP_ARTIFACT_SUFFIX_PATTERN, '')
+  if (stem === name) return false
+  const match = DUMP_ARTIFACT_ID_PATTERN.exec(stem)
+  if (!match) return false
+  return DIRECT_DUMP_PATTERN.test(match[1]) || RELAY_DUMP_PATTERN.test(match[1])
+}
+
+async function writeDumpFile(path: string, contents: string) {
+  const partialPath = `${path}.partial`
+  try {
+    await writeFile(partialPath, contents, 'utf8')
+    await rename(partialPath, path)
+  } catch (error) {
+    await unlink(partialPath).catch(() => {})
+    throw error
+  }
+}
+
 /**
- * Caps the configured dump directory. A custom path opts its stale regular
- * files into deletion; symlinked directories and files younger than the
- * newness floor remain protected.
+ * Caps completed dump artifacts in the configured directory. A zero-byte cap
+ * disables sweeping. Custom directories may contain unrelated files: only
+ * recognized final artifact names are eligible, while symlinks, partial
+ * writes, and files younger than the newness floor remain protected.
  */
 export async function sweepDumpDirectory(options: {
   dumpDir?: string
@@ -82,7 +119,7 @@ export async function sweepDumpDirectory(options: {
   const now = options.now ?? Date.now()
   const minAgeMs = options.minAgeMs ?? DUMP_SWEEP_NEWNESS_FLOOR_MS
   const emptyResult = { removed: 0, freedBytes: 0 }
-  if (!isConfiguredDumpDirectory(dumpDir) || maxBytes < 0) return emptyResult
+  if (!isConfiguredDumpDirectory(dumpDir) || maxBytes <= 0) return emptyResult
 
   try {
     const dumpDirStats = await lstat(dumpDir)
@@ -95,7 +132,7 @@ export async function sweepDumpDirectory(options: {
 
     await Promise.all(
       entries.map(async (entry) => {
-        if (!entry.isFile()) return
+        if (!entry.isFile() || !isDumpArtifactFileName(entry.name)) return
         const path = join(dumpDir, entry.name)
         try {
           const stats = await lstat(path)
@@ -432,27 +469,22 @@ async function dumpRequest(input: {
     }
 
     const writes = [
-      writeFile(files.body, input.bodyText, 'utf8'),
-      writeFile(
-        files.metadata,
-        `${JSON.stringify(metadata, null, 2)}\n`,
-        'utf8',
-      ),
+      writeDumpFile(files.body, input.bodyText),
+      writeDumpFile(files.metadata, `${JSON.stringify(metadata, null, 2)}\n`),
     ]
 
     if (input.payload !== undefined && files.relay) {
       writes.push(
-        writeFile(
+        writeDumpFile(
           files.relay,
           `${JSON.stringify(redactForDump(input.payload), null, 2)}\n`,
-          'utf8',
         ),
       )
     }
 
     if (input.request !== undefined && files.request) {
       writes.push(
-        writeFile(
+        writeDumpFile(
           files.request,
           `${JSON.stringify(
             redactForDump({
@@ -462,7 +494,6 @@ async function dumpRequest(input: {
             null,
             2,
           )}\n`,
-          'utf8',
         ),
       )
     }
