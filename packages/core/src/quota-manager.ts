@@ -25,6 +25,7 @@ import {
   isQuotaPolicyAuthError,
   quotaBackoffActive,
 } from './accounts.ts'
+import { mergeHeaderQuotaSnapshot } from './quota-headers.ts'
 
 // Capture real setTimeout before tests can mock globalThis.setTimeout
 const nativeSetTimeout = globalThis.setTimeout
@@ -178,6 +179,44 @@ export class QuotaManager {
     } else {
       this.fallbackTokenFps.delete(accountId)
     }
+  }
+
+  pushMainFromHeaders(
+    accessToken: string,
+    incoming: OAuthQuotaSnapshot,
+  ): QuotaEntry {
+    const checkedAt = incoming.checkedAt ?? this.now()
+    const accessTokenFp = tokenFingerprint(accessToken)
+    const quota = mergeHeaderQuotaSnapshot(
+      this.mainTokenFp === accessTokenFp ? this.main?.quota : undefined,
+      incoming,
+    )
+    const entry = {
+      quota,
+      checkedAt,
+      refreshAfter: getQuotaNextRefreshAt(quota, this.storage, checkedAt),
+    }
+    this.setMain(accessToken, entry)
+    return entry
+  }
+
+  pushFallbackFromHeaders(
+    accountId: string,
+    accessToken: string,
+    incoming: OAuthQuotaSnapshot,
+  ): QuotaEntry {
+    const checkedAt = incoming.checkedAt ?? this.now()
+    const quota = mergeHeaderQuotaSnapshot(
+      this.getFallback(accountId, accessToken)?.quota,
+      incoming,
+    )
+    const entry = {
+      quota,
+      checkedAt,
+      refreshAfter: getQuotaNextRefreshAt(quota, this.storage, checkedAt),
+    }
+    this.setFallback(accountId, entry, accessToken)
+    return entry
   }
 
   // =========================================================================

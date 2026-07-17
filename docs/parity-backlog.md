@@ -337,6 +337,24 @@ production-only regression (env-override bypass) — first-hand DIFF review caug
 
 ---
 
+## 8. Relay response eligibility for quota harvest — FOLLOW-UP
+
+The corrected Miniflare gate confirms both relay transports preserve
+`anthropic-ratelimit-unified-*`: the HTTP Worker copies `upstream.headers` into its response and
+WebSocket sends them in `response_start`. The earlier HTTP-negative test omitted
+`x-session-affinity`, so `sendViaRelay` returned its direct fallback without reaching the Worker.
+Quota harvest remains direct-only at the client `usedRelay` guard because WebSocket response
+headers are transport-reconstructed and are not yet canonical harvest evidence. Resolve that
+eligibility/synthetic-header question at the client guard before enabling relay harvest. Do not add
+a quota side channel.
+
+## 9. Pi quota-header harvest parity — FOLLOW-UP
+
+Pi uses the distinct `packages/pi/src/stream.ts` response path. Header harvest, served-account
+attribution, sidecar persistence, and quota display parity remain out of scope for v1. Port the
+OpenCode direct-path behavior without sharing request-path state implicitly, then gate Pi's own
+streaming response headers and malformed-header handling.
+
 ## Implementation phase (operator directive)
 
 When implementation begins, create a **fresh parity branch off `upstream/main`** — NOT off `dev`,

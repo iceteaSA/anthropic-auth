@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
 import {
+  buildAccountDialogOption,
   buildKillswitchThresholdSeed,
   buildPrimeStatusRows,
   handlePrimeStatusOption,
@@ -99,5 +100,24 @@ describe('openCommandDialog — claude-prime modal interaction (M6)', () => {
       returned = true
     })
     expect(returned).toBe(true)
+  })
+})
+
+describe('buildAccountDialogOption', () => {
+  test('threads the tier label into the account row detail', () => {
+    expect(
+      buildAccountDialogOption({
+        id: 'work',
+        label: 'Work',
+        role: 'fallback',
+        enabled: true,
+        quotaPercent: 22,
+        tierLabel: 'Team · Max 5x',
+      }),
+    ).toEqual({
+      title: 'Work [fallback] 22%',
+      value: 'work',
+      description: 'Team · Max 5x',
+    })
   })
 })

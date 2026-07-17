@@ -1,20 +1,25 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
+  __setLogTestSink,
   type AccountStorage,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   getAccountStatePath,
   hashRefreshToken,
+  type LogTestRecord,
   loadAccounts,
+  type OAuthAccount,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  PROFILE_TTL_MS,
   resetCache1hState,
   resetDumpState,
   resetFastModeState,
   saveAccountState,
   saveAccounts,
+  setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
@@ -598,6 +603,7 @@ describe('auth.loader', () => {
     resetDumpState()
     resetFastModeState()
     resetNotificationsForTest()
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -608,6 +614,7 @@ describe('auth.loader', () => {
     globalThis.clearInterval = originalClearInterval
     Math.random = originalRandom
     resetNotificationsForTest()
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -2746,6 +2753,651 @@ describe('auth.loader', () => {
     expect(text).toContain('### fallback personal (fallback)')
     expect(text).toContain('5h: 75% remaining')
     expect(text).toContain('1w: 50% remaining')
+  })
+
+  test('profile fetch runs once per account per boot and persists the result', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const mockClient = createMockClient()
+    const profileCalls: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        const auth = new Headers(init?.headers).get('authorization') ?? ''
+        if (url.includes('/api/oauth/profile')) {
+          profileCalls.push(auth)
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: auth.includes('fallback')
+                  ? 'claude_team'
+                  : 'claude_max',
+                rate_limit_tier: auth.includes('fallback')
+                  ? 'default_claude_max_5x'
+                  : 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    for (let call = 0; call < 2; call++) {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    }
+
+    expect(profileCalls).toEqual([
+      'Bearer main-access',
+      'Bearer fallback-access',
+    ])
+    const loaded = await loadAccounts()
+    expect(loaded?.main?.profile?.tier).toBe('default_claude_max_20x')
+    expect((loaded?.accounts[0] as any)?.profile?.tier).toBe(
+      'default_claude_max_5x',
+    )
+  })
+
+  test('fresh profile under seven days skips fetch', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(
+        Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 20 },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('main token rotation clears a stale bound profile before display', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('old-access'),
+          },
+        },
+      }),
+    )
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? new Response('failed', { status: 500 })
+          : new Response('ok'),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'new-access',
+          refresh: 'new-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text
+
+    expect(text).not.toContain('Max 20x')
+    expect((await loadAccounts())?.main?.profile).toBeUndefined()
+  })
+
+  test('same main token keeps a fresh bound profile without refetching', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(0)
+    expect((await loadAccounts())?.main?.profile?.tier).toBe(
+      'default_claude_max_20x',
+    )
+  })
+
+  test('boot profile hydration publishes tier labels to the sidebar', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const state = await waitForSidebarState(
+      (value) => value.main.tierLabel === 'Max 20x',
+    )
+
+    expect(state.main.tierLabel).toBe('Max 20x')
+    expect(profileCalls).toBe(1)
+  })
+
+  test('mock-environment opt-out prevents boot profile network calls', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await Bun.sleep(20)
+
+    expect(profileCalls).toBe(0)
+  })
+
+  test('token rotation hydrates the new profile once and restores its tier label', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const profileCalls: string[] = []
+    let liveAccess = 'token-a'
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (extractUrl(input).includes('/api/oauth/profile')) {
+          const authorization = new Headers(init?.headers).get('authorization')
+          profileCalls.push(authorization ?? '')
+          const firstToken = authorization?.includes('token-a')
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: firstToken ? 'claude_team' : 'claude_max',
+                rate_limit_tier: firstToken
+                  ? 'default_claude_max_5x'
+                  : 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const showAccounts = async () => {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      return (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+        ?.body.parts[0]?.text as string
+    }
+
+    expect(await showAccounts()).toContain('Team · Max 5x')
+    liveAccess = 'token-b'
+    expect(await showAccounts()).toContain('Max 20x')
+    expect(await showAccounts()).toContain('Max 20x')
+
+    expect(profileCalls).toEqual(['Bearer token-a', 'Bearer token-b'])
+    expect((await loadAccounts())?.main?.profile?.tokenFingerprint).toBe(
+      tokenFingerprint('token-b'),
+    )
+  })
+
+  test('expired profile TTL triggers a fresh hydration in the same process', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const originalDateNow = Date.now
+    let now = 1_000_000
+    let profileCalls = 0
+    Date.now = () => now
+    try {
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/profile')) {
+          profileCalls++
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: 'claude_max',
+                rate_limit_tier: 'default_claude_max_20x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(mockClient)
+      await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: now + PROFILE_TTL_MS * 3,
+          }),
+        { models: {} },
+      )
+      const showAccounts = async () => {
+        await expect(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: '',
+            sessionID: 'session-1',
+          }),
+        ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      }
+
+      await showAccounts()
+      now += PROFILE_TTL_MS + 1
+      await showAccounts()
+
+      expect(profileCalls).toBe(2)
+      expect((await loadAccounts())?.main?.profile?.checkedAt).toBe(now)
+    } finally {
+      Date.now = originalDateNow
+    }
+  })
+
+  test('completed profile hydrations do not block later token generations', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let profileCalls = 0
+    let liveAccess = 'token-0'
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const showAccounts = async () => {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    }
+
+    for (let generation = 0; generation < 66; generation++) {
+      liveAccess = `token-${generation}`
+      await showAccounts()
+    }
+    liveAccess = 'token-0'
+    await showAccounts()
+
+    expect(profileCalls).toBe(67)
+  })
+
+  test('stale profile refreshes on display', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'old',
+            orgType: 'claude_max',
+            checkedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
+          },
+        },
+      }),
+    )
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(
+        Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 20 },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(createMockClient())
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+
+    expect(profileCalls).toBe(1)
+    expect((await loadAccounts())?.main?.profile?.tier).toBe(
+      'default_claude_max_20x',
+    )
+  })
+
+  test('profile fetch failure is silent and label is omitted', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? new Response('failed', { status: 500 })
+          : Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    setLogLevel('debug')
+
+    try {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel('info')
+    }
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text
+
+    expect(text).not.toContain('Max 20x')
+    expect(
+      records.filter(
+        (record) =>
+          record.level === 'debug' &&
+          record.channel === 'quota' &&
+          record.message === 'failed to hydrate account profile' &&
+          record.payload?.account === 'main',
+      ),
+    ).toHaveLength(1)
+  })
+
+  test('profile persistence failure does not block account display', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    globalThis.fetch = mock((input: string | URL | Request) =>
+      Promise.resolve(
+        extractUrl(input).includes('/api/oauth/profile')
+          ? Response.json({
+              organization: {
+                organization_type: 'claude_max',
+                rate_limit_tier: 'default_claude_max_20x',
+              },
+            })
+          : new Response('ok'),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const statePath = getAccountStatePath(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
+    )
+    const stateDir = dirname(statePath)
+    await chmod(stateDir, 0o555)
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    setLogLevel('debug')
+
+    let commandError: unknown
+    try {
+      await plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      })
+    } catch (error) {
+      commandError = error
+    } finally {
+      await chmod(stateDir, 0o755)
+      __setLogTestSink(null)
+      setLogLevel('info')
+    }
+    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
+      ?.body.parts[0]?.text as string
+
+    expect(commandError).toBeInstanceOf(Error)
+    expect((commandError as Error).message).toContain(
+      '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__',
+    )
+    expect(text).toContain('Max 20x')
+    expect(
+      records.filter(
+        (record) =>
+          record.level === 'debug' &&
+          record.channel === 'quota' &&
+          record.message === 'failed to persist account profile',
+      ),
+    ).toHaveLength(1)
+  })
+
+  test('ordinary model request never calls the profile endpoint', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let profileCalls = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) profileCalls++
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(profileCalls).toBe(0)
   })
 
   test('persistent claudeFast setting makes fetch wrapper request fast mode', async () => {
@@ -5164,6 +5816,441 @@ describe('auth.loader', () => {
     )
     expect(state.fallbacks[0]?.id).toBe('fallback-1')
   })
+
+  describe('quota header harvest', () => {
+    const quotaHeaders = {
+      'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+      'anthropic-ratelimit-unified-5h-utilization': '0.78',
+      'anthropic-ratelimit-unified-5h-reset': '1784246400',
+      'anthropic-ratelimit-unified-7d-utilization': '0.4',
+      'anthropic-ratelimit-unified-7d-reset': '1784628000',
+    }
+
+    const harvestStorage = (accounts: AccountStorage['accounts'] = []) =>
+      createFallbackStorage({
+        accounts,
+        quota: { enabled: false },
+      })
+
+    async function loadFetch(
+      getAccessToken: () => string = () => 'main-access',
+    ) {
+      const plugin = await getPlugin()
+      return plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: getAccessToken(),
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+    }
+
+    async function waitForState(predicate: (state: any) => boolean) {
+      let lastState: unknown
+      for (let attempt = 0; attempt < 200; attempt++) {
+        try {
+          const state = JSON.parse(
+            await readFile(
+              getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE),
+              'utf8',
+            ),
+          )
+          lastState = state
+          if (predicate(state)) return state
+        } catch {}
+        await Bun.sleep(10)
+      }
+      throw new Error(
+        `quota state did not persist: ${JSON.stringify(lastState)}`,
+      )
+    }
+
+    test('main 200 response pushes unified headers before returning the response', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('main-ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(await response.text()).toBe('main-ok')
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(state.main.quotaToken).toBe(tokenFingerprint('main-access'))
+    })
+
+    test('main header push skips persistence after access-token rotation', async () => {
+      let liveAccessToken = 'old-main-access'
+      const existingQuota = {
+        five_hour: {
+          usedPercent: 11,
+          remainingPercent: 89,
+          checkedAt: 1,
+        },
+        source: 'poll' as const,
+        checkedAt: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainQuota: existingQuota,
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: tokenFingerprint('new-main-access'),
+          },
+        }),
+      )
+      let resolveResponse: ((response: Response) => void) | undefined
+      let markRequestStarted: (() => void) | undefined
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve
+      })
+      const requestAuthorizations: Array<string | null> = []
+      globalThis.fetch = mock(
+        (_input: string | URL | Request, init?: RequestInit) =>
+          new Promise<Response>((resolve) => {
+            requestAuthorizations.push(
+              new Headers(init?.headers).get('authorization'),
+            )
+            resolveResponse = resolve
+            markRequestStarted?.()
+          }),
+      ) as unknown as typeof fetch
+      const result = await loadFetch(() => liveAccessToken)
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      setLogLevel('debug')
+
+      const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
+      await requestStarted
+      liveAccessToken = 'new-main-access'
+      resolveResponse?.(new Response('main-ok', { headers: quotaHeaders }))
+      await responsePromise
+      await Bun.sleep(100)
+      const rawState = JSON.parse(
+        await readFile(
+          getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE),
+          'utf8',
+        ),
+      )
+      const reloaded = await loadAccounts()
+
+      expect(
+        records.some(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+        ),
+      ).toBe(true)
+      expect(requestAuthorizations[0]).toBe('Bearer old-main-access')
+      expect(rawState.main.quota).toEqual(existingQuota)
+      expect(rawState.main.quotaToken).toBe(tokenFingerprint('new-main-access'))
+      expect(reloaded?.quota?.mainQuota).toEqual(existingQuota)
+      expect(reloaded?.quota?.mainQuotaToken).toBe(
+        tokenFingerprint('new-main-access'),
+      )
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
+    test('main header push preserves persisted poll backoff across reload', async () => {
+      const pollBackoff = {
+        message: 'Claude quota check failed: 429 — rate limited',
+        checkedAt: Date.now(),
+        nextRetryAt: Date.now() + 60_000,
+        retryCount: 1,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainLastQuotaApiError: pollBackoff,
+          },
+        }),
+      )
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('main-ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'main-ok',
+      )
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+      const reloaded = await loadAccounts()
+
+      expect(state.main.lastQuotaApiError).toEqual(pollBackoff)
+      expect(state.main.quota.five_hour.usedPercent).toBe(78)
+      expect(reloaded?.quota?.mainLastQuotaApiError).toEqual(pollBackoff)
+      expect(reloaded?.quota?.mainQuota?.source).toBe('headers')
+    })
+
+    test('primary adapter harvests one response frame and makes no corroborating usage request', async () => {
+      await useTempAccountFile(harvestStorage())
+      let messageCalls = 0
+      let usageCalls = 0
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) usageCalls++
+        if (url.includes('/v1/messages')) messageCalls++
+        return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForState(
+        (value) => value.main?.quota?.source === 'headers',
+      )
+
+      expect(messageCalls).toBe(1)
+      expect(usageCalls).toBe(0)
+      expect(
+        records.filter(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+        ),
+      ).toHaveLength(1)
+      expect(state.main.quota.source).toBe('headers')
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
+    test('fallback-served response updates that fallback and not main', async () => {
+      await useTempAccountFile(harvestStorage(createFallbackStorage().accounts))
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'fallback-ok',
+      )
+      const state = await waitForState(
+        (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
+      )
+      expect(state.main?.quota?.source).not.toBe('headers')
+    })
+
+    test('fallback header push preserves persisted poll backoff across reload', async () => {
+      const pollBackoff = {
+        message: 'Claude quota check failed: 429 — rate limited',
+        checkedAt: Date.now(),
+        nextRetryAt: Date.now() + 60_000,
+        retryCount: 1,
+      }
+      const fallback = createFallbackStorage().accounts[0]
+      if (fallback?.type !== 'oauth') {
+        throw new Error('expected OAuth fallback fixture')
+      }
+      await useTempAccountFile(
+        harvestStorage([{ ...fallback, lastQuotaRefreshError: pollBackoff }]),
+      )
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
+        'fallback-ok',
+      )
+      const state = await waitForState(
+        (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
+      )
+      const reloaded = await loadAccounts()
+      const reloadedFallback = reloaded?.accounts.find(
+        (account): account is OAuthAccount =>
+          account.id === 'fallback-1' && account.type === 'oauth',
+      )
+
+      expect(state.accounts['fallback-1'].lastQuotaRefreshError).toEqual(
+        pollBackoff,
+      )
+      expect(state.accounts['fallback-1'].quota.five_hour.usedPercent).toBe(78)
+      expect(reloadedFallback?.lastQuotaRefreshError).toEqual(pollBackoff)
+      expect(reloadedFallback?.quota?.source).toBe('headers')
+    })
+
+    test('sidebar state reflects header-pushed freshness and served fallback attribution', async () => {
+      await useTempAccountFile(harvestStorage(createFallbackStorage().accounts))
+      let messages = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(
+          messages === 1
+            ? new Response('limited', { status: 429 })
+            : new Response('fallback-ok', { headers: quotaHeaders }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForSidebarState(
+        (value) =>
+          value.activeId === 'fallback-1' &&
+          value.fallbacks[0]?.quota?.five_hour?.usedPercent === 78,
+      )
+
+      expect(state.main.quota?.five_hour?.usedPercent).not.toBe(78)
+      expect(state.fallbacks[0]?.id).toBe('fallback-1')
+      expect(state.lastUpdated).toBeGreaterThan(0)
+    })
+
+    test('non-quota response does not push or persist quota', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('ok')),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await Bun.sleep(30)
+
+      expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
+    })
+
+    test('malformed quota headers never reject or replace the original response', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('original', {
+            status: 202,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.5',
+              'anthropic-ratelimit-unified-5h-reset': '1e308',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(202)
+      expect(await response.text()).toBe('original')
+    })
+
+    test('header push persists source headers and refreshes sidebar checkedAt without a usage poll', async () => {
+      await useTempAccountFile(harvestStorage())
+      let usageCalls = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
+        return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const state = await waitForSidebarState(
+        (value) => value.main.quota?.five_hour?.usedPercent === 78,
+      )
+
+      expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
+      expect(state.lastUpdated).toBeGreaterThan(0)
+      expect(usageCalls).toBe(0)
+    })
+
+    test('successful harvest emits one quota debug record without raw headers', async () => {
+      await useTempAccountFile(harvestStorage())
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('ok', { headers: quotaHeaders })),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      const harvested = records.filter(
+        (record) =>
+          record.channel === 'quota' &&
+          record.message === 'harvested response quota',
+      )
+      expect(harvested).toHaveLength(1)
+      expect(JSON.stringify(harvested[0])).not.toContain('anthropic-ratelimit')
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+
+    test('repeated out-of-range resets do not warn and restore log state', async () => {
+      await useTempAccountFile(harvestStorage())
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('ok', {
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.5',
+              'anthropic-ratelimit-unified-5h-reset': '1e308',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(
+        records.filter(
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'failed to normalize response quota headers',
+        ),
+      ).toHaveLength(0)
+      __setLogTestSink(null)
+      setLogLevel('info')
+    })
+  })
 })
 
 describe('killswitch fetch gate', () => {
@@ -5172,6 +6259,7 @@ describe('killswitch fetch gate', () => {
 
   beforeEach(() => {
     globalThis.fetch = originalFetch
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     // Prevent the plugin's background quota-refresh interval from leaking a
     // real timer that fires during later tests (test-isolation flake).
     globalThis.setInterval = mock(
@@ -5182,6 +6270,7 @@ describe('killswitch fetch gate', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch
     globalThis.setInterval = originalSetInterval
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
   })
 
   const oauthLoader = () =>
