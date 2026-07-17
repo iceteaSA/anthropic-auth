@@ -1108,67 +1108,91 @@ describe('setSidebarState cross-process writes', () => {
     }
   })
 
-  test('repairs a write when lock ownership is lost after rename', async () => {
-    const stateFile = sidebarTestPath('lost-after-rename')
-    const stateDir = join(stateFile, '..')
-    const lockDir = `${stateFile}.lock`
-    const initial = make({
-      activeId: 'initial-routing',
-      route: 'initial-route',
-      fastMode: false,
-      lastUpdated: 100,
-    })
-    const successor = make({
-      activeId: 'successor-routing',
-      route: 'successor-route',
-      fastMode: false,
-      lastUpdated: 300,
-    })
-    const staleWriter = make({ fastMode: true, lastUpdated: 200 })
-    await mkdir(stateDir, { recursive: true })
-    await writeFile(stateFile, JSON.stringify(initial))
-
-    let child: ReturnType<typeof Bun.spawn> | undefined
-    let paused = false
-    __setSidebarStateWriteTestHooks({
-      afterRename: async () => {
-        if (paused) return
-        paused = true
-        const stale = new Date(Date.now() - 3_000)
-        await utimes(lockDir, stale, stale)
-        const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
-        child = Bun.spawn([
-          process.execPath,
-          '--eval',
-          `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
-        ])
-        expect(await child.exited).toBe(0)
-      },
-    })
-
-    try {
-      await setSidebarState(staleWriter, stateFile, {
-        routingAuthoritative: false,
-        resolvePreservedRouting: (current) => ({
-          activeId: current.activeId,
-          route: current.route,
-        }),
+  for (const routingAuthoritative of [true, false]) {
+    test(`repairs an ${routingAuthoritative ? 'authoritative' : 'non-authoritative'} write after losing ownership post-rename`, async () => {
+      const stateFile = sidebarTestPath(
+        `lost-after-rename-${routingAuthoritative ? 'authoritative' : 'merge'}`,
+      )
+      const stateDir = join(stateFile, '..')
+      const lockDir = `${stateFile}.lock`
+      const initial = make({
+        activeId: 'initial-routing',
+        route: 'initial-route',
+        main: { quota: quota(20), killed: false },
+        fastMode: false,
+        lastUpdated: 100,
       })
-      const settled = await Promise.race([
-        drainSidebarWrites().then(() => true),
-        Bun.sleep(100).then(() => false),
-      ])
-      expect(settled).toBe(true)
-      const written = JSON.parse(await readFile(stateFile, 'utf8'))
-      expect(written.activeId).toBe('successor-routing')
-      expect(written.route).toBe('successor-route')
-      expect(written.fastMode).toBe(true)
-    } finally {
-      __setSidebarStateWriteTestHooks(null)
-      child?.kill()
-      await rm(stateDir, { recursive: true, force: true })
-    }
-  })
+      const successor = make({
+        activeId: 'successor-routing',
+        route: 'successor-route',
+        main: { quota: quota(80), killed: false },
+        fastMode: false,
+        lastUpdated: 300,
+      })
+      const staleWriter = make({
+        activeId: 'writer-routing',
+        route: 'writer-route',
+        main: { quota: quota(10), killed: false },
+        fastMode: true,
+        lastUpdated: 200,
+      })
+      await mkdir(stateDir, { recursive: true })
+      await writeFile(stateFile, JSON.stringify(initial))
+
+      let child: ReturnType<typeof Bun.spawn> | undefined
+      let paused = false
+      __setSidebarStateWriteTestHooks({
+        afterRename: async () => {
+          if (paused) return
+          paused = true
+          const stale = new Date(Date.now() - 3_000)
+          await utimes(lockDir, stale, stale)
+          const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
+          child = Bun.spawn([
+            process.execPath,
+            '--eval',
+            `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
+          ])
+          expect(await child.exited).toBe(0)
+        },
+      })
+
+      try {
+        await setSidebarState(staleWriter, stateFile, {
+          routingAuthoritative,
+          resolvePreservedRouting: routingAuthoritative
+            ? undefined
+            : (current) => ({
+                activeId: current.activeId,
+                route: current.route,
+                state: {
+                  ...staleWriter,
+                  main: current.main,
+                  fallbacks: current.fallbacks,
+                },
+              }),
+        })
+        const settled = await Promise.race([
+          drainSidebarWrites().then(() => true),
+          Bun.sleep(100).then(() => false),
+        ])
+        expect(settled).toBe(true)
+        const written = JSON.parse(await readFile(stateFile, 'utf8'))
+        expect(written.activeId).toBe(
+          routingAuthoritative ? 'writer-routing' : 'successor-routing',
+        )
+        expect(written.route).toBe(
+          routingAuthoritative ? 'writer-route' : 'successor-route',
+        )
+        expect(written.main.quota.five_hour.usedPercent).toBe(80)
+        expect(written.fastMode).toBe(true)
+      } finally {
+        __setSidebarStateWriteTestHooks(null)
+        child?.kill()
+        await rm(stateDir, { recursive: true, force: true })
+      }
+    })
+  }
 
   for (const routingAuthoritative of [true, false]) {
     test(`skips ${routingAuthoritative ? 'authoritative' : 'non-authoritative'} writes when the lock budget is exhausted`, async () => {

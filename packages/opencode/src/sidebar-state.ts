@@ -662,7 +662,17 @@ export async function setSidebarState(
             await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
           } else if (repairingPostRenameLoss) {
             const current = await readSidebarState(stateFile)
-            stateToWrite = { ...current, ...state }
+            // A successor owns its fresh account/quota and recovery snapshots;
+            // this routing frame may only republish its decision and shared UI state.
+            stateToWrite = {
+              ...current,
+              activeId: state.activeId,
+              route: state.route,
+              relay: state.relay,
+              fastMode: state.fastMode,
+              cacheKeep: state.cacheKeep,
+              lastUpdated: Math.max(current.lastUpdated, state.lastUpdated),
+            }
           }
           result = await writeSidebarStateAtomic(
             stateFile,
