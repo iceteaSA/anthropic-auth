@@ -205,6 +205,22 @@ async function waitForReady(
   throw new Error(`opencode serve did not become ready: ${String(lastError)}`)
 }
 
+export async function terminateChildProcess(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      resolve()
+    }, 3000)
+    child.once('exit', finish)
+    child.kill('SIGTERM')
+  })
+}
+
 export async function spawnOpencode(
   options: SpawnOptions,
 ): Promise<SpawnedOpencode> {
@@ -259,7 +275,7 @@ export async function spawnOpencode(
   try {
     await waitForReady(url, () => ({ stdout, stderr }))
   } catch (error) {
-    child.kill('SIGTERM')
+    await terminateChildProcess(child)
     await removeE2ETempDir(env.tempDir, {
       keep: process.env.ANTHROPIC_AUTH_E2E_KEEP_TMP === '1',
     })
@@ -276,19 +292,7 @@ export async function spawnOpencode(
     stderr: () => stderr,
     kill: async () => {
       try {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill('SIGTERM')
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(() => {
-              child.kill('SIGKILL')
-              resolve()
-            }, 3000)
-            child.once('exit', () => {
-              clearTimeout(timer)
-              resolve()
-            })
-          })
-        }
+        await terminateChildProcess(child)
       } finally {
         await removeE2ETempDir(env.tempDir, {
           keep: process.env.ANTHROPIC_AUTH_E2E_KEEP_TMP === '1',

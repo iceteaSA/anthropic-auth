@@ -1,6 +1,8 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from 'bun:test'
+import type { ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import {
   lstat,
   mkdir,
@@ -15,6 +17,7 @@ import { join } from 'node:path'
 import {
   removeE2ETempDir,
   sweepStaleE2ETempDirs,
+  terminateChildProcess,
 } from '../src/opencode-runner.ts'
 
 const roots: string[] = []
@@ -77,5 +80,36 @@ describe('e2e temporary directory hygiene', () => {
 
     expect(await removeE2ETempDir(unrelated, { root })).toBe(false)
     expect((await lstat(unrelated)).isDirectory()).toBe(true)
+  })
+
+  it('waits for a child process to exit after requesting termination', async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      exitCode: number | null
+      signalCode: NodeJS.Signals | null
+      killSignals: NodeJS.Signals[]
+      kill: (signal: NodeJS.Signals) => boolean
+    }
+    child.exitCode = null
+    child.signalCode = null
+    child.killSignals = []
+    child.kill = (signal) => {
+      child.killSignals.push(signal)
+      return true
+    }
+    let resolved = false
+
+    const termination = terminateChildProcess(child as unknown as ChildProcess).then(
+      () => {
+        resolved = true
+      },
+    )
+    await Bun.sleep(0)
+
+    expect(child.killSignals).toEqual(['SIGTERM'])
+    expect(resolved).toBe(false)
+    child.exitCode = 0
+    child.emit('exit', 0, null)
+    await termination
+    expect(resolved).toBe(true)
   })
 })
