@@ -36,6 +36,7 @@ export const CLAUDE_PRIME_COMMAND_NAME = 'claude-prime'
 export const PRIME_TICK_MS = 60_000
 export const PRIME_DUE_OFFSET_MS = 60_000
 export const PRIME_MARKER_MAX_AGE_MS = 6 * 60 * 60_000
+export const PRIME_POST_FIRE_REFRESH_MS = 90_000
 
 export type PrimeCommandAction =
   | { type: 'status' }
@@ -479,6 +480,7 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
  */
 export class PrimeManager {
   private timer: ReturnType<typeof setInterval> | null = null
+  private postFireRefreshTimers = new Set<ReturnType<typeof setTimeout>>()
   // Set true by `stop()` so a tick already in flight can short-circuit
   // before claim/send, preventing a stale in-flight cycle from firing
   // after `/claude-prime off` or after a newer plugin invocation has
@@ -548,15 +550,16 @@ export class PrimeManager {
   }
 
   stop(): void {
-    if (!this.timer && !this.stopped) {
-      this.stopped = true
-      return
-    }
+    const hadTimer = this.timer !== null
+    const hadPostFireRefresh = this.postFireRefreshTimers.size > 0
     this.stopped = true
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = null
     }
+    for (const timer of this.postFireRefreshTimers) clearTimeout(timer)
+    this.postFireRefreshTimers.clear()
+    if (!hadTimer && !hadPostFireRefresh) return
     logger.trace('prime', 'manager stopped')
   }
 
@@ -653,7 +656,7 @@ export class PrimeManager {
 
       const storedResetEpoch = storedResetMs(evaluation.storedFiveHour)
       if (
-        storedResetEpoch === undefined ||
+        storedResetEpoch !== undefined &&
         now < storedResetEpoch + PRIME_DUE_OFFSET_MS
       ) {
         // "Not due" is a routine tick outcome, not an operator-visible
@@ -723,9 +726,12 @@ export class PrimeManager {
       }
       this.windowActive.delete(evaluation.id)
 
-      // Use the FRESH snapshot's reset epoch if available; fall back to
-      // the stored one. The marker key must stay stable per cycle.
-      const markerEpoch = freshResetEpoch ?? storedResetEpoch ?? Math.floor(now)
+      // Bootstrap claims use an hour bucket because cross-process dedup needs
+      // every process to independently compute the same marker epoch.
+      const markerEpoch =
+        freshResetEpoch ??
+        storedResetEpoch ??
+        Math.floor(now / 3_600_000) * 3_600_000
       const markerPath = await this.tryClaim(evaluation.id, markerEpoch)
       if (!markerPath) {
         logger.debug('prime', 'claim lost', {
@@ -845,6 +851,7 @@ export class PrimeManager {
           outputTokens: counters.outputTokens,
         },
       })
+      this.schedulePostFireRefresh(evaluation)
     } catch (error) {
       // Persisting counters failed; surface the error but keep the marker so
       // the cycle counts as attempted. Operator can retry next reset epoch.
@@ -856,6 +863,26 @@ export class PrimeManager {
         lastPrimedAt: now,
         lastResult: 'error',
       })
+    }
+  }
+
+  private schedulePostFireRefresh(evaluation: AccountEvaluation): void {
+    // Unified fire-response headers can arm the window instantly on newer
+    // trees. This branch predates header harvesting, so a delayed poll captures
+    // the reset after the usage API's observed propagation lag.
+    const timer = setTimeout(() => {
+      this.postFireRefreshTimers.delete(timer)
+      if (this.stopped) return
+      void this.options.refreshQuota(evaluation.id).catch((error) => {
+        logger.debug('prime', 'post-fire refresh failed', {
+          account: evaluation.label,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    }, PRIME_POST_FIRE_REFRESH_MS)
+    this.postFireRefreshTimers.add(timer)
+    if (typeof timer === 'object' && 'unref' in timer) {
+      ;(timer as { unref?: () => void }).unref?.()
     }
   }
 

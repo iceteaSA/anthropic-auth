@@ -497,6 +497,76 @@ describe('PrimeManager — due boundary', () => {
   })
 })
 
+describe('PrimeManager — bootstrap', () => {
+  test('missing stored reset with an inactive fresh window fires using the hour bucket marker', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: undefined,
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 7_234_567
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: null as unknown as string,
+          checkedAt: 2,
+        },
+      },
+    })
+
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(h.sendCalls.map((call) => call.accountId)).toEqual(['main'])
+    expect(await readdir(markerRoot)).toEqual(['main-7200000'])
+    await h.cleanup()
+  })
+
+  test('missing stored reset with a future fresh reset records an active window without firing', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 7_234_567
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now + 60_000).toISOString(),
+          checkedAt: 2,
+        },
+      },
+    })
+
+    await h.manager.tick()
+
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(h.sendCalls).toEqual([])
+    expect(h.manager.isWindowActive('main')).toBe(true)
+    expect(await readdir(markerRoot)).toEqual([])
+    await h.cleanup()
+  })
+})
+
 describe('PrimeManager — fresh-check', () => {
   test('future resetsAt → skip + no claim', async () => {
     const fixture = makePrimeFixture({
@@ -631,6 +701,45 @@ describe('PrimeManager — claim atomicity', () => {
     await a.cleanup()
     await b.cleanup()
   })
+
+  test('two bootstrap managers in the same hour bucket fire exactly once', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 7_234_567
+    const fresh: OAuthQuotaSnapshot = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: 2,
+      },
+    }
+    const a = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: fresh,
+    })
+    const b = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now: now + 1_000,
+      quotaFresh: fresh,
+    })
+
+    await Promise.all([a.manager.tick(), b.manager.tick()])
+
+    expect(a.sendCalls.length + b.sendCalls.length).toBe(1)
+    expect(await readdir(markerRoot)).toEqual(['main-7200000'])
+    await a.cleanup()
+    await b.cleanup()
+  })
 })
 
 describe('PrimeManager — eligibility', () => {
@@ -681,6 +790,14 @@ describe('PrimeManager — eligibility', () => {
 
   test('disabled fallback is skipped', async () => {
     const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(10_000_000).toISOString(),
+          checkedAt: 1,
+        },
+      },
       fallbackType: 'oauth',
       fallbackEnabled: false,
       fallbackQuota: {
@@ -716,7 +833,16 @@ describe('PrimeManager — eligibility', () => {
     const previousLevel = getLogLevel()
     setLogLevel('debug')
     setLogLevelSource('debug')
-    const fixture = makePrimeFixture({})
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(10_000_000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
     fixture.storage.accounts.push({
       id: 'main',
       type: 'oauth',
@@ -764,6 +890,14 @@ describe('PrimeManager — eligibility', () => {
 
   test('api-key fallback is skipped', async () => {
     const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(10_000_000).toISOString(),
+          checkedAt: 1,
+        },
+      },
       fallbackType: 'api',
     })
     const h = await makeHarness({
@@ -786,6 +920,14 @@ describe('PrimeManager — eligibility', () => {
 
   test('permanent refresh error → skipped', async () => {
     const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(10_000_000).toISOString(),
+          checkedAt: 1,
+        },
+      },
       fallbackPermanent: true,
       fallbackQuota: {
         five_hour: {
@@ -1051,6 +1193,58 @@ describe('PrimeManager — recordSuccess', () => {
     )
     await h.cleanup()
   })
+
+  test('successful fire schedules one quota refresh after 90 seconds', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    let scheduled: (() => void) | undefined
+    let scheduledDelay: number | undefined
+    globalThis.setTimeout = ((handler: () => void, delay?: number) => {
+      scheduled = handler
+      scheduledDelay = delay
+      return 42
+    }) as typeof setTimeout
+    globalThis.clearTimeout = (() => {}) as typeof clearTimeout
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1_000).toISOString(),
+          checkedAt: 2,
+        },
+      },
+    })
+
+    try {
+      await h.manager.tick()
+      expect(h.refreshCalls).toEqual(['main'])
+      expect(scheduledDelay).toBe(90_000)
+
+      scheduled?.()
+      await Promise.resolve()
+
+      expect(h.refreshCalls).toEqual(['main', 'main'])
+      await h.cleanup()
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+      globalThis.clearTimeout = originalClearTimeout
+    }
+  })
 })
 
 describe('PrimeManager — marker sweep', () => {
@@ -1151,6 +1345,58 @@ describe('PrimeManager — lifecycle', () => {
     const remaining = await readdir(markerRoot)
     expect(remaining).toEqual([])
     await h.cleanup()
+  })
+
+  test('stop cancels the pending post-fire quota refresh', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    let scheduled: (() => void) | undefined
+    const cleared: unknown[] = []
+    globalThis.setTimeout = ((handler: () => void) => {
+      scheduled = handler
+      return 42
+    }) as typeof setTimeout
+    globalThis.clearTimeout = ((timer: unknown) => {
+      cleared.push(timer)
+    }) as typeof clearTimeout
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1_000).toISOString(),
+          checkedAt: 2,
+        },
+      },
+    })
+
+    try {
+      await h.manager.tick()
+      h.manager.stop()
+      scheduled?.()
+      await Promise.resolve()
+
+      expect(cleared).toEqual([42])
+      expect(h.refreshCalls).toEqual(['main'])
+    } finally {
+      await h.cleanup()
+      globalThis.setTimeout = originalSetTimeout
+      globalThis.clearTimeout = originalClearTimeout
+    }
   })
 })
 
@@ -1459,11 +1705,18 @@ describe('PrimeManager — logging', () => {
     const previousLevel = getLogLevel()
     setLogLevel('warn')
     setLogLevelSource('warn')
-    // Only one eligible account (work-alt) so the assertion is
-    // unambiguous: exactly one `prime token refresh failed` record
-    // for the single fire path. Main has no stored quota, so its
-    // runForAccount short-circuits on the not-due branch.
-    const fixture = makePrimeFixture({})
+    // Only work-alt is due, so the assertion remains unambiguous: exactly one
+    // `prime token refresh failed` record for the single fire path.
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(10_000_000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
     fixture.storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
