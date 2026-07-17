@@ -16,12 +16,18 @@ import { sweepDumpDirectory } from '../dump'
 const dumpDirs: string[] = []
 const dumpLinks: string[] = []
 const originalDumpMaxBytes = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES
+const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
 
 afterEach(async () => {
   if (originalDumpMaxBytes === undefined) {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES
   } else {
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES = originalDumpMaxBytes
+  }
+  if (originalDumpDir === undefined) {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+  } else {
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
   }
   await Promise.all(
     dumpLinks.splice(0).map((path) => unlink(path).catch(() => {})),
@@ -38,6 +44,7 @@ test('dump sweep deletes oldest files until the directory is under its cap', asy
     join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
   )
   dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
   const oldFile = join(dumpDir, 'old.json')
   const middleFile = join(dumpDir, 'middle.json')
   const newestFile = join(dumpDir, 'newest.json')
@@ -62,7 +69,7 @@ test('dump sweep deletes oldest files until the directory is under its cap', asy
 })
 
 describe('dump sweep safety guard', () => {
-  test('refuses a symlinked dump directory without deleting target files', async () => {
+  test('refuses a configured symlinked dump directory without deleting target files', async () => {
     const targetDir = await mkdtemp(join(tmpdir(), 'target-dir-secret-'))
     dumpDirs.push(targetDir)
     const secretFile = join(targetDir, 'secret.txt')
@@ -73,18 +80,20 @@ describe('dump sweep safety guard', () => {
     )
     dumpLinks.push(dumpDir)
     await symlink(targetDir, dumpDir)
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
 
-    expect(await sweepDumpDirectory({ dumpDir, maxBytes: 0 })).toEqual({
+    expect(await sweepDumpDirectory({ maxBytes: 0 })).toEqual({
       removed: 0,
       freedBytes: 0,
     })
     expect(await readdir(targetDir)).toEqual(['secret.txt'])
   })
 
-  test('refuses directories outside the expected tmp prefix', async () => {
+  test('refuses a directory that is not configured for dumps', async () => {
     const dumpDir = await mkdtemp(join(tmpdir(), 'unrelated-dumps-test-'))
     dumpDirs.push(dumpDir)
     await writeFile(join(dumpDir, 'old.json'), '12345678')
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
 
     expect(await sweepDumpDirectory({ dumpDir, maxBytes: 1 })).toEqual({
       removed: 0,
@@ -94,11 +103,29 @@ describe('dump sweep safety guard', () => {
   })
 })
 
+test('enforces the cap in a configured custom dump directory', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'custom-dump-root-'))
+  dumpDirs.push(root)
+  const dumpDir = join(root, 'dumps')
+  await mkdir(dumpDir)
+  const oldFile = join(dumpDir, 'old.json')
+  await writeFile(oldFile, '12345678')
+  await utimes(oldFile, new Date(1_000), new Date(1_000))
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+
+  expect(await sweepDumpDirectory({ maxBytes: 0 })).toEqual({
+    removed: 1,
+    freedBytes: 8,
+  })
+  expect(await readdir(dumpDir)).toEqual([])
+})
+
 test('honors an explicit zero-byte cap from the environment', async () => {
   const dumpDir = await mkdtemp(
     join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
   )
   dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
   const oldFile = join(dumpDir, 'old.json')
   await writeFile(oldFile, '12345678')
   await utimes(oldFile, new Date(1_000), new Date(1_000))
@@ -116,6 +143,7 @@ test('preserves files younger than the sweep newness floor', async () => {
     join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
   )
   dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
   const recentFile = join(dumpDir, 'recent.json')
   const now = new Date('2026-07-17T12:00:00.000Z')
   await writeFile(recentFile, '12345678')

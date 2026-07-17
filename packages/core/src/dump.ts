@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { lstat, mkdir, readdir, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
 
@@ -21,7 +21,6 @@ const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
 const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
 const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
-const DUMP_DIR_PREFIX = 'opencode-anthropic-auth-dumps'
 
 let dumpEnabled = false
 let nextDumpId = 0
@@ -62,14 +61,15 @@ function getDumpMaxBytes() {
     : DEFAULT_DUMP_MAX_BYTES
 }
 
-function isExpectedDumpDirectory(path: string) {
-  const resolvedPath = resolve(path)
-  return (
-    dirname(resolvedPath) === resolve(tmpdir()) &&
-    basename(resolvedPath).startsWith(DUMP_DIR_PREFIX)
-  )
+function isConfiguredDumpDirectory(path: string) {
+  return resolve(path) === resolve(getDumpDirectory())
 }
 
+/**
+ * Caps the configured dump directory. A custom path opts its stale regular
+ * files into deletion; symlinked directories and files younger than the
+ * newness floor remain protected.
+ */
 export async function sweepDumpDirectory(options: {
   dumpDir?: string
   maxBytes?: number
@@ -82,7 +82,7 @@ export async function sweepDumpDirectory(options: {
   const now = options.now ?? Date.now()
   const minAgeMs = options.minAgeMs ?? DUMP_SWEEP_NEWNESS_FLOOR_MS
   const emptyResult = { removed: 0, freedBytes: 0 }
-  if (!isExpectedDumpDirectory(dumpDir) || maxBytes < 0) return emptyResult
+  if (!isConfiguredDumpDirectory(dumpDir) || maxBytes < 0) return emptyResult
 
   try {
     const dumpDirStats = await lstat(dumpDir)
