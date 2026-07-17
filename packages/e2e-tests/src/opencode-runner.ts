@@ -1,18 +1,79 @@
 /// <reference types="bun-types" />
 
 import { type ChildProcess, spawn } from 'node:child_process'
-import { mkdirSync, realpathSync, writeFileSync } from 'node:fs'
+import { type Dirent, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
+import { lstat, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 
 const REPO_ROOT = resolve(import.meta.dir, '../../..')
 const PLUGIN_ENTRY = join(REPO_ROOT, 'packages/opencode/src/index.ts')
+const E2E_TEMP_PREFIX = 'anthropic-auth-e2e-'
+const DEFAULT_STALE_AGE_MS = 24 * 60 * 60 * 1000
 
 export type IsolatedEnv = {
+  tempDir: string
   configDir: string
   dataDir: string
   cacheDir: string
   workdir: string
+}
+
+function isExpectedE2ETempDir(path: string, root: string) {
+  const resolvedPath = resolve(path)
+  const resolvedRoot = resolve(root)
+  return (
+    dirname(resolvedPath) === resolvedRoot &&
+    basename(resolvedPath).startsWith(E2E_TEMP_PREFIX)
+  )
+}
+
+export async function removeE2ETempDir(
+  path: string,
+  options: { root?: string; keep?: boolean } = {},
+) {
+  if (options.keep) return false
+  const root = options.root ?? tmpdir()
+  if (!isExpectedE2ETempDir(path, root)) return false
+
+  try {
+    const stats = await lstat(path)
+    if (stats.isSymbolicLink()) return false
+    await rm(path, { recursive: true, force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+export async function sweepStaleE2ETempDirs(
+  options: { root?: string; now?: number; maxAgeMs?: number } = {},
+) {
+  const root = options.root ?? tmpdir()
+  const now = options.now ?? Date.now()
+  const maxAgeMs = options.maxAgeMs ?? DEFAULT_STALE_AGE_MS
+
+  let entries: Dirent[]
+  try {
+    entries = await readdir(root, { withFileTypes: true })
+  } catch {
+    return
+  }
+
+  await Promise.all(
+    entries.map(async (entry) => {
+      if (!entry.name.startsWith(E2E_TEMP_PREFIX) || !entry.isDirectory())
+        return
+      const path = join(root, entry.name)
+      try {
+        const stats = await lstat(path)
+        if (stats.isSymbolicLink() || now - stats.mtimeMs <= maxAgeMs) return
+        await removeE2ETempDir(path, { root })
+      } catch {
+        // A crashed-run sweep must not prevent a new harness from starting.
+      }
+    }),
+  )
 }
 
 export type SpawnedOpencode = {
@@ -46,9 +107,10 @@ async function pickFreePort() {
 function createIsolatedEnv(): IsolatedEnv {
   const base = join(
     tmpdir(),
-    `anthropic-auth-e2e-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    `${E2E_TEMP_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2)}`,
   )
   const env = {
+    tempDir: base,
     configDir: join(base, 'config'),
     dataDir: join(base, 'data'),
     cacheDir: join(base, 'cache'),
@@ -146,6 +208,7 @@ async function waitForReady(
 export async function spawnOpencode(
   options: SpawnOptions,
 ): Promise<SpawnedOpencode> {
+  await sweepStaleE2ETempDirs()
   const env = createIsolatedEnv()
   const port = options.port ?? (await pickFreePort())
   writeConfigs(env, options)
@@ -197,6 +260,9 @@ export async function spawnOpencode(
     await waitForReady(url, () => ({ stdout, stderr }))
   } catch (error) {
     child.kill('SIGTERM')
+    await removeE2ETempDir(env.tempDir, {
+      keep: process.env.ANTHROPIC_AUTH_E2E_KEEP_TMP === '1',
+    })
     throw new Error(
       `opencode serve failed to start\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n${String(error)}`,
     )
@@ -209,18 +275,25 @@ export async function spawnOpencode(
     stdout: () => stdout,
     stderr: () => stderr,
     kill: async () => {
-      if (child.exitCode !== null || child.signalCode !== null) return
-      child.kill('SIGTERM')
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          child.kill('SIGKILL')
-          resolve()
-        }, 3000)
-        child.once('exit', () => {
-          clearTimeout(timer)
-          resolve()
+      try {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGTERM')
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(() => {
+              child.kill('SIGKILL')
+              resolve()
+            }, 3000)
+            child.once('exit', () => {
+              clearTimeout(timer)
+              resolve()
+            })
+          })
+        }
+      } finally {
+        await removeE2ETempDir(env.tempDir, {
+          keep: process.env.ANTHROPIC_AUTH_E2E_KEEP_TMP === '1',
         })
-      })
+      }
     },
   }
 }
