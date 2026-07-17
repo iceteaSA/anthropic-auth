@@ -389,6 +389,20 @@ export async function spawnOpencode(
       env.configDir,
       'anthropic-auth.json',
     )
+    childEnv.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = join(
+      env.configDir,
+      'anthropic-auth-state.json',
+    )
+    childEnv.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+      env.configDir,
+      'sidebar-state.json',
+    )
+    childEnv.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(env.tempDir, 'rpc')
+    childEnv.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = join(env.tempDir, 'dumps')
+    childEnv.OPENCODE_ANTHROPIC_AUTH_LOG_FILE = join(
+      env.tempDir,
+      'opencode-anthropic-auth.log',
+    )
     childEnv.XDG_CONFIG_HOME = env.configDir
     childEnv.XDG_DATA_HOME = env.dataDir
     childEnv.XDG_CACHE_HOME = env.cacheDir
