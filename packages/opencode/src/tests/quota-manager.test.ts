@@ -49,6 +49,49 @@ describe('QuotaManager', () => {
     })
   }
 
+  describe('model-scoped staleness', () => {
+    test('treats a stale matching Fable window as stale even when standard windows are fresh', () => {
+      const qm = createQM()
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'fallback-token',
+          refresh: 'fallback-refresh',
+          expires: now + 60_000,
+          quota: {
+            checkedAt: now,
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: now,
+            },
+            seven_day: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: now,
+            },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: now - 6 * 60_000,
+              },
+            ],
+          },
+        },
+      ])
+
+      expect(qm.isFallbackStale('fallback-1', 'fallback-token')).toBe(false)
+      expect(
+        qm.isFallbackStale('fallback-1', 'fallback-token', 'claude-fable-5'),
+      ).toBe(true)
+    })
+  })
+
   describe('cross-process quota locks', () => {
     test('fallback quota refresh does not call the API while another process holds the account lock', async () => {
       const lock = await acquireRefreshFileLock({

@@ -65,6 +65,17 @@ export function openCommandDialog(
             value: 'fallback-first',
             description: 'Prefer fallback accounts, preserve main',
           },
+          {
+            title: 'Sticky balanced',
+            value: 'sticky-balanced',
+            description:
+              'Balance new sessions by quota and keep each account sticky',
+          },
+          {
+            title: 'Reset this session',
+            value: 'reset',
+            description: 'Reassign this session on its next request',
+          },
         ]}
         onSelect={(option) => {
           void apply('claude-routing', String(option.value)).then((r) => {
@@ -158,9 +169,9 @@ export function openCommandDialog(
     api.ui.dialog.setSize('xlarge')
     api.ui.dialog.replace(() => (
       <DialogPrompt
-        title='Claude cachekeep window'
+        title='Claude cachekeep schedule'
         description={() => <text>{payload.text}</text>}
-        placeholder="HH-HH (e.g. 08-20) or 'off'"
+        placeholder="'always', HH-HH (e.g. 08-20), or 'off'"
         value={seed}
         onConfirm={(value: string) => {
           void apply('claude-cachekeep', value.trim()).then((r) => {

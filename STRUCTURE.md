@@ -35,7 +35,7 @@ anthropic-auth/
 **`packages/core/src/`:**
 - Purpose: All reusable OAuth, account management, quota, cache, relay, dump, signing, routing, and command execution logic
 - Contains: TypeScript modules, each focused on one concern
-- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (fallback routing mode), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
+- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
@@ -85,13 +85,14 @@ anthropic-auth/
 
 **Core Logic:**
 - `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → refresh
-- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, file locking
+- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, in-process write serialization, cross-process configuration file locking and account merging
 - `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
 - `packages/core/src/cch.ts`: XXH64-based request body signing
-- `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager
+- `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager with local-window and process-lifetime `always` schedules
 - `packages/core/src/cachekeep-registry.ts`: Temporary lease registry for cross-process tracked-session status
-- `packages/core/src/routing.ts`: Main-first / fallback-first routing mode
+- `packages/core/src/routing.ts`: Main-first / fallback-first / sticky-balanced routing mode configuration and commands
+- `packages/core/src/sticky-routing.ts`: Cross-process session assignment registry and quota-weighted sticky allocator
 - `packages/core/src/killswitch.ts`: Per-account and model-scoped hard-block thresholds and command execution logic
 - `packages/core/src/provider.ts`: Duck-typed provider HTTP error classification
 - `packages/core/src/logging.ts`: Logging level command execution logic

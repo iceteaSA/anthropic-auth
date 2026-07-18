@@ -48,6 +48,7 @@ import {
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
+  setCacheKeepPersistentAlways,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
@@ -889,14 +890,33 @@ describe('account storage', () => {
     const storage = await setCacheKeepPersistentWindow(9, 23)
     expect(storage.cacheKeep).toEqual({
       enabled: true,
+      always: false,
       startHour: 9,
       endHour: 23,
     })
     const disabled = await setCacheKeepPersistentEnabled(false)
     expect(disabled.cacheKeep).toEqual({
       enabled: false,
+      always: false,
       startHour: 9,
       endHour: 23,
+    })
+  })
+
+  test('persists cacheKeep always mode, preserves subagents, and clears the old window', async () => {
+    await setCacheKeepSubagentsEnabled(true)
+    const windowed = await setCacheKeepPersistentWindow(9, 23)
+    expect(windowed.cacheKeep?.subagents).toBe(true)
+    const storage = await setCacheKeepPersistentAlways()
+    expect(storage.cacheKeep).toEqual({
+      enabled: true,
+      always: true,
+      subagents: true,
+    })
+    expect((await loadAccounts())?.cacheKeep).toEqual({
+      enabled: true,
+      always: true,
+      subagents: true,
     })
   })
 

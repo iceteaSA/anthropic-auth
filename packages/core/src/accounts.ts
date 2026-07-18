@@ -126,7 +126,7 @@ export type OAuthQuotaSnapshot = Partial<
   checkedAt?: number
 }
 
-export type RoutingMode = 'main-first' | 'fallback-first'
+export type RoutingMode = 'main-first' | 'fallback-first' | 'sticky-balanced'
 
 export type KillswitchThresholds = Partial<
   Record<QuotaWindowName | '5h' | '1w' | 'scoped', number>
@@ -197,6 +197,7 @@ export type AccountStorage = {
   }
   cacheKeep?: {
     enabled?: boolean
+    always?: boolean
     startHour?: number
     endHour?: number
     subagents?: boolean
@@ -1388,10 +1389,27 @@ export async function setCacheKeepPersistentWindow(
 ) {
   const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
     enabled: true,
+    always: false,
     startHour,
     endHour,
   }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export async function setCacheKeepPersistentAlways(
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+  storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
+    enabled: true,
+    always: true,
+  }
+  delete storage.cacheKeep.startHour
+  delete storage.cacheKeep.endHour
   await saveAccounts(storage, path)
   return storage
 }
@@ -1437,7 +1455,9 @@ export function shouldFallbackStatus(
   return getFallbackStatuses(storage).includes(status)
 }
 
-function normalizeThresholds(storage: AccountStorage | null) {
+export function getQuotaMinimumRemainingThresholds(
+  storage: AccountStorage | null,
+) {
   const configured = storage?.quota?.minimumRemaining || {}
   return {
     five_hour:
@@ -1754,7 +1774,7 @@ export function quotaSnapshotPassesPolicy(
   storage: AccountStorage | null,
 ) {
   if (!quotaEnabled(storage)) return true
-  const thresholds = normalizeThresholds(storage)
+  const thresholds = getQuotaMinimumRemainingThresholds(storage)
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
     if (!window) return !failClosedOnUnknownQuota(storage)
@@ -1980,7 +2000,7 @@ export function getQuotaNextRefreshAt(
 ) {
   if (!quotaEnabled(storage)) return now + getQuotaCheckIntervalMs(storage)
 
-  const thresholds = normalizeThresholds(storage)
+  const thresholds = getQuotaMinimumRemainingThresholds(storage)
   const blockedResetTimes: number[] = []
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
@@ -2026,8 +2046,13 @@ function quotaIsStale(
   account: OAuthAccount,
   storage: AccountStorage | null,
   now: number,
+  modelId?: string,
 ) {
-  return !quotaSnapshotIsFresh(account.quota, storage, now)
+  if (!quotaSnapshotIsFresh(account.quota, storage, now)) return true
+  const scoped = getScopedQuotaWindowForModel(account.quota, modelId)
+  return Boolean(
+    scoped && now - scoped.checkedAt >= getQuotaCheckIntervalMs(storage),
+  )
 }
 
 function cachedQuotaWindowStillRelevant(
@@ -2406,8 +2431,12 @@ export class FallbackAccountManager {
         }
         this.seedFallbackQuota(next, storage)
         const stale = this.quotaManager
-          ? this.quotaManager.isFallbackStale(next.id, next.access)
-          : quotaIsStale(next, storage, this.now())
+          ? this.quotaManager.isFallbackStale(
+              next.id,
+              next.access,
+              options.modelId,
+            )
+          : quotaIsStale(next, storage, this.now(), options.modelId)
         // Skip the request-time refresh when this account's quota API is
         // backed off (recent 429/5xx). Hitting it again would extend the
         // backoff; evaluate policy on the cached/seeded quota instead. Mirrors
