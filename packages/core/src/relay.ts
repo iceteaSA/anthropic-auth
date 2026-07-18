@@ -498,6 +498,7 @@ type PendingWebSocketRequest = {
   retryAttempts: number
   retryingBeforeResponse: boolean
   onResponseHeaders?: (headers: Headers) => void
+  stagedResponseHeaders?: Headers
   responseHeadersDelivered: boolean
 }
 
@@ -763,6 +764,7 @@ class PersistentRelaySession {
         retryAttempts: 0,
         retryingBeforeResponse: false,
         onResponseHeaders,
+        stagedResponseHeaders: undefined,
         responseHeadersDelivered: false,
       }
       this.pending = pending
@@ -828,6 +830,7 @@ class PersistentRelaySession {
         pending.accepted = false
         pending.acceptedAt = undefined
         pending.responseStartedAt = undefined
+        pending.stagedResponseHeaders = undefined
         pending.responseHeadersDelivered = false
         pending.sentAt = perfNowMs()
         pending.retryingBeforeResponse = false
@@ -854,9 +857,22 @@ class PersistentRelaySession {
     pending: PendingWebSocketRequest,
     chunk: Uint8Array,
   ) {
+    this.deliverResponseHeaders(pending)
     pending.streamChunkCount += 1
     pending.streamByteCount += chunk.byteLength
     pending.streamController?.enqueue(chunk)
+  }
+
+  private deliverResponseHeaders(pending: PendingWebSocketRequest) {
+    if (
+      pending.responseHeadersDelivered ||
+      pending.stagedResponseHeaders == null
+    )
+      return
+    pending.responseHeadersDelivered = true
+    try {
+      pending.onResponseHeaders?.(pending.stagedResponseHeaders)
+    } catch {}
   }
 
   private handleBinaryChunk(data: unknown) {
@@ -918,18 +934,15 @@ class PersistentRelaySession {
       return
     }
     if (message.type === 'response_start') {
+      if (pending.responseStartedAt != null) return
       const responseStartedAt = perfNowMs()
       pending.responseStartedAt = responseStartedAt
       relayLog(
         `perf websocket response_start session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(responseStartedAt - pending.sentAt)} upstreamMs=${pending.acceptedAt == null ? 'unknown' : formatMs(responseStartedAt - pending.acceptedAt)} status=${message.status}`,
       )
       clearTimeout(pending.timeout)
-      if (message.headers && !pending.responseHeadersDelivered) {
-        pending.responseHeadersDelivered = true
-        try {
-          pending.onResponseHeaders?.(new Headers(message.headers))
-        } catch {}
-      }
+      if (message.headers)
+        pending.stagedResponseHeaders = new Headers(message.headers)
       this.resolvePendingResponse(
         pending,
         message.status,
@@ -937,6 +950,7 @@ class PersistentRelaySession {
         message.headers,
       )
       if (pending.optimisticResponse && message.status >= 400) {
+        this.deliverResponseHeaders(pending)
         pending.streamController?.enqueue(
           new TextEncoder().encode(
             `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_upstream_error', message: `Relay upstream returned HTTP ${message.status}` } })}\n\n`,
@@ -963,6 +977,7 @@ class PersistentRelaySession {
         relayLog(
           `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${message.status} message=${message.message || 'unknown'} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
         )
+        this.deliverResponseHeaders(pending)
         pending.streamController?.enqueue(
           new TextEncoder().encode(
             `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_error', message: message.message || 'relay error' } })}\n\n`,
@@ -1002,6 +1017,7 @@ class PersistentRelaySession {
     )
     clearTimeout(pending.timeout)
     if (!pending.streamDone) {
+      this.deliverResponseHeaders(pending)
       pending.streamDone = true
       pending.streamController?.close()
     }
@@ -1076,6 +1092,12 @@ export async function sendViaRelay(options: {
   fallback: () => Promise<Response>
   affinity?: string | null
   optimisticResponse?: boolean
+  /**
+   * Observes genuine upstream headers once per delivered response. WebSocket
+   * retries before downstream bytes replace staged headers, so the callback
+   * receives only the final accepted response; duplicate response_start frames
+   * within an attempt are ignored.
+   */
   onResponseHeaders?: (headers: Headers) => void
 }): Promise<Response> {
   const {

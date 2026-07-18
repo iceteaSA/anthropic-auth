@@ -440,7 +440,7 @@ describe('relay client', () => {
     expect(sentPayloads[0]).toMatchObject({ mode: 'full_sync' })
   })
 
-  test('websocket optimistic response resolves immediately after local send', async () => {
+  test('websocket optimistic response resolves immediately and delivers headers once for duplicate response_start', async () => {
     const originalWebSocket = globalThis.WebSocket
     const receivedHeaders: Headers[] = []
     let socket: OptimisticWebSocket | undefined
@@ -834,7 +834,7 @@ describe('relay client', () => {
       receivedHeaders.map((value) =>
         value.get('anthropic-ratelimit-unified-5h-utilization'),
       ),
-    ).toEqual(['0.91', '0.42'])
+    ).toEqual(['0.42'])
   })
 
   test('websocket optimistic response reports stream close after bytes without retry', async () => {
