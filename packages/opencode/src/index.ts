@@ -707,6 +707,7 @@ export function primeQuotaSnapshotIsFreshSince(
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
+  const profileFetch = globalThis.fetch
   const accountStoragePath = getAccountStoragePath()
 
   // -- OAuth add-flow pending state (Add account modal) --------------------
@@ -830,7 +831,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const attemptKey = `${accountId}:${tokenFingerprint(accessToken)}`
     let attempt = profileHydrationAttempts.get(attemptKey)
     if (!attempt) {
-      const fetchAttempt = fetchOAuthAccountProfile({ accessToken, signal })
+      const fetchAttempt = fetchOAuthAccountProfile({
+        accessToken,
+        fetchImpl: profileFetch,
+        signal,
+      })
         .catch((error) => {
           logger.debug('quota', 'failed to hydrate account profile', {
             account: accountId,
@@ -3090,6 +3095,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   route: 'main',
                   mainAccessToken: auth.access,
                   mainRefreshToken: auth.refresh,
+                  routingAuthoritative: false,
                 })
               })
               .catch(() => {})
@@ -3636,6 +3642,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           function mainQuotaEntryIsFreshExhausted(accessToken?: string) {
             if (!accessToken) return false
             const entry = quotaManager.getMain(accessToken)
+            // A genuine response header is live routing evidence like a 429, but
+            // it gets no exemption from the shared freshness and token gates.
             return Boolean(
               entry &&
                 entry.refreshAfter > Date.now() &&

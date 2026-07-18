@@ -1051,6 +1051,29 @@ describe('getSidebarState malformed file round-trip', () => {
     const state = await getSidebarState()
     expect(state).toEqual(valid)
   })
+
+  test('non-authoritative writes preserve the latest routing decision', async () => {
+    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = testFile
+    await mkdir(testDir, { recursive: true })
+    const fallback = make({ activeId: 'fallback-1', route: 'fallback' })
+    const delayedHydration = make({
+      activeId: 'main',
+      route: 'main',
+      main: { quota: null, killed: false, tierLabel: 'Max 20x' },
+    })
+
+    const routingWrite = setSidebarState(fallback, testFile)
+    const hydrationWrite = setSidebarState(delayedHydration, testFile, {
+      routingAuthoritative: false,
+    })
+    await Promise.all([routingWrite, hydrationWrite])
+
+    expect(await getSidebarState()).toMatchObject({
+      activeId: 'fallback-1',
+      route: 'fallback',
+      main: { tierLabel: 'Max 20x' },
+    })
+  })
 })
 
 describe('setSidebarState cross-process writes', () => {

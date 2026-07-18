@@ -150,6 +150,11 @@ async function useTempAccountFile(storage: AccountStorage) {
     'sidebar-state.json',
   )
   await saveAccounts(storage)
+  if (storage.main?.profile) {
+    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
+      mainProfile: true,
+    })
+  }
 }
 
 function restoreProcessTestFiles() {
@@ -3665,6 +3670,143 @@ describe('auth.loader', () => {
     expect(profileCalls).toBe(1)
   })
 
+  test('delayed boot hydration preserves a live fallback sidebar route', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    let resolveMainProfile!: (response: Response) => void
+    let markMainProfileStarted!: () => void
+    const mainProfileStarted = new Promise<void>((resolve) => {
+      markMainProfileStarted = resolve
+    })
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (
+          url.includes('/api/oauth/profile') &&
+          authorization === 'Bearer main-access'
+        ) {
+          markMainProfileStarted()
+          return new Promise<Response>((resolve) => {
+            resolveMainProfile = resolve
+          })
+        }
+        if (url.includes('/api/oauth/profile')) {
+          return Promise.resolve(
+            Response.json({
+              organization: {
+                organization_type: 'claude_team',
+                rate_limit_tier: 'default_claude_max_5x',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('ok'))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await mainProfileStarted
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+    await waitForSidebarState(
+      (state) =>
+        state.activeId === 'fallback-1' && state.route === 'fallback-first',
+    )
+    resolveMainProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      }),
+    )
+
+    const hydratedState = await waitForSidebarState(
+      (state) => state.main.tierLabel === 'Max 20x',
+    )
+    expect(hydratedState).toMatchObject({
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+    })
+  })
+
+  test('profile hydration keeps its plugin-scoped fetch across test turnover', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage())
+    let resolveMainProfile!: (response: Response) => void
+    let markMainProfileStarted!: () => void
+    const mainProfileStarted = new Promise<void>((resolve) => {
+      markMainProfileStarted = resolve
+    })
+    const firstFetchCalls: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const authorization = new Headers(
+          input instanceof Request ? input.headers : init?.headers,
+        ).get('authorization')
+        firstFetchCalls.push(authorization ?? '')
+        if (authorization === 'Bearer main-access') {
+          markMainProfileStarted()
+          return new Promise<Response>((resolve) => {
+            resolveMainProfile = resolve
+          })
+        }
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_team',
+              rate_limit_tier: 'default_claude_max_5x',
+            },
+          }),
+        )
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await mainProfileStarted
+
+    const nextTestFetch = mock(() => Promise.resolve(new Response('ok')))
+    globalThis.fetch = nextTestFetch as unknown as typeof fetch
+    resolveMainProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      }),
+    )
+    await waitForSidebarState(
+      (state) => state.fallbacks[0]?.tierLabel === 'Team · Max 5x',
+    )
+
+    expect(firstFetchCalls).toEqual([
+      'Bearer main-access',
+      'Bearer fallback-access',
+    ])
+    expect(nextTestFetch).not.toHaveBeenCalled()
+  })
+
   test('mock-environment opt-out prevents boot profile network calls', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     let profileCalls = 0
@@ -6842,6 +6984,88 @@ describe('auth.loader', () => {
 
       await Bun.sleep(30)
       expect((await loadAccounts())?.quota?.mainQuota?.source).toBeUndefined()
+    })
+
+    test('fresh header exhaustion licenses API-key fallback on the next request', async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          accounts: [
+            {
+              id: 'kie-opus',
+              type: 'api',
+              apiKey: 'kie-key',
+              baseURL: 'https://api.kie.ai/claude',
+              authHeader: 'authorization-bearer',
+            },
+          ],
+          quota: { enabled: false },
+        }),
+      )
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        const authorization = new Headers(init?.headers).get('authorization')
+        authorizations.push(authorization)
+        return Promise.resolve(
+          new Response('ok', {
+            headers:
+              authorization === 'Bearer main-access'
+                ? {
+                    ...quotaHeaders,
+                    'anthropic-ratelimit-unified-5h-utilization': '1',
+                  }
+                : undefined,
+          }),
+        )
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(authorizations).toEqual(['Bearer main-access', 'Bearer kie-key'])
+    })
+
+    test('stale header exhaustion does not license API-key fallback', async () => {
+      const checkedAt = Date.now() - 60 * 60 * 1000
+      await useTempAccountFile(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          accounts: [
+            {
+              id: 'kie-opus',
+              type: 'api',
+              apiKey: 'kie-key',
+              baseURL: 'https://api.kie.ai/claude',
+              authHeader: 'authorization-bearer',
+            },
+          ],
+          quota: {
+            enabled: false,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt,
+              },
+              source: 'headers',
+              checkedAt,
+            },
+            mainQuotaCheckedAt: checkedAt,
+            mainQuotaToken: tokenFingerprint('main-access'),
+          },
+        }),
+      )
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        authorizations.push(new Headers(init?.headers).get('authorization'))
+        return Promise.resolve(new Response('ok'))
+      }) as unknown as typeof fetch
+      const result = await loadFetch()
+
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(authorizations).toEqual(['Bearer main-access'])
     })
 
     test('main header push skips persistence after access-token rotation', async () => {

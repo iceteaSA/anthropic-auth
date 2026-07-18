@@ -233,7 +233,7 @@ describe('OAuth account profiles', () => {
     ).toBe(false)
   })
 
-  test('profile survives sidecar save and load for main and fallback accounts', async () => {
+  test('dedicated main and scoped fallback profiles survive sidecar load', async () => {
     const storage = baseStorage()
     const mainProfile: OAuthAccountProfile = {
       tier: 'default_claude_max_20x',
@@ -254,6 +254,7 @@ describe('OAuth account profiles', () => {
     })
 
     await saveAccounts(storage, accountPath)
+    await saveAccountState(storage, accountPath, { mainProfile: true })
     const loaded = await loadAccounts(accountPath)
 
     expect(loaded?.main?.profile).toEqual(mainProfile)
@@ -633,6 +634,33 @@ describe('account storage', () => {
     expect(loaded?.quota?.checkIntervalMinutes).toBe(20)
     expect(loaded?.quota?.mainQuotaToken).toBe('token-b')
     expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(22)
+  })
+
+  test('generic saves preserve a newer persisted main profile', async () => {
+    const staleStorage = baseStorage()
+    await saveAccounts(staleStorage)
+
+    const hydratedStorage = await loadAccounts()
+    expect(hydratedStorage).not.toBeNull()
+    ;(hydratedStorage as AccountStorage).main = {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: {
+        tier: 'default_claude_max_20x',
+        orgType: 'claude_max',
+        checkedAt: 500,
+        tokenFingerprint: tokenFingerprint('main-access'),
+      },
+    }
+    await saveAccountState(hydratedStorage as AccountStorage, accountPath, {
+      mainProfile: true,
+    })
+
+    await saveAccounts(staleStorage)
+
+    expect((await loadAccounts())?.main?.profile).toEqual(
+      hydratedStorage?.main?.profile,
+    )
   })
 
   test('runtime state saves do not overwrite newer quota snapshots', async () => {

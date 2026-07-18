@@ -658,6 +658,15 @@ export async function setSidebarState(
                   current.lastUpdated,
                 ),
               }
+            } else if (!options.resolvePreservedRouting) {
+              // Without a resolver, a non-authoritative write must not own the
+              // routing decision: keep the file's current activeId/route.
+              stateToWrite = {
+                ...state,
+                activeId: current.activeId,
+                route: current.route,
+                lastUpdated: Math.max(state.lastUpdated, current.lastUpdated),
+              }
             }
             await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
           } else if (repairingPostRenameLoss) {

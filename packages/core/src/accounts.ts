@@ -1213,7 +1213,6 @@ async function saveAccountsLocked(storage: AccountStorage, path: string) {
   const nextConfig = { ...existing, ...configFromStorage(storage) }
   await writeJsonAtomic(path, nextConfig)
   await saveAccountStateUnlocked(storage, path, {
-    mainProfile: true,
     mainQuota: true,
     mainRefresh: true,
     accounts: true,
