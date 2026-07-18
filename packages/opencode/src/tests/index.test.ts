@@ -22,7 +22,11 @@ import {
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
+import {
+  __setInitialSidebarRoutingTestHooks,
+  AnthropicAuthPlugin,
+  primeQuotaSnapshotIsFreshSince,
+} from '../index'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -619,6 +623,7 @@ describe('auth.loader', () => {
     resetFastModeState()
     resetNotificationsForTest()
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    __setInitialSidebarRoutingTestHooks(null)
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -630,6 +635,7 @@ describe('auth.loader', () => {
     Math.random = originalRandom
     resetNotificationsForTest()
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    __setInitialSidebarRoutingTestHooks(null)
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -749,6 +755,68 @@ describe('auth.loader', () => {
     )
     await drainSidebarWrites()
 
+    const state = await getSidebarState()
+    expect(state.activeId).toBe('work-alt')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('boot reads preserved routing after its asynchronous storage load', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 100000,
+          },
+        ],
+      }),
+    )
+
+    let sequence = 0
+    let sidebarReadAt = 0
+    let storageLoadedAt = 0
+    let storageLoadStarted!: () => void
+    const storageLoadPaused = new Promise<void>((resolve) => {
+      storageLoadStarted = resolve
+    })
+    let resumeStorageLoad!: () => void
+    const storageLoadResumed = new Promise<void>((resolve) => {
+      resumeStorageLoad = resolve
+    })
+    __setInitialSidebarRoutingTestHooks({
+      beforeSidebarRead: () => {
+        sidebarReadAt = ++sequence
+      },
+      beforeStorageLoad: async () => {
+        storageLoadStarted()
+        await storageLoadResumed
+      },
+      afterStorageLoad: () => {
+        storageLoadedAt = ++sequence
+      },
+    })
+
+    const plugin = await getPlugin()
+    const loaderResult = plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await storageLoadPaused
+    await seedSidebarRouting('work-alt', 'fallback-first', Date.now())
+    resumeStorageLoad()
+    await loaderResult
+    await drainSidebarWrites()
+
+    expect(storageLoadedAt).toBeLessThan(sidebarReadAt)
     const state = await getSidebarState()
     expect(state.activeId).toBe('work-alt')
     expect(state.route).toBe('fallback-first')

@@ -223,6 +223,23 @@ function validateSidebarRouting(
   return deriveSidebarRouting(storage)
 }
 
+function resolveLoadedSidebarRouting(
+  existing: SidebarState,
+  freshStorage: AccountStorage | null,
+  fallbackRouting?: Pick<SidebarState, 'activeId' | 'route'>,
+): Pick<SidebarState, 'activeId' | 'route'> {
+  const existingAge = Date.now() - existing.lastUpdated
+  if (
+    !existing.activeId ||
+    existingAge < 0 ||
+    existingAge > SIDEBAR_ROUTING_FRESH_MS
+  ) {
+    return validateSidebarRouting(fallbackRouting, freshStorage)
+  }
+
+  return validateSidebarRouting(existing, freshStorage)
+}
+
 async function resolveFreshSidebarRouting(
   existing: SidebarState,
   loadFreshStorage: () => Promise<AccountStorage | null>,
@@ -239,22 +256,24 @@ async function resolveFreshSidebarRouting(
     return { activeId: 'main', route: 'main', freshStorage: null }
   }
 
-  const existingAge = Date.now() - existing.lastUpdated
-  if (
-    !existing.activeId ||
-    existingAge < 0 ||
-    existingAge > SIDEBAR_ROUTING_FRESH_MS
-  ) {
-    return {
-      ...validateSidebarRouting(fallbackRouting, freshStorage),
-      freshStorage,
-    }
-  }
-
   return {
-    ...validateSidebarRouting(existing, freshStorage),
+    ...resolveLoadedSidebarRouting(existing, freshStorage, fallbackRouting),
     freshStorage,
   }
+}
+
+interface InitialSidebarRoutingTestHooks {
+  beforeSidebarRead?: () => void | Promise<void>
+  beforeStorageLoad?: () => void | Promise<void>
+  afterStorageLoad?: () => void | Promise<void>
+}
+
+let initialSidebarRoutingTestHooks: InitialSidebarRoutingTestHooks | null = null
+
+export function __setInitialSidebarRoutingTestHooks(
+  hooks: InitialSidebarRoutingTestHooks | null,
+) {
+  initialSidebarRoutingTestHooks = hooks
 }
 
 async function resolveInitialSidebarRouting(
@@ -264,11 +283,22 @@ async function resolveInitialSidebarRouting(
   route: string
   freshStorage: AccountStorage | null
 }> {
-  const existingRouting = await resolveFreshSidebarRouting(
-    await getSidebarState(),
-    () => loadAccounts(accountStoragePath),
-  )
-  return existingRouting
+  await initialSidebarRoutingTestHooks?.beforeStorageLoad?.()
+  let freshStorage: AccountStorage | null
+  try {
+    freshStorage = await loadAccounts(accountStoragePath)
+  } catch {
+    return { activeId: 'main', route: 'main', freshStorage: null }
+  } finally {
+    await initialSidebarRoutingTestHooks?.afterStorageLoad?.()
+  }
+
+  await initialSidebarRoutingTestHooks?.beforeSidebarRead?.()
+  const existing = await getSidebarState()
+  return {
+    ...resolveLoadedSidebarRouting(existing, freshStorage),
+    freshStorage,
+  }
 }
 
 /**
