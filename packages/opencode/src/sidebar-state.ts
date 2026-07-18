@@ -101,9 +101,8 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { logger } from '@cortexkit/anthropic-auth-core'
-
 import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
+import { logger } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
@@ -433,6 +432,29 @@ export function __setSidebarStateWriteTestHooks(
   hooks: SidebarStateWriteTestHooks | null,
 ): void {
   sidebarStateWriteTestHooks = hooks
+}
+
+// Boot-routing test hooks live here rather than in index.ts: the plugin entry
+// module must export nothing beyond the plugin factory — opencode's plugin
+// loader treats extra entry-point exports as plugin candidates and fails to
+// load the plugin (same incident class as the removed
+// __setBootProfileHydrationForTest export).
+export interface InitialSidebarRoutingTestHooks {
+  beforeSidebarRead?: () => void | Promise<void>
+  beforeStorageLoad?: () => void | Promise<void>
+  afterStorageLoad?: () => void | Promise<void>
+}
+
+let initialSidebarRoutingTestHooks: InitialSidebarRoutingTestHooks | null = null
+
+export function __setInitialSidebarRoutingTestHooks(
+  hooks: InitialSidebarRoutingTestHooks | null,
+): void {
+  initialSidebarRoutingTestHooks = hooks
+}
+
+export function getInitialSidebarRoutingTestHooks(): InitialSidebarRoutingTestHooks | null {
+  return initialSidebarRoutingTestHooks
 }
 
 function sleep(ms: number): Promise<void> {

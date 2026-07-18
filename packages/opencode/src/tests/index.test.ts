@@ -22,16 +22,13 @@ import {
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import {
-  __setInitialSidebarRoutingTestHooks,
-  AnthropicAuthPlugin,
-  primeQuotaSnapshotIsFreshSince,
-} from '../index'
+import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
 import {
   drainNotifications,
   resetNotificationsForTest,
 } from '../rpc/notifications'
 import {
+  __setInitialSidebarRoutingTestHooks,
   drainSidebarWrites,
   getSidebarState,
   getSidebarStateFile,

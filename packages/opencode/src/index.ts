@@ -153,6 +153,7 @@ import type {
 import { getRpcDir } from './rpc/rpc-dir.ts'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
 import {
+  getInitialSidebarRoutingTestHooks,
   getSidebarState,
   getSidebarStateFile,
   type SidebarState,
@@ -262,20 +263,6 @@ async function resolveFreshSidebarRouting(
   }
 }
 
-interface InitialSidebarRoutingTestHooks {
-  beforeSidebarRead?: () => void | Promise<void>
-  beforeStorageLoad?: () => void | Promise<void>
-  afterStorageLoad?: () => void | Promise<void>
-}
-
-let initialSidebarRoutingTestHooks: InitialSidebarRoutingTestHooks | null = null
-
-export function __setInitialSidebarRoutingTestHooks(
-  hooks: InitialSidebarRoutingTestHooks | null,
-) {
-  initialSidebarRoutingTestHooks = hooks
-}
-
 async function resolveInitialSidebarRouting(
   accountStoragePath: string,
 ): Promise<{
@@ -283,17 +270,17 @@ async function resolveInitialSidebarRouting(
   route: string
   freshStorage: AccountStorage | null
 }> {
-  await initialSidebarRoutingTestHooks?.beforeStorageLoad?.()
+  await getInitialSidebarRoutingTestHooks()?.beforeStorageLoad?.()
   let freshStorage: AccountStorage | null
   try {
     freshStorage = await loadAccounts(accountStoragePath)
   } catch {
     return { activeId: 'main', route: 'main', freshStorage: null }
   } finally {
-    await initialSidebarRoutingTestHooks?.afterStorageLoad?.()
+    await getInitialSidebarRoutingTestHooks()?.afterStorageLoad?.()
   }
 
-  await initialSidebarRoutingTestHooks?.beforeSidebarRead?.()
+  await getInitialSidebarRoutingTestHooks()?.beforeSidebarRead?.()
   const existing = await getSidebarState()
   return {
     ...resolveLoadedSidebarRouting(existing, freshStorage),
