@@ -265,8 +265,14 @@ async function resolveFreshSidebarRouting(
   let freshStorage: AccountStorage | null
   try {
     freshStorage = await loadFreshStorage()
-  } catch {
-    return { activeId: 'main', route: 'main', freshStorage: null }
+  } catch (error) {
+    logger.warn('sidebar', 'account storage reload failed; routing preserved', {
+      message: error instanceof Error ? error.message : String(error),
+    })
+    const preservedRouting = existing.activeId
+      ? { activeId: existing.activeId, route: existing.route }
+      : (fallbackRouting ?? { activeId: 'main', route: 'main' })
+    return { ...preservedRouting, freshStorage: null }
   }
 
   return {

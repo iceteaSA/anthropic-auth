@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { chmod, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -29,6 +29,7 @@ import {
 } from '../rpc/notifications'
 import {
   __setInitialSidebarRoutingTestHooks,
+  __setSidebarStateWriteTestHooks,
   drainSidebarWrites,
   getSidebarState,
   getSidebarStateFile,
@@ -625,6 +626,7 @@ describe('auth.loader', () => {
     resetNotificationsForTest()
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     __setInitialSidebarRoutingTestHooks(null)
+    __setSidebarStateWriteTestHooks(null)
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })
 
@@ -638,6 +640,7 @@ describe('auth.loader', () => {
     resetNotificationsForTest()
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     __setInitialSidebarRoutingTestHooks(null)
+    __setSidebarStateWriteTestHooks(null)
     await drainSidebarWrites()
     restoreProcessTestFiles()
     if (tempConfigDir) {
@@ -1072,6 +1075,104 @@ describe('auth.loader', () => {
     const state = await getSidebarState()
     expect(state.activeId).toBe('main')
     expect(state.route).toBe('main')
+  })
+
+  async function runQuotaRefreshWithFailedStorageReload(
+    clearExistingRouting: boolean,
+  ) {
+    await useTempAccountFile(
+      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+    )
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.25 },
+              seven_day: { utilization: 0.3 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+    if (clearExistingRouting) {
+      const current = await getSidebarState()
+      await setSidebarState({
+        ...current,
+        activeId: undefined,
+        route: 'main',
+        lastUpdated: Date.now(),
+      })
+    } else {
+      await seedSidebarRouting('fallback-1', 'fallback-first', Date.now())
+    }
+
+    let signalBlocked!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      signalBlocked = resolve
+    })
+    let releaseWrite!: () => void
+    const released = new Promise<void>((resolve) => {
+      releaseWrite = resolve
+    })
+    let shouldBlock = true
+    __setSidebarStateWriteTestHooks({
+      beforeRename: async () => {
+        if (!shouldBlock) return
+        shouldBlock = false
+        signalBlocked()
+        await released
+      },
+    })
+
+    const blockingWrite = setSidebarState(await getSidebarState())
+    await blocked
+    try {
+      await expectHandledCommandResponse(
+        plugin['command.execute.before']({
+          command: 'claude-quota',
+          arguments: '',
+          sessionID: 'session-1',
+        }),
+      )
+      const accountFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+      if (!accountFile) throw new Error('Expected isolated account file')
+      await rm(accountFile)
+      await mkdir(accountFile)
+    } finally {
+      releaseWrite()
+    }
+    await blockingWrite
+    await drainSidebarWrites()
+    __setSidebarStateWriteTestHooks(null)
+    return getSidebarState()
+  }
+
+  test('quota refresh preserves existing fallback routing when storage reload fails', async () => {
+    const state = await runQuotaRefreshWithFailedStorageReload(false)
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
+  })
+
+  test('quota refresh uses supplied routing when storage reload fails without existing routing', async () => {
+    const state = await runQuotaRefreshWithFailedStorageReload(true)
+    expect(state.activeId).toBe('fallback-1')
+    expect(state.route).toBe('fallback-first')
   })
 
   test('/claude-quota preserves the last sidebar routing decision', async () => {
