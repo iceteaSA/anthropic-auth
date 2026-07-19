@@ -3834,6 +3834,165 @@ describe('auth.loader', () => {
     expect(profileCalls).toBe(1)
   })
 
+  test('late fallback profile hydration cannot restore rotated credentials', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: { enabled: false },
+        main: {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile: {
+            tier: 'default_claude_max_20x',
+            orgType: 'claude_max',
+            checkedAt: Date.now(),
+            tokenFingerprint: tokenFingerprint('main-access'),
+          },
+        },
+        accounts: [
+          {
+            id: 'fb',
+            type: 'oauth',
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            lastRefreshedAt: 100,
+          },
+        ],
+      }),
+    )
+    let resolveProfile!: (response: Response) => void
+    let markProfileStarted!: () => void
+    const profileStarted = new Promise<void>((resolve) => {
+      markProfileStarted = resolve
+    })
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        markProfileStarted()
+        return new Promise<Response>((resolve) => {
+          resolveProfile = resolve
+        })
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await profileStarted
+    await drainSidebarWrites()
+    const initialSidebarUpdatedAt = (await getSidebarState()).lastUpdated
+
+    const rotated = await loadAccounts()
+    const fallback = rotated?.accounts[0]
+    if (!rotated || fallback?.type !== 'oauth') {
+      throw new Error('expected fallback OAuth account')
+    }
+    fallback.access = 'new-access'
+    fallback.refresh = 'new-refresh'
+    fallback.lastRefreshedAt = 200
+    await saveAccounts(rotated)
+    await Bun.sleep(2)
+    resolveProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_team',
+          rate_limit_tier: 'default_claude_max_5x',
+        },
+      }),
+    )
+    await waitForSidebarState(
+      (state) => state.lastUpdated > initialSidebarUpdatedAt,
+    )
+
+    const reloaded = await loadAccounts()
+    const reloadedFallback = reloaded?.accounts[0]
+    expect(reloadedFallback).toMatchObject({
+      access: 'new-access',
+      refresh: 'new-refresh',
+      lastRefreshedAt: 200,
+    })
+    if (reloadedFallback?.type !== 'oauth') {
+      throw new Error('expected reloaded fallback OAuth account')
+    }
+    expect(reloadedFallback.profile).toBeUndefined()
+  })
+
+  test('late main profile hydration cannot replace a rotated-token profile', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    let liveAccess = 'old-main-access'
+    let resolveProfile!: (response: Response) => void
+    let markProfileStarted!: () => void
+    const profileStarted = new Promise<void>((resolve) => {
+      markProfileStarted = resolve
+    })
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/api/oauth/profile')) {
+        markProfileStarted()
+        return new Promise<Response>((resolve) => {
+          resolveProfile = resolve
+        })
+      }
+      return Promise.resolve(new Response('ok'))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await profileStarted
+    await drainSidebarWrites()
+    const initialSidebarUpdatedAt = (await getSidebarState()).lastUpdated
+
+    liveAccess = 'new-main-access'
+    const rotated = await loadAccounts()
+    if (!rotated) throw new Error('expected account storage')
+    rotated.main = {
+      type: 'opencode',
+      provider: 'anthropic',
+      profile: {
+        tier: 'default_claude_max_20x',
+        orgType: 'claude_max',
+        checkedAt: Date.now(),
+        tokenFingerprint: tokenFingerprint(liveAccess),
+      },
+    }
+    await saveAccountState(rotated, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
+      mainProfile: true,
+    })
+    await Bun.sleep(2)
+    resolveProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_team',
+          rate_limit_tier: 'default_claude_max_5x',
+        },
+      }),
+    )
+    await waitForSidebarState(
+      (state) => state.lastUpdated > initialSidebarUpdatedAt,
+    )
+
+    expect((await loadAccounts())?.main?.profile).toMatchObject({
+      tier: 'default_claude_max_20x',
+      tokenFingerprint: tokenFingerprint('new-main-access'),
+    })
+  })
+
   test('delayed boot hydration preserves a live fallback sidebar route', async () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await useTempAccountFile(

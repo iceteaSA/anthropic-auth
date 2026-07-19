@@ -6,8 +6,6 @@
  * Handles deduplication, rate-limiting (429 backoff), and staleness.
  */
 
-import { createHash } from 'node:crypto'
-
 import type {
   AccountOperationError,
   AccountStorage,
@@ -28,17 +26,12 @@ import {
 } from './accounts.ts'
 import { mergeHeaderQuotaSnapshot } from './quota-headers.ts'
 
+export { tokenFingerprint } from './token-fingerprint.ts'
+
+import { tokenFingerprint } from './token-fingerprint.ts'
+
 // Capture real setTimeout before tests can mock globalThis.setTimeout
 const nativeSetTimeout = globalThis.setTimeout
-
-/**
- * Stable, non-reversible fingerprint of an access token. Used to detect a
- * main-account switch so a different account's persisted/cached quota is never
- * reused. Not a secret — a truncated SHA-256, safe to persist alongside quota.
- */
-export function tokenFingerprint(token: string): string {
-  return createHash('sha256').update(token).digest('hex').slice(0, 16)
-}
 
 // ---------------------------------------------------------------------------
 // Types

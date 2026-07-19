@@ -11,6 +11,7 @@ import {
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
 import { type LogLevel, log, logger } from './logger.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -307,6 +308,7 @@ export type AccountRuntimeState = {
   version: 1
   main?: {
     profile?: OAuthAccountProfile
+    profileToken?: string
     quota?: OAuthQuotaSnapshot
     quotaCheckedAt?: number
     quotaToken?: string
@@ -1256,25 +1258,52 @@ function mergeAccountsForSave(
 
 const ACCOUNT_CONFIG_LOCK_TTL_MS = 10_000
 const ACCOUNT_CONFIG_LOCK_WAIT_MS = 12_000
+const ACCOUNT_STATE_LOCK_TTL_MS = 10_000
+const ACCOUNT_STATE_LOCK_WAIT_MS = 12_000
 
-async function acquireAccountConfigWriteLock(path: string) {
+async function acquireAccountWriteLock(input: {
+  path: string
+  name: string
+  ttlMs: number
+  waitMs: number
+  description: string
+}) {
+  const { path, name, ttlMs, waitMs, description } = input
   await mkdir(dirname(path), { recursive: true })
-  const deadline = Date.now() + ACCOUNT_CONFIG_LOCK_WAIT_MS
+  const deadline = Date.now() + waitMs
   while (true) {
     const lock = await acquireRefreshFileLock({
-      name: 'config-write',
-      ttlMs: ACCOUNT_CONFIG_LOCK_TTL_MS,
+      name,
+      ttlMs,
       path,
       renew: true,
     })
     if (lock) return lock
     if (Date.now() >= deadline) {
-      throw new Error(
-        'Timed out waiting for the account configuration write lock',
-      )
+      throw new Error(`Timed out waiting for the account ${description} lock`)
     }
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
+}
+
+function acquireAccountConfigWriteLock(path: string) {
+  return acquireAccountWriteLock({
+    path,
+    name: 'config-write',
+    ttlMs: ACCOUNT_CONFIG_LOCK_TTL_MS,
+    waitMs: ACCOUNT_CONFIG_LOCK_WAIT_MS,
+    description: 'configuration write',
+  })
+}
+
+function acquireAccountStateWriteLock(path: string) {
+  return acquireAccountWriteLock({
+    path,
+    name: 'state-write',
+    ttlMs: ACCOUNT_STATE_LOCK_TTL_MS,
+    waitMs: ACCOUNT_STATE_LOCK_WAIT_MS,
+    description: 'state write',
+  })
 }
 
 export function saveAccounts(
@@ -1305,11 +1334,18 @@ async function saveAccountsLocked(
     const existing = await loadExistingTopLevelFields(path)
     const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
     await writeJsonAtomic(path, nextConfig)
-    await saveAccountStateUnlocked(nextStorage, path, {
-      mainQuota: true,
-      mainRefresh: true,
-      accounts: true,
-    })
+    // Config precedes state everywhere both locks are needed; reversing this
+    // order can deadlock profile mutations against full account saves.
+    const stateLock = await acquireAccountStateWriteLock(path)
+    try {
+      await saveAccountStateUnlocked(nextStorage, path, {
+        mainQuota: true,
+        mainRefresh: true,
+        accounts: true,
+      })
+    } finally {
+      await stateLock.release()
+    }
   } finally {
     await lock.release()
   }
@@ -1413,9 +1449,104 @@ export function saveAccountState(
   },
 ): Promise<void> {
   const resolvedPath = path
-  return enqueueSave(() =>
-    saveAccountStateUnlocked(storage, resolvedPath, scope),
-  )
+  return enqueueSave(async () => {
+    const lock = await acquireAccountStateWriteLock(resolvedPath)
+    try {
+      await saveAccountStateUnlocked(storage, resolvedPath, scope)
+    } finally {
+      await lock.release()
+    }
+  })
+}
+
+export function saveOAuthProfileState(
+  input: {
+    accountId: 'main' | string
+    profile: OAuthAccountProfile | undefined
+    expectedTokenFingerprint: string
+  },
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  const resolvedPath = path
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(resolvedPath)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(resolvedPath)
+      try {
+        const current = await loadAccounts(resolvedPath)
+        const statePath = getAccountStatePath(resolvedPath)
+        const existing = (await readJsonIfPresent(statePath)).value
+        const next: AccountRuntimeState = isRecord(existing)
+          ? ({ ...existing, version: 1 } as AccountRuntimeState)
+          : { version: 1 }
+        const { accountId, expectedTokenFingerprint, profile } = input
+        if (
+          profile?.tokenFingerprint &&
+          profile.tokenFingerprint !== expectedTokenFingerprint
+        ) {
+          return false
+        }
+
+        if (accountId === 'main') {
+          next.main = { ...(next.main ?? {}) }
+          const existingProfile = normalizeOAuthAccountProfile(
+            next.main.profile,
+          )
+          const persistedToken =
+            next.main.profileToken ?? existingProfile?.tokenFingerprint
+          if (profile) {
+            if (persistedToken && persistedToken !== expectedTokenFingerprint) {
+              return false
+            }
+            if (
+              existingProfile &&
+              existingProfile.checkedAt > profile.checkedAt
+            ) {
+              return false
+            }
+          }
+          next.main.profile = profile
+          next.main.profileToken = expectedTokenFingerprint
+        } else {
+          const account = current?.accounts.find(
+            (candidate): candidate is OAuthAccount =>
+              candidate.id === accountId && isOAuthAccount(candidate),
+          )
+          if (
+            !account?.access ||
+            tokenFingerprint(account.access) !== expectedTokenFingerprint
+          ) {
+            return false
+          }
+          next.accounts = {
+            ...(isRecord(next.accounts) ? next.accounts : {}),
+          }
+          const existingEntry = isRecord(next.accounts[accountId])
+            ? { ...next.accounts[accountId] }
+            : {}
+          const existingProfile = normalizeOAuthAccountProfile(
+            existingEntry.profile,
+          )
+          if (
+            profile &&
+            existingProfile &&
+            existingProfile.checkedAt > profile.checkedAt
+          ) {
+            return false
+          }
+          existingEntry.profile = profile
+          next.accounts[accountId] = existingEntry
+        }
+
+        await writeJsonAtomic(statePath, pruneUndefined(next))
+        return true
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
 }
 
 async function saveAccountStateUnlocked(

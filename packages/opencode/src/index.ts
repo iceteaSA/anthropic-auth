@@ -120,6 +120,7 @@ import {
   type StickyRouteCandidate,
   StickySessionRouter,
   saveAccountState,
+  saveOAuthProfileState,
   sendViaRelay,
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
@@ -885,18 +886,35 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
-  async function persistProfileStateBestEffort(
-    storage: AccountStorage,
-    scope: Parameters<typeof saveAccountState>[2],
-    accountId: string,
-  ) {
+  async function persistProfileStateBestEffort(input: {
+    accountId: 'main' | string
+    accessToken: string
+    profile: OAuthAccount['profile']
+  }): Promise<boolean | undefined> {
     try {
-      await saveAccountState(storage, accountStoragePath, scope)
+      if (input.accountId === 'main') {
+        const currentAuth = await latestGetAuth?.()
+        if (
+          currentAuth?.type !== 'oauth' ||
+          currentAuth.access !== input.accessToken
+        ) {
+          return false
+        }
+      }
+      return await saveOAuthProfileState(
+        {
+          accountId: input.accountId,
+          profile: input.profile,
+          expectedTokenFingerprint: tokenFingerprint(input.accessToken),
+        },
+        accountStoragePath,
+      )
     } catch (error) {
       logger.debug('quota', 'failed to persist account profile', {
-        account: accountId,
+        account: input.accountId,
         error: error instanceof Error ? error.message : String(error),
       })
+      return undefined
     }
   }
 
@@ -915,29 +933,27 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       !oauthProfileMatchesToken(storage.main.profile, mainAccessToken)
     ) {
       storage.main.profile = undefined
-      await persistProfileStateBestEffort(
-        storage,
-        {
-          mainProfile: true,
-        },
-        'main',
-      )
+      await persistProfileStateBestEffort({
+        accountId: 'main',
+        accessToken: mainAccessToken,
+        profile: undefined,
+      })
     }
     if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
       const profile = await hydrateProfileOnce('main', mainAccessToken, signal)
       if (profile) {
-        storage.main = {
-          type: 'opencode',
-          provider: 'anthropic',
+        const persisted = await persistProfileStateBestEffort({
+          accountId: 'main',
+          accessToken: mainAccessToken,
           profile,
+        })
+        if (persisted !== false) {
+          storage.main = {
+            type: 'opencode',
+            provider: 'anthropic',
+            profile,
+          }
         }
-        await persistProfileStateBestEffort(
-          storage,
-          {
-            mainProfile: true,
-          },
-          'main',
-        )
       }
     }
 
@@ -950,25 +966,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         !oauthProfileMatchesToken(account.profile, accessToken)
       ) {
         account.profile = undefined
-        await persistProfileStateBestEffort(
-          storage,
-          {
-            accounts: [account.id],
-          },
-          account.id,
-        )
+        await persistProfileStateBestEffort({
+          accountId: account.id,
+          accessToken,
+          profile: undefined,
+        })
       }
       if (oauthProfileIsFresh(account.profile, now)) continue
       const profile = await hydrateProfileOnce(account.id, accessToken, signal)
       if (profile) {
-        account.profile = profile
-        await persistProfileStateBestEffort(
-          storage,
-          {
-            accounts: [account.id],
-          },
-          account.id,
-        )
+        const persisted = await persistProfileStateBestEffort({
+          accountId: account.id,
+          accessToken,
+          profile,
+        })
+        if (persisted !== false) account.profile = profile
       }
     }
     return storage
