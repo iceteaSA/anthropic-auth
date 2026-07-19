@@ -43,8 +43,8 @@ import {
   type PrimeSendResult,
   type PrimeUsageCounters,
   parsePrimeCommandAction,
+  primeAccountMarkerDir,
   primeIsEligible,
-  primeMarkerNamespaceDir,
   primeMarkerPath,
 } from '../prime.ts'
 
@@ -375,6 +375,7 @@ async function makeHarness(opts: {
   const manager = new PrimeManager({
     storagePath,
     loadStorage: async () => opts.storage,
+    getAccountFingerprint: async () => '0123456789abcdef',
     refreshQuota: async (id) => {
       refreshCalls.push(id)
       if (opts.refreshError) throw opts.refreshError
@@ -416,7 +417,11 @@ async function makeHarness(opts: {
     refreshCalls,
     recordSuccessCalls,
     records: [],
-    markerDir: primeMarkerNamespaceDir(opts.markerDir, storagePath),
+    markerDir: primeAccountMarkerDir(
+      opts.markerDir,
+      storagePath,
+      '0123456789abcdef',
+    ),
     cleanup: async () => {
       manager.stop()
     },

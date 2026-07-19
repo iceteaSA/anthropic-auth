@@ -414,6 +414,20 @@ export function primeMarkerNamespaceDir(
   return join(markerDir, primeStorageFingerprint(storagePath))
 }
 
+export function primeAccountMarkerDir(
+  markerDir: string,
+  storagePath: string,
+  accountFingerprint: string,
+): string {
+  if (!/^[a-f0-9]{12,}$/i.test(accountFingerprint)) {
+    throw new Error('Prime account fingerprint must be a hexadecimal digest')
+  }
+  return join(
+    primeMarkerNamespaceDir(markerDir, storagePath),
+    accountFingerprint.toLowerCase().slice(0, 12),
+  )
+}
+
 export function primeMarkerPath(
   markerDir: string,
   accountId: 'main' | string,
@@ -512,6 +526,8 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
  */
 export type PrimeManagerOptions = {
   loadStorage: () => Promise<AccountStorage | null>
+  /** Returns a non-secret digest of the live OAuth credential. */
+  getAccountFingerprint: (accountId: 'main' | string) => Promise<string>
   refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
   sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
   recordSuccess: (
@@ -527,7 +543,7 @@ export class PrimeManager {
   private timer: ReturnType<typeof setInterval> | null = null
   private postFireRefreshTimers = new Set<ReturnType<typeof setTimeout>>()
   private lastForcedCheck = new Map<
-    'main' | string,
+    string,
     { at: number; resetEpoch: number | undefined }
   >()
   // Set true by `stop()` so a tick already in flight can short-circuit
@@ -688,11 +704,6 @@ export class PrimeManager {
       }
 
       const storedResetEpoch = storedResetMs(evaluation.storedFiveHour)
-      const markerDir = this.markerDir()
-      const bootstrapMarkerPath = primeBootstrapMarkerPath(
-        markerDir,
-        evaluation.id,
-      )
       if (
         storedResetEpoch !== undefined &&
         now < storedResetEpoch + PRIME_DUE_OFFSET_MS
@@ -702,6 +713,18 @@ export class PrimeManager {
         logger.trace('prime', 'not due', { account: evaluation.label })
         return
       }
+
+      const accountFingerprint = await this.options.getAccountFingerprint(
+        evaluation.id,
+      )
+      const claimIdentity = `${evaluation.id}:${accountFingerprint
+        .toLowerCase()
+        .slice(0, 12)}`
+      const markerDir = this.markerDir(accountFingerprint)
+      const bootstrapMarkerPath = primeBootstrapMarkerPath(
+        markerDir,
+        evaluation.id,
+      )
 
       const expectedMarkerPath =
         storedResetEpoch === undefined
@@ -717,7 +740,7 @@ export class PrimeManager {
       }
       if (
         storedResetEpoch === undefined &&
-        (await this.hasAnyClaimMarker(evaluation.id))
+        (await this.hasAnyClaimMarker(evaluation.id, accountFingerprint))
       ) {
         // The bootstrap sentinel is replaced only after an epoch claim exists.
         // A stale process must observe one side of that transition.
@@ -727,7 +750,7 @@ export class PrimeManager {
 
       // Binding the throttle to the observed epoch preserves the immediate
       // check when a newly passed reset replaces the previous window.
-      const lastForcedCheck = this.lastForcedCheck.get(evaluation.id)
+      const lastForcedCheck = this.lastForcedCheck.get(claimIdentity)
       if (
         lastForcedCheck !== undefined &&
         lastForcedCheck.resetEpoch === storedResetEpoch &&
@@ -735,7 +758,7 @@ export class PrimeManager {
       ) {
         return
       }
-      this.lastForcedCheck.set(evaluation.id, {
+      this.lastForcedCheck.set(claimIdentity, {
         at: now,
         resetEpoch: storedResetEpoch,
       })
@@ -804,8 +827,8 @@ export class PrimeManager {
       const markerEpoch = freshResetEpoch ?? storedResetEpoch
       const markerPath =
         markerEpoch === undefined
-          ? await this.tryClaimBootstrap(evaluation.id)
-          : await this.tryClaim(evaluation.id, markerEpoch)
+          ? await this.tryClaimBootstrap(evaluation.id, accountFingerprint)
+          : await this.tryClaim(evaluation.id, accountFingerprint, markerEpoch)
       if (!markerPath) {
         logger.debug('prime', 'claim lost', {
           account: evaluation.label,
@@ -841,17 +864,19 @@ export class PrimeManager {
 
   private async tryClaim(
     accountId: 'main' | string,
+    accountFingerprint: string,
     resetsAtEpochMs: number,
   ): Promise<string | null> {
-    const dir = this.markerDir()
+    const dir = this.markerDir(accountFingerprint)
     const markerPath = primeMarkerPath(dir, accountId, resetsAtEpochMs)
     return this.tryClaimPath(dir, markerPath)
   }
 
   private async tryClaimBootstrap(
     accountId: 'main' | string,
+    accountFingerprint: string,
   ): Promise<string | null> {
-    const dir = this.markerDir()
+    const dir = this.markerDir(accountFingerprint)
     const markerPath = primeBootstrapMarkerPath(dir, accountId)
     return this.tryClaimPath(dir, markerPath)
   }
@@ -877,8 +902,9 @@ export class PrimeManager {
 
   private async hasAnyClaimMarker(
     accountId: 'main' | string,
+    accountFingerprint: string,
   ): Promise<boolean> {
-    const dir = this.markerDir()
+    const dir = this.markerDir(accountFingerprint)
     const prefix = `${encodeURIComponent(accountId)}-`
     try {
       return (await readdir(dir)).some((entry) => entry.startsWith(prefix))
@@ -1002,34 +1028,55 @@ export class PrimeManager {
   }
 
   private async sweepMarkers(now: number): Promise<void> {
-    const dir = this.markerDir()
+    const dir = this.storageMarkerDir()
+    const swept = await this.sweepMarkerDirectory(dir, now)
+    if (swept > 0) {
+      logger.trace('prime', 'swept stale markers', { swept })
+    }
+  }
+
+  private async sweepMarkerDirectory(
+    dir: string,
+    now: number,
+  ): Promise<number> {
     let entries: string[]
     try {
       entries = await readdir(dir)
     } catch {
-      return
+      return 0
     }
     let swept = 0
     for (const entry of entries) {
       try {
-        const s = await stat(join(dir, entry))
+        const path = join(dir, entry)
+        const s = await stat(path)
+        if (s.isDirectory()) {
+          swept += await this.sweepMarkerDirectory(path, now)
+          continue
+        }
         if (now - s.mtimeMs > PRIME_MARKER_MAX_AGE_MS) {
-          await rm(join(dir, entry), { force: true })
+          await rm(path, { force: true })
           swept += 1
         }
       } catch {
         // Markers can vanish between readdir and stat; skip silently.
       }
     }
-    if (swept > 0) {
-      logger.trace('prime', 'swept stale markers', { swept })
-    }
+    return swept
   }
 
-  private markerDir(): string {
+  private storageMarkerDir(): string {
     return primeMarkerNamespaceDir(
       this.options.markerDir ?? defaultMarkerDir(),
       this.options.storagePath,
+    )
+  }
+
+  private markerDir(accountFingerprint: string): string {
+    return primeAccountMarkerDir(
+      this.options.markerDir ?? defaultMarkerDir(),
+      this.options.storagePath,
+      accountFingerprint,
     )
   }
 }

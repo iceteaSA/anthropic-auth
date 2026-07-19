@@ -5,9 +5,12 @@ import { dirname, join } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
+  buildPrimeRequestBody,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
+  extractBillingHeaderCCH,
   getAccountStatePath,
+  getClaudeCodeIdentity,
   hashRefreshToken,
   type LogTestRecord,
   loadAccounts,
@@ -36,6 +39,7 @@ import {
   resolveActiveAccount,
   setSidebarState,
 } from '../sidebar-state'
+import { rewriteRequestBody } from '../transform.ts'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -8874,12 +8878,18 @@ describe('claude-prime direct request', () => {
           ? new TextDecoder().decode(init.body)
           : ''
     const body = JSON.parse(bodyText)
-    expect(body).toEqual({
-      model: 'claude-haiku-4-5',
-      max_tokens: 1,
-      system: 'Reply with 1 when you receive 0.',
-      messages: [{ role: 'user', content: '0' }],
-    })
+    const canonicalBody = await rewriteRequestBody(
+      JSON.stringify(buildPrimeRequestBody()),
+      { identity: getClaudeCodeIdentity('main-access') },
+    )
+    expect(bodyText).toBe(canonicalBody)
+    expect(body.model).toBe('claude-haiku-4-5')
+    expect(body.max_tokens).toBe(1)
+    expect(body.messages).toEqual([{ role: 'user', content: '0' }])
+    expect(JSON.stringify(body.system)).toContain(
+      'Reply with 1 when you receive 0.',
+    )
+    expect(extractBillingHeaderCCH(bodyText)).toMatch(/^[a-f0-9]{5}$/)
     expect(body.stream).toBeUndefined()
     expect(body.thinking).toBeUndefined()
     expect(body.tools).toBeUndefined()

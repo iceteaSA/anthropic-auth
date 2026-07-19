@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import {
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -7,7 +14,9 @@ import type { AccountStorage, OAuthQuotaSnapshot } from '../accounts.ts'
 import {
   buildPrimeRequestBody,
   PRIME_DUE_OFFSET_MS,
+  PRIME_MARKER_MAX_AGE_MS,
   PrimeManager,
+  primeMarkerNamespaceDir,
   primeStorageFingerprint,
 } from '../prime.ts'
 
@@ -62,12 +71,15 @@ function manager(input: {
   loadStorage: () => Promise<AccountStorage>
   refreshQuota: () => Promise<OAuthQuotaSnapshot>
   sendPrime: () => Promise<void>
+  accountFingerprint?: () => Promise<string>
 }): PrimeManager {
   const instance = new PrimeManager({
     storagePath: input.storagePath,
     markerDir: input.markerDir,
     now: input.now,
     loadStorage: input.loadStorage,
+    getAccountFingerprint:
+      input.accountFingerprint ?? (async () => '0123456789abcdef'),
     refreshQuota: async () => ({
       quota: await input.refreshQuota(),
       fresh: true,
@@ -150,6 +162,77 @@ describe('PrimeManager storage namespaces', () => {
     await Promise.all([make().tick(), make().tick()])
 
     expect(fires).toBe(1)
+  })
+
+  test('a main OAuth credential switch primes independently and sweeps the old identity', async () => {
+    const markerDir = await tempMarkerRoot()
+    const storagePath = join(markerDir, 'accounts.json')
+    const reset = Date.now() - PRIME_DUE_OFFSET_MS
+    let accountFingerprint = 'aaaaaaaaaaaaaaaa'
+    let fires = 0
+    const mgr = manager({
+      storagePath,
+      markerDir,
+      now: () => reset + PRIME_DUE_OFFSET_MS,
+      loadStorage: async () => storage(reset),
+      refreshQuota: async () => storage(reset).quota!.mainQuota!,
+      accountFingerprint: async () => accountFingerprint,
+      sendPrime: async () => {
+        fires += 1
+      },
+    })
+
+    await mgr.tick()
+    accountFingerprint = 'bbbbbbbbbbbbbbbb'
+    await mgr.tick()
+
+    expect(fires).toBe(2)
+    const namespaceDir = primeMarkerNamespaceDir(markerDir, storagePath)
+    const oldIdentityDir = join(namespaceDir, 'aaaaaaaaaaaa')
+    const newIdentityDir = join(namespaceDir, 'bbbbbbbbbbbb')
+    expect(await readdir(oldIdentityDir)).toEqual([`main-${reset}`])
+    expect(await readdir(newIdentityDir)).toEqual([`main-${reset}`])
+
+    const oldMarker = join(oldIdentityDir, `main-${reset}`)
+    const staleAt = new Date(
+      reset + PRIME_DUE_OFFSET_MS - PRIME_MARKER_MAX_AGE_MS - 1,
+    )
+    await utimes(oldMarker, staleAt, staleAt)
+    await mgr.tick()
+
+    expect(await readdir(oldIdentityDir)).toEqual([])
+    expect(await readdir(newIdentityDir)).toEqual([`main-${reset}`])
+  })
+
+  test('bootstrap sentinels are independent after a main OAuth credential switch', async () => {
+    const markerDir = await tempMarkerRoot()
+    const storagePath = join(markerDir, 'accounts.json')
+    let accountFingerprint = 'aaaaaaaaaaaaaaaa'
+    let fires = 0
+    const mgr = manager({
+      storagePath,
+      markerDir,
+      now: () => Date.now(),
+      loadStorage: async () => storage(),
+      refreshQuota: async () => ({}),
+      accountFingerprint: async () => accountFingerprint,
+      sendPrime: async () => {
+        fires += 1
+      },
+    })
+
+    await mgr.tick()
+    accountFingerprint = 'bbbbbbbbbbbbbbbb'
+    await mgr.tick()
+
+    expect(fires).toBe(2)
+    const namespaceDir = primeMarkerNamespaceDir(markerDir, storagePath)
+    expect(await readdir(join(namespaceDir, 'aaaaaaaaaaaa'))).toEqual([
+      'main-bootstrap',
+    ])
+    expect(await readdir(join(namespaceDir, 'bbbbbbbbbbbb'))).toEqual([
+      'main-bootstrap',
+    ])
   })
 
   test('bootstrap sentinels do not cross storage namespaces', async () => {

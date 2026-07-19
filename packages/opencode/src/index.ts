@@ -1173,6 +1173,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   // OpenCode processes via atomic marker claim. In-process manager mirrors the
   // cacheKeep singleton shape; cross-process exclusivity is the marker's job.
 
+  let latestMainPrimeAccountFingerprint = tokenFingerprint(
+    'main-oauth-unavailable',
+  )
+
   // Obtain a CURRENT main access token via the existing refresh path
   // (M2). If the cached auth has no access or the token is expired, refresh
   // first; only fail when the refresh path itself fails. Returns the live
@@ -1304,15 +1308,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         return { ok: false, error: 'prime: no access token available' }
       }
 
-      const body = buildPrimeRequestBody()
+      const primeBody = buildPrimeRequestBody()
       const identity = await resolveClaudeCodeIdentity(
         accessToken,
         resolvedModel,
       )
+      const body = await rewriteRequestBody(JSON.stringify(primeBody), {
+        identity,
+      })
       const headers = new Headers({
         'content-type': 'application/json',
       })
-      setOAuthHeaders(headers, accessToken, { body, identity })
+      setOAuthHeaders(headers, accessToken, {
+        body: JSON.parse(body),
+        identity,
+      })
       headers.delete('content-length')
       headers.delete('transfer-encoding')
       // Route through rewriteUrl so the request inherits the canonical
@@ -1326,7 +1336,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const response = await fetch(primeUrl, {
         method: 'POST',
         headers,
-        body: JSON.stringify(body),
+        body,
         signal: AbortSignal.timeout(30_000),
       })
       const ms = Math.round(performance.now() - start)
@@ -1368,6 +1378,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const primeManagerOptions: PrimeManagerOptions = {
     storagePath: accountStoragePath,
     loadStorage: () => loadAccounts(accountStoragePath),
+    getAccountFingerprint: async (accountId) => {
+      if (accountId === 'main') {
+        return latestMainPrimeAccountFingerprint
+      }
+      const storage = await loadAccounts(accountStoragePath)
+      const account = storage?.accounts.find(
+        (candidate): candidate is OAuthAccount =>
+          candidate.id === accountId &&
+          candidate.enabled !== false &&
+          isOAuthAccount(candidate),
+      )
+      if (!account || !storage) {
+        throw new Error(`prime: OAuth account ${accountId} is unavailable`)
+      }
+      return tokenFingerprint(
+        account.refresh ?? account.access ?? `oauth-unavailable:${accountId}`,
+      )
+    },
     refreshQuota: async (accountId) => {
       if (accountId === 'main') return refreshPrimeMainQuota()
       return refreshPrimeFallbackQuota(accountId)
@@ -2747,6 +2775,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         latestGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type === 'oauth') {
+          latestMainPrimeAccountFingerprint = tokenFingerprint(
+            auth.refresh ?? auth.access ?? 'main-oauth-unavailable',
+          )
           // Shared inflight refresh promise — prevents concurrent token refreshes
           // from racing against each other (and causing 401 cascades with token rotation)
           let refreshPromise: Promise<string> | null = null

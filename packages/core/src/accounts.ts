@@ -1993,17 +1993,6 @@ export async function setPrimePersistentEnabled(
  * are intentionally NOT triggered so prime counters cannot leak into
  * `anthropic-auth.json`. Callers should not depend on this function to mutate
  * the caller's storage object.
- *
- * KNOWN LIMITATION: cross-process RMW race. The in-process `enqueueSave`
- * mutex serializes calls within one Node process, but two processes can
- * both win their marker claim in the same reset window and race their
- * `load → mutate → writeJsonAtomic` cycles. The later rename drops the
- * earlier process's new counters. This is bounded to a cosmetic counter
- * increment (prime is idempotent at the API level — only the cumulative
- * displayed total may briefly under-count). The durable fix is the
- * project-wide cross-process RMW lock around runtime state writes (a
- * `mutateAccounts` helper held under the same file lock that
- * refreshAccount uses). Tracked separately; not implemented here.
  */
 export async function incrementPrimeUsagePersistent(
   accountId: 'main' | string,
@@ -2018,40 +2007,57 @@ export async function incrementPrimeUsagePersistent(
     ? Math.max(0, Math.floor(usage.outputTokens as number))
     : 0
 
-  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+  return enqueueSave(async () => {
+    // The config-write lock is the repository-wide outer lock for config and
+    // runtime-state RMW operations; taking it before the state write preserves
+    // saveAccountsLocked's config → state ordering across processes.
+    const lock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = (await loadAccounts(path)) ?? createEmptyStorage()
 
-  if (accountId === 'main') {
-    const existing = storage.prime?.main
-    const next: PrimeUsageCounters = {
-      count: (existing?.count ?? 0) + 1,
-      inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
-      outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
-      since: existing?.since ?? Math.floor(now),
+        if (accountId === 'main') {
+          const existing = storage.prime?.main
+          const next: PrimeUsageCounters = {
+            count: (existing?.count ?? 0) + 1,
+            inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
+            outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
+            since: existing?.since ?? Math.floor(now),
+          }
+          storage.prime = { ...(storage.prime ?? {}), main: next }
+          await saveAccountStateUnlocked(storage, path, { mainPrime: true })
+          return next
+        }
+
+        const index = storage.accounts.findIndex(
+          (account) => account.id === accountId,
+        )
+        if (index < 0) {
+          throw new Error(
+            `incrementPrimeUsagePersistent: account "${accountId}" not found`,
+          )
+        }
+        const account = storage.accounts[index] as OAuthAccount
+        const existing = account.prime
+        const next: PrimeUsageCounters = {
+          count: (existing?.count ?? 0) + 1,
+          inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
+          outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
+          since: existing?.since ?? Math.floor(now),
+        }
+        storage.accounts[index] = { ...account, prime: next }
+        await saveAccountStateUnlocked(storage, path, {
+          accounts: [accountId],
+        })
+        return next
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await lock.release()
     }
-    storage.prime = { ...(storage.prime ?? {}), main: next }
-    await saveAccountState(storage, path, { mainPrime: true })
-    return next
-  }
-
-  const index = storage.accounts.findIndex(
-    (account) => account.id === accountId,
-  )
-  if (index < 0) {
-    throw new Error(
-      `incrementPrimeUsagePersistent: account "${accountId}" not found`,
-    )
-  }
-  const account = storage.accounts[index] as OAuthAccount
-  const existing = account.prime
-  const next: PrimeUsageCounters = {
-    count: (existing?.count ?? 0) + 1,
-    inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
-    outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
-    since: existing?.since ?? Math.floor(now),
-  }
-  storage.accounts[index] = { ...account, prime: next }
-  await saveAccountState(storage, path, { accounts: [accountId] })
-  return next
+  })
 }
 
 function getFallbackStatuses(storage: AccountStorage | null) {
