@@ -2,6 +2,21 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.16.0
+
+### Minor Changes
+
+- Add `sticky-balanced` routing, assigning cold sessions by current quota headroom while preserving account affinity across processes, restarts, transient failures, short reset holds, model-scoped limits, and Fable recovery.
+- Add `/claude-cachekeep always` and aggregate live tracked-session status across OpenCode project plugin instances without sharing request bodies, credentials, or headers.
+
+### Patch Changes
+
+- Prevent concurrent fallback-account additions and configuration saves from dropping accounts by serializing cross-process writes, merging current disk state, and using explicit removal semantics.
+- Preserve fresh empty model-scoped quota snapshots and evaluate scoped quota freshness independently during sticky routing.
+- Bound request-dump storage to 512 MB by default and harden end-to-end process and temporary-directory cleanup.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the dump-storage and end-to-end cleanup contribution.
+
 ## 1.15.1
 
 ### Patch Changes
