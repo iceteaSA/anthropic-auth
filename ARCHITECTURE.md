@@ -37,7 +37,7 @@
 **End-to-End Tests:**
 - Purpose: Integration tests for the full OpenCode plugin flow with mock Anthropic and relay servers
 - Location: `packages/e2e-tests/`
-- Contains: Test harness (`harness.ts`), mock servers (`mock-anthropic.ts`, `mock-relay.ts`), OpenCode runner (`opencode-runner.ts`), test files (`tests/tool-prefix.test.ts`)
+- Contains: Test harness (`harness.ts`), mock servers (`mock-anthropic.ts`, `mock-relay.ts`), OpenCode runner (`opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`)
 
 ## Data Flow
 
@@ -164,6 +164,6 @@
 
 **Caching:** In-memory quota cache (`QuotaManager`) with staleness-based refresh logic; memoized system prompt sanitization (`sanitize-memo.ts`) with 8MB max; 1-hour Anthropic prompt cache managed via cache strategy (`cache1h.ts`, `cachekeep.ts`)
 
-**Storage:** Sidecar JSON files for config + credential/quota state (separate files to avoid config overwrite), a cross-process locked `anthropic-auth-routing-state.json` containing hashed sticky session assignments, JSONC preferences for the TUI (`tui-preferences.jsonc`), and JSON state for TUI sidebar IPC at `$TMPDIR/opencode-anthropic-auth/`
+**Storage:** Sidecar JSON files for config + credential/quota state (separate files to avoid config overwrite), a cross-process locked `anthropic-auth-routing-state.json` containing hashed sticky session assignments, JSONC preferences for the TUI (`tui-preferences.jsonc`), JSON state for TUI sidebar IPC at `$TMPDIR/opencode-anthropic-auth/`, and an auto-sweeping dump directory for request payloads capped at 512MB by default.
 
 **Security:** OAuth tokens are stored in the sidecar state file (separate from config); sticky routing stores only SHA-256 session hashes, account IDs, quota timestamps, and initial input byte counts; relay uses a shared secret token; RPC server uses a bearer token; token refresh and configuration/routing writes use file locks to prevent races and concurrent write loss; no secrets are stored in git

@@ -35,7 +35,7 @@ anthropic-auth/
 **`packages/core/src/`:**
 - Purpose: All reusable OAuth, account management, quota, cache, relay, dump, signing, routing, and command execution logic
 - Contains: TypeScript modules, each focused on one concern
-- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
+- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture and size-capped background sweeping), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
@@ -58,7 +58,7 @@ anthropic-auth/
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic and relay servers
-- Contains: Test harness, mock server implementations, tool prefix tests
+- Contains: Test harness, mock server implementations, process runner with temp dir hygiene, tool prefix tests
 
 **`scripts/`:**
 - Purpose: Development, release, and analysis utilities
