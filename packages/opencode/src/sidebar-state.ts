@@ -56,9 +56,20 @@ export interface SidebarState {
   lastUpdated: number
 }
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import {
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { logger } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
@@ -238,23 +249,329 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
 
 let writeChain: Promise<void> = Promise.resolve()
 
-export async function getSidebarState(): Promise<SidebarState> {
+// Wait through ordinary contention while staying below the 2s stale-eviction window.
+const SIDEBAR_LOCK_BUDGET_MS = 1_000
+const SIDEBAR_LOCK_STALE_MS = 2_000
+const SIDEBAR_LOCK_RETRY_MIN_MS = 5
+const SIDEBAR_LOCK_RETRY_MAX_MS = 15
+
+interface SidebarStateWriteTestHooks {
+  afterMergeRead?: (stateFile: string) => void | Promise<void>
+  beforeRename?: (stateFile: string, tempFile: string) => void | Promise<void>
+  afterRename?: (stateFile: string) => void | Promise<void>
+  afterStaleLockStat?: (lockDir: string) => void | Promise<void>
+  onStaleLockClaimed?: (lockDir: string) => void | Promise<void>
+  onLockAcquired?: (lockDir: string) => void | Promise<void>
+  beforeReleaseDirectoryRemoval?: (lockDir: string) => void | Promise<void>
+  lockBudgetMs?: number
+  lockRetryMinMs?: number
+  lockRetryMaxMs?: number
+}
+
+let sidebarStateWriteTestHooks: SidebarStateWriteTestHooks | null = null
+
+export function __setSidebarStateWriteTestHooks(
+  hooks: SidebarStateWriteTestHooks | null,
+): void {
+  sidebarStateWriteTestHooks = hooks
+}
+
+// Boot-routing test hooks live here rather than in index.ts: the plugin entry
+// module must export nothing beyond the plugin factory — opencode's plugin
+// loader treats extra entry-point exports as plugin candidates and fails to
+// load the plugin (same incident class as the removed
+// __setBootProfileHydrationForTest export).
+export interface InitialSidebarRoutingTestHooks {
+  beforeSidebarRead?: () => void | Promise<void>
+  beforeStorageLoad?: () => void | Promise<void>
+  afterStorageLoad?: () => void | Promise<void>
+}
+
+let initialSidebarRoutingTestHooks: InitialSidebarRoutingTestHooks | null = null
+
+export function __setInitialSidebarRoutingTestHooks(
+  hooks: InitialSidebarRoutingTestHooks | null,
+): void {
+  initialSidebarRoutingTestHooks = hooks
+}
+
+export function getInitialSidebarRoutingTestHooks(): InitialSidebarRoutingTestHooks | null {
+  return initialSidebarRoutingTestHooks
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function acquireSidebarStateLock(stateFile: string): Promise<{
+  release: () => Promise<void>
+  ownsLock: () => Promise<boolean>
+} | null> {
+  const lockDir = `${stateFile}.lock`
+  const budgetMs =
+    sidebarStateWriteTestHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
+  const retryMinMs =
+    sidebarStateWriteTestHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
+  const retryMaxMs =
+    sidebarStateWriteTestHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
+  const deadline = Date.now() + budgetMs
+
+  while (true) {
+    try {
+      await mkdir(lockDir)
+      const ownerId = randomUUID()
+      const ownerFile = join(lockDir, ownerId)
+      await writeFile(ownerFile, '', {
+        encoding: 'utf8',
+        mode: 0o600,
+        flag: 'wx',
+      })
+      await sidebarStateWriteTestHooks?.onLockAcquired?.(lockDir)
+      return {
+        ownsLock: async () => {
+          try {
+            await stat(ownerFile)
+            return true
+          } catch {
+            return false
+          }
+        },
+        release: async () => {
+          // Unlinking this acquisition's unique file makes the filesystem reject
+          // a stale release after eviction handed the path to a successor.
+          try {
+            await unlink(ownerFile)
+          } catch {
+            return
+          }
+          await sidebarStateWriteTestHooks?.beforeReleaseDirectoryRemoval?.(
+            lockDir,
+          )
+          await rmdir(lockDir).catch(() => {})
+        },
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        logger.trace('sidebar', 'state lock unavailable; write skipped', {
+          stateFile,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return null
+      }
+    }
+
+    try {
+      const lockStat = await stat(lockDir)
+      if (Date.now() - lockStat.mtimeMs > SIDEBAR_LOCK_STALE_MS) {
+        await sidebarStateWriteTestHooks?.afterStaleLockStat?.(lockDir)
+        const evictedLockDir = `${lockDir}.evict-${process.pid}-${randomUUID()}`
+        try {
+          await rename(lockDir, evictedLockDir)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+          throw error
+        }
+        await sidebarStateWriteTestHooks?.onStaleLockClaimed?.(lockDir)
+        await rm(evictedLockDir, { recursive: true, force: true }).catch(
+          () => {},
+        )
+        continue
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      logger.trace('sidebar', 'state lock inspection failed; write skipped', {
+        stateFile,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return null
+    }
+
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      logger.warn('sidebar', 'lock budget exhausted, write skipped', {
+        stateFile,
+        budgetMs,
+      })
+      return null
+    }
+    const jitterMs =
+      retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
+    await sleep(Math.min(jitterMs, remainingMs))
+  }
+}
+
+export async function __acquireSidebarStateLockForTest(
+  stateFile: string,
+): Promise<(() => Promise<void>) | null> {
+  return (await acquireSidebarStateLock(stateFile))?.release ?? null
+}
+
+async function writeSidebarStateAtomic(
+  stateFile: string,
+  state: SidebarState,
+  ownsLock: () => Promise<boolean>,
+): Promise<'written' | 'lock-lost-before-rename' | 'lock-lost-after-rename'> {
+  const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(tempFile, JSON.stringify(state), {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
   try {
-    const raw = await readFile(getSidebarStateFile(), 'utf8')
+    if (!(await ownsLock())) {
+      logger.trace('sidebar', 'state lock lost before rename; write aborted', {
+        stateFile,
+      })
+      await rm(tempFile, { force: true }).catch(() => {})
+      return 'lock-lost-before-rename'
+    }
+    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
+    // No production await separates this ownership fence from rename. A process
+    // freeze between the adjacent syscalls remains possible, so rename is also
+    // fenced from the other side below.
+    if (!(await ownsLock())) {
+      logger.trace('sidebar', 'state lock lost before rename; write aborted', {
+        stateFile,
+      })
+      await rm(tempFile, { force: true }).catch(() => {})
+      return 'lock-lost-before-rename'
+    }
+    await rename(tempFile, stateFile)
+    await sidebarStateWriteTestHooks?.afterRename?.(stateFile)
+    if (!(await ownsLock())) return 'lock-lost-after-rename'
+    return 'written'
+  } catch (error) {
+    await rm(tempFile, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+async function readSidebarState(stateFile: string): Promise<SidebarState> {
+  try {
+    const raw = await readFile(stateFile, 'utf8')
     return normalizeSidebarState(JSON.parse(raw))
   } catch {
     return DEFAULT_SIDEBAR_STATE
   }
 }
 
+export async function getSidebarState(): Promise<SidebarState> {
+  return readSidebarState(getSidebarStateFile())
+}
+
+export interface SidebarStateWriteOptions {
+  routingAuthoritative?: boolean
+  resolvePreservedRouting?: (current: SidebarState) =>
+    | (Pick<SidebarState, 'activeId' | 'route'> & {
+        state?: SidebarState
+      })
+    | undefined
+    | Promise<
+        | (Pick<SidebarState, 'activeId' | 'route'> & {
+            state?: SidebarState
+          })
+        | undefined
+      >
+  onRoutingResolved?: (
+    routing: Pick<SidebarState, 'activeId' | 'route'>,
+  ) => void
+}
+
 export async function setSidebarState(
   state: SidebarState,
   stateFile = getSidebarStateFile(),
+  options: SidebarStateWriteOptions = {},
 ): Promise<void> {
   writeChain = writeChain
     .then(async () => {
       await mkdir(dirname(stateFile), { recursive: true })
-      await writeFile(stateFile, JSON.stringify(state), 'utf8')
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const repairingPostRenameLoss = attempt === 1
+        const lock = await acquireSidebarStateLock(stateFile)
+        // Sidebar frames are display-only and refresh within seconds; dropping one
+        // is safer than clobbering routing state that may stay authoritative until
+        // another process handles its next request.
+        if (!lock) {
+          if (repairingPostRenameLoss) {
+            logger.warn(
+              'sidebar',
+              'post-rename repair lock unavailable; write skipped',
+              { stateFile },
+            )
+          }
+          return
+        }
+
+        let stateToWrite = state
+        let result:
+          | 'written'
+          | 'lock-lost-before-rename'
+          | 'lock-lost-after-rename'
+        try {
+          if (options.routingAuthoritative === false) {
+            const current = await readSidebarState(stateFile)
+            const preservedRouting =
+              await options.resolvePreservedRouting?.(current)
+            if (preservedRouting) {
+              const preservedState = preservedRouting.state ?? state
+              stateToWrite = {
+                ...preservedState,
+                activeId: preservedRouting.activeId,
+                route: preservedRouting.route,
+                lastUpdated: Math.max(
+                  preservedState.lastUpdated,
+                  current.lastUpdated,
+                ),
+              }
+            }
+            await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+          } else if (repairingPostRenameLoss) {
+            const current = await readSidebarState(stateFile)
+            // A successor owns its fresh account/quota and recovery snapshots;
+            // this routing frame may only republish its decision and shared UI state.
+            stateToWrite = {
+              ...current,
+              activeId: state.activeId,
+              route: state.route,
+              relay: state.relay,
+              fastMode: state.fastMode,
+              cacheKeep: state.cacheKeep,
+              lastUpdated: Math.max(current.lastUpdated, state.lastUpdated),
+            }
+          }
+          result = await writeSidebarStateAtomic(
+            stateFile,
+            stateToWrite,
+            lock.ownsLock,
+          )
+        } finally {
+          await lock.release()
+        }
+
+        if (result === 'lock-lost-after-rename') {
+          if (repairingPostRenameLoss) {
+            logger.warn(
+              'sidebar',
+              'post-rename repair lost lock; write skipped',
+              { stateFile },
+            )
+            return
+          }
+          logger.warn(
+            'sidebar',
+            'state lock lost after rename; repairing write',
+            {
+              stateFile,
+            },
+          )
+          continue
+        }
+        if (result === 'lock-lost-before-rename') return
+        options.onRoutingResolved?.({
+          activeId: stateToWrite.activeId,
+          route: stateToWrite.route,
+        })
+        return
+      }
     })
     .catch(() => {
       // Best-effort — sidebar is non-critical
