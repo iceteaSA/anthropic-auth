@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readdir, rm, utimes, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import {
@@ -37,6 +44,7 @@ import {
   type PrimeUsageCounters,
   parsePrimeCommandAction,
   primeIsEligible,
+  primeMarkerNamespaceDir,
   primeMarkerPath,
 } from '../prime.ts'
 
@@ -357,12 +365,15 @@ async function makeHarness(opts: {
   send?: (id: 'main' | string) => PrimeSendResult | Promise<PrimeSendResult>
   recordSuccessReturn?: PrimeUsageCounters
   refreshError?: Error
+  storagePath?: string
 }): Promise<Harness> {
   const sendCalls: SendCall[] = []
   const refreshCalls: string[] = []
   const recordSuccessCalls: Harness['recordSuccessCalls'] = []
 
+  const storagePath = opts.storagePath ?? join(opts.markerDir, 'accounts.json')
   const manager = new PrimeManager({
+    storagePath,
     loadStorage: async () => opts.storage,
     refreshQuota: async (id) => {
       refreshCalls.push(id)
@@ -405,7 +416,7 @@ async function makeHarness(opts: {
     refreshCalls,
     recordSuccessCalls,
     records: [],
-    markerDir: opts.markerDir,
+    markerDir: primeMarkerNamespaceDir(opts.markerDir, storagePath),
     cleanup: async () => {
       manager.stop()
     },
@@ -531,7 +542,7 @@ describe('PrimeManager — bootstrap', () => {
 
     expect(h.refreshCalls).toEqual(['main'])
     expect(h.sendCalls.map((call) => call.accountId)).toEqual(['main'])
-    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    expect(await readdir(h.markerDir)).toEqual(['main-bootstrap'])
     await h.cleanup()
   })
 
@@ -798,7 +809,7 @@ describe('PrimeManager — bootstrap', () => {
 
     expect(stale.refreshCalls).toEqual([])
     expect(stale.sendCalls).toEqual([])
-    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    expect(await readdir(observing.markerDir)).toEqual(['main-bootstrap'])
     await observing.cleanup()
     await stale.cleanup()
   })
@@ -838,7 +849,7 @@ describe('PrimeManager — bootstrap', () => {
 
     expect(h.sendCalls).toHaveLength(1)
     expect(h.refreshCalls).toEqual(['main'])
-    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    expect(await readdir(h.markerDir)).toEqual(['main-bootstrap'])
     await h.cleanup()
   })
 
@@ -870,20 +881,20 @@ describe('PrimeManager — bootstrap', () => {
 
     await h.manager.tick()
     expect(h.sendCalls).toHaveLength(1)
-    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    expect(await readdir(h.markerDir)).toEqual(['main-bootstrap'])
 
     const observedReset = 11_000_000
     fixture.storage.quota!.mainQuota!.five_hour!.resetsAt = new Date(
       observedReset,
     ).toISOString()
     await h.manager.tick()
-    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    expect(await readdir(h.markerDir)).toEqual(['main-bootstrap'])
 
     now = observedReset + PRIME_DUE_OFFSET_MS + 1
     await h.manager.tick()
 
     expect(h.sendCalls).toHaveLength(2)
-    expect(await readdir(markerRoot)).toEqual([`main-${observedReset}`])
+    expect(await readdir(h.markerDir)).toEqual([`main-${observedReset}`])
     await h.cleanup()
   })
 })
@@ -1057,7 +1068,7 @@ describe('PrimeManager — claim atomicity', () => {
     await Promise.all([a.manager.tick(), b.manager.tick()])
 
     expect(a.sendCalls.length + b.sendCalls.length).toBe(1)
-    expect(await readdir(markerRoot)).toEqual(['main-bootstrap'])
+    expect(await readdir(a.markerDir)).toEqual(['main-bootstrap'])
     await a.cleanup()
     await b.cleanup()
   })
@@ -1623,17 +1634,6 @@ describe('PrimeManager — recordSuccess', () => {
 
 describe('PrimeManager — marker sweep', () => {
   test('markers older than six hours are removed; fresh markers survive', async () => {
-    const oldMarker = join(markerRoot, 'main-100000')
-    await writeFile(oldMarker, '', 'utf8')
-    const oldBootstrapMarker = join(markerRoot, 'main-bootstrap')
-    await writeFile(oldBootstrapMarker, '', 'utf8')
-    const oldTime = new Date(0)
-    await utimes(oldMarker, oldTime, oldTime)
-    await utimes(oldBootstrapMarker, oldTime, oldTime)
-
-    const freshMarker = join(markerRoot, 'main-200000')
-    await writeFile(freshMarker, '', 'utf8')
-
     const fixture = makePrimeFixture({
       mainQuota: {
         five_hour: {
@@ -1650,8 +1650,20 @@ describe('PrimeManager — marker sweep', () => {
       now: 1_000_000_000,
       quotaFresh: {},
     })
+    await mkdir(h.markerDir, { recursive: true })
+    const oldMarker = join(h.markerDir, 'main-100000')
+    await writeFile(oldMarker, '', 'utf8')
+    const oldBootstrapMarker = join(h.markerDir, 'main-bootstrap')
+    await writeFile(oldBootstrapMarker, '', 'utf8')
+    const oldTime = new Date(0)
+    await utimes(oldMarker, oldTime, oldTime)
+    await utimes(oldBootstrapMarker, oldTime, oldTime)
+
+    const freshMarker = join(h.markerDir, 'main-200000')
+    await writeFile(freshMarker, '', 'utf8')
+
     await h.manager.tick()
-    const remaining = (await readdir(markerRoot)).sort()
+    const remaining = (await readdir(h.markerDir)).sort()
     expect(remaining).toContain('main-200000')
     expect(remaining).not.toContain('main-100000')
     expect(remaining).not.toContain('main-bootstrap')
@@ -2034,7 +2046,7 @@ describe('PrimeManager — post-claim abort', () => {
 
     await h.manager.tick()
     expect(h.sendCalls).toEqual([])
-    expect(await readdir(markerRoot)).toEqual([])
+    expect(await readdir(h.markerDir)).toEqual([])
 
     now += PRIME_CHECK_THROTTLE_MS
     await h.manager.tick()

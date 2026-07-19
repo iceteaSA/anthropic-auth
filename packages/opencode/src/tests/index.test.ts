@@ -9316,26 +9316,42 @@ describe('claude-prime direct request', () => {
     expect(headers.get('authorization')).toContain('refreshed-main-access')
   })
 
-  test('a new plugin instance stops the previous prime manager (M3a)', async () => {
+  test('plugin instances with the same storage path adopt one prime manager', async () => {
     const fixture = createFallbackStorage({
       prime: { enabled: true },
     })
     await useTempAccountFile(fixture)
-    ;(globalThis as any).setInterval = mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    )
-    // First plugin invocation creates the prime manager and starts it.
+    let intervalCalls = 0
+    ;(globalThis as any).setInterval = mock(() => {
+      intervalCalls += 1
+      return { unref() {} } as unknown as ReturnType<typeof setInterval>
+    })
     const plugin1 = await getPlugin()
     const mgr1 = (plugin1 as any).__primeManager
     expect(mgr1).toBeDefined()
     expect(mgr1.isStopped?.()).toBeFalsy()
-    // Second invocation (simulating /reload) must stop the previous
-    // instance before constructing a new one.
+    const intervalsAfterFirstPlugin = intervalCalls
     const plugin2 = await getPlugin()
     const mgr2 = (plugin2 as any).__primeManager
     expect(mgr2).toBeDefined()
+    expect(mgr2).toBe(mgr1)
+    expect(mgr1.isStopped()).toBe(false)
+    expect(intervalCalls - intervalsAfterFirstPlugin).toBe(1)
+  })
+
+  test('plugin instances with different storage paths own independent prime managers', async () => {
+    const fixture = createFallbackStorage({ prime: { enabled: true } })
+    await useTempAccountFile(fixture)
+    const plugin1 = await getPlugin()
+    const mgr1 = (plugin1 as any).__primeManager
+
+    await useTempAccountFile(fixture)
+    const plugin2 = await getPlugin()
+    const mgr2 = (plugin2 as any).__primeManager
+
     expect(mgr2).not.toBe(mgr1)
-    expect(mgr1.isStopped()).toBe(true)
+    expect(mgr1.isStopped()).toBe(false)
+    expect(mgr2.isStopped()).toBe(false)
   })
 })
 

@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import {
   type AccountQuotaWindow,
@@ -391,6 +392,20 @@ function defaultMarkerDir(): string {
   return join(tmpdir(), 'opencode-anthropic-auth', 'prime')
 }
 
+export function primeStorageFingerprint(storagePath: string): string {
+  return createHash('sha256')
+    .update(resolve(storagePath))
+    .digest('hex')
+    .slice(0, 12)
+}
+
+export function primeMarkerNamespaceDir(
+  markerDir: string,
+  storagePath: string,
+): string {
+  return join(markerDir, primeStorageFingerprint(storagePath))
+}
+
 export function primeMarkerPath(
   markerDir: string,
   accountId: 'main' | string,
@@ -512,6 +527,7 @@ export class PrimeManager {
     ) => Promise<PrimeUsageCounters>
     now?: () => number
     markerDir?: string
+    storagePath: string
   }
   // Per-account transient state from the last ATTEMPT — overlays persisted
   // counters in `stats()` so the sidebar/dialog can show "just attempted"
@@ -542,6 +558,7 @@ export class PrimeManager {
     ) => Promise<PrimeUsageCounters>
     now?: () => number
     markerDir?: string
+    storagePath: string
   }) {
     this.options = options
   }
@@ -669,7 +686,7 @@ export class PrimeManager {
       }
 
       const storedResetEpoch = storedResetMs(evaluation.storedFiveHour)
-      const markerDir = this.options.markerDir ?? defaultMarkerDir()
+      const markerDir = this.markerDir()
       const bootstrapMarkerPath = primeBootstrapMarkerPath(
         markerDir,
         evaluation.id,
@@ -824,7 +841,7 @@ export class PrimeManager {
     accountId: 'main' | string,
     resetsAtEpochMs: number,
   ): Promise<string | null> {
-    const dir = this.options.markerDir ?? defaultMarkerDir()
+    const dir = this.markerDir()
     const markerPath = primeMarkerPath(dir, accountId, resetsAtEpochMs)
     return this.tryClaimPath(dir, markerPath)
   }
@@ -832,7 +849,7 @@ export class PrimeManager {
   private async tryClaimBootstrap(
     accountId: 'main' | string,
   ): Promise<string | null> {
-    const dir = this.options.markerDir ?? defaultMarkerDir()
+    const dir = this.markerDir()
     const markerPath = primeBootstrapMarkerPath(dir, accountId)
     return this.tryClaimPath(dir, markerPath)
   }
@@ -859,7 +876,7 @@ export class PrimeManager {
   private async hasAnyClaimMarker(
     accountId: 'main' | string,
   ): Promise<boolean> {
-    const dir = this.options.markerDir ?? defaultMarkerDir()
+    const dir = this.markerDir()
     const prefix = `${encodeURIComponent(accountId)}-`
     try {
       return (await readdir(dir)).some((entry) => entry.startsWith(prefix))
@@ -983,7 +1000,7 @@ export class PrimeManager {
   }
 
   private async sweepMarkers(now: number): Promise<void> {
-    const dir = this.options.markerDir ?? defaultMarkerDir()
+    const dir = this.markerDir()
     let entries: string[]
     try {
       entries = await readdir(dir)
@@ -1005,5 +1022,12 @@ export class PrimeManager {
     if (swept > 0) {
       logger.trace('prime', 'swept stale markers', { swept })
     }
+  }
+
+  private markerDir(): string {
+    return primeMarkerNamespaceDir(
+      this.options.markerDir ?? defaultMarkerDir(),
+      this.options.storagePath,
+    )
   }
 }

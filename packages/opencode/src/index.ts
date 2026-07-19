@@ -151,6 +151,7 @@ import {
   type FableFallbackPlan,
   type FableStandbyCacheAnchor,
 } from './fable-fallback.ts'
+import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   drainNotifications,
@@ -1363,31 +1364,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
   }
 
-  // -- Plugin-level singleton guard for the prime manager (M3a). A new
-  // plugin invocation (e.g. /reload) replaces the previous instance; the
-  // older instance is `stop()`ed so its in-flight tick aborts and any
-  // future interval is cleared. Without this guard a leaked manager
-  // could continue firing after `/claude-prime off` or a settings edit
-  // because the new manager only knew about its own state.
-  const primeGlobal = globalThis as {
-    __anthropicPrimeManager?: PrimeManager | null
-  }
-  const previousPrimeManager: PrimeManager | null =
-    primeGlobal.__anthropicPrimeManager ?? null
-  if (previousPrimeManager) {
-    previousPrimeManager.stop()
-  }
-  const primeManager: PrimeManager = new PrimeManager({
-    loadStorage: () => loadAccounts(accountStoragePath),
-    refreshQuota: async (accountId) => {
-      if (accountId === 'main') return refreshPrimeMainQuota()
-      return refreshPrimeFallbackQuota(accountId)
-    },
-    sendPrime,
-    recordSuccess: (accountId, usage) =>
-      incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
-  })
-  primeGlobal.__anthropicPrimeManager = primeManager
+  const primeManager: PrimeManager = adoptPrimeManager(
+    accountStoragePath,
+    () =>
+      new PrimeManager({
+        storagePath: accountStoragePath,
+        loadStorage: () => loadAccounts(accountStoragePath),
+        refreshQuota: async (accountId) => {
+          if (accountId === 'main') return refreshPrimeMainQuota()
+          return refreshPrimeFallbackQuota(accountId)
+        },
+        sendPrime,
+        recordSuccess: (accountId, usage) =>
+          incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
+      }),
+  )
   if (isPrimePersistentlyEnabled(initialStorage)) {
     primeManager.start()
   }
