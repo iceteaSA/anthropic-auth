@@ -22,6 +22,7 @@ import {
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
   getQuotaRefreshEveryNRequests,
+  getScopedQuotaWindowForModel,
   isQuotaPolicyAuthError,
   quotaBackoffActive,
 } from './accounts.ts'
@@ -352,16 +353,34 @@ export class QuotaManager {
   // Staleness queries
   // =========================================================================
 
-  isMainStale(): boolean {
-    if (!this.main) return true
-    return this.now() >= this.main.refreshAfter
+  private scopedWindowIsStale(entry: QuotaEntry, modelId?: string) {
+    const scoped = getScopedQuotaWindowForModel(entry.quota, modelId)
+    return Boolean(
+      scoped &&
+        this.now() - scoped.checkedAt >= getQuotaCheckIntervalMs(this.storage),
+    )
   }
 
-  isFallbackStale(accountId: string, accessToken?: string): boolean {
+  isMainStale(modelId?: string): boolean {
+    if (!this.main) return true
+    return (
+      this.now() >= this.main.refreshAfter ||
+      this.scopedWindowIsStale(this.main, modelId)
+    )
+  }
+
+  isFallbackStale(
+    accountId: string,
+    accessToken?: string,
+    modelId?: string,
+  ): boolean {
     // Token-aware: a credential change invalidates the entry (treated as stale).
     const entry = this.getFallback(accountId, accessToken)
     if (!entry) return true
-    return this.now() >= entry.refreshAfter
+    return (
+      this.now() >= entry.refreshAfter ||
+      this.scopedWindowIsStale(entry, modelId)
+    )
   }
 
   shouldRefreshOnRequestCount(requestCount: number): boolean {
@@ -374,8 +393,11 @@ export class QuotaManager {
    * Combined check: should a refresh happen right now?
    * True if main is stale by time OR triggered by request count.
    */
-  needsRefresh(requestCount: number): boolean {
-    return this.isMainStale() || this.shouldRefreshOnRequestCount(requestCount)
+  needsRefresh(requestCount: number, modelId?: string): boolean {
+    return (
+      this.isMainStale(modelId) ||
+      this.shouldRefreshOnRequestCount(requestCount)
+    )
   }
 
   // =========================================================================

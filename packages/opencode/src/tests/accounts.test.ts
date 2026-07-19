@@ -55,6 +55,7 @@ import {
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
+  setCacheKeepPersistentAlways,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
@@ -1513,14 +1514,33 @@ describe('account storage', () => {
     const storage = await setCacheKeepPersistentWindow(9, 23)
     expect(storage.cacheKeep).toEqual({
       enabled: true,
+      always: false,
       startHour: 9,
       endHour: 23,
     })
     const disabled = await setCacheKeepPersistentEnabled(false)
     expect(disabled.cacheKeep).toEqual({
       enabled: false,
+      always: false,
       startHour: 9,
       endHour: 23,
+    })
+  })
+
+  test('persists cacheKeep always mode, preserves subagents, and clears the old window', async () => {
+    await setCacheKeepSubagentsEnabled(true)
+    const windowed = await setCacheKeepPersistentWindow(9, 23)
+    expect(windowed.cacheKeep?.subagents).toBe(true)
+    const storage = await setCacheKeepPersistentAlways()
+    expect(storage.cacheKeep).toEqual({
+      enabled: true,
+      always: true,
+      subagents: true,
+    })
+    expect((await loadAccounts())?.cacheKeep).toEqual({
+      enabled: true,
+      always: true,
+      subagents: true,
     })
   })
 
@@ -4148,6 +4168,79 @@ describe('setAccountEnabled', () => {
 })
 
 // -- Persistent round-trip tests -----------------------------------------------
+
+describe('multi-account persistence', () => {
+  test('a stale full snapshot cannot delete a newer account from config or state', async () => {
+    const current = baseStorage()
+    current.accounts.push({
+      id: 'umut',
+      label: 'umut',
+      type: 'oauth',
+      access: 'umut-access',
+      refresh: 'umut-refresh',
+    })
+    await saveAccounts(current, accountPath)
+
+    const stale = baseStorage()
+    stale.accounts.push({
+      id: 'yiyi',
+      label: 'yiyi',
+      type: 'oauth',
+      access: 'yiyi-access',
+      refresh: 'yiyi-refresh',
+    })
+    await saveAccounts(stale, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.accounts.map((account) => account.id)).toEqual([
+      'umut',
+      'yiyi',
+    ])
+    expect(
+      expectOAuthAccount(
+        loaded?.accounts.find((account) => account.id === 'umut'),
+      ).refresh,
+    ).toBe('umut-refresh')
+    expect(
+      expectOAuthAccount(
+        loaded?.accounts.find((account) => account.id === 'yiyi'),
+      ).refresh,
+    ).toBe('yiyi-refresh')
+
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(Object.keys(state.accounts)).toEqual(['umut', 'yiyi'])
+  })
+
+  test('concurrent account additions preserve both accounts', async () => {
+    await Promise.all([
+      addAccountPersistent(
+        {
+          id: 'first',
+          label: 'first',
+          type: 'oauth',
+          refresh: 'first-refresh',
+        },
+        accountPath,
+      ),
+      addAccountPersistent(
+        {
+          id: 'second',
+          label: 'second',
+          type: 'oauth',
+          refresh: 'second-refresh',
+        },
+        accountPath,
+      ),
+    ])
+
+    const loaded = await loadAccounts(accountPath)
+    expect(new Set(loaded?.accounts.map((account) => account.id))).toEqual(
+      new Set(['first', 'second']),
+    )
+  })
+})
 
 describe('removeAccountPersistent', () => {
   test('persists removal across load', async () => {

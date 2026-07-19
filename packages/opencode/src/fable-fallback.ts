@@ -112,6 +112,28 @@ export class FableFallbackManager {
     }
   }
 
+  recoveryAccount(plan: FableFallbackPlan) {
+    if (plan.cycle === undefined) return plan.cacheAccountId
+    const state = this.sessions.get(plan.sessionId)
+    return state?.cycle === plan.cycle
+      ? state.cacheAccountId
+      : plan.cacheAccountId
+  }
+
+  bindRecoveryAccount(plan: FableFallbackPlan, oauthAccountId: string) {
+    if (!plan.downgraded || plan.cycle === undefined) return false
+    const state = this.sessions.get(plan.sessionId)
+    if (!state || state.cycle !== plan.cycle) return false
+    if (state.cacheAccountId === oauthAccountId) return false
+    state.cacheAccountId = oauthAccountId
+    state.standbyCacheAnchor = undefined
+    state.standbyAnchorSequence = 0
+    state.updatedAt = this.now()
+    plan.cacheAccountId = oauthAccountId
+    plan.standbyCacheAnchor = undefined
+    return true
+  }
+
   activate(plan: FableFallbackPlan, cacheAccountId?: string): number {
     if (plan.downgraded || !isFableModel(plan.requestedModel)) {
       return this.remaining(plan.sessionId)
@@ -148,6 +170,8 @@ export class FableFallbackManager {
     state.remaining--
     if (
       standbyCacheAnchor &&
+      (!state.cacheAccountId ||
+        standbyCacheAnchor.oauthAccountId === state.cacheAccountId) &&
       plan.requestSequence != null &&
       plan.requestSequence >= state.standbyAnchorSequence
     ) {

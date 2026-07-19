@@ -4,6 +4,7 @@ import { stdin as input, stdout as output } from 'node:process'
 import { createInterface } from 'node:readline/promises'
 import {
   type AccountStorage,
+  addAccountPersistent,
   authorize,
   exchange,
   generateRelayToken,
@@ -12,7 +13,6 @@ import {
   isValidApiBaseURL,
   loadAccounts,
   saveAccounts,
-  upsertAccount,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -217,7 +217,6 @@ export interface RelaySetupDeps {
 export async function relaySetup(deps: RelaySetupDeps = {}) {
   const fetchImpl = deps.fetchImpl ?? fetch
   const ask = deps.prompt ?? prompt
-  const storage = (await loadAccounts()) ?? defaultStorage()
   const token = requireText(
     process.env.CLOUDFLARE_API_TOKEN?.trim() ||
       (await ask('Cloudflare API token: ')),
@@ -276,6 +275,9 @@ export async function relaySetup(deps: RelaySetupDeps = {}) {
     defaultUrl ||
     requireText(await prompt('Relay Worker URL: '), 'Relay Worker URL')
 
+  // Provisioning can take minutes. Reload immediately before commit so the
+  // relay setup cannot overwrite fallback accounts changed while it was open.
+  const storage = (await loadAccounts()) ?? defaultStorage()
   storage.relay = {
     enabled: true,
     url,
@@ -319,7 +321,6 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const ask = deps.prompt ?? prompt
   const authorizeImpl = deps.authorize ?? authorize
   const exchangeImpl = deps.exchange ?? exchange
-  const storage = (await loadAccounts()) ?? defaultStorage()
   const label =
     labelArg?.trim() || (await ask('Fallback account label (optional): '))
   const authorization = await authorizeImpl('max')
@@ -341,7 +342,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   }
 
   const now = Date.now()
-  upsertAccount(storage, {
+  await addAccountPersistent({
     id: label || crypto.randomUUID(),
     label: label || undefined,
     type: 'oauth',
@@ -353,7 +354,6 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     lastUsed: now,
     lastRefreshedAt: now,
   })
-  await saveAccounts(storage)
 
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }
@@ -370,7 +370,6 @@ export interface ApiAddDeps {
 
 export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
   const ask = deps.prompt ?? prompt
-  const storage = (await loadAccounts()) ?? defaultStorage()
   const label =
     labelArg?.trim() || (await ask('API fallback label (optional): '))
   const baseURL =
@@ -400,7 +399,7 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
     authHeaderInput === 'x-api-key' ? 'x-api-key' : 'authorization-bearer'
   const now = Date.now()
 
-  upsertAccount(storage, {
+  await addAccountPersistent({
     id: label || crypto.randomUUID(),
     label: label || undefined,
     type: 'api',
@@ -411,7 +410,6 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
     addedAt: now,
     lastUsed: now,
   })
-  await saveAccounts(storage)
 
   console.log(
     `\nSaved API fallback route${label ? ` "${label}"` : ''} (${baseURL}).`,

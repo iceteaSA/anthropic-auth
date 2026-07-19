@@ -50,6 +50,27 @@ describe('FableFallbackManager', () => {
     expect(JSON.parse(restored.bodyText).model).toBe('claude-fable-5')
   })
 
+  test('rebinds an active recovery cycle when sticky routing must migrate accounts', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body())!, 'old-account')
+    const lateOldRoute = manager.plan('session-a', body())!
+    const migrated = manager.plan('session-a', body())!
+
+    expect(manager.bindRecoveryAccount(migrated, 'new-account')).toBe(true)
+    expect(migrated.cacheAccountId).toBe('new-account')
+    expect(manager.recoveryAccount(lateOldRoute)).toBe('new-account')
+    manager.complete(lateOldRoute, {
+      fingerprint: 'old-account-anchor',
+      messageIndex: 1,
+      messageCount: 2,
+      oauthAccountId: 'old-account',
+    })
+    expect(manager.plan('session-a', body())).toMatchObject({
+      cacheAccountId: 'new-account',
+      standbyCacheAnchor: undefined,
+    })
+  })
+
   test('retains the newest Opus cache anchor across a restored Fable period', () => {
     const manager = new FableFallbackManager()
     manager.activate(manager.plan('session-a', body())!)

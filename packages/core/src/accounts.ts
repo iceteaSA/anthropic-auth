@@ -180,7 +180,7 @@ export type PrimeRuntimeState = {
   main?: PrimeUsageCounters
 }
 
-export type RoutingMode = 'main-first' | 'fallback-first'
+export type RoutingMode = 'main-first' | 'fallback-first' | 'sticky-balanced'
 
 export type KillswitchThresholds = Partial<
   Record<QuotaWindowName | '5h' | '1w' | 'scoped', number>
@@ -252,6 +252,7 @@ export type AccountStorage = {
   }
   cacheKeep?: {
     enabled?: boolean
+    always?: boolean
     startHour?: number
     endHour?: number
     subagents?: boolean
@@ -1200,23 +1201,118 @@ async function writeJsonAtomic(path: string, value: unknown) {
   }
 }
 
+export interface SaveAccountsOptions {
+  /** Account ids intentionally removed by this mutation. */
+  removedAccountIds?: readonly string[]
+  /** Preserve disk order when a stale snapshot is missing newer accounts. */
+  preserveExistingAccountOrder?: boolean
+}
+
+function sameAccountIdentity(
+  left: FallbackAccount,
+  right: FallbackAccount,
+): boolean {
+  return (
+    left.id === right.id ||
+    Boolean(left.label && right.label && left.label === right.label)
+  )
+}
+
+function mergeAccountsForSave(
+  existing: readonly FallbackAccount[],
+  incoming: readonly FallbackAccount[],
+  options: SaveAccountsOptions,
+): FallbackAccount[] {
+  const removedIds = new Set(options.removedAccountIds ?? [])
+  const current = existing.filter((account) => !removedIds.has(account.id))
+  const next = incoming.filter((account) => !removedIds.has(account.id))
+  const missing = current.filter(
+    (account) =>
+      !next.some((candidate) => sameAccountIdentity(candidate, account)),
+  )
+  if (!missing.length) return [...next]
+  if (options.preserveExistingAccountOrder === false) {
+    return [...next, ...missing]
+  }
+
+  const usedIncoming = new Set<number>()
+  const merged = current.map((account) => {
+    const index = next.findIndex(
+      (candidate, candidateIndex) =>
+        !usedIncoming.has(candidateIndex) &&
+        sameAccountIdentity(candidate, account),
+    )
+    const candidate = next[index]
+    if (!candidate) return account
+    usedIncoming.add(index)
+    return candidate
+  })
+  for (let index = 0; index < next.length; index++) {
+    const candidate = next[index]
+    if (!usedIncoming.has(index) && candidate) merged.push(candidate)
+  }
+  return merged
+}
+
+const ACCOUNT_CONFIG_LOCK_TTL_MS = 10_000
+const ACCOUNT_CONFIG_LOCK_WAIT_MS = 12_000
+
+async function acquireAccountConfigWriteLock(path: string) {
+  await mkdir(dirname(path), { recursive: true })
+  const deadline = Date.now() + ACCOUNT_CONFIG_LOCK_WAIT_MS
+  while (true) {
+    const lock = await acquireRefreshFileLock({
+      name: 'config-write',
+      ttlMs: ACCOUNT_CONFIG_LOCK_TTL_MS,
+      path,
+      renew: true,
+    })
+    if (lock) return lock
+    if (Date.now() >= deadline) {
+      throw new Error(
+        'Timed out waiting for the account configuration write lock',
+      )
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
 export function saveAccounts(
   storage: AccountStorage,
   path = getAccountStoragePath(),
+  options: SaveAccountsOptions = {},
 ): Promise<void> {
   const resolvedPath = path
-  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath))
+  return enqueueSave(() => saveAccountsLocked(storage, resolvedPath, options))
 }
 
-async function saveAccountsLocked(storage: AccountStorage, path: string) {
-  const existing = await loadExistingTopLevelFields(path)
-  const nextConfig = { ...existing, ...configFromStorage(storage) }
-  await writeJsonAtomic(path, nextConfig)
-  await saveAccountStateUnlocked(storage, path, {
-    mainQuota: true,
-    mainRefresh: true,
-    accounts: true,
-  })
+async function saveAccountsLocked(
+  storage: AccountStorage,
+  path: string,
+  options: SaveAccountsOptions,
+) {
+  const lock = await acquireAccountConfigWriteLock(path)
+  try {
+    const current = await loadAccounts(path)
+    const nextStorage: AccountStorage = {
+      ...storage,
+      accounts: mergeAccountsForSave(
+        current?.accounts ?? [],
+        storage.accounts,
+        options,
+      ),
+    }
+    const existing = await loadExistingTopLevelFields(path)
+    const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+    await writeJsonAtomic(path, nextConfig)
+    await saveAccountStateUnlocked(nextStorage, path, {
+      mainQuota: true,
+      mainRefresh: true,
+      accounts: true,
+    })
+  } finally {
+    await lock.release()
+  }
 }
 
 function applyMainProfileStatePatch(
@@ -1687,10 +1783,27 @@ export async function setCacheKeepPersistentWindow(
 ) {
   const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
     enabled: true,
+    always: false,
     startHour,
     endHour,
   }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export async function setCacheKeepPersistentAlways(
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+  storage.cacheKeep = {
+    ...(storage.cacheKeep ?? {}),
+    enabled: true,
+    always: true,
+  }
+  delete storage.cacheKeep.startHour
+  delete storage.cacheKeep.endHour
   await saveAccounts(storage, path)
   return storage
 }
@@ -1821,7 +1934,9 @@ export function shouldFallbackStatus(
   return getFallbackStatuses(storage).includes(status)
 }
 
-function normalizeThresholds(storage: AccountStorage | null) {
+export function getQuotaMinimumRemainingThresholds(
+  storage: AccountStorage | null,
+) {
   const configured = storage?.quota?.minimumRemaining || {}
   return {
     five_hour:
@@ -2142,7 +2257,7 @@ export function quotaSnapshotPassesPolicy(
   storage: AccountStorage | null,
 ) {
   if (!quotaEnabled(storage)) return true
-  const thresholds = normalizeThresholds(storage)
+  const thresholds = getQuotaMinimumRemainingThresholds(storage)
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
     if (!window) return !failClosedOnUnknownQuota(storage)
@@ -2324,7 +2439,9 @@ export async function removeAccountPersistent(
   const storage = await loadAccounts(path)
   if (!storage) return false
   const existed = removeAccount(storage, id)
-  if (existed) await saveAccounts(storage, path)
+  if (existed) {
+    await saveAccounts(storage, path, { removedAccountIds: [id] })
+  }
   return existed
 }
 
@@ -2335,7 +2452,7 @@ export async function reorderAccountsPersistent(
   const storage = await loadAccounts(path)
   if (!storage) return
   reorderAccounts(storage, orderedIds)
-  await saveAccounts(storage, path)
+  await saveAccounts(storage, path, { preserveExistingAccountOrder: false })
 }
 
 export async function setAccountEnabledPersistent(
@@ -2382,7 +2499,7 @@ export function getQuotaNextRefreshAt(
       ? Math.min(candidate, windowFreshnessDeadline)
       : candidate
 
-  const thresholds = normalizeThresholds(storage)
+  const thresholds = getQuotaMinimumRemainingThresholds(storage)
   const blockedResetTimes: number[] = []
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
@@ -2428,8 +2545,13 @@ function quotaIsStale(
   account: OAuthAccount,
   storage: AccountStorage | null,
   now: number,
+  modelId?: string,
 ) {
-  return !quotaSnapshotIsFresh(account.quota, storage, now)
+  if (!quotaSnapshotIsFresh(account.quota, storage, now)) return true
+  const scoped = getScopedQuotaWindowForModel(account.quota, modelId)
+  return Boolean(
+    scoped && now - scoped.checkedAt >= getQuotaCheckIntervalMs(storage),
+  )
 }
 
 function cachedQuotaWindowStillRelevant(
@@ -2873,8 +2995,12 @@ export class FallbackAccountManager {
         }
         this.seedFallbackQuota(next, storage)
         const stale = this.quotaManager
-          ? this.quotaManager.isFallbackStale(next.id, next.access)
-          : quotaIsStale(next, storage, this.now())
+          ? this.quotaManager.isFallbackStale(
+              next.id,
+              next.access,
+              options.modelId,
+            )
+          : quotaIsStale(next, storage, this.now(), options.modelId)
         // Skip the request-time refresh when this account's quota API is
         // backed off (recent 429/5xx). Hitting it again would extend the
         // backoff; evaluate policy on the cached/seeded quota instead. Mirrors

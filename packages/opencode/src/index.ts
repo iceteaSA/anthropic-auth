@@ -13,6 +13,7 @@ import {
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
+  CacheKeepSessionRegistry,
   CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
@@ -28,6 +29,7 @@ import {
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
+  decideStickyQuotaFailure,
   dumpDirectRequest,
   exchange,
   executeAccountCommand,
@@ -48,6 +50,7 @@ import {
   getCache1hMode,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getDefaultCacheKeepRegistryDirectory,
   getKillswitchConfig,
   getKillswitchThresholdsForAccount,
   getPersistedLogLevel,
@@ -56,11 +59,13 @@ import {
   getRelayConfig,
   getRoutingMode,
   getScopedQuotaWindowForModel,
+  getStickyRoutingStatePath,
   hashRefreshToken,
   incrementPrimeUsagePersistent,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
+  isCacheKeepAlways,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isCacheKeepSubagentsEnabled,
@@ -111,12 +116,16 @@ import {
   removeAccountPersistent,
   reorderAccountsPersistent,
   resolveClaudeCodeIdentity,
+  STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  type StickyRouteCandidate,
+  StickySessionRouter,
   saveAccountState,
   sendViaRelay,
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
   setCache1hState,
+  setCacheKeepPersistentAlways,
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
@@ -130,6 +139,9 @@ import {
   setPrimePersistentEnabled,
   setRoutingMode,
   shouldFallbackStatus,
+  stickyQuotaSnapshotIsFresh,
+  stickyRetryAfterWithJitter,
+  stickyRouteFamilyForModel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
@@ -612,6 +624,14 @@ type FableRequestContext = {
   standbyBridgeLogged?: boolean
 }
 
+type StickyOAuthRoute = {
+  id: string
+  access: string
+  quota?: OAuthQuotaSnapshot
+  order: number
+  account?: OAuthAccount
+}
+
 const FABLE_SWITCHED_TO_OPUS_NOTICE =
   'Fable content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Fable cache warm.'
 const FABLE_RESTORED_NOTICE =
@@ -757,6 +777,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
   const fableFallbackManager = new FableFallbackManager()
+  const stickySessionRouter = new StickySessionRouter({
+    path:
+      process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
+      getStickyRoutingStatePath(accountStoragePath),
+  })
   const quotaManager = new QuotaManager({
     storage: initialStorage,
     onMainQuotaFetched: async (
@@ -1039,8 +1064,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   fallbackManager.startBackgroundRefresh()
   let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
+  const cacheKeepRegistry = new CacheKeepSessionRegistry({
+    directory:
+      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
+      getDefaultCacheKeepRegistryDirectory('opencode'),
+  })
+  let aggregateCacheKeepSessions: ReturnType<
+    CacheKeepManager['trackedSessions']
+  > = []
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    onTrackedSessionsChanged: async (sessions) => {
+      await cacheKeepRegistry.publish(sessions)
+      aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)
+    },
     prepareHeaders: async (headers, target) => {
       let accessToken: string | undefined
       const accountId = target.oauthAccountId
@@ -1368,7 +1405,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           url: target.url,
           headers: target.headers,
           bodyText: source.bodyText,
-          oauthAccountId: context.plan.cacheAccountId ?? target.oauthAccountId,
+          oauthAccountId:
+            fableFallbackManager.recoveryAccount(context.plan) ??
+            target.oauthAccountId,
         })
         if (result.ok) {
           logger.debug('fable-fallback', 'Fable cache warmed', {
@@ -1400,6 +1439,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     })
     return current
+  }
+
+  async function getAllTrackedCacheKeepSessions() {
+    aggregateCacheKeepSessions = await cacheKeepRegistry.list(
+      cacheKeepManager.trackedSessions(),
+    )
+    return aggregateCacheKeepSessions
   }
 
   setCache1hState({
@@ -1542,12 +1588,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       fastMode: isFastModeEnabled(),
       cacheKeep: {
         enabled: isCacheKeepHybridActive(storage),
-        window:
-          storage?.cacheKeep?.startHour != null &&
-          storage?.cacheKeep?.endHour != null
+        window: isCacheKeepAlways(storage)
+          ? 'always'
+          : storage?.cacheKeep?.startHour != null &&
+              storage?.cacheKeep?.endHour != null
             ? `${storage.cacheKeep.startHour}-${storage.cacheKeep.endHour}`
             : undefined,
-        trackedSessions: cacheKeepManager.trackedCount(),
+        trackedSessions: aggregateCacheKeepSessions.length,
       },
       // Prime section is omitted from the wire when the feature is disabled
       // so the sidebar reads a clean `prime === undefined` and the expanded
@@ -1895,7 +1942,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         action.startHour,
         action.endHour,
       )
-      logger.info('commands', 'cachekeep enabled changed', { enabled: true })
+      logger.info('commands', 'cachekeep schedule changed', {
+        schedule: `${action.startHour}-${action.endHour}`,
+      })
+    } else if (action.type === 'always') {
+      storage = await setCacheKeepPersistentAlways()
+      logger.info('commands', 'cachekeep schedule changed', {
+        schedule: 'always',
+      })
     } else if (action.type === 'disable') {
       storage = await setCacheKeepPersistentEnabled(false)
       logger.info('commands', 'cachekeep enabled changed', { enabled: false })
@@ -1907,14 +1961,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
 
     const window = getCacheKeepWindow(storage)
-    const stats = cacheKeepManager.stats(window)
+    const trackedSessionDetails = await getAllTrackedCacheKeepSessions()
+    const nextPrewarmAt = trackedSessionDetails.length
+      ? Math.min(
+          ...trackedSessionDetails.map((session) => session.nextPrewarmAt),
+        )
+      : undefined
     return executeCacheKeepCommand({
       argumentsText,
       enabled: isCacheKeepPersistentlyEnabled(storage),
+      always: isCacheKeepAlways(storage),
       window,
       hybridActive: isCacheKeepHybridActive(storage),
-      trackedSessions: stats.trackedSessions,
-      nextPrewarmAt: stats.nextPrewarmAt,
+      trackedSessions: trackedSessionDetails.length,
+      trackedSessionDetails,
+      nextPrewarmAt,
     })
   }
 
@@ -1950,15 +2011,23 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return executeFastModeCommand({ argumentsText, enabled })
   }
 
-  async function executePersistentRoutingCommand(argumentsText: string) {
+  async function executePersistentRoutingCommand(
+    argumentsText: string,
+    sessionId?: string,
+  ) {
     const action = parseRoutingCommandAction(argumentsText)
     if (action.type === 'mode') {
-      await setRoutingMode(action.mode)
+      await setRoutingMode(action.mode, accountStoragePath)
       logger.info('commands', 'routing mode changed', { mode: action.mode })
       return executeRoutingCommand({ argumentsText, mode: action.mode })
     }
 
-    const storage = await loadAccounts()
+    if (action.type === 'reset' && sessionId) {
+      await stickySessionRouter.clear(sessionId)
+      logger.info('commands', 'sticky routing assignment reset')
+    }
+
+    const storage = await loadAccounts(accountStoragePath)
     return executeRoutingCommand({
       argumentsText,
       mode: getRoutingMode(storage),
@@ -2299,7 +2368,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     }
     if (command === 'claude-routing') {
-      const text = await executePersistentRoutingCommand(args)
+      const text = await executePersistentRoutingCommand(args, sessionId)
       const storage = await loadAccounts(accountStoragePath)
       return { command, text, knobs: { mode: getRoutingMode(storage) } }
     }
@@ -2538,7 +2607,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         [CLAUDE_CACHE_KEEP_COMMAND_NAME]: {
           template: CLAUDE_CACHE_KEEP_COMMAND_NAME,
           description:
-            'Keep hybrid Claude cache warm for recently used sessions during a local time window.',
+            'Keep hybrid Claude cache warm always or during a local time window.',
         },
         [CLAUDE_PRIME_COMMAND_NAME]: {
           template: CLAUDE_PRIME_COMMAND_NAME,
@@ -2569,7 +2638,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         [CLAUDE_ROUTING_COMMAND_NAME]: {
           template: CLAUDE_ROUTING_COMMAND_NAME,
           description:
-            'Show or change Claude account routing between main-first and fallback-first.',
+            'Show or change Claude account routing: main-first, fallback-first, or sticky-balanced.',
         },
         [KILLSWITCH_COMMAND_NAME]: {
           template: KILLSWITCH_COMMAND_NAME,
@@ -3691,6 +3760,198 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             )
           }
 
+          async function buildStickyOAuthRoutes(input: {
+            storage: AccountStorage | null
+            mainAccessToken: string
+            requestedModelId?: string
+          }) {
+            const mainEntry = quotaManager.getMain(input.mainAccessToken)
+            let mainQuota = mainEntry?.quota
+            if (
+              !stickyQuotaSnapshotIsFresh(
+                mainEntry?.quota,
+                input.storage,
+                Date.now(),
+                input.requestedModelId,
+              )
+            ) {
+              try {
+                mainQuota = await quotaManager.refreshMain(
+                  input.mainAccessToken,
+                )
+              } catch {}
+            }
+            const usableFallbacks =
+              await fallbackManager.getUsableFallbackAccounts(input.storage, {
+                modelId: input.requestedModelId,
+              })
+            const latestStorage =
+              (await loadAccounts(accountStoragePath)) ?? input.storage
+            const usableById = new Map(
+              usableFallbacks.map((account) => [account.id, account]),
+            )
+            const allRoutes: StickyOAuthRoute[] = []
+            if (
+              !isPermanentRefreshError(
+                latestStorage?.refresh?.mainLastRefreshError,
+              )
+            ) {
+              allRoutes.push({
+                id: STICKY_ROUTING_MAIN_ACCOUNT_ID,
+                access: input.mainAccessToken,
+                quota: mainQuota,
+                order: 0,
+              })
+            }
+            for (const [index, stored] of (
+              latestStorage?.accounts ?? []
+            ).entries()) {
+              if (stored.enabled === false || !isOAuthAccount(stored)) continue
+              const account = usableById.get(stored.id) ?? stored
+              if (
+                !account.access ||
+                isPermanentRefreshError(account.lastRefreshError)
+              )
+                continue
+              let accountQuota = getFallbackQuota(account)
+              if (
+                !stickyQuotaSnapshotIsFresh(
+                  accountQuota,
+                  latestStorage,
+                  Date.now(),
+                  input.requestedModelId,
+                )
+              ) {
+                try {
+                  accountQuota = await quotaManager.refreshFallback(
+                    account.id,
+                    account.access,
+                  )
+                } catch {}
+              }
+              allRoutes.push({
+                id: account.id,
+                access: account.access,
+                quota: accountQuota,
+                order: index + 1,
+                account,
+              })
+            }
+
+            const retainAccountIds = new Set(
+              allRoutes.flatMap((route) => {
+                const refreshError =
+                  route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                    ? latestStorage?.refresh?.mainLastRefreshError
+                    : route.account?.lastRefreshError
+                if (isPermanentRefreshError(refreshError)) return []
+                if (
+                  stickyQuotaSnapshotIsFresh(
+                    route.quota,
+                    latestStorage,
+                    Date.now(),
+                    input.requestedModelId,
+                  ) &&
+                  decideStickyQuotaFailure({
+                    quota: route.quota,
+                    modelId: input.requestedModelId,
+                  }).action === 'migrate'
+                ) {
+                  return []
+                }
+                if (
+                  isKillswitchEnabled(latestStorage) &&
+                  !killswitchPassesPolicy(
+                    route.quota,
+                    latestStorage,
+                    route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                      ? undefined
+                      : route.id,
+                    input.requestedModelId,
+                  )
+                ) {
+                  return []
+                }
+                return [route.id]
+              }),
+            )
+            const usableIds = new Set(
+              usableFallbacks.map((account) => account.id),
+            )
+            const candidates: StickyRouteCandidate[] = allRoutes.flatMap(
+              (route) => {
+                if (!route.quota) return []
+                const accountId =
+                  route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                    ? undefined
+                    : route.id
+                const passes =
+                  quotaSnapshotPassesPolicy(route.quota, latestStorage) &&
+                  quotaSnapshotPassesModelScope(
+                    route.quota,
+                    input.requestedModelId,
+                  ) &&
+                  (!isKillswitchEnabled(latestStorage) ||
+                    killswitchPassesPolicy(
+                      route.quota,
+                      latestStorage,
+                      accountId,
+                      input.requestedModelId,
+                    )) &&
+                  (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
+                    usableIds.has(route.id))
+                return passes
+                  ? [
+                      {
+                        accountId: route.id,
+                        quota: route.quota,
+                        order: route.order,
+                      },
+                    ]
+                  : []
+              },
+            )
+            return {
+              storage: latestStorage,
+              allRoutes,
+              candidates,
+              retainAccountIds,
+            }
+          }
+
+          async function withStickyRetryAfter(
+            response: Response,
+            sessionId: string,
+            retryAfterSeconds: number,
+            streamingRateLimit = false,
+          ) {
+            const headers = new Headers(response.headers)
+            headers.set(
+              'retry-after',
+              String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
+            )
+            if (streamingRateLimit) {
+              await response.body?.cancel().catch(() => {})
+              headers.set('content-type', 'application/json')
+              return new Response(
+                JSON.stringify({
+                  type: 'error',
+                  error: {
+                    type: 'rate_limit_error',
+                    message:
+                      'Sticky OAuth account five-hour quota resets shortly; retaining session affinity.',
+                  },
+                }),
+                { status: 429, headers },
+              )
+            }
+            return new Response(response.body, {
+              status: response.status,
+              statusText: response.statusText,
+              headers,
+            })
+          }
+
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -4065,6 +4326,349 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
               if (
                 replayableRequest &&
+                sessionId &&
+                getRoutingMode(storage) === 'sticky-balanced' &&
+                auth.access
+              ) {
+                const routingModelId =
+                  fablePlan?.effectiveModel ?? requestModelId
+                const family = stickyRouteFamilyForModel(routingModelId)
+                const trackedRoute =
+                  cacheKeepManager.trackedOAuthRoute(sessionId)
+                const preferredAccountId =
+                  fablePlan?.cacheAccountId ??
+                  (trackedRoute
+                    ? (trackedRoute.oauthAccountId ??
+                      STICKY_ROUTING_MAIN_ACCOUNT_ID)
+                    : undefined)
+                let stickyRouteSelected = false
+                try {
+                  let stickyRoutes = await buildStickyOAuthRoutes({
+                    storage,
+                    mainAccessToken: auth.access,
+                    requestedModelId: routingModelId,
+                  })
+                  const resolveRoute = (excludeAccountIds?: Set<string>) =>
+                    stickySessionRouter.resolve({
+                      sessionId,
+                      family,
+                      modelId: routingModelId,
+                      candidates: stickyRoutes.candidates,
+                      retainAccountIds: stickyRoutes.retainAccountIds,
+                      storage: stickyRoutes.storage,
+                      inputBytes:
+                        typeof init?.body === 'string'
+                          ? Buffer.byteLength(init.body)
+                          : 1,
+                      preferredAccountId,
+                      excludeAccountIds,
+                    })
+                  const incompleteQuotaPool =
+                    stickyRoutes.allRoutes.length === 0 ||
+                    stickyRoutes.allRoutes.some(
+                      (candidate) =>
+                        !candidate.quota ||
+                        !stickyQuotaSnapshotIsFresh(
+                          candidate.quota,
+                          stickyRoutes.storage,
+                          Date.now(),
+                          routingModelId,
+                        ),
+                    )
+                  let resolution = await resolveRoute()
+                  if (!resolution && incompleteQuotaPool) {
+                    throw new Error(
+                      'Sticky-balanced routing is waiting for current OAuth quota snapshots',
+                    )
+                  }
+                  let route = stickyRoutes.allRoutes.find(
+                    (candidate) => candidate.id === resolution?.accountId,
+                  )
+                  if (resolution && route) {
+                    stickyRouteSelected = true
+                    if (
+                      fablePlan?.downgraded &&
+                      fableFallbackManager.bindRecoveryAccount(
+                        fablePlan,
+                        route.id,
+                      )
+                    ) {
+                      logger.info(
+                        'fable-fallback',
+                        'rebound recovery to migrated sticky account',
+                        { accountId: route.id },
+                      )
+                    }
+                    const sendRoute = (selected: StickyOAuthRoute) =>
+                      sendWithAccessToken(
+                        input,
+                        init,
+                        selected.access,
+                        trace,
+                        `sticky:${selected.id}`,
+                        stickyRoutes.storage,
+                        selected.id,
+                        fableRequest,
+                      )
+                    const completeRoute = async (
+                      selected: StickyOAuthRoute,
+                      response: Response,
+                      markUsed = true,
+                    ) => {
+                      if (markUsed && selected.account) {
+                        await fallbackManager.markUsed(selected.account)
+                      }
+                      writeCurrentSidebarState(selected.id, 'sticky-balanced')
+                      trace.done('return_sticky_balanced', {
+                        status: response.status,
+                        accountId: selected.id,
+                        created: resolution?.created,
+                        migrated: resolution?.migrated,
+                      })
+                      return wrapResponse(response)
+                    }
+                    const inspectResponse = async (response: Response) => {
+                      let inspectedResponse = response
+                      let routeFailure = shouldFallbackStatus(
+                        response.status,
+                        stickyRoutes.storage,
+                      )
+                      let streamingRateLimit = false
+                      if (!routeFailure) {
+                        const inspected = await inspectStreamingRateLimit(
+                          response,
+                          trace,
+                        )
+                        inspectedResponse = inspected.response
+                        streamingRateLimit = inspected.rateLimited
+                        routeFailure = inspected.rateLimited
+                      }
+                      return {
+                        response: inspectedResponse,
+                        routeFailure,
+                        streamingRateLimit,
+                      }
+                    }
+
+                    const proactiveQuotaDecision = stickyQuotaSnapshotIsFresh(
+                      route.quota,
+                      stickyRoutes.storage,
+                      Date.now(),
+                      routingModelId,
+                    )
+                      ? decideStickyQuotaFailure({
+                          quota: route.quota,
+                          modelId: routingModelId,
+                        })
+                      : undefined
+                    if (proactiveQuotaDecision?.action === 'hold') {
+                      return completeRoute(
+                        route,
+                        await withStickyRetryAfter(
+                          new Response(
+                            JSON.stringify({
+                              type: 'error',
+                              error: {
+                                type: 'rate_limit_error',
+                                message:
+                                  'Sticky OAuth account five-hour quota resets shortly; retaining session affinity.',
+                              },
+                            }),
+                            {
+                              status: 429,
+                              headers: { 'content-type': 'application/json' },
+                            },
+                          ),
+                          sessionId,
+                          proactiveQuotaDecision.retryAfterSeconds,
+                        ),
+                        false,
+                      )
+                    }
+
+                    let inspected = await inspectResponse(
+                      await sendRoute(route),
+                    )
+                    let permanentAuthFailure = false
+                    if (!inspected.routeFailure) {
+                      return completeRoute(route, inspected.response)
+                    }
+
+                    if (inspected.response.status === 401) {
+                      const authRouteId = route.id
+                      try {
+                        if (authRouteId === STICKY_ROUTING_MAIN_ACCOUNT_ID) {
+                          auth.access = await refreshMainAccessToken()
+                          route = { ...route, access: auth.access }
+                        } else if (route.account && stickyRoutes.storage) {
+                          const refreshed =
+                            await fallbackManager.refreshAccount(
+                              route.account,
+                              stickyRoutes.storage,
+                              { force: true },
+                            )
+                          if (refreshed.access) {
+                            route = {
+                              ...route,
+                              access: refreshed.access,
+                              account: refreshed,
+                            }
+                          }
+                        }
+                        await inspected.response.body?.cancel().catch(() => {})
+                        inspected = await inspectResponse(
+                          await sendRoute(route),
+                        )
+                        if (!inspected.routeFailure) {
+                          return completeRoute(route, inspected.response)
+                        }
+                        permanentAuthFailure = inspected.response.status === 401
+                      } catch (error) {
+                        const latest = await loadAccounts(accountStoragePath)
+                        const refreshError =
+                          authRouteId === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                            ? latest?.refresh?.mainLastRefreshError
+                            : latest?.accounts.find(
+                                (account): account is OAuthAccount =>
+                                  account.id === authRouteId &&
+                                  isOAuthAccount(account),
+                              )?.lastRefreshError
+                        if (!isPermanentRefreshError(refreshError)) throw error
+                        permanentAuthFailure = true
+                      }
+                    }
+
+                    let migrate =
+                      inspected.response.status === 403 || permanentAuthFailure
+                    if (
+                      inspected.response.status === 429 ||
+                      inspected.streamingRateLimit
+                    ) {
+                      let quota: OAuthQuotaSnapshot | undefined
+                      try {
+                        quota =
+                          route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                            ? await quotaManager.refreshMain(route.access)
+                            : await quotaManager.refreshFallback(
+                                route.id,
+                                route.access,
+                              )
+                      } catch {
+                        // A model 429 plus a failed quota probe is not enough to
+                        // break session affinity. Migrate only from fresh quota.
+                        quota = undefined
+                      }
+                      const decision = decideStickyQuotaFailure({
+                        quota,
+                        modelId: routingModelId,
+                      })
+                      trace.mark('sticky_quota_failure', {
+                        accountId: route.id,
+                        action: decision.action,
+                        reason: decision.reason,
+                      })
+                      if (decision.action === 'hold') {
+                        return completeRoute(
+                          route,
+                          await withStickyRetryAfter(
+                            inspected.response,
+                            sessionId,
+                            decision.retryAfterSeconds,
+                            inspected.streamingRateLimit,
+                          ),
+                        )
+                      }
+                      migrate = decision.action === 'migrate'
+                    }
+
+                    if (migrate) {
+                      const failedRouteId = route.id
+                      stickyRoutes = await buildStickyOAuthRoutes({
+                        storage: stickyRoutes.storage,
+                        mainAccessToken: auth.access,
+                        requestedModelId: routingModelId,
+                      })
+                      const alternatives = stickyRoutes.candidates.filter(
+                        (candidate) => candidate.accountId !== failedRouteId,
+                      )
+                      if (alternatives.length > 0) {
+                        await inspected.response.body?.cancel().catch(() => {})
+                        resolution = await resolveRoute(
+                          new Set([failedRouteId]),
+                        )
+                        const migratedRoute = stickyRoutes.allRoutes.find(
+                          (candidate) => candidate.id === resolution?.accountId,
+                        )
+                        if (resolution && migratedRoute) {
+                          route = migratedRoute
+                          if (fablePlan?.downgraded) {
+                            fableFallbackManager.bindRecoveryAccount(
+                              fablePlan,
+                              route.id,
+                            )
+                          }
+                          return completeRoute(route, await sendRoute(route))
+                        }
+                      } else if (
+                        (inspected.response.status === 429 ||
+                          inspected.streamingRateLimit) &&
+                        mainQuotaEntryIsFreshExhausted(auth.access)
+                      ) {
+                        const apiAccounts = (
+                          await getRoutableFallbackAccounts(
+                            stickyRoutes.storage,
+                            {
+                              includeApiRoutes: true,
+                              modelId: routingModelId,
+                            },
+                          )
+                        ).filter(isApiKeyAccount)
+                        if (apiAccounts.length > 0) {
+                          const apiResponse = await tryUsableFallbackAccounts(
+                            input,
+                            init,
+                            apiAccounts,
+                            stickyRoutes.storage,
+                            inspected.response,
+                            trace,
+                            {
+                              onSuccess: (account) =>
+                                writeCurrentSidebarState(
+                                  account.id,
+                                  'sticky-balanced',
+                                ),
+                              fableRequest,
+                            },
+                          )
+                          if (apiResponse) {
+                            trace.done('return_sticky_api_fallback', {
+                              status: apiResponse.status,
+                            })
+                            return wrapResponse(apiResponse)
+                          }
+                        }
+                      }
+                    }
+                    return completeRoute(route, inspected.response)
+                  }
+                } catch (error) {
+                  trace.mark('sticky_balanced_error', {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  })
+                  if (stickyRouteSelected) throw error
+                  const retryable =
+                    error instanceof Error ? error : new Error(String(error))
+                  Object.assign(retryable, {
+                    code: 'ECONNRESET',
+                    syscall: 'sticky-routing',
+                  })
+                  throw retryable
+                }
+              }
+
+              if (
+                replayableRequest &&
                 getRoutingMode(storage) === 'fallback-first'
               ) {
                 try {
@@ -4220,7 +4824,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     routingQuota = await quotaManager.refreshMain(auth.access)
                     routingQuotaEntry = quotaManager.getMain(auth.access)
                     showQuotaToastFromCache()
-                  } else if (quotaManager.needsRefresh(sessionRequestCount)) {
+                  } else if (
+                    quotaManager.needsRefresh(
+                      sessionRequestCount,
+                      requestModelId,
+                    )
+                  ) {
                     if (
                       quotaSnapshotIsExhausted(routingQuota) ||
                       quotaSnapshotModelScopeIsExhausted(
@@ -4356,8 +4965,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
               // Killswitch — eagerly refresh quota so it can evaluate
               if (isKillswitchEnabled(storage)) {
-                const needsRefresh =
-                  quotaManager.needsRefresh(sessionRequestCount)
+                const needsRefresh = quotaManager.needsRefresh(
+                  sessionRequestCount,
+                  requestModelId,
+                )
                 if (needsRefresh) {
                   try {
                     const fallbackAccts = (storage?.accounts ?? []).filter(
