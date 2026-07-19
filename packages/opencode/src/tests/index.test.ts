@@ -243,10 +243,14 @@ function fireConcurrentFetches(result: { fetch: typeof fetch }) {
   )
 }
 
-async function getPlugin(client?: ReturnType<typeof createMockClient>) {
+async function getPlugin(
+  client?: ReturnType<typeof createMockClient>,
+  directory?: string,
+) {
   return (await AnthropicAuthPlugin({
     // @ts-expect-error: minimal mock for testing
     client: client ?? createMockClient(),
+    ...(directory && { directory }),
   })) as Promise<any>
 }
 
@@ -9328,6 +9332,7 @@ describe('claude-prime direct request', () => {
     })
     const plugin1 = await getPlugin()
     const mgr1 = (plugin1 as any).__primeManager
+    const firstLoadStorage = mgr1.options.loadStorage
     expect(mgr1).toBeDefined()
     expect(mgr1.isStopped?.()).toBeFalsy()
     const intervalsAfterFirstPlugin = intervalCalls
@@ -9335,6 +9340,7 @@ describe('claude-prime direct request', () => {
     const mgr2 = (plugin2 as any).__primeManager
     expect(mgr2).toBeDefined()
     expect(mgr2).toBe(mgr1)
+    expect(mgr2.options.loadStorage).not.toBe(firstLoadStorage)
     expect(mgr1.isStopped()).toBe(false)
     expect(intervalCalls - intervalsAfterFirstPlugin).toBe(1)
   })
@@ -9342,11 +9348,11 @@ describe('claude-prime direct request', () => {
   test('plugin instances with different storage paths own independent prime managers', async () => {
     const fixture = createFallbackStorage({ prime: { enabled: true } })
     await useTempAccountFile(fixture)
-    const plugin1 = await getPlugin()
+    const plugin1 = await getPlugin(undefined, '/project/one')
     const mgr1 = (plugin1 as any).__primeManager
 
     await useTempAccountFile(fixture)
-    const plugin2 = await getPlugin()
+    const plugin2 = await getPlugin(undefined, '/project/two')
     const mgr2 = (plugin2 as any).__primeManager
 
     expect(mgr2).not.toBe(mgr1)

@@ -94,6 +94,7 @@ import {
   oauthProfileMatchesToken,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   PrimeManager,
+  type PrimeManagerOptions,
   type PrimeRefreshResult,
   type PrimeSendResult,
   parseAccountCommandAction,
@@ -1364,20 +1365,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
   }
 
+  const primeManagerOptions: PrimeManagerOptions = {
+    storagePath: accountStoragePath,
+    loadStorage: () => loadAccounts(accountStoragePath),
+    refreshQuota: async (accountId) => {
+      if (accountId === 'main') return refreshPrimeMainQuota()
+      return refreshPrimeFallbackQuota(accountId)
+    },
+    sendPrime,
+    recordSuccess: (accountId, usage) =>
+      incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
+  }
   const primeManager: PrimeManager = adoptPrimeManager(
     accountStoragePath,
-    () =>
-      new PrimeManager({
-        storagePath: accountStoragePath,
-        loadStorage: () => loadAccounts(accountStoragePath),
-        refreshQuota: async (accountId) => {
-          if (accountId === 'main') return refreshPrimeMainQuota()
-          return refreshPrimeFallbackQuota(accountId)
-        },
-        sendPrime,
-        recordSuccess: (accountId, usage) =>
-          incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
-      }),
+    () => new PrimeManager(primeManagerOptions),
+    {
+      slot: ctx.directory ?? 'default',
+      rebind: (manager) => manager.updateOptions(primeManagerOptions),
+    },
   )
   if (isPrimePersistentlyEnabled(initialStorage)) {
     primeManager.start()

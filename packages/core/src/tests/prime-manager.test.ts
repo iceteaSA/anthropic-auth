@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -95,6 +95,18 @@ describe('PrimeManager storage namespaces', () => {
     expect(fingerprint).toBe(primeStorageFingerprint(resolve(relative)))
     expect(fingerprint).toMatch(/^[a-f0-9]{12}$/)
     expect(fingerprint).not.toContain('config')
+  })
+
+  test('symlink and real storage paths share a fingerprint', async () => {
+    const directory = await tempMarkerRoot()
+    const realPath = join(directory, 'accounts.json')
+    const symlinkPath = join(directory, 'linked-accounts.json')
+    await writeFile(realPath, '{}', 'utf8')
+    await symlink(realPath, symlinkPath)
+
+    expect(primeStorageFingerprint(symlinkPath)).toBe(
+      primeStorageFingerprint(realPath),
+    )
   })
 
   test('different storage paths prime the same account and reset independently', async () => {

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -393,16 +394,23 @@ function defaultMarkerDir(): string {
 }
 
 export function primeStorageFingerprint(storagePath: string): string {
-  return createHash('sha256')
-    .update(resolve(storagePath))
-    .digest('hex')
-    .slice(0, 12)
+  const absolutePath = resolve(storagePath)
+  let canonicalPath: string
+  try {
+    canonicalPath = realpathSync(absolutePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    canonicalPath = absolutePath
+  }
+  return createHash('sha256').update(canonicalPath).digest('hex').slice(0, 12)
 }
 
 export function primeMarkerNamespaceDir(
   markerDir: string,
   storagePath: string,
 ): string {
+  // Legacy root markers are intentionally not migrated: an upgrade may send
+  // one extra ~21-token Haiku per account, then the namespaced claim self-heals.
   return join(markerDir, primeStorageFingerprint(storagePath))
 }
 
@@ -502,6 +510,19 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
  * Dependencies are injected so the manager can be exercised deterministically
  * without filesystem, network, or live OAuth state.
  */
+export type PrimeManagerOptions = {
+  loadStorage: () => Promise<AccountStorage | null>
+  refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
+  sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
+  recordSuccess: (
+    accountId: 'main' | string,
+    usage: { inputTokens?: number; outputTokens?: number },
+  ) => Promise<PrimeUsageCounters>
+  now?: () => number
+  markerDir?: string
+  storagePath: string
+}
+
 export class PrimeManager {
   private timer: ReturnType<typeof setInterval> | null = null
   private postFireRefreshTimers = new Set<ReturnType<typeof setTimeout>>()
@@ -514,21 +535,9 @@ export class PrimeManager {
   // after `/claude-prime off` or after a newer plugin invocation has
   // replaced this instance (M3b).
   private stopped = false
-  // `options` is exposed as a public-readonly view so the existing test
-  // seam can swap a single dependency (the refresh adapter) between
-  // ticks. Do not mutate `options` in production code.
-  public readonly options: {
-    loadStorage: () => Promise<AccountStorage | null>
-    refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
-    sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
-    recordSuccess: (
-      accountId: 'main' | string,
-      usage: { inputTokens?: number; outputTokens?: number },
-    ) => Promise<PrimeUsageCounters>
-    now?: () => number
-    markerDir?: string
-    storagePath: string
-  }
+  // The registry replaces this dependency bundle on plugin reload so the
+  // singleton manager cannot retain closures from an obsolete plugin context.
+  public options: PrimeManagerOptions
   // Per-account transient state from the last ATTEMPT — overlays persisted
   // counters in `stats()` so the sidebar/dialog can show "just attempted"
   // without waiting for the next save. NOT persisted.
@@ -548,18 +557,11 @@ export class PrimeManager {
   // text; independent of lastPrimedAt/lastResult.
   private windowActive = new Map<'main' | string, number>()
 
-  constructor(options: {
-    loadStorage: () => Promise<AccountStorage | null>
-    refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
-    sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
-    recordSuccess: (
-      accountId: 'main' | string,
-      usage: { inputTokens?: number; outputTokens?: number },
-    ) => Promise<PrimeUsageCounters>
-    now?: () => number
-    markerDir?: string
-    storagePath: string
-  }) {
+  constructor(options: PrimeManagerOptions) {
+    this.options = options
+  }
+
+  updateOptions(options: PrimeManagerOptions): void {
     this.options = options
   }
 
