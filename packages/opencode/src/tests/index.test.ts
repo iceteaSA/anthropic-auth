@@ -964,6 +964,9 @@ describe('auth.loader', () => {
       }),
     )
     const plugin = await getPlugin()
+    // Upstream's mergeAccountsForSave unions existing+incoming accounts, so a
+    // deletion must be declared explicitly via removedAccountIds — a plain
+    // save without the account no longer removes it.
     await saveAccounts(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
@@ -977,6 +980,8 @@ describe('auth.loader', () => {
           },
         ],
       }),
+      undefined,
+      { removedAccountIds: ['work-deleted'] },
     )
     await seedSidebarRouting('work-deleted', 'fallback-first', Date.now())
 
