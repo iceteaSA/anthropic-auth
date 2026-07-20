@@ -7,7 +7,7 @@ Three independent surfaces expose Claude plan quota and account identity to OAut
 | Usage API (`GET /api/oauth/usage`) | active poll, per token | on demand | **yes** (`limits[]`) | **yes** — pollable without traffic |
 | `anthropic-ratelimit-unified-*` headers | passive, on every `/v1/messages` response | every request | no | no — only accounts you send through |
 
-The plugin combines surface 1 background polling (`fetchOAuthQuotaSnapshot` + `QuotaManager`) with passive direct-path harvest from surface 2. Relay responses remain gated from harvest.
+The plugin combines surface 1 background polling (`fetchOAuthQuotaSnapshot` + `QuotaManager`) with passive response-header harvest from surface 2 across direct and relay transports.
 
 ---
 
@@ -143,7 +143,7 @@ Conditional headers (absent on main, present on work-alt): `fallback` appears on
 | Scoped per-model windows | `limits[]` `weekly_scoped` | n/a |
 | Representative/binding marker | `representative-claim` header + `is_active` (inferred) | `x-codex-…-over-…` style flags |
 
-openai-auth is push-based by necessity (QuotaManager fed via `setMain`/`setFallback`); anthropic-auth now combines the usage poll with passive header pushes on direct requests.
+openai-auth is push-based by necessity (QuotaManager fed via `setMain`/`setFallback`); anthropic-auth combines the usage poll with passive header pushes on direct and relayed requests.
 
 ---
 
@@ -171,17 +171,16 @@ Also returned: account/org uuids, email, subscription status/created, `enabled_p
 
 ## Implemented behavior
 
-- Direct `/v1/messages` responses harvest the unified 5h and 7d windows. Utilization fractions are multiplied by 100, then rounded; reset values are epoch seconds converted to ISO timestamps.
+- Direct and relayed `/v1/messages` responses harvest the unified 5h and 7d windows. Utilization fractions are multiplied by 100, then rounded; reset values are epoch seconds converted to ISO timestamps.
 - Header pushes merge into the last poll snapshot. They preserve poll-owned `scoped`, including meaningful empty `[]`, and `extraUsage` credit data.
 - Poll `limits[].is_active` owns `bindingWindow` when present. The header `representative-claim` fills the marker only when the poll did not supply one.
 - Money stays in integer minor units with an explicit currency exponent. Formatting happens at the display boundary.
 - `fallback: available` becomes `fallbackAdvised`; it appears only in expanded quota views and does not change routing.
 - Profile metadata is sidecar-persisted, uses a seven-day TTL, and is absent from the request path.
-- Relay transport is direct-only for harvest in v1. Both the HTTP Worker (`upstream.headers` copied into its response) and WebSocket `response_start` preserve unified headers, but relay responses remain gated because transport-reconstructed WebSocket headers are not yet treated as canonical harvest evidence. See the relay parity item in `docs/parity-backlog.md`.
+- Relay HTTP harvest reads the Worker's genuine upstream response headers only when the relay handled the request. WebSocket harvest reads the genuine `response_start` headers through a callback even when the caller already received an optimistic response with synthetic headers. Relay-to-direct fallback remains owned by the direct-path harvest, so one upstream response produces one push.
 
 ## Gaps / opportunities
 
-- Relay-side harvest requires a client eligibility decision and synthetic-header safety gate at the `usedRelay` guard, not an HTTP Worker passthrough fix.
 - Pi has a separate streaming response path and does not harvest quota headers in v1.
 
 ## Probe recipes

@@ -1020,17 +1020,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   }
 
   function harvestQuotaHeaders(
-    response: Response,
+    headers: Headers,
     served: { accountId: 'main' | string; accessToken: string },
   ): void {
     try {
-      if (!isQuotaBearingHeaderFrame(response.headers)) {
+      if (!isQuotaBearingHeaderFrame(headers)) {
         logger.trace('quota', 'skipped non-quota response headers', {
           account: served.accountId,
         })
         return
       }
-      const incoming = normalizeQuotaHeaders(response.headers)
+      const incoming = normalizeQuotaHeaders(headers)
       const entry =
         served.accountId === 'main'
           ? quotaManager.pushMainFromHeaders(served.accessToken, incoming)
@@ -3343,6 +3343,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             }
 
             const relayConfig = getRelayConfig(await getRequestStorage())
+            const served = {
+              accountId: oauthAccountId,
+              accessToken,
+            }
             const sendStart = nowMs()
             const response = await sendViaRelay({
               config: relayConfig,
@@ -3353,6 +3357,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               fallback: directFetch,
               affinity: relayAffinity,
               optimisticResponse: relayConfig?.transport === 'websocket',
+              onResponseHeaders: (headers) =>
+                harvestQuotaHeaders(headers, served),
             })
             trace?.mark('send_headers_received', {
               route,
@@ -3362,17 +3368,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               totalSendWithAccessMs: roundMs(nowMs() - start),
             })
 
-            if (!relayConfig || usedDirectFetch) {
-              harvestQuotaHeaders(response, {
-                accountId: oauthAccountId,
-                accessToken,
-              })
-            } else {
-              logger.trace('quota', 'skipped relay response quota headers', {
-                account: oauthAccountId,
-                transport: relayConfig.transport,
-              })
-            }
+            if (usedDirectFetch) harvestQuotaHeaders(response.headers, served)
             return response
           }
 

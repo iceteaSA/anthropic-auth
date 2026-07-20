@@ -13,6 +13,7 @@ type ControlMessage = {
   id?: string
   status?: number
   message?: string
+  headers?: Record<string, string>
   state?: { hash: string; revision: number } | null
   hash?: string
   revision?: number
@@ -264,6 +265,16 @@ describe('relay Worker under Miniflare', () => {
         revision: 1,
         body: firstBody,
       })
+      const responseStart = await workerSocket.waitForControl(
+        (message) =>
+          message.type === 'response_start' && message.id === 'req_full_sync',
+      )
+      expect(
+        responseStart.headers?.['anthropic-ratelimit-unified-5h-utilization'],
+      ).toBe('0.78')
+      expect(
+        responseStart.headers?.['anthropic-ratelimit-unified-fallback'],
+      ).toBe('available')
       await workerSocket.waitForControl(
         (message) => message.type === 'done' && message.id === 'req_full_sync',
       )
