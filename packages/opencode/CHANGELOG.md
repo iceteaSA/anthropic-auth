@@ -2,6 +2,20 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## 1.17.0
+
+### Minor Changes
+
+- Refresh OAuth 5h and 7d quota from genuine `anthropic-ratelimit-unified-*` response headers across direct, HTTP relay, and WebSocket relay transports while preserving poll-owned model-scoped quota data.
+- Show account plan/tier metadata, the binding quota window, extra-usage credit status, and Anthropic fallback hints in expanded quota and account surfaces.
+
+### Patch Changes
+
+- Prevent startup, quota-refresh, metadata, and command writes from overwriting another process's active sidebar route by preserving routing-authoritative fields behind cross-process locked and fenced state writes.
+- Token-fence asynchronous account-profile persistence so delayed profile fetches or clears cannot restore stale credentials or remove a newer profile.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the quota surfaces, relay harvesting, and sidebar-state contributions.
+
 ## 1.16.0
 
 ### Minor Changes
