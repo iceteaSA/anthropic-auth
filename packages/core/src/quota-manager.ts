@@ -6,8 +6,6 @@
  * Handles deduplication, rate-limiting (429 backoff), and staleness.
  */
 
-import { createHash } from 'node:crypto'
-
 import type {
   AccountOperationError,
   AccountStorage,
@@ -26,18 +24,14 @@ import {
   isQuotaPolicyAuthError,
   quotaBackoffActive,
 } from './accounts.ts'
+import { mergeHeaderQuotaSnapshot } from './quota-headers.ts'
+
+export { tokenFingerprint } from './token-fingerprint.ts'
+
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 // Capture real setTimeout before tests can mock globalThis.setTimeout
 const nativeSetTimeout = globalThis.setTimeout
-
-/**
- * Stable, non-reversible fingerprint of an access token. Used to detect a
- * main-account switch so a different account's persisted/cached quota is never
- * reused. Not a secret — a truncated SHA-256, safe to persist alongside quota.
- */
-export function tokenFingerprint(token: string): string {
-  return createHash('sha256').update(token).digest('hex').slice(0, 16)
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,6 +54,37 @@ export type QuotaManagerOptions = {
     fetchStartedAt: number,
   ) => void
   onApiError?: (error: AccountOperationError) => void
+}
+
+function mergePollCompletionWithNewerHeaders(
+  current: OAuthQuotaSnapshot | undefined,
+  polled: OAuthQuotaSnapshot,
+): OAuthQuotaSnapshot {
+  if (current?.source !== 'headers') return polled
+  const fiveHourIsNewer = Boolean(
+    current.five_hour &&
+      current.five_hour.checkedAt > (polled.five_hour?.checkedAt ?? 0),
+  )
+  const sevenDayIsNewer = Boolean(
+    current.seven_day &&
+      current.seven_day.checkedAt > (polled.seven_day?.checkedAt ?? 0),
+  )
+  if (!fiveHourIsNewer && !sevenDayIsNewer) return polled
+
+  return mergeHeaderQuotaSnapshot(polled, {
+    ...(fiveHourIsNewer && { five_hour: current.five_hour }),
+    ...(sevenDayIsNewer && { seven_day: current.seven_day }),
+    fallbackAdvised: current.fallbackAdvised,
+    ...(current.bindingWindowSource === 'headers' && {
+      bindingWindow: current.bindingWindow,
+      bindingWindowSource: current.bindingWindowSource,
+    }),
+    source: 'headers',
+    checkedAt: Math.max(
+      fiveHourIsNewer ? (current.five_hour?.checkedAt ?? 0) : 0,
+      sevenDayIsNewer ? (current.seven_day?.checkedAt ?? 0) : 0,
+    ),
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +204,44 @@ export class QuotaManager {
     } else {
       this.fallbackTokenFps.delete(accountId)
     }
+  }
+
+  pushMainFromHeaders(
+    accessToken: string,
+    incoming: OAuthQuotaSnapshot,
+  ): QuotaEntry {
+    const checkedAt = incoming.checkedAt ?? this.now()
+    const accessTokenFp = tokenFingerprint(accessToken)
+    const quota = mergeHeaderQuotaSnapshot(
+      this.mainTokenFp === accessTokenFp ? this.main?.quota : undefined,
+      incoming,
+    )
+    const entry = {
+      quota,
+      checkedAt,
+      refreshAfter: getQuotaNextRefreshAt(quota, this.storage, checkedAt),
+    }
+    this.setMain(accessToken, entry)
+    return entry
+  }
+
+  pushFallbackFromHeaders(
+    accountId: string,
+    accessToken: string,
+    incoming: OAuthQuotaSnapshot,
+  ): QuotaEntry {
+    const checkedAt = incoming.checkedAt ?? this.now()
+    const quota = mergeHeaderQuotaSnapshot(
+      this.getFallback(accountId, accessToken)?.quota,
+      incoming,
+    )
+    const entry = {
+      quota,
+      checkedAt,
+      refreshAfter: getQuotaNextRefreshAt(quota, this.storage, checkedAt),
+    }
+    this.setFallback(accountId, entry, accessToken)
+    return entry
   }
 
   // =========================================================================
@@ -495,20 +558,28 @@ export class QuotaManager {
             now: this.now,
           })
           const now = this.now()
+          const completedQuota = mergePollCompletionWithNewerHeaders(
+            this.mainTokenFp === thisFetchFp ? this.main?.quota : undefined,
+            quota,
+          )
           this.mainTokenFp = tokenFingerprint(accessToken)
           this.main = {
-            quota,
-            refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
-            checkedAt: now,
+            quota: completedQuota,
+            refreshAfter: getQuotaNextRefreshAt(
+              completedQuota,
+              this.storage,
+              now,
+            ),
+            checkedAt: completedQuota.checkedAt ?? now,
           }
           this.mainLastApiError = undefined
           this.onMainQuotaFetched?.(
-            quota,
+            completedQuota,
             now,
             this.mainTokenFp,
             fetchStartedAt,
           )
-          return quota
+          return completedQuota
         } catch (error) {
           this._handleMainFetchError(error)
           throw error
@@ -552,18 +623,26 @@ export class QuotaManager {
             now: this.now,
           })
           const now = this.now()
+          const completedQuota = mergePollCompletionWithNewerHeaders(
+            this.getFallback(accountId, accessToken)?.quota,
+            quota,
+          )
           this.setFallback(
             accountId,
             {
-              quota,
-              refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
-              checkedAt: now,
+              quota: completedQuota,
+              refreshAfter: getQuotaNextRefreshAt(
+                completedQuota,
+                this.storage,
+                now,
+              ),
+              checkedAt: completedQuota.checkedAt ?? now,
             },
             accessToken,
           )
           this.fallbackApiErrors.delete(accountId)
           this.fallbackErrorTokenFps.delete(accountId)
-          return quota
+          return completedQuota
         } finally {
           await fileLock.release()
         }

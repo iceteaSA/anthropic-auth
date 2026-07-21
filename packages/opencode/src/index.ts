@@ -38,6 +38,8 @@ import {
   executeLoggingCommand,
   executeRoutingCommand,
   FallbackAccountManager,
+  fetchOAuthAccountProfile,
+  formatOAuthAccountTier,
   formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
   getAccountStoragePath,
@@ -70,6 +72,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
+  isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -78,8 +81,11 @@ import {
   log,
   logger,
   mergeAnthropicBetas,
+  normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  oauthProfileIsFresh,
+  oauthProfileMatchesToken,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   parseAccountCommandAction,
   parseCache1hCommandAction,
@@ -89,6 +95,7 @@ import {
   parseLoggingCommandAction,
   parseRoutingCommandAction,
   type QuotaAccountSummary,
+  type QuotaEntry,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -102,6 +109,7 @@ import {
   type StickyRouteCandidate,
   StickySessionRouter,
   saveAccountState,
+  saveOAuthProfileState,
   sendViaRelay,
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
@@ -123,6 +131,7 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import {
@@ -692,6 +701,7 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
+  const profileFetch = globalThis.fetch
   const accountStoragePath = getAccountStoragePath()
 
   // -- OAuth add-flow pending state (Add account modal) --------------------
@@ -806,6 +816,242 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     },
   })
+  const profileHydrationAttempts = new Map<
+    string,
+    Promise<Awaited<ReturnType<typeof fetchOAuthAccountProfile>> | undefined>
+  >()
+
+  async function hydrateProfileOnce(
+    accountId: string,
+    accessToken: string,
+    signal?: AbortSignal,
+  ) {
+    if (signal?.aborted) return undefined
+    const attemptKey = `${accountId}:${tokenFingerprint(accessToken)}`
+    let attempt = profileHydrationAttempts.get(attemptKey)
+    if (!attempt) {
+      const fetchAttempt = fetchOAuthAccountProfile({
+        accessToken,
+        fetchImpl: profileFetch,
+        signal,
+      })
+        .catch((error) => {
+          logger.debug('quota', 'failed to hydrate account profile', {
+            account: accountId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          return undefined
+        })
+        .finally(() => {
+          if (profileHydrationAttempts.get(attemptKey) === fetchAttempt) {
+            profileHydrationAttempts.delete(attemptKey)
+          }
+        })
+      attempt = fetchAttempt
+      profileHydrationAttempts.set(attemptKey, attempt)
+    }
+    if (!signal) return attempt
+    return new Promise<Awaited<typeof attempt>>((resolve) => {
+      let settled = false
+      const finish = (profile: Awaited<typeof attempt>) => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', onAbort)
+        resolve(profile)
+      }
+      const onAbort = () => finish(undefined)
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
+      void attempt.then(finish)
+    })
+  }
+
+  async function persistProfileStateBestEffort(input: {
+    accountId: 'main' | string
+    accessToken: string
+    profile: OAuthAccount['profile']
+  }): Promise<boolean | undefined> {
+    try {
+      if (input.accountId === 'main') {
+        const currentAuth = await latestGetAuth?.()
+        if (
+          currentAuth?.type !== 'oauth' ||
+          currentAuth.access !== input.accessToken
+        ) {
+          return false
+        }
+      }
+      return await saveOAuthProfileState(
+        {
+          accountId: input.accountId,
+          profile: input.profile,
+          expectedTokenFingerprint: tokenFingerprint(input.accessToken),
+        },
+        accountStoragePath,
+      )
+    } catch (error) {
+      logger.debug('quota', 'failed to persist account profile', {
+        account: input.accountId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return undefined
+    }
+  }
+
+  async function ensureProfilesForQuotaDisplay(
+    storage: AccountStorage,
+    mainAccessToken?: string,
+    signal?: AbortSignal,
+  ): Promise<AccountStorage> {
+    if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1') {
+      return storage
+    }
+    const now = Date.now()
+    if (
+      mainAccessToken &&
+      storage.main?.profile &&
+      !oauthProfileMatchesToken(storage.main.profile, mainAccessToken)
+    ) {
+      storage.main.profile = undefined
+      void persistProfileStateBestEffort({
+        accountId: 'main',
+        accessToken: mainAccessToken,
+        profile: undefined,
+      }).catch(() => {})
+    }
+    if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
+      const profile = await hydrateProfileOnce('main', mainAccessToken, signal)
+      if (profile) {
+        storage.main = {
+          type: 'opencode',
+          provider: 'anthropic',
+          profile,
+        }
+        void persistProfileStateBestEffort({
+          accountId: 'main',
+          accessToken: mainAccessToken,
+          profile,
+        }).catch(() => {})
+      }
+    }
+
+    for (const account of storage.accounts) {
+      if (signal?.aborted) break
+      if (!isOAuthAccount(account) || !account.access) continue
+      const accessToken = account.access
+      if (
+        account.profile &&
+        !oauthProfileMatchesToken(account.profile, accessToken)
+      ) {
+        account.profile = undefined
+        void persistProfileStateBestEffort({
+          accountId: account.id,
+          accessToken,
+          profile: undefined,
+        }).catch(() => {})
+      }
+      if (oauthProfileIsFresh(account.profile, now)) continue
+      const profile = await hydrateProfileOnce(account.id, accessToken, signal)
+      if (profile) {
+        account.profile = profile
+        void persistProfileStateBestEffort({
+          accountId: account.id,
+          accessToken,
+          profile,
+        }).catch(() => {})
+      }
+    }
+    return storage
+  }
+
+  const warnedQuotaNormalizeErrors = new Set<string>()
+
+  async function persistPushedQuota(
+    served: { accountId: 'main' | string; accessToken: string },
+    entry: QuotaEntry,
+  ) {
+    const storage =
+      (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+    if (served.accountId === 'main') {
+      let currentAccessToken: string | undefined
+      try {
+        const auth = await latestGetAuth?.()
+        if (auth?.type === 'oauth') currentAccessToken = auth.access
+      } catch {}
+      if (currentAccessToken !== served.accessToken) {
+        logger.trace('quota', 'skipped stale main response quota persistence')
+        return
+      }
+      storage.quota = storage.quota ?? {}
+      storage.quota.mainQuota = entry.quota
+      storage.quota.mainQuotaCheckedAt = entry.checkedAt
+      storage.quota.mainQuotaToken = tokenFingerprint(served.accessToken)
+      await saveAccountState(storage, accountStoragePath, { mainQuota: true })
+      return
+    }
+    const account = storage.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === served.accountId &&
+        isOAuthAccount(candidate) &&
+        candidate.access === served.accessToken,
+    )
+    if (!account) return
+    account.quota = entry.quota
+    await saveAccountState(storage, accountStoragePath, {
+      accounts: [served.accountId],
+    })
+  }
+
+  function logPersistFailure(error: unknown) {
+    logger.warn('quota', 'failed to persist harvested response quota', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  function warnQuotaNormalizeOnce(error: unknown) {
+    const name = error instanceof Error ? error.name : typeof error
+    const message = error instanceof Error ? error.message : String(error)
+    const shape = `${name}:${message}`
+    if (warnedQuotaNormalizeErrors.has(shape)) return
+    warnedQuotaNormalizeErrors.add(shape)
+    logger.warn('quota', 'failed to normalize response quota headers', {
+      error: message,
+    })
+  }
+
+  function harvestQuotaHeaders(
+    response: Response,
+    served: { accountId: 'main' | string; accessToken: string },
+  ): void {
+    try {
+      if (!isQuotaBearingHeaderFrame(response.headers)) {
+        logger.trace('quota', 'skipped non-quota response headers', {
+          account: served.accountId,
+        })
+        return
+      }
+      const incoming = normalizeQuotaHeaders(response.headers)
+      const entry =
+        served.accountId === 'main'
+          ? quotaManager.pushMainFromHeaders(served.accessToken, incoming)
+          : quotaManager.pushFallbackFromHeaders(
+              served.accountId,
+              served.accessToken,
+              incoming,
+            )
+      void persistPushedQuota(served, entry).catch(logPersistFailure)
+      void refreshSidebarQuota().catch(() => {})
+      logger.debug('quota', 'harvested response quota', {
+        account: served.accountId,
+        fiveHourPercent: entry.quota.five_hour?.usedPercent,
+        sevenDayPercent: entry.quota.seven_day?.usedPercent,
+        source: 'headers',
+      })
+    } catch (error) {
+      warnQuotaNormalizeOnce(error)
+    }
+  }
+
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
     onFallbackStorageChanged: () => {
@@ -1023,6 +1269,47 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     mainAccessToken?: string
     mainRefreshToken?: string
     routingAuthoritative?: boolean
+    useHydratedProfiles?: boolean
+  }
+
+  function mergeHydratedProfilesForSidebar(
+    latest: Awaited<ReturnType<typeof loadAccounts>>,
+    hydrated: Awaited<ReturnType<typeof loadAccounts>>,
+    mainAccessToken?: string,
+  ) {
+    if (!latest || !hydrated) return latest
+    const merged: AccountStorage = {
+      ...latest,
+      accounts: latest.accounts.map((account) => {
+        const hydratedAccount = hydrated.accounts.find(
+          (candidate) => candidate.id === account.id,
+        )
+        if (
+          !isOAuthAccount(account) ||
+          !hydratedAccount ||
+          !isOAuthAccount(hydratedAccount) ||
+          !account.access ||
+          hydratedAccount.access !== account.access
+        ) {
+          return account
+        }
+        return { ...account, profile: hydratedAccount.profile }
+      }),
+    }
+    const latestMainProfile = latest.main?.profile
+    const mainState = latest.main ?? hydrated.main
+    if (
+      mainAccessToken &&
+      mainState &&
+      (!latestMainProfile ||
+        oauthProfileMatchesToken(latestMainProfile, mainAccessToken))
+    ) {
+      merged.main = {
+        ...mainState,
+        profile: hydrated.main?.profile,
+      }
+    }
+    return merged
   }
 
   function buildSidebarState(
@@ -1040,6 +1327,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return {
       main: {
         quota: mainEntry?.quota ?? null,
+        tierLabel: formatOAuthAccountTier(storage?.main?.profile),
         quotaBackedOff: quotaManager.isBackedOff(),
         quotaBackoffUntil: lastApiError?.nextRetryAt,
         refreshBackedOff: mainRefreshError
@@ -1059,6 +1347,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         .map((account) => ({
           id: account.id,
           label: account.label,
+          tierLabel: formatOAuthAccountTier(account.profile),
           // Token-aware read: if a fallback account was re-logged with the same
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
@@ -1129,10 +1418,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               () => loadAccounts(accountStoragePath),
               { activeId: state.activeId, route: state.route },
             )
+            const displayStorage = options.useHydratedProfiles
+              ? mergeHydratedProfilesForSidebar(
+                  preservedRouting.freshStorage,
+                  storage,
+                  options.mainAccessToken,
+                )
+              : preservedRouting.freshStorage
             return {
               activeId: preservedRouting.activeId,
               route: preservedRouting.route,
-              state: buildSidebarState(preservedRouting.freshStorage, {
+              state: buildSidebarState(displayStorage, {
                 ...options,
                 activeId: preservedRouting.activeId,
                 route: preservedRouting.route,
@@ -1258,10 +1554,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   async function buildQuotaCommandSummary() {
     const accounts: QuotaAccountSummary[] = []
+    let mainAccessToken: string | undefined
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
         if (auth.type === 'oauth' && auth.access) {
+          mainAccessToken = auth.access
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
           // returns the last cached snapshot when the API is backed off.
@@ -1297,8 +1595,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     // per-account), saves refreshed snapshots, and clears stale errors.
     const { storage, errors } =
       await fallbackManager.refreshQuotaForAllAccounts({ force: true })
+    const displayStorage = await ensureProfilesForQuotaDisplay(
+      storage ?? createEmptyStorage(),
+      mainAccessToken,
+      AbortSignal.timeout(3_000),
+    )
+    const mainSummary = accounts.find((account) => account.role === 'main')
+    if (mainSummary) {
+      mainSummary.tierLabel = formatOAuthAccountTier(
+        displayStorage.main?.profile,
+      )
+    }
     const errorMap = new Map(errors.map((e) => [e.accountId, e.message]))
-    accounts.push(...buildFallbackQuotaSummaries(storage, errorMap))
+    accounts.push(...buildFallbackQuotaSummaries(displayStorage, errorMap))
 
     if (!latestGetAuth) {
       accounts.unshift({
@@ -1683,7 +1992,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
 
     // -- existing flows ----------------------------------------------------
-    const storage = await loadAccounts(accountStoragePath)
+    let storage = await loadAccounts(accountStoragePath)
+    if (action.type === 'status' && storage) {
+      let mainAccessToken: string | undefined
+      if (latestGetAuth) {
+        try {
+          const auth = await latestGetAuth()
+          if (auth.type === 'oauth') mainAccessToken = auth.access
+        } catch {}
+      }
+      storage = await ensureProfilesForQuotaDisplay(
+        storage,
+        mainAccessToken,
+        AbortSignal.timeout(3_000),
+      )
+    }
     const result = executeAccountCommand({
       argumentsText,
       storage: storage ?? { version: 1, accounts: [] },
@@ -2524,6 +2847,26 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             mainRefreshToken: auth.refresh,
             routingAuthoritative: false,
           })
+          if (
+            process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION !==
+            '1'
+          ) {
+            void ensureProfilesForQuotaDisplay(
+              initialStorage ?? createEmptyStorage(),
+              auth.access,
+            )
+              .then((displayStorage) => {
+                writeSidebarState(displayStorage, {
+                  activeId: 'main',
+                  route: 'main',
+                  mainAccessToken: auth.access,
+                  mainRefreshToken: auth.refresh,
+                  routingAuthoritative: false,
+                  useHydratedProfiles: true,
+                })
+              })
+              .catch(() => {})
+          }
 
           function isReplayableRequest(
             input: string | URL | Request,
@@ -2957,7 +3300,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
             }
 
+            let usedDirectFetch = false
             const directFetch = async () => {
+              usedDirectFetch = true
               try {
                 const response = await fetch(rewritten.input, {
                   ...init,
@@ -3017,6 +3362,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               totalSendWithAccessMs: roundMs(nowMs() - start),
             })
 
+            if (!relayConfig || usedDirectFetch) {
+              harvestQuotaHeaders(response, {
+                accountId: oauthAccountId,
+                accessToken,
+              })
+            } else {
+              logger.trace('quota', 'skipped relay response quota headers', {
+                account: oauthAccountId,
+                transport: relayConfig.transport,
+              })
+            }
             return response
           }
 
@@ -3057,6 +3413,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           function mainQuotaEntryIsFreshExhausted(accessToken?: string) {
             if (!accessToken) return false
             const entry = quotaManager.getMain(accessToken)
+            // A genuine response header is live routing evidence like a 429, but
+            // it gets no exemption from the shared freshness and token gates.
             return Boolean(
               entry &&
                 entry.refreshAfter > Date.now() &&
