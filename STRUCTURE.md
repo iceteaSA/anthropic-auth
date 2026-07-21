@@ -107,7 +107,7 @@ anthropic-auth/
 - `packages/core/src/constants.ts`: Global application constants
 - `packages/opencode/src/transform.ts`: Request rewriting, system sanitization, cache strategy and model-specific cache bridges, tool prefix, SSE stripping
 - `packages/opencode/src/fable-fallback.ts`: Per-session 10-response Opus downgrade state and standby Opus cache-anchor identity for Fable content-filter recovery
-- `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed Fable recovery state file for TUI sidebar IPC
+- `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed Fable recovery state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
