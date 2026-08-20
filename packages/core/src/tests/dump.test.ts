@@ -195,6 +195,31 @@ test('tagged prewarm dumps include the tag in filenames and metadata', async () 
   expect(metadata.tag).toBe('cachekeep')
 })
 
+test('start dumps use the distinct start filename segment', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({
+    affinity: 'ses-start',
+    bodyText: '{}',
+    tag: 'start',
+  })
+  expect(handle?.tag).toBe('start')
+  expect(handle?.responsePath).toMatch(/-start-direct\.response\.json$/)
+  expect(handle?.responsePath).not.toContain('-prewarm-start')
+  const files = await readdir(dumpDir)
+  const metadata = JSON.parse(
+    await readFile(
+      join(dumpDir, files.find((name) => name.endsWith('.meta.json'))!),
+      'utf8',
+    ),
+  )
+  expect(metadata.tag).toBe('start')
+})
+
 test('dump sweep recognizes response artifacts', async () => {
   const dumpDir = await mkdtemp(
     join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),

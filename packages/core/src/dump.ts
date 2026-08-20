@@ -55,7 +55,7 @@ export type DumpCommandAction =
   | { type: 'disable' }
   | { type: 'usage' }
 
-export type DumpTag = 'cachekeep'
+export type DumpTag = 'cachekeep' | 'start'
 
 export type DumpHandle = {
   responsePath: string
@@ -362,7 +362,9 @@ function dumpRequestSegment(input: {
 }
 
 function dumpTagSegment(tag: DumpTag | undefined) {
-  return tag ? `-prewarm-${tag}` : ''
+  if (tag === 'cachekeep') return '-prewarm-cachekeep'
+  if (tag === 'start') return '-start'
+  return ''
 }
 
 function directDumpPreviousKey(input: {

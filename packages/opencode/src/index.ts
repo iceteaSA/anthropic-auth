@@ -28,6 +28,7 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  CLAUDE_START_COMMAND_NAME,
   computeXxhash64Hex,
   continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
@@ -43,6 +44,7 @@ import {
   executeDumpCommand,
   executeFastModeCommand,
   executeKillswitchCommand,
+  executeLaneStartCommand,
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
@@ -110,6 +112,7 @@ import {
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseLaneStartCommandAction,
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
@@ -174,6 +177,11 @@ import {
   isRecoverableRefusalModel,
   recoverableRefusalFamily,
 } from './fable-fallback.ts'
+import {
+  fireLaneStart,
+  LANE_START_REQUEST_HEADER,
+  LaneStartTracker,
+} from './lane-start.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
@@ -900,6 +908,7 @@ const anthropicAuthPlugin = async (
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
   const fableFallbackManager = new FableFallbackManager()
+  const laneStartTracker = new LaneStartTracker()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const desktopNoticeFlushes = new Map<string, Promise<void>>()
@@ -2622,6 +2631,25 @@ const anthropicAuthPlugin = async (
     return executeFastModeCommand({ argumentsText, enabled })
   }
 
+  async function executePersistentStartCommand(
+    argumentsText: string,
+    sessionId?: string,
+  ) {
+    const action = parseLaneStartCommandAction(argumentsText)
+    if (action.type === 'fire') {
+      if (!sessionId) {
+        return '## Claude Start Failed\n\n- OpenCode did not provide a session ID.'
+      }
+      try {
+        await fireLaneStart(ctx.client, sessionId)
+        return executeLaneStartCommand({ argumentsText }).text
+      } catch (error) {
+        return `## Claude Start Failed\n\n- ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+    return executeLaneStartCommand({ argumentsText }).text
+  }
+
   async function executePersistentRoutingCommand(
     argumentsText: string,
     sessionId?: string,
@@ -2957,6 +2985,14 @@ const anthropicAuthPlugin = async (
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-start') {
+      const text = await executePersistentStartCommand(args, sessionId)
+      return {
+        command,
+        text,
+        knobs: {},
+      }
+    }
     if (command === 'claude-logging') {
       const text = await executePersistentLoggingCommand(args)
       const storage = await loadAccounts(accountStoragePath)
@@ -3182,6 +3218,36 @@ const anthropicAuthPlugin = async (
   }
 
   return {
+    'chat.message': async (
+      {
+        sessionID,
+      }: {
+        sessionID: string
+      },
+      output: { message: { id: string }; parts: unknown[] },
+    ) => {
+      laneStartTracker.observeSyntheticMessage({
+        sessionId: sessionID,
+        messageId: output.message.id,
+        parts: output.parts,
+      })
+    },
+    'chat.headers': async (
+      {
+        sessionID,
+        message,
+      }: {
+        sessionID: string
+        message: { id: string }
+      },
+      output: { headers: Record<string, string> },
+    ) => {
+      laneStartTracker.markHeaders({
+        sessionId: sessionID,
+        messageId: message.id,
+        headers: output.headers,
+      })
+    },
     event: async ({ event }: { event: unknown }) => {
       const value = event as unknown as {
         type?: string
@@ -3221,6 +3287,7 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.deleted') {
+        laneStartTracker.clearSession(sessionId)
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
         desktopNoticeSafeSessions.delete(sessionId)
@@ -3249,6 +3316,11 @@ const anthropicAuthPlugin = async (
           template: CLAUDE_PRIME_COMMAND_NAME,
           description:
             "Start each OAuth account's five-hour quota window after reset.",
+        },
+        [CLAUDE_START_COMMAND_NAME]: {
+          template: CLAUDE_START_COMMAND_NAME,
+          description:
+            'Warm and renew the current Claude session cache with a one-token synthetic turn.',
         },
 
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
@@ -3323,6 +3395,7 @@ const anthropicAuthPlugin = async (
         'claude-cache',
         'claude-cachekeep',
         'claude-prime',
+        'claude-start',
         'claude-quota',
         'claude-dump',
         'claude-fast',
@@ -4116,6 +4189,7 @@ const anthropicAuthPlugin = async (
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             oauthAccountId = 'main',
             fableRequest?: FableRequestContext,
+            laneStartRequest = false,
           ) {
             const start = nowMs()
             let requestStorage = currentStorage
@@ -4196,6 +4270,7 @@ const anthropicAuthPlugin = async (
                 identity,
                 hybridStandbyAnchor: standbyCacheAnchor,
                 serverSideFallbackEnabled: fallbackMode === 'server',
+                laneStart: laneStartRequest,
                 cacheDiagnosticsPreviousMessageId,
                 perf: (stage, data) => {
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data })
@@ -4353,6 +4428,7 @@ const anthropicAuthPlugin = async (
                       fetchInputUrl(rewritten.input),
                     method: fetchMethod(input, init),
                     headers: requestHeaders,
+                    tag: laneStartRequest ? 'start' : undefined,
                   })
                 }
                 return response
@@ -4368,6 +4444,7 @@ const anthropicAuthPlugin = async (
                       fetchInputUrl(rewritten.input),
                     method: fetchMethod(input, init),
                     headers: requestHeaders,
+                    tag: laneStartRequest ? 'start' : undefined,
                   })
                 }
                 throw error
@@ -4394,6 +4471,7 @@ const anthropicAuthPlugin = async (
               onDumpCreated: (handle) => {
                 relayDump = handle
               },
+              dumpTag: laneStartRequest ? 'start' : undefined,
             })
             trace?.mark('send_headers_received', {
               route,
@@ -4405,9 +4483,9 @@ const anthropicAuthPlugin = async (
 
             if (usedDirectFetch) harvestQuotaHeaders(response.headers, served)
             attachCacheDiagnosticsResponse(response, {
-              source: 'turn',
+              source: laneStartRequest ? 'start' : 'turn',
               accountId: oauthAccountId,
-              synthetic: false,
+              synthetic: laneStartRequest,
               ...cacheDiagnosticsBetas,
               requestedModel: parseRequestModel(body),
               request: cacheDiagnosticsRequest,
@@ -4677,6 +4755,8 @@ const anthropicAuthPlugin = async (
             }
           }
 
+          const responseRouteKinds = new WeakMap<Response, 'oauth' | 'api'>()
+
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -4691,6 +4771,7 @@ const anthropicAuthPlugin = async (
                 access?: string
               }) => void | Promise<void>
               fableRequest?: FableRequestContext
+              laneStartRequest?: boolean
             },
           ) {
             if (!accounts.length) return currentResponse ?? null
@@ -4724,6 +4805,7 @@ const anthropicAuthPlugin = async (
                   storage,
                   account.id,
                   options?.fableRequest,
+                  options?.laneStartRequest,
                 )
               }
               lastResponse = response
@@ -4738,6 +4820,10 @@ const anthropicAuthPlugin = async (
                 fallbackAgain = inspected.rateLimited
               }
               if (!fallbackAgain) {
+                responseRouteKinds.set(
+                  response,
+                  isApiKeyAccount(account) ? 'api' : 'oauth',
+                )
                 await fallbackManager.markUsed(account)
                 await options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
@@ -4777,6 +4863,7 @@ const anthropicAuthPlugin = async (
             }) => void,
             modelId?: string,
             fableRequest?: FableRequestContext,
+            laneStartRequest = false,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
@@ -4875,6 +4962,7 @@ const anthropicAuthPlugin = async (
                 {
                   onSuccess: onFallbackSuccess,
                   fableRequest,
+                  laneStartRequest,
                 },
               )) ?? currentResponse
             )
@@ -4884,6 +4972,10 @@ const anthropicAuthPlugin = async (
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
               const incomingHeaders = mergeHeaders(input, init)
+              const laneStartRequest =
+                incomingHeaders.get(LANE_START_REQUEST_HEADER) === '1'
+              incomingHeaders.delete(LANE_START_REQUEST_HEADER)
+              init = { ...init, headers: incomingHeaders }
               const sessionId =
                 incomingHeaders.get('x-session-affinity') ||
                 incomingHeaders.get('x-opencode-session')
@@ -4922,6 +5014,9 @@ const anthropicAuthPlugin = async (
                   cacheDiagnosticsResponses.get(response)
                 return createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
+                  laneStart: laneStartRequest,
+                  laneStartOAuthServed:
+                    responseRouteKinds.get(response) !== 'api',
                   ...(diagnosticsContext
                     ? diagnosticsContext.streaming
                       ? {
@@ -5215,6 +5310,7 @@ const anthropicAuthPlugin = async (
                         stickyRoutes.storage,
                         selected.id,
                         fableRequest,
+                        laneStartRequest,
                       )
                     const completeRoute = async (
                       selected: StickyOAuthRoute,
@@ -5447,6 +5543,7 @@ const anthropicAuthPlugin = async (
                                   'sticky-balanced',
                                 ),
                               fableRequest,
+                              laneStartRequest,
                             },
                           )
                           if (apiResponse) {
@@ -5505,6 +5602,7 @@ const anthropicAuthPlugin = async (
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback-first'),
                       fableRequest,
+                      laneStartRequest,
                     },
                   )
                   if (fallbackResponse) {
@@ -5704,6 +5802,7 @@ const anthropicAuthPlugin = async (
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
                         fableRequest,
+                        laneStartRequest,
                       },
                     )
                     if (fallbackResponse) {
@@ -5847,6 +5946,7 @@ const anthropicAuthPlugin = async (
                       // is wrong once the killswitch hands off to a fallback.
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback'),
+                      laneStartRequest,
                     },
                   )
                   // The killswitch is a HARD block: it must never fall through to
@@ -5916,6 +6016,7 @@ const anthropicAuthPlugin = async (
                 storage,
                 'main',
                 fableRequest,
+                laneStartRequest,
               )
               let fallbackServed = false
               const response = await tryFallbackAccounts(
@@ -5932,6 +6033,7 @@ const anthropicAuthPlugin = async (
                 },
                 requestModelId,
                 fableRequest,
+                laneStartRequest,
               )
               if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 
