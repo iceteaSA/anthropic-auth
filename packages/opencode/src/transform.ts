@@ -1558,6 +1558,7 @@ type SseFinishState = {
   pending: string
   completed: boolean
   disabled: boolean
+  resyncCarry: string
 }
 
 type SseFinishUpdate =
@@ -1565,7 +1566,7 @@ type SseFinishUpdate =
   | { type: 'complete'; finishReason: string }
 
 function createSseFinishState(): SseFinishState {
-  return { pending: '', completed: false, disabled: false }
+  return { pending: '', completed: false, disabled: false, resyncCarry: '' }
 }
 
 function updateSseFinishState(
@@ -1575,10 +1576,15 @@ function updateSseFinishState(
 ): SseFinishUpdate | null {
   if (!text || state.completed) return null
   if (state.disabled) {
-    const boundary = findSseBoundary(text)
-    if (!boundary) return null
+    const window = state.resyncCarry + text
+    const boundary = findSseBoundary(window)
+    if (!boundary) {
+      state.resyncCarry = window.slice(-3)
+      return null
+    }
     state.disabled = false
-    text = text.slice(boundary.index + boundary.length)
+    state.resyncCarry = ''
+    text = window.slice(boundary.index + boundary.length)
     if (!text) return null
   }
   state.pending += text
@@ -1600,6 +1606,7 @@ function updateSseFinishState(
   if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
     state.pending = ''
     state.disabled = true
+    state.resyncCarry = ''
   }
   return update
 }

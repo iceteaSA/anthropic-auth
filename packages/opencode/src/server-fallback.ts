@@ -223,6 +223,7 @@ export function createServerSideFallbackStreamRewriter(options: {
   let pending = ''
   let pendingBytes = 0
   let resync = false
+  let resyncCarry = ''
   let servedModel: string | undefined
   let handoff: ServerSideFallbackMarker | undefined
   let fallbackIterationModel: string | undefined
@@ -339,12 +340,17 @@ export function createServerSideFallbackStreamRewriter(options: {
     push(text: string) {
       let output = ''
       if (resync) {
-        const boundary = findSseBoundary(text)
-        if (!boundary) return text
+        const window = resyncCarry + text
+        const boundary = findSseBoundary(window)
+        if (!boundary) {
+          resyncCarry = window.slice(-3)
+          return text
+        }
         const end = boundary.index + boundary.length
-        output = text.slice(0, end)
-        text = text.slice(end)
+        output = text.slice(0, Math.max(0, end - resyncCarry.length))
+        text = window.slice(end)
         resync = false
+        resyncCarry = ''
       }
       if (!text) return output
       const textBytes = new TextEncoder().encode(text).byteLength
@@ -359,12 +365,16 @@ export function createServerSideFallbackStreamRewriter(options: {
         pending = ''
         pendingBytes = 0
         resync = true
+        resyncCarry = ''
         return output + tail
       }
       return output
     },
     flush() {
-      if (resync) return ''
+      if (resync) {
+        resyncCarry = ''
+        return ''
+      }
       const output = drain()
       if (!pending) return output
       const tail = rewriteEvent(pending, '')

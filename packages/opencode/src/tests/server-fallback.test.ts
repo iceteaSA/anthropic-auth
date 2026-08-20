@@ -451,11 +451,13 @@ describe('createServerSideFallbackStreamRewriter', () => {
     ])
   })
 
-  test('resyncs after an oversized incomplete frame before preserving a later tool use', () => {
+  test.each([
+    ['LF', '\n\n', 1],
+    ['CRLF', '\r\n\r\n', 2],
+  ])('resyncs after an oversized frame across a split %s boundary', (_name, delimiter, splitAt) => {
     let handled = 0
     const skipped = `data: ${'x'.repeat(256)}`
     const later = [
-      '\n\n',
       sse('content_block_start', {
         type: 'content_block_start',
         index: 0,
@@ -491,9 +493,14 @@ describe('createServerSideFallbackStreamRewriter', () => {
     })
 
     const output =
-      rewriter.push(skipped) + rewriter.push(later) + rewriter.flush()
+      rewriter.push(skipped) +
+      rewriter.push(delimiter.slice(0, splitAt)) +
+      rewriter.push(`${delimiter.slice(splitAt)}${later}`) +
+      rewriter.flush()
 
-    expect(output.startsWith(`${skipped}\n\n`)).toBe(true)
+    expect(output.slice(0, skipped.length + delimiter.length)).toBe(
+      `${skipped}${delimiter}`,
+    )
     expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
     expect(output).toContain('"stop_reason":"tool_use"')
     expect(output).not.toContain('"stop_reason":"refusal"')

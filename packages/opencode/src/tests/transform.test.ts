@@ -721,21 +721,27 @@ describe('createStrippedStream', () => {
     })
   })
 
-  test('resyncs finish detection after an oversized incomplete SSE frame', async () => {
+  test.each([
+    ['LF', '\n\n', 1],
+    ['CRLF', '\r\n\r\n', 2],
+  ])('resyncs finish detection across a split %s boundary', async (_name, delimiter, splitAt) => {
     const completed: string[] = []
     const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
     const terminal = sse('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'end_turn' },
     })
-    const body = `${skipped}\n\n${terminal}`
+    const body = `${skipped}${delimiter}${terminal}`
     const response = createStrippedStream(
       new Response(
         new ReadableStream({
           start(controller) {
             const encoder = new TextEncoder()
             controller.enqueue(encoder.encode(skipped))
-            controller.enqueue(encoder.encode(`\n\n${terminal}`))
+            controller.enqueue(encoder.encode(delimiter.slice(0, splitAt)))
+            controller.enqueue(
+              encoder.encode(`${delimiter.slice(splitAt)}${terminal}`),
+            )
             controller.close()
           },
         }),
