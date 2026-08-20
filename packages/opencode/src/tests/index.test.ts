@@ -24,6 +24,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
+import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -1441,7 +1442,23 @@ describe('auth.loader', () => {
         createFallbackStorage({
           accounts: [],
           dump: { enabled: true },
-          quota: { enabled: false },
+          quota: {
+            enabled: false,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 40,
+                remainingPercent: 60,
+                checkedAt: Date.now(),
+              },
+            },
+            mainQuotaCheckedAt: Date.now(),
+            mainQuotaToken: tokenFingerprint('main-access'),
+          },
         }),
       )
 
@@ -3182,6 +3199,7 @@ describe('auth.loader', () => {
       'claude-account',
       'claude-cache',
       'claude-cachekeep',
+      'claude-start',
       'claude-quota',
       'claude-dump',
       'claude-fast',
@@ -3194,7 +3212,7 @@ describe('auth.loader', () => {
     }
 
     // The config hook must not register extra claude-* commands beyond the
-    // modalCommands set (drift in either direction is a bug). Exactly the 9
+    // modalCommands set (drift in either direction is a bug). Exactly the 10
     // required names should be claude-* keys — no more, no less. (The foreign
     // 'other-plugin-cmd' is excluded from this count via the claude- prefix.)
     const claudeRegistered = registered.filter((name) =>
@@ -3202,6 +3220,51 @@ describe('auth.loader', () => {
     )
     expect(claudeRegistered).toHaveLength(required.length)
     expect([...claudeRegistered].sort()).toEqual([...required].sort())
+  })
+
+  test('handles /claude-start by injecting one visible synthetic prompt', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-start',
+        arguments: '',
+        sessionID: 'session-start',
+      }),
+    )
+
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: {
+          calls: Array<[{ body: { parts: Array<Record<string, unknown>> } }]>
+        }
+      }
+    ).mock.calls as Array<
+      [
+        {
+          path: { id: string }
+          body: { noReply: boolean; parts: Array<Record<string, unknown>> }
+        },
+      ]
+    >
+    const startCall = promptCalls
+      .map(([call]) => call)
+      .find((call) => call.body.parts[0]?.synthetic === true)
+    expect(startCall).toEqual({
+      path: { id: 'session-start' },
+      body: {
+        noReply: false,
+        parts: [
+          {
+            type: 'text',
+            text: '[lane start] — automated cache warm; no response needed.',
+            synthetic: true,
+          },
+        ],
+      },
+    })
   })
 
   test('handles /claude-cachekeep command and persists window', async () => {
@@ -9400,6 +9463,569 @@ describe('auth.loader', () => {
       __setLogTestSink(null)
       setLogLevel('info')
     })
+  })
+})
+
+describe('claude-start integration', () => {
+  const originalFetch = globalThis.fetch
+
+  beforeEach(async () => {
+    pluginTimerOverrides = {
+      setInterval: mock(
+        () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+      ) as unknown as typeof setInterval,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    }
+    resetCache1hState()
+    resetDumpState()
+    setLogLevel('info')
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+      }),
+    )
+  })
+
+  afterEach(async () => {
+    __setLogTestSink(null)
+    globalThis.fetch = originalFetch
+    pluginTimerOverrides = {}
+    resetDumpState()
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await drainSidebarWrites()
+    restoreProcessTestFiles()
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { recursive: true, force: true })
+      tempConfigDir = undefined
+    }
+  })
+
+  test('claude-start request shapes only its correlated OAuth turn and emits diagnostics', async () => {
+    const sent: Array<{ body: Record<string, unknown>; headers: Headers }> = []
+    const records: LogTestRecord[] = []
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      sent.push({
+        body: JSON.parse(String(init?.body)),
+        headers: new Headers(init?.headers),
+      })
+      return Promise.resolve(
+        new Response(
+          `event: message_start\ndata: ${JSON.stringify({
+            type: 'message_start',
+            message: {
+              id: 'provider-start',
+              model: 'claude-opus-4-8',
+              usage: {
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 1,
+                cache_creation: {
+                  ephemeral_5m_input_tokens: 0,
+                  ephemeral_1h_input_tokens: 1,
+                },
+              },
+              diagnostics: { cache_miss_reason: null },
+            },
+          })}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+    __setLogTestSink((record) => records.push(record))
+
+    const client = createMockClient()
+    const plugin = await getPlugin(client)
+    // Diagnostics records emit at debug level; enable it after plugin
+    // load so boot-time level application cannot reset it.
+    setLogLevel('debug')
+    const headers: Record<string, string> = {}
+    await plugin['chat.message'](
+      { sessionID: 'ses-start' },
+      {
+        message: { id: 'msg-start' },
+        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+      },
+    )
+    await plugin['chat.headers'](
+      { sessionID: 'ses-start', message: { id: 'msg-start' } },
+      { headers },
+    )
+    expect(headers).toEqual({ [LANE_START_REQUEST_HEADER]: '1' })
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await (
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-start', ...headers },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          stream: true,
+          max_tokens: 99,
+          thinking: { type: 'enabled', budget_tokens: 10 },
+          messages: [{ role: 'user', content: 'start' }],
+        }),
+      })
+    ).text()
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.body).toMatchObject({ max_tokens: 1, stream: true })
+    expect(sent[0]?.body.thinking).toBeUndefined()
+    expect(sent[0]?.headers.has(LANE_START_REQUEST_HEADER)).toBe(false)
+    const record = records.find(
+      (entry) =>
+        entry.channel === 'cache-diagnostics' &&
+        entry.message.includes('provider-start'),
+    )
+    expect(record).toBeDefined()
+    expect(
+      JSON.parse(record!.message.replace('MC-CACHE-DIAG ', '')),
+    ).toMatchObject({
+      v: 2,
+      source: 'start',
+      synthetic: true,
+      account_id: 'main',
+      session_id: 'ses-start',
+    })
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-cachekeep',
+        arguments: '',
+        sessionID: 'ses-start',
+      }),
+    )
+    const latest = (
+      client.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls.at(-1)?.[0]
+    expect(latest?.body.parts[0]?.text).toContain('ses-start')
+    setLogLevel('info')
+  })
+
+  test('claude-start concurrency does not shape an interleaved real turn', async () => {
+    const sent: Array<{ body: Record<string, unknown>; headers: Headers }> = []
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      sent.push({
+        body: JSON.parse(String(init?.body)),
+        headers: new Headers(init?.headers),
+      })
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const startHeaders: Record<string, string> = {}
+    const realHeaders: Record<string, string> = {}
+    await plugin['chat.message'](
+      { sessionID: 'ses-race' },
+      {
+        message: { id: 'msg-start' },
+        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+      },
+    )
+    await plugin['chat.headers'](
+      { sessionID: 'ses-race', message: { id: 'msg-start' } },
+      { headers: startHeaders },
+    )
+    await plugin['chat.headers'](
+      { sessionID: 'ses-race', message: { id: 'msg-real' } },
+      { headers: realHeaders },
+    )
+    expect(realHeaders).toEqual({})
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const request = (headers: Record<string, string>, maxTokens: number) =>
+      result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-race', ...headers },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          stream: true,
+          max_tokens: maxTokens,
+          thinking: { type: 'enabled', budget_tokens: 10 },
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+    await Promise.all([request(startHeaders, 99), request(realHeaders, 77)])
+
+    expect(sent.map((entry) => entry.body.max_tokens).sort()).toEqual([1, 77])
+    expect(
+      sent.find((entry) => entry.body.max_tokens === 77)?.body.thinking,
+    ).toEqual({
+      type: 'enabled',
+      budget_tokens: 10,
+    })
+    expect(
+      sent.every((entry) => !entry.headers.has(LANE_START_REQUEST_HEADER)),
+    ).toBe(true)
+  })
+
+  test('claude-start tags direct dumps', async () => {
+    const previousDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-start-dump-test-'))
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    try {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false },
+          dump: { enabled: true },
+        }),
+      )
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const headers: Record<string, string> = {}
+      await plugin['chat.message'](
+        { sessionID: 'ses-start-dump' },
+        {
+          message: { id: 'msg-start-dump' },
+          parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+        },
+      )
+      await plugin['chat.headers'](
+        { sessionID: 'ses-start-dump', message: { id: 'msg-start-dump' } },
+        { headers },
+      )
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-start-dump', ...headers },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'start' }],
+        }),
+      })
+      expect(
+        (await readdir(dumpDir)).some((file) => file.includes('-start-')),
+      ).toBe(true)
+    } finally {
+      if (previousDumpDir === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDumpDir
+      }
+      await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('claude-start keeps a fallback-first API-key send ordinary', async () => {
+    const previousDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-api-start-dump-'))
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    try {
+      await useTempAccountFile(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          accounts: [
+            {
+              id: 'api-start',
+              type: 'api',
+              apiKey: 'api-start-key',
+              baseURL: 'https://api.example.test',
+              authHeader: 'x-api-key',
+            },
+          ],
+          quota: { enabled: false },
+          dump: { enabled: true },
+        }),
+      )
+      const sent: Array<{ body: Record<string, unknown>; headers: Headers }> =
+        []
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        const headers = new Headers(init?.headers)
+        sent.push({ body: JSON.parse(String(init?.body)), headers })
+        return Promise.resolve(
+          new Response('{}', {
+            status: 200,
+            headers:
+              headers.get('authorization') === 'Bearer main-access'
+                ? {
+                    'anthropic-ratelimit-unified-representative-claim':
+                      'five_hour',
+                    'anthropic-ratelimit-unified-5h-utilization': '1',
+                    'anthropic-ratelimit-unified-5h-reset': '1784246400',
+                    'anthropic-ratelimit-unified-7d-utilization': '0.4',
+                    'anthropic-ratelimit-unified-7d-reset': '1784628000',
+                  }
+                : undefined,
+          }),
+        )
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+      const body = (maxTokens: number) =>
+        JSON.stringify({
+          model: 'claude-opus-4-8',
+          stream: true,
+          max_tokens: maxTokens,
+          thinking: { type: 'enabled', budget_tokens: 10 },
+          messages: [{ role: 'user', content: 'start' }],
+        })
+      await result.fetch(MESSAGES_URL, { method: 'POST', body: body(50) })
+      const headers: Record<string, string> = {}
+      await plugin['chat.message'](
+        { sessionID: 'ses-api-start' },
+        {
+          message: { id: 'msg-api-start' },
+          parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+        },
+      )
+      await plugin['chat.headers'](
+        { sessionID: 'ses-api-start', message: { id: 'msg-api-start' } },
+        { headers },
+      )
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-api-start', ...headers },
+        body: body(99),
+      })
+
+      const apiSend = sent.find(
+        (entry) => entry.headers.get('x-api-key') === 'api-start-key',
+      )
+      expect(apiSend?.body).toMatchObject({ max_tokens: 99 })
+      expect(apiSend?.body.thinking).toEqual({
+        type: 'enabled',
+        budget_tokens: 10,
+      })
+      expect(apiSend?.headers.has(LANE_START_REQUEST_HEADER)).toBe(false)
+      const metadata = await Promise.all(
+        (await readdir(dumpDir))
+          .filter((file) => file.endsWith('.meta.json'))
+          .map(
+            async (file) =>
+              JSON.parse(await readFile(join(dumpDir, file), 'utf8')) as {
+                tag?: string
+              },
+          ),
+      )
+      expect(metadata.some((entry) => entry.tag === 'start')).toBe(false)
+    } finally {
+      if (previousDumpDir === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDumpDir
+      }
+      await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('claude-start shapes the OAuth fallback after an API-key failure', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'api-fails',
+            type: 'api',
+            apiKey: 'api-fails-key',
+            baseURL: 'https://api.example.test',
+            authHeader: 'x-api-key',
+          },
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 25,
+                remainingPercent: 75,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 30,
+                remainingPercent: 70,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+        quota: {
+          enabled: false,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              checkedAt: Date.now(),
+            },
+            seven_day: {
+              usedPercent: 40,
+              remainingPercent: 60,
+              checkedAt: Date.now(),
+            },
+          },
+          mainQuotaCheckedAt: Date.now(),
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+      }),
+    )
+    const sent: Array<{ body: Record<string, unknown>; headers: Headers }> = []
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      const headers = new Headers(init?.headers)
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      sent.push({ body, headers })
+      if (headers.get('x-api-key') === 'api-fails-key') {
+        return Promise.resolve(new Response('{}', { status: 429 }))
+      }
+      return Promise.resolve(
+        new Response('{}', {
+          status: 200,
+          headers:
+            headers.get('authorization') === 'Bearer main-access'
+              ? {
+                  'anthropic-ratelimit-unified-representative-claim':
+                    'five_hour',
+                  'anthropic-ratelimit-unified-5h-utilization': '1',
+                  'anthropic-ratelimit-unified-5h-reset': '1784246400',
+                  'anthropic-ratelimit-unified-7d-utilization': '0.4',
+                  'anthropic-ratelimit-unified-7d-reset': '1784628000',
+                }
+              : undefined,
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      stream: true,
+      max_tokens: 99,
+      thinking: { type: 'enabled', budget_tokens: 10 },
+      messages: [{ role: 'user', content: 'start' }],
+    })
+    const headers: Record<string, string> = {}
+    await plugin['chat.message'](
+      { sessionID: 'ses-api-then-oauth' },
+      {
+        message: { id: 'msg-api-then-oauth' },
+        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+      },
+    )
+    await plugin['chat.headers'](
+      {
+        sessionID: 'ses-api-then-oauth',
+        message: { id: 'msg-api-then-oauth' },
+      },
+      { headers },
+    )
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses-api-then-oauth', ...headers },
+      body,
+    })
+
+    const apiSend = sent.find(
+      (entry) => entry.headers.get('x-api-key') === 'api-fails-key',
+    )
+    const oauthSend = sent.find(
+      (entry) =>
+        entry.headers.get('authorization') === 'Bearer fallback-access',
+    )
+    expect(apiSend?.body).toMatchObject({ max_tokens: 99 })
+    expect(apiSend?.body.thinking).toEqual({
+      type: 'enabled',
+      budget_tokens: 10,
+    })
+    expect(oauthSend?.body).toMatchObject({ max_tokens: 1, stream: true })
+    expect(oauthSend?.body.thinking).toBeUndefined()
+  })
+
+  test('claude-start clears the one-shot header before non-OAuth passthrough and session reuse', async () => {
+    const seenHeaders: Headers[] = []
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      seenHeaders.push(new Headers(init?.headers))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const headers: Record<string, string> = {}
+    await plugin['chat.message'](
+      { sessionID: 'ses-deleted' },
+      {
+        message: { id: 'reused-message' },
+        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+      },
+    )
+    await plugin.event({
+      event: {
+        type: 'session.deleted',
+        properties: { sessionID: 'ses-deleted' },
+      },
+    })
+    await plugin['chat.headers'](
+      { sessionID: 'ses-deleted', message: { id: 'reused-message' } },
+      { headers },
+    )
+    expect(headers).toEqual({})
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { [LANE_START_REQUEST_HEADER]: '1' },
+      body: JSON.stringify({ max_tokens: 99, thinking: { type: 'enabled' } }),
+    })
+    expect(seenHeaders[0]?.has(LANE_START_REQUEST_HEADER)).toBe(false)
   })
 })
 

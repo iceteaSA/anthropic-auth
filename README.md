@@ -20,7 +20,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
 | Runtime state | `~/.config/opencode/anthropic-auth-state.json` | next to the Pi sidecar as `anthropic-auth-state.json` |
-| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump`, `/claude-killswitch` | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-start`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump`, `/claude-killswitch` | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
 | Quota sidebar widget | OpenCode TUI plugin via `tui.json` | Not available |
 | Fallback accounts, quota routing, killswitch, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
@@ -31,6 +31,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Quota-aware routing**: skip main or fallback accounts when their 5-hour or 7-day Claude quota falls below your configured minimum.
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
+- **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline. `/claude-start automatic` is unavailable in the explicit-only v1 build; `/claude-start off` persists the disabled setting.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
 - **Fable/Opus 5 safety fallback (OpenCode)**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
@@ -49,7 +50,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
-- Add `/claude-cache`, `/claude-cachekeep`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
+- Add `/claude-cache`, `/claude-cachekeep`, `/claude-start`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands to OpenCode.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
 
 ## Install
@@ -218,6 +219,9 @@ Example:
 The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. Killswitch `scoped` thresholds apply to matching model-scoped quota windows such as Fable weekly quota. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. `sticky-balanced` session assignments use a separate `anthropic-auth-routing-state.json`; session IDs are SHA-256 hashed in that file. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
+
+## OpenCode lane-start setting
+
 
 ## Fallback accounts
 
@@ -487,6 +491,18 @@ Request bodies, headers, and tokens remain in memory. A lease-backed file under 
 
 Pre-warm requests preserve explicit cache anchors but remove response-only fields that Anthropic rejects with `max_tokens: 0`, such as streaming, enabled thinking, structured output format, and forced/any tool choice. The feature works only while OpenCode or Pi is running and the machine is awake, and cache writes are still billed when the cache entry is no longer warm.
 
+## OpenCode lane start
+
+`/claude-start` is an OpenCode-only command. It queues one synthetic turn for the current session:
+
+```text
+/claude-start
+```
+
+The bare command fires immediately. The synthetic prompt uses the session's current model, agent, and variant, then travels through the ordinary quota, routing, cache, relay, signing, and response pipeline. OpenCode shapes that OAuth request to `max_tokens: 1` while keeping streaming enabled, and correlates the request by its synthetic message ID. A queued modal is a request to start the turn, not a provider-success claim.
+
+Pi does not expose this command.
+
 ## Claude fast mode
 
 Both OpenCode and Pi packages can persistently request Anthropic fast mode for supported Opus models:
@@ -617,6 +633,8 @@ Each filename includes a sanitized session/affinity segment so dumps from differ
 - `*.meta.json` — hashes, byte counts, diff ranges, model, `messages[0]` hash, later-message hash, and cache-relevant structure.
 - `*.relay.json` — redacted relay payload/frame metadata for relay requests.
 - `*.request.json` — redacted direct request URL, method, and headers for direct requests.
+
+Lane-start requests use the `-start-` dump marker; CacheKeep keeps `-prewarm-cachekeep-`. Their cache-diagnostics records use `source: "start"` with `synthetic: true`, alongside ordinary `turn` records.
 
 Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.config/opencode/anthropic-auth.json` for OpenCode, `~/.pi/agent/anthropic-auth.json` for Pi). Dumps may contain prompt content and should be treated as sensitive local debugging artifacts.
 
