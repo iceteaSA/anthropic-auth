@@ -656,6 +656,71 @@ describe('createStrippedStream', () => {
     expect(outcomes).toHaveLength(1)
   })
 
+  test('drains an over-cap refusal terminal frame before disabling the tail', async () => {
+    const contentFilters: boolean[] = []
+    const perf: Array<Record<string, unknown>> = []
+    const terminal = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'refusal' },
+    })
+    const body = `${terminal}${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        onContentFilter: () => {
+          contentFilters.push(true)
+          return false
+        },
+        perf: (_stage, stats) => perf.push(stats ?? {}),
+      },
+    )
+
+    expect(await response.text()).toBe(body)
+    expect(contentFilters).toEqual([true])
+    expect(perf.at(-1)).toMatchObject({
+      sseFinishPending: 0,
+      sseFinishDisabled: true,
+    })
+  })
+
+  test('drains an over-cap ordinary terminal frame before disabling the tail', async () => {
+    const completed: string[] = []
+    const perf: Array<Record<string, unknown>> = []
+    const terminal = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+    })
+    const body = `${terminal}${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        onComplete: (finishReason) => completed.push(finishReason),
+        perf: (_stage, stats) => perf.push(stats ?? {}),
+      },
+    )
+
+    expect(await response.text()).toBe(body)
+    expect(completed).toEqual(['end_turn'])
+    expect(perf.at(-1)).toMatchObject({
+      sseFinishPending: 0,
+      sseFinishDisabled: true,
+    })
+  })
+
   test('swallows observation callback errors', async () => {
     const payload = sse('message_start', {
       type: 'message_start',

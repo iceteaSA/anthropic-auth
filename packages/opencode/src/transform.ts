@@ -1574,27 +1574,27 @@ function updateSseFinishState(
   maxPendingBytes: number,
 ): SseFinishUpdate | null {
   if (!text || state.completed || state.disabled) return null
-  if (
-    new TextEncoder().encode(state.pending + text).byteLength > maxPendingBytes
-  ) {
-    state.pending = ''
-    state.disabled = true
-    return null
-  }
   state.pending += text
+  let update: SseFinishUpdate | null = null
 
   while (true) {
     const boundary = findSseBoundary(state.pending)
-    if (!boundary) return null
+    if (!boundary) break
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
     const summary = summarizeSseEvent(rawEvent)
     if (summary?.type !== 'message_delta' || !summary.stopReason) continue
     state.completed = true
-    return summary.stopReason === 'refusal'
-      ? { type: 'content-filter' }
-      : { type: 'complete', finishReason: summary.stopReason }
+    update ??=
+      summary.stopReason === 'refusal'
+        ? { type: 'content-filter' }
+        : { type: 'complete', finishReason: summary.stopReason }
   }
+  if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
+    state.pending = ''
+    state.disabled = true
+  }
+  return update
 }
 
 type RetryableAnthropicStreamError = Error & {
@@ -1848,6 +1848,7 @@ export function createStrippedStream(
     pendingChars: pending.length,
     sseErrorPending: sseErrors.pending.length,
     sseFinishPending: sseFinish?.pending.length ?? 0,
+    sseFinishDisabled: sseFinish?.disabled ?? false,
     serverFallbackPending: serverSideFallback?.pendingLength() ?? 0,
     rewriteMs: rewriteRoundMs(rewriteMs),
     totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
