@@ -166,6 +166,11 @@ describe('LaneStartTracker', () => {
       }),
     ).toBe(true)
     tracker.observeSyntheticMessage({
+      sessionId: 'session-a',
+      messageId: 'second',
+      parts: startParts(),
+    })
+    tracker.observeSyntheticMessage({
       sessionId: 'session-b',
       messageId: 'other',
       parts: startParts(),
@@ -174,7 +179,7 @@ describe('LaneStartTracker', () => {
     expect(
       tracker.markHeaders({
         sessionId: 'session-a',
-        messageId: 'third',
+        messageId: 'second',
         headers: {},
       }),
     ).toBe(false)
