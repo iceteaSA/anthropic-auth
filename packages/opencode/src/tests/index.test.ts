@@ -3200,6 +3200,7 @@ describe('auth.loader', () => {
       'claude-cache',
       'claude-cachekeep',
       'claude-prime',
+      'claude-start',
       'claude-quota',
       'claude-dump',
       'claude-fast',
@@ -3220,6 +3221,45 @@ describe('auth.loader', () => {
     )
     expect(claudeRegistered).toHaveLength(required.length)
     expect([...claudeRegistered].sort()).toEqual([...required].sort())
+  })
+
+  test('handles /claude-start by injecting one visible synthetic prompt', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-start',
+        arguments: '',
+        sessionID: 'session-start',
+      }),
+    )
+
+    const promptCalls = (
+      mockClient.session.promptAsync as unknown as {
+        mock: {
+          calls: Array<[{ body: { parts: Array<Record<string, unknown>> } }]>
+        }
+      }
+    ).mock.calls as Array<
+      [
+        {
+          path: { id: string }
+          body: { noReply: boolean; parts: Array<Record<string, unknown>> }
+        },
+      ]
+    >
+    const startCall = promptCalls
+      .map(([call]) => call)
+      .find((call) => call.body.parts[0]?.synthetic === true)
+    expect(startCall).toEqual({
+      path: { id: 'session-start' },
+      body: {
+        noReply: false,
+        parts: [{ type: 'text', text: '[lane start]', synthetic: true }],
+      },
+    })
   })
 
   test('handles /claude-cachekeep command and persists window', async () => {

@@ -28,6 +28,7 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  CLAUDE_START_COMMAND_NAME,
   computeXxhash64Hex,
   continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
@@ -43,6 +44,7 @@ import {
   executeDumpCommand,
   executeFastModeCommand,
   executeKillswitchCommand,
+  executeLaneStartCommand,
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
@@ -86,6 +88,7 @@ import {
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
+  isStartAutomaticPersistentlyEnabled,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -109,6 +112,7 @@ import {
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseLaneStartCommandAction,
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
@@ -147,6 +151,7 @@ import {
   setLogLevelPersistent,
   setPrimePersistentEnabled,
   setRoutingMode,
+  setStartAutomaticPersistentEnabled,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
@@ -173,6 +178,7 @@ import {
   isRecoverableRefusalModel,
   recoverableRefusalFamily,
 } from './fable-fallback.ts'
+import { fireLaneStart } from './lane-start.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
@@ -2587,6 +2593,34 @@ const anthropicAuthPlugin = async (
     return executeFastModeCommand({ argumentsText, enabled })
   }
 
+  async function executePersistentStartCommand(
+    argumentsText: string,
+    sessionId?: string,
+  ) {
+    const action = parseLaneStartCommandAction(argumentsText)
+    const storage = await loadAccounts(accountStoragePath)
+    const automaticEnabled = isStartAutomaticPersistentlyEnabled(storage)
+    if (action.type === 'fire') {
+      if (!sessionId) {
+        return '## Claude Start Failed\n\n- OpenCode did not provide a session ID.'
+      }
+      try {
+        await fireLaneStart(ctx.client, sessionId)
+        return executeLaneStartCommand({ argumentsText, automaticEnabled }).text
+      } catch (error) {
+        return `## Claude Start Failed\n\n- ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+    if (action.type === 'off') {
+      await setStartAutomaticPersistentEnabled(false, accountStoragePath)
+      return executeLaneStartCommand({
+        argumentsText,
+        automaticEnabled: false,
+      }).text
+    }
+    return executeLaneStartCommand({ argumentsText, automaticEnabled }).text
+  }
+
   async function executePersistentRoutingCommand(
     argumentsText: string,
     sessionId?: string,
@@ -2922,6 +2956,17 @@ const anthropicAuthPlugin = async (
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-start') {
+      const text = await executePersistentStartCommand(args, sessionId)
+      const storage = await loadAccounts(accountStoragePath)
+      return {
+        command,
+        text,
+        knobs: {
+          enabled: isStartAutomaticPersistentlyEnabled(storage),
+        },
+      }
+    }
     if (command === 'claude-logging') {
       const text = await executePersistentLoggingCommand(args)
       const storage = await loadAccounts(accountStoragePath)
@@ -3211,6 +3256,11 @@ const anthropicAuthPlugin = async (
           description:
             "Start each OAuth account's five-hour quota window after reset.",
         },
+        [CLAUDE_START_COMMAND_NAME]: {
+          template: CLAUDE_START_COMMAND_NAME,
+          description:
+            'Warm and renew the current Claude session cache with a one-token synthetic turn.',
+        },
 
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
           template: CLAUDE_QUOTAS_COMMAND_NAME,
@@ -3284,6 +3334,7 @@ const anthropicAuthPlugin = async (
         'claude-cache',
         'claude-cachekeep',
         'claude-prime',
+        'claude-start',
         'claude-quota',
         'claude-dump',
         'claude-fast',
