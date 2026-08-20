@@ -87,6 +87,75 @@ describe('mergeHeaders', () => {
   })
 })
 
+describe('lane start request shaping', () => {
+  const laneStartBody = (
+    model: string,
+    thinking: unknown = { type: 'enabled' },
+  ) =>
+    JSON.stringify({
+      model,
+      max_tokens: 512,
+      stream: true,
+      thinking,
+      output_config: { effort: 'high' },
+      tools: [{ name: 'lookup', input_schema: { type: 'object' } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      cache_control: { type: 'ephemeral' },
+      speed: 'fast',
+    })
+
+  test('sets one streaming token and strips thinking after model normalization', async () => {
+    const thinkingShapes = [
+      { type: 'enabled' },
+      { type: 'adaptive' },
+      { type: 'summarized' },
+      { type: 'disabled' },
+    ]
+    for (const model of [
+      'claude-fable-5',
+      'claude-sonnet-5',
+      'claude-opus-5',
+    ]) {
+      for (const thinking of thinkingShapes) {
+        const result = JSON.parse(
+          await rewriteRequestBody(laneStartBody(model, thinking), {
+            laneStart: true,
+          }),
+        )
+        expect(result.max_tokens).toBe(1)
+        expect(result.stream).toBe(true)
+        expect(result.model).toBe(model)
+        expect(result.thinking).toBeUndefined()
+      }
+    }
+  })
+
+  test('preserves prompt and request features governed by existing paths', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(laneStartBody('claude-opus-4-8'), {
+        laneStart: true,
+        fastModeEnabled: true,
+      }),
+    )
+    expect(result.output_config).toEqual({ effort: 'high' })
+    expect(result.tools).toHaveLength(1)
+    expect(result.messages).toHaveLength(1)
+    expect(result.cache_control).toBeUndefined()
+    expect(result.speed).toBe('fast')
+  })
+
+  test('leaves ordinary requests unchanged and fails closed on invalid JSON', async () => {
+    const body = laneStartBody('claude-opus-4-8')
+    expect(await rewriteRequestBody(body)).not.toContain('"max_tokens":1')
+    expect(await rewriteRequestBody(body, { laneStart: false })).not.toContain(
+      '"max_tokens":1',
+    )
+    expect(await rewriteRequestBody('{not-json', { laneStart: true })).toBe(
+      '{not-json',
+    )
+  })
+})
+
 describe('mergeBetaHeaders', () => {
   test('includes required betas when no incoming betas', () => {
     const headers = new Headers()

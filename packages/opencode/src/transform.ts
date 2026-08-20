@@ -1184,6 +1184,7 @@ export async function rewriteRequestBody(
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
+    laneStart?: boolean
     cacheDiagnosticsPreviousMessageId?: string | null
   } = {},
 ): Promise<string> {
@@ -1243,6 +1244,11 @@ export async function rewriteRequestBody(
       serverFallbackMarkersDropped: serverSideFallback.droppedMarkers,
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
+
+    if (options.laneStart === true) {
+      parsed.max_tokens = 1
+      delete parsed.thinking
+    }
 
     const billingStart = rewriteNowMs()
     const billingHeader =

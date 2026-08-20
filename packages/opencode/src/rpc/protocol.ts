@@ -3,6 +3,7 @@ export type CommandModalName =
   | 'claude-cache'
   | 'claude-cachekeep'
   | 'claude-prime'
+  | 'claude-start'
   | 'claude-quota'
   | 'claude-dump'
   | 'claude-fast'

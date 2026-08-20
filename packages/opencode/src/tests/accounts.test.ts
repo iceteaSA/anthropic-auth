@@ -34,6 +34,7 @@ import {
   isFastModePersistentlyEnabled,
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
+  isStartAutomaticPersistentlyEnabled,
   type KillswitchThresholds,
   killswitchPassesPolicy,
   loadAccounts,
@@ -65,6 +66,7 @@ import {
   setLogLevel,
   setLogLevelPersistent,
   setPrimePersistentEnabled,
+  setStartAutomaticPersistentEnabled,
   shouldFallbackStatus,
   tokenFingerprint,
   upsertAccount,
@@ -158,6 +160,50 @@ afterEach(async () => {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   await rm(tempDir, { recursive: true, force: true })
   mock.restore()
+})
+
+describe('claudeStart persistence', () => {
+  test('absent claudeStart reads as disabled', async () => {
+    const storage = await loadAccounts(accountPath)
+    expect(isStartAutomaticPersistentlyEnabled(storage)).toBe(false)
+  })
+
+  test('true round-trips through the config sidecar', async () => {
+    const storage = await setStartAutomaticPersistentEnabled(true, accountPath)
+    expect(storage.claudeStart).toEqual({ enabled: true })
+    expect(
+      isStartAutomaticPersistentlyEnabled(await loadAccounts(accountPath)),
+    ).toBe(true)
+  })
+
+  test('false is explicitly serialized instead of dropped', async () => {
+    await setStartAutomaticPersistentEnabled(false, accountPath)
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(config.claudeStart).toEqual({ enabled: false })
+  })
+
+  test('preserves unrelated config fields and accounts', async () => {
+    const storage = baseStorage()
+    storage.routing = { mode: 'sticky-balanced' }
+    await saveAccounts(storage, accountPath)
+    await setStartAutomaticPersistentEnabled(false, accountPath)
+    const loaded = await loadAccounts(accountPath)
+    expect(loaded?.routing).toEqual({ mode: 'sticky-balanced' })
+    expect(loaded?.accounts).toEqual([])
+  })
+
+  test('writes claudeStart to config, not runtime state', async () => {
+    await setStartAutomaticPersistentEnabled(true, accountPath)
+    expect(JSON.parse(await readFile(accountPath, 'utf8')).claudeStart).toEqual(
+      {
+        enabled: true,
+      },
+    )
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(state.claudeStart).toBeUndefined()
+  })
 })
 
 describe('OAuth account profiles', () => {
