@@ -28,6 +28,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
+import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -9460,6 +9461,323 @@ describe('auth.loader', () => {
       __setLogTestSink(null)
       setLogLevel('info')
     })
+  })
+})
+
+describe('claude-start integration', () => {
+  const originalFetch = globalThis.fetch
+
+  beforeEach(async () => {
+    pluginTimerOverrides = {
+      setInterval: mock(
+        () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+      ) as unknown as typeof setInterval,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    }
+    resetCache1hState()
+    resetDumpState()
+    setLogLevel('info')
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+      }),
+    )
+  })
+
+  afterEach(async () => {
+    __setLogTestSink(null)
+    globalThis.fetch = originalFetch
+    pluginTimerOverrides = {}
+    resetDumpState()
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    await drainSidebarWrites()
+    restoreProcessTestFiles()
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { recursive: true, force: true })
+      tempConfigDir = undefined
+    }
+  })
+
+  test('claude-start request shapes only its correlated OAuth turn and emits diagnostics', async () => {
+    const sent: Array<{ body: Record<string, unknown>; headers: Headers }> = []
+    const records: LogTestRecord[] = []
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      sent.push({
+        body: JSON.parse(String(init?.body)),
+        headers: new Headers(init?.headers),
+      })
+      return Promise.resolve(
+        new Response(
+          `event: message_start\ndata: ${JSON.stringify({
+            type: 'message_start',
+            message: {
+              id: 'provider-start',
+              model: 'claude-opus-4-8',
+              usage: {
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 1,
+                cache_creation: {
+                  ephemeral_5m_input_tokens: 0,
+                  ephemeral_1h_input_tokens: 1,
+                },
+              },
+              diagnostics: { cache_miss_reason: null },
+            },
+          })}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+    __setLogTestSink((record) => records.push(record))
+
+    const client = createMockClient()
+    const plugin = await getPlugin(client)
+    const headers: Record<string, string> = {}
+    await plugin['chat.message'](
+      { sessionID: 'ses-start' },
+      {
+        message: { id: 'msg-start' },
+        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+      },
+    )
+    await plugin['chat.headers'](
+      { sessionID: 'ses-start', message: { id: 'msg-start' } },
+      { headers },
+    )
+    expect(headers).toEqual({ [LANE_START_REQUEST_HEADER]: '1' })
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await (
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-start', ...headers },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          stream: true,
+          max_tokens: 99,
+          thinking: { type: 'enabled', budget_tokens: 10 },
+          messages: [{ role: 'user', content: 'start' }],
+        }),
+      })
+    ).text()
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.body).toMatchObject({ max_tokens: 1, stream: true })
+    expect(sent[0]?.body.thinking).toBeUndefined()
+    expect(sent[0]?.headers.has(LANE_START_REQUEST_HEADER)).toBe(false)
+    const record = records.find(
+      (entry) =>
+        entry.channel === 'cache-diagnostics' &&
+        entry.message.includes('provider-start'),
+    )
+    expect(record).toBeDefined()
+    expect(
+      JSON.parse(record!.message.replace('MC-CACHE-DIAG ', '')),
+    ).toMatchObject({
+      v: 2,
+      source: 'start',
+      synthetic: true,
+      account_id: 'main',
+      session_id: 'ses-start',
+    })
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-cachekeep',
+        arguments: '',
+        sessionID: 'ses-start',
+      }),
+    )
+    const latest = (
+      client.session.promptAsync as unknown as {
+        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+      }
+    ).mock.calls.at(-1)?.[0]
+    expect(latest?.body.parts[0]?.text).toContain('ses-start')
+  })
+
+  test('claude-start concurrency does not shape an interleaved real turn', async () => {
+    const sent: Array<{ body: Record<string, unknown>; headers: Headers }> = []
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      sent.push({
+        body: JSON.parse(String(init?.body)),
+        headers: new Headers(init?.headers),
+      })
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const startHeaders: Record<string, string> = {}
+    const realHeaders: Record<string, string> = {}
+    await plugin['chat.message'](
+      { sessionID: 'ses-race' },
+      {
+        message: { id: 'msg-start' },
+        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+      },
+    )
+    await plugin['chat.headers'](
+      { sessionID: 'ses-race', message: { id: 'msg-start' } },
+      { headers: startHeaders },
+    )
+    await plugin['chat.headers'](
+      { sessionID: 'ses-race', message: { id: 'msg-real' } },
+      { headers: realHeaders },
+    )
+    expect(realHeaders).toEqual({})
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const request = (headers: Record<string, string>, maxTokens: number) =>
+      result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-race', ...headers },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          stream: true,
+          max_tokens: maxTokens,
+          thinking: { type: 'enabled', budget_tokens: 10 },
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+    await Promise.all([request(startHeaders, 99), request(realHeaders, 77)])
+
+    expect(sent.map((entry) => entry.body.max_tokens).sort()).toEqual([1, 77])
+    expect(
+      sent.find((entry) => entry.body.max_tokens === 77)?.body.thinking,
+    ).toEqual({
+      type: 'enabled',
+      budget_tokens: 10,
+    })
+    expect(
+      sent.every((entry) => !entry.headers.has(LANE_START_REQUEST_HEADER)),
+    ).toBe(true)
+  })
+
+  test('claude-start tags direct dumps', async () => {
+    const previousDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-start-dump-test-'))
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    try {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false },
+          dump: { enabled: true },
+        }),
+      )
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const headers: Record<string, string> = {}
+      await plugin['chat.message'](
+        { sessionID: 'ses-start-dump' },
+        {
+          message: { id: 'msg-start-dump' },
+          parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+        },
+      )
+      await plugin['chat.headers'](
+        { sessionID: 'ses-start-dump', message: { id: 'msg-start-dump' } },
+        { headers },
+      )
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-start-dump', ...headers },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'start' }],
+        }),
+      })
+      expect(
+        (await readdir(dumpDir)).some((file) => file.includes('-start-')),
+      ).toBe(true)
+    } finally {
+      if (previousDumpDir === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDumpDir
+      }
+      await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('claude-start clears the one-shot header before non-OAuth passthrough and session reuse', async () => {
+    const seenHeaders: Headers[] = []
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      seenHeaders.push(new Headers(init?.headers))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const headers: Record<string, string> = {}
+    await plugin['chat.message'](
+      { sessionID: 'ses-deleted' },
+      {
+        message: { id: 'reused-message' },
+        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+      },
+    )
+    await plugin.event({
+      event: {
+        type: 'session.deleted',
+        properties: { sessionID: 'ses-deleted' },
+      },
+    })
+    await plugin['chat.headers'](
+      { sessionID: 'ses-deleted', message: { id: 'reused-message' } },
+      { headers },
+    )
+    expect(headers).toEqual({})
+
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { [LANE_START_REQUEST_HEADER]: '1' },
+      body: JSON.stringify({ max_tokens: 99, thinking: { type: 'enabled' } }),
+    })
+    expect(seenHeaders[0]?.has(LANE_START_REQUEST_HEADER)).toBe(false)
   })
 })
 
