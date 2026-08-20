@@ -3274,7 +3274,13 @@ describe('auth.loader', () => {
       path: { id: 'session-start' },
       body: {
         noReply: false,
-        parts: [{ type: 'text', text: '[lane start]', synthetic: true }],
+        parts: [
+          {
+            type: 'text',
+            text: '[lane start] — automated cache warm; no response needed.',
+            synthetic: true,
+          },
+        ],
       },
     })
   })

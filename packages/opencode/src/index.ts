@@ -4983,6 +4983,7 @@ const anthropicAuthPlugin = async (
                   cacheDiagnosticsResponses.get(response)
                 return createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
+                  laneStart: laneStartRequest,
                   ...(diagnosticsContext
                     ? diagnosticsContext.streaming
                       ? {
