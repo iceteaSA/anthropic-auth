@@ -1573,7 +1573,14 @@ function updateSseFinishState(
   text: string,
   maxPendingBytes: number,
 ): SseFinishUpdate | null {
-  if (!text || state.completed || state.disabled) return null
+  if (!text || state.completed) return null
+  if (state.disabled) {
+    const boundary = findSseBoundary(text)
+    if (!boundary) return null
+    state.disabled = false
+    text = text.slice(boundary.index + boundary.length)
+    if (!text) return null
+  }
   state.pending += text
   let update: SseFinishUpdate | null = null
 

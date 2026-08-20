@@ -450,4 +450,53 @@ describe('createServerSideFallbackStreamRewriter', () => {
       }),
     ])
   })
+
+  test('resyncs after an oversized incomplete frame before preserving a later tool use', () => {
+    let handled = 0
+    const skipped = `data: ${'x'.repeat(256)}`
+    const later = [
+      '\n\n',
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: 'toolu_after_overflow',
+          name: 'mcp_Bash',
+          input: {},
+        },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-4-8' },
+        },
+      }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'refusal' },
+      }),
+    ].join('')
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      maxPendingBytes: 64,
+      onRefusalAfterToolUse: () => {
+        handled++
+        return true
+      },
+    })
+
+    const output =
+      rewriter.push(skipped) + rewriter.push(later) + rewriter.flush()
+
+    expect(output.startsWith(`${skipped}\n\n`)).toBe(true)
+    expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+    expect(output).toContain('"stop_reason":"tool_use"')
+    expect(output).not.toContain('"stop_reason":"refusal"')
+    expect(handled).toBe(1)
+  })
 })

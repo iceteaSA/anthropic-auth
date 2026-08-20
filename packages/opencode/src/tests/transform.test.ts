@@ -721,6 +721,32 @@ describe('createStrippedStream', () => {
     })
   })
 
+  test('resyncs finish detection after an oversized incomplete SSE frame', async () => {
+    const completed: string[] = []
+    const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+    const terminal = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+    })
+    const body = `${skipped}\n\n${terminal}`
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder()
+            controller.enqueue(encoder.encode(skipped))
+            controller.enqueue(encoder.encode(`\n\n${terminal}`))
+            controller.close()
+          },
+        }),
+      ),
+      { onComplete: (finishReason) => completed.push(finishReason) },
+    )
+
+    expect(await response.text()).toBe(body)
+    expect(completed).toEqual(['end_turn'])
+  })
+
   test('swallows observation callback errors', async () => {
     const payload = sse('message_start', {
       type: 'message_start',
