@@ -25,6 +25,7 @@ import {
   CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  computeXxhash64Hex,
   createEmptyStorage,
   createStickyNoRouteResponse,
   type DumpHandle,
@@ -141,7 +142,9 @@ import {
   applyCacheDiagnosticsOptIn,
   buildCacheDiagnosticsRecord,
   CACHE_DIAGNOSTICS_BETA,
+  CacheDiagnosticsBetaTracker,
   type CacheDiagnosticsRequestContext,
+  type CacheDiagnosticsSource,
   CacheDiagnosticsTracker,
   copyCacheDiagnosticsContext,
   formatCacheDiagnosticsLogLine,
@@ -1175,9 +1178,16 @@ const anthropicAuthPlugin = async (
   })
   fallbackManager.startBackgroundRefresh()
   const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
+  const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
   type CacheDiagnosticsResponse = {
     request?: CacheDiagnosticsRequestContext
     trackSessionId?: string
+    source: CacheDiagnosticsSource
+    accountId: string
+    synthetic: boolean
+    betasHash: string
+    betas: string[]
+    requestedModel?: string
     dump: DumpHandle | null
     status: number
     streaming: boolean
@@ -1187,12 +1197,36 @@ const anthropicAuthPlugin = async (
     Response,
     CacheDiagnosticsResponse
   >()
-  const cacheKeepDiagnosticsRequests = new WeakMap<
-    object,
-    CacheDiagnosticsRequestContext
+  const cacheKeepDiagnosticsRequests = new Map<
+    string,
+    CacheDiagnosticsRequestContext & {
+      accountId: string
+      synthetic: boolean
+      betasHash?: string
+      betas?: string[]
+      requestedModel?: string
+    }
   >()
 
+  async function getCacheDiagnosticsBetas(headers: Headers) {
+    const betas = (headers.get('anthropic-beta') ?? '')
+      .split(',')
+      .map((beta) => beta.trim())
+      .filter(Boolean)
+      .sort()
+    return {
+      betas,
+      betasHash: await computeXxhash64Hex(betas.join(',')),
+    }
+  }
+
   function observeCacheDiagnosticsMessage(input: {
+    source: CacheDiagnosticsSource
+    accountId: string
+    synthetic: boolean
+    betasHash: string
+    betas: string[]
+    requestedModel?: string
     request?: CacheDiagnosticsRequestContext
     trackSessionId?: string
     status: number
@@ -1215,6 +1249,12 @@ const anthropicAuthPlugin = async (
       if (!input.request) return
       const observed = buildCacheDiagnosticsRecord({
         request: input.request,
+        source: input.source,
+        accountId: input.accountId,
+        synthetic: input.synthetic,
+        betasHash: input.betasHash,
+        requestedModel: input.requestedModel,
+        onWarning: (message) => logger.warn('cache-diagnostics', message),
         message: input.message,
         receivedAt: input.receivedAt,
       })
@@ -1228,6 +1268,11 @@ const anthropicAuthPlugin = async (
         'cache-diagnostics',
         formatCacheDiagnosticsLogLine(observed.record),
       )
+      const betaLine = cacheDiagnosticsBetaTracker.capture(
+        input.betasHash,
+        input.betas,
+      )
+      if (betaLine) logger.info('cache-diagnostics', betaLine)
       if (observed.canary) {
         logger.warn(
           'cache-diagnostics',
@@ -1308,7 +1353,7 @@ const anthropicAuthPlugin = async (
         const previous = cacheDiagnosticsTracker.previousFor(target.id)
         const previousMessageId = previous?.messageId ?? null
         applyCacheDiagnosticsOptIn(body, previousMessageId)
-        cacheKeepDiagnosticsRequests.set(target, {
+        cacheKeepDiagnosticsRequests.set(target.id, {
           sessionId: target.id,
           previousMessageId,
           ...(previous
@@ -1316,6 +1361,10 @@ const anthropicAuthPlugin = async (
             : {}),
           isSubagent: target.isSubagent,
           ttlSent: summarizeCacheTtl(body),
+          accountId: target.oauthAccountId ?? 'main',
+          synthetic: true,
+          requestedModel:
+            typeof body.model === 'string' ? body.model : undefined,
         })
         return JSON.stringify(body)
       } catch {
@@ -1323,8 +1372,11 @@ const anthropicAuthPlugin = async (
       }
     },
     onResponse: ({ target, bodyText, status, data, receivedAt }) => {
-      const prepared = cacheKeepDiagnosticsRequests.get(target)
-      if (!prepared) return
+      const prepared = cacheKeepDiagnosticsRequests.get(target.id)
+      if (!prepared?.betasHash || !prepared.betas) {
+        cacheKeepDiagnosticsRequests.delete(target.id)
+        return
+      }
       try {
         const sentBody = JSON.parse(bodyText)
         const diagnostics =
@@ -1341,6 +1393,12 @@ const anthropicAuthPlugin = async (
             : undefined
         if (previousMessageId === undefined) return
         observeCacheDiagnosticsMessage({
+          source: 'prewarm_cachekeep',
+          accountId: prepared.accountId,
+          synthetic: prepared.synthetic,
+          betasHash: prepared.betasHash,
+          betas: prepared.betas,
+          requestedModel: prepared.requestedModel,
           request: {
             ...prepared,
             previousMessageId,
@@ -1351,7 +1409,10 @@ const anthropicAuthPlugin = async (
           message: data,
           receivedAt,
         })
-      } catch {}
+      } catch {
+      } finally {
+        cacheKeepDiagnosticsRequests.delete(target.id)
+      }
     },
     prepareHeaders: async (headers, target) => {
       let accessToken: string | undefined
@@ -1416,6 +1477,12 @@ const anthropicAuthPlugin = async (
           ]),
         )
         if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+        const prepared = cacheKeepDiagnosticsRequests.get(target.id)
+        if (prepared) {
+          const { betas, betasHash } = await getCacheDiagnosticsBetas(headers)
+          prepared.betas = betas
+          prepared.betasHash = betasHash
+        }
       } catch {
         setOAuthHeaders(headers, accessToken)
       }
@@ -3563,6 +3630,8 @@ const anthropicAuthPlugin = async (
               configureApiRouteHeaders(requestHeaders, account)
             }
 
+            const cacheDiagnosticsBetas =
+              await getCacheDiagnosticsBetas(requestHeaders)
             const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
             const sendStart = nowMs()
             let response: Response
@@ -3601,6 +3670,11 @@ const anthropicAuthPlugin = async (
               })
             }
             attachCacheDiagnosticsResponse(response, {
+              source: 'turn',
+              accountId: account.id,
+              synthetic: false,
+              ...cacheDiagnosticsBetas,
+              requestedModel: parseRequestModel(body),
               dump,
               status: response.status,
               streaming,
@@ -3802,6 +3876,8 @@ const anthropicAuthPlugin = async (
               })
             }
 
+            const cacheDiagnosticsBetas =
+              await getCacheDiagnosticsBetas(requestHeaders)
             const rewritten = rewriteUrl(input)
             if (fableRequest && typeof body === 'string') {
               fableRequest.warmTarget = {
@@ -3912,6 +3988,11 @@ const anthropicAuthPlugin = async (
 
             if (usedDirectFetch) harvestQuotaHeaders(response.headers, served)
             attachCacheDiagnosticsResponse(response, {
+              source: 'turn',
+              accountId: oauthAccountId,
+              synthetic: false,
+              ...cacheDiagnosticsBetas,
+              requestedModel: parseRequestModel(body),
               request: cacheDiagnosticsRequest,
               trackSessionId: relayAffinity ?? undefined,
               dump: usedDirectFetch ? directDump : relayDump,
