@@ -26,8 +26,9 @@ describe('claude-start command contract', () => {
       automaticEnabled: false,
     })
     expect(result.action).toEqual({ type: 'automatic' })
-    expect(result.text).toContain('Unavailable')
-    expect(result.text).toContain('not yet wired')
+    expect(result.text).toBe(
+      'Automatic lane start is not yet wired in this build; no setting was changed.',
+    )
     expect(result.text).not.toContain('Persisted:')
   })
 

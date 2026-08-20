@@ -105,17 +105,28 @@ describe('lane start request shaping', () => {
     })
 
   test('sets one streaming token and strips thinking after model normalization', async () => {
+    const thinkingShapes = [
+      { type: 'enabled' },
+      { type: 'adaptive' },
+      { type: 'summarized' },
+      { type: 'disabled' },
+    ]
     for (const model of [
       'claude-fable-5',
       'claude-sonnet-5',
       'claude-opus-5',
     ]) {
-      const result = JSON.parse(
-        await rewriteRequestBody(laneStartBody(model), { laneStart: true }),
-      )
-      expect(result.max_tokens).toBe(1)
-      expect(result.stream).toBe(true)
-      expect(result.thinking).toBeUndefined()
+      for (const thinking of thinkingShapes) {
+        const result = JSON.parse(
+          await rewriteRequestBody(laneStartBody(model, thinking), {
+            laneStart: true,
+          }),
+        )
+        expect(result.max_tokens).toBe(1)
+        expect(result.stream).toBe(true)
+        expect(result.model).toBe(model)
+        expect(result.thinking).toBeUndefined()
+      }
     }
   })
 

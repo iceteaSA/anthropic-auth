@@ -2,7 +2,6 @@ export const CLAUDE_START_COMMAND_NAME = 'claude-start'
 
 const START_STATUS_TITLE = '## Claude Lane Start Status'
 const START_QUEUED_TITLE = '## Claude Lane Start Queued'
-const START_AUTOMATIC_TITLE = '## Claude Lane Start Unavailable'
 const START_OFF_TITLE = '## Claude Lane Start Disabled'
 const START_USAGE_TITLE = '## Claude Lane Start Usage'
 const START_USAGE =
@@ -57,12 +56,7 @@ export function executeLaneStartCommand(input: {
   if (action.type === 'automatic') {
     return {
       action,
-      text: [
-        START_AUTOMATIC_TITLE,
-        '',
-        '- Automatic lane starts are not yet wired.',
-        '- No setting was changed or persisted.',
-      ].join('\n'),
+      text: 'Automatic lane start is not yet wired in this build; no setting was changed.',
     }
   }
   if (action.type === 'off') {

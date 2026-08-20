@@ -182,7 +182,8 @@ test('start dumps use the distinct start filename segment', async () => {
     tag: 'start',
   })
   expect(handle?.tag).toBe('start')
-  expect(handle?.responsePath).toContain('-start-direct.')
+  expect(handle?.responsePath).toMatch(/-start-direct\.response\.json$/)
+  expect(handle?.responsePath).not.toContain('-prewarm-start')
   const files = await readdir(dumpDir)
   const metadata = JSON.parse(
     await readFile(
