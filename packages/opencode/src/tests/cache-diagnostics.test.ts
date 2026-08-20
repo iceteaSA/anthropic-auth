@@ -297,6 +297,22 @@ describe('cache diagnostics v2 contract', () => {
     ).toEqual({})
   })
 
+  test.each([
+    ['negative cache_read', { cache_read_input_tokens: -1 }],
+    ['non-finite input_tokens', { input_tokens: Number.POSITIVE_INFINITY }],
+  ])('rejects a record with %s', (_name, usageOverrides) => {
+    expect(
+      buildCacheDiagnosticsRecord(
+        input({
+          message: {
+            ...message({ cache_miss_reason: { type: 'unavailable' } }),
+            usage: { ...usage, ...usageOverrides },
+          },
+        }),
+      ),
+    ).toEqual({})
+  })
+
   test('applies opt-in without replacing existing body fields', () => {
     const body: Record<string, unknown> = { model: 'x' }
     applyCacheDiagnosticsOptIn(body, null)

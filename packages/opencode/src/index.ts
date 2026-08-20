@@ -4731,6 +4731,8 @@ const anthropicAuthPlugin = async (
             }
           }
 
+          const responseRouteKinds = new WeakMap<Response, 'oauth' | 'api'>()
+
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -4794,6 +4796,10 @@ const anthropicAuthPlugin = async (
                 fallbackAgain = inspected.rateLimited
               }
               if (!fallbackAgain) {
+                responseRouteKinds.set(
+                  response,
+                  isApiKeyAccount(account) ? 'api' : 'oauth',
+                )
                 await fallbackManager.markUsed(account)
                 await options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
@@ -4985,6 +4991,8 @@ const anthropicAuthPlugin = async (
                 return createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
                   laneStart: laneStartRequest,
+                  laneStartOAuthServed:
+                    responseRouteKinds.get(response) !== 'api',
                   ...(diagnosticsContext
                     ? diagnosticsContext.streaming
                       ? {

@@ -585,6 +585,21 @@ describe('createStrippedStream', () => {
     expect(finishReasons).toEqual(['end_turn'])
   })
 
+  test('leaves API-key-served lane-start max_tokens finish unchanged', async () => {
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'max_tokens' },
+      usage: { output_tokens: 1 },
+    })
+
+    const text = await createStrippedStream(new Response(body), {
+      laneStart: true,
+      laneStartOAuthServed: false,
+    }).text()
+
+    expect(text).toBe(body)
+  })
+
   test('leaves max_tokens bytes unchanged without the lane-start marker', async () => {
     const finishReasons: string[] = []
     const body = sse('message_delta', {

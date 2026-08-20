@@ -1851,6 +1851,7 @@ export function createStrippedStream(
     onMessageResponse?: (message: Record<string, unknown>) => void
     responseMode?: 'json'
     laneStart?: boolean
+    laneStartOAuthServed?: boolean
   } = {},
 ): Response {
   if (!response.body) return response
@@ -1887,9 +1888,10 @@ export function createStrippedStream(
     options.onContentFilter || options.onComplete
       ? createSseFinishState()
       : undefined
-  const laneStartFinish = options.laneStart
-    ? createSseLaneStartFinishRewriteState()
-    : undefined
+  const laneStartFinish =
+    options.laneStart && options.laneStartOAuthServed !== false
+      ? createSseLaneStartFinishRewriteState()
+      : undefined
   let contentFilterInvoked = false
   let contentFilterHandled = false
   const invokeContentFilter = (completedToolUse = false) => {

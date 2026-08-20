@@ -92,6 +92,32 @@ test('request dumps return response handles only when enabled', async () => {
   expect(await lstat(direct!.responsePath).catch(() => null)).toBeNull()
 })
 
+test('sweeps tagged dumps with a maximum-length affinity segment', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+
+  await dumpDirectRequest({
+    affinity: 'a'.repeat(80),
+    bodyText: '{"messages":[]}',
+    tag: 'cachekeep',
+  })
+
+  expect(await readdir(dumpDir)).not.toEqual([])
+  const result = await sweepDumpDirectory({
+    dumpDir,
+    maxBytes: 1,
+    minAgeMs: 0,
+    now: Date.now() + 1,
+  })
+
+  expect(result.removed).toBeGreaterThan(0)
+  expect(await readdir(dumpDir)).toEqual([])
+})
+
 test('failed request dumps return no handle or orphan response artifact', async () => {
   if (process.getuid?.() === 0) return
   const dumpDir = await mkdtemp(

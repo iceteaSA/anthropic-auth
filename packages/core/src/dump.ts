@@ -297,13 +297,15 @@ function shortAffinity(affinity: string) {
   return affinity.length <= 16 ? affinity : `${affinity.slice(0, 12)}…`
 }
 
-function dumpFileSessionSegment(affinity: string) {
+function dumpFileSessionSegment(affinity: string, maxLength = 80) {
   const normalized = affinity
     .trim()
     .replace(/[^a-zA-Z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '')
   if (!normalized) return 'session-unknown'
-  return normalized.length <= 80 ? normalized : normalized.slice(0, 80)
+  return normalized.length <= maxLength
+    ? normalized
+    : normalized.slice(0, maxLength)
 }
 
 function dumpRequestSegment(input: {
@@ -491,7 +493,8 @@ async function dumpRequest(input: {
   if (!dumpEnabled) return null
   nextDumpId += 1
   const affinity = input.affinity?.trim() || 'session-unknown'
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(6, '0')}-${dumpFileSessionSegment(affinity)}${dumpTagSegment(input.tag)}-${dumpRequestSegment(input)}`
+  const tagSegment = dumpTagSegment(input.tag)
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(6, '0')}-${dumpFileSessionSegment(affinity, 80 - tagSegment.length)}${tagSegment}-${dumpRequestSegment(input)}`
   const dumpDir = getDumpDirectory()
   const prefix = join(dumpDir, id)
   const files: {

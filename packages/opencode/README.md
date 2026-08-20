@@ -466,6 +466,8 @@ The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Version `2` cont
 
 `cache_missed_input_tokens` is a byte-derived, pre-tokenization magnitude indicator, not a token count: it can differ from and occasionally exceed `input_tokens`, so never difference it against usage fields.
 
+All required usage counters must be finite, non-negative numbers. A malformed required counter rejects the whole record rather than emitting a partial receipt.
+
 Consumers classifying these records should check `cache_read` before `miss_reason`: `cache_read > 0` is a fact and `miss_reason` is an interpretation, and facts win. On multi-turn agent traffic a populated `*_changed` reason routinely coexists with a full prefix hit (each turn appends messages), so a populated-first classifier inverts every such record into a false miss.
 
 Known sources map to `synthetic` as follows:

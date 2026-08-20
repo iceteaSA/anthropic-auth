@@ -201,7 +201,10 @@ function numericUsage(
   usage: Record<string, unknown>,
   key: string,
 ): number | null {
-  return typeof usage[key] === 'number' ? usage[key] : null
+  const value = usage[key]
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : null
 }
 
 export function buildCacheDiagnosticsRecord(input: {
