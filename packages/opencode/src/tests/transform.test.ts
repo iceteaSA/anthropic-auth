@@ -8,6 +8,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
+  createServerSideFallbackStreamRewriter,
   SERVER_FALLBACK_MARKER_TEXT,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
@@ -535,18 +536,44 @@ describe('createStrippedStream', () => {
       id: 'msg_provider_over_cap',
       usage: { input_tokens: 3 },
       diagnostics: { cache_miss_reason: { type: 'unavailable' } },
-      padding: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES),
+      padding: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2),
     })
     const seen: unknown[] = []
     const perf: Array<Record<string, unknown>> = []
     const response = createStrippedStream(new Response(body), {
       responseMode: 'json',
+      serverSideFallbackModel: 'claude-fable-5',
+      onComplete: () => {},
       onMessageResponse: (value) => seen.push(value),
       perf: (_stage, stats) => perf.push(stats ?? {}),
     })
     expect(await response.text()).toBe(body)
     expect(seen).toEqual([])
-    expect(perf.at(-1)?.ssePendingChars).toBe(0)
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.ssePendingChars ?? 0))),
+    ).toBe(0)
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.sseErrorPending ?? 0))),
+    ).toBe(0)
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.sseFinishPending ?? 0))),
+    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+    expect(
+      Math.max(
+        ...perf.map((stats) => Number(stats.serverFallbackPending ?? 0)),
+      ),
+    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+  })
+
+  test('bounds server fallback pending state', () => {
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      maxPendingBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+    })
+    rewriter.push('x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2))
+    expect(rewriter.pendingLength()).toBeLessThanOrEqual(
+      NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+    )
   })
 
   test('swallows observation callback errors', async () => {

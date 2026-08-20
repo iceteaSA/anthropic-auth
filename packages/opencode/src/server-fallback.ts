@@ -216,10 +216,13 @@ function sameRequestedModel(requestedModel: string, servedModel: string) {
 
 export function createServerSideFallbackStreamRewriter(options: {
   requestedModel: string
+  maxPendingBytes?: number
   onOutcome?: (outcome: ServerSideFallbackOutcome) => void
   onRefusalAfterToolUse?: () => boolean | undefined
 }) {
   let pending = ''
+  let pendingBytes = 0
+  let passthrough = false
   let servedModel: string | undefined
   let handoff: ServerSideFallbackMarker | undefined
   let fallbackIterationModel: string | undefined
@@ -323,21 +326,40 @@ export function createServerSideFallbackStreamRewriter(options: {
         boundary.index + boundary.length,
       )
       pending = pending.slice(boundary.index + boundary.length)
+      pendingBytes = new TextEncoder().encode(pending).byteLength
       output += rewriteEvent(rawEvent, delimiter)
     }
     return output
   }
 
   return {
+    pendingLength() {
+      return pendingBytes
+    },
     push(text: string) {
+      if (passthrough) return text
+      const textBytes = new TextEncoder().encode(text).byteLength
+      if (
+        options.maxPendingBytes !== undefined &&
+        pendingBytes + textBytes > options.maxPendingBytes
+      ) {
+        const output = pending + text
+        pending = ''
+        pendingBytes = 0
+        passthrough = true
+        return output
+      }
       pending += text
+      pendingBytes += textBytes
       return drain()
     },
     flush() {
+      if (passthrough) return ''
       const output = drain()
       if (!pending) return output
       const tail = rewriteEvent(pending, '')
       pending = ''
+      pendingBytes = 0
       return output + tail
     },
   }

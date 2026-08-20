@@ -1546,6 +1546,7 @@ type SseErrorState = {
 type SseFinishState = {
   pending: string
   completed: boolean
+  disabled: boolean
 }
 
 type SseFinishUpdate =
@@ -1553,14 +1554,22 @@ type SseFinishUpdate =
   | { type: 'complete'; finishReason: string }
 
 function createSseFinishState(): SseFinishState {
-  return { pending: '', completed: false }
+  return { pending: '', completed: false, disabled: false }
 }
 
 function updateSseFinishState(
   state: SseFinishState,
   text: string,
+  maxPendingBytes: number,
 ): SseFinishUpdate | null {
-  if (!text || state.completed) return null
+  if (!text || state.completed || state.disabled) return null
+  if (
+    new TextEncoder().encode(state.pending + text).byteLength > maxPendingBytes
+  ) {
+    state.pending = ''
+    state.disabled = true
+    return null
+  }
   state.pending += text
 
   while (true) {
@@ -1738,6 +1747,7 @@ export function createStrippedStream(
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  const jsonMode = options.responseMode === 'json'
   let pending = ''
   let chunkCount = 0
   let pullCount = 0
@@ -1780,6 +1790,7 @@ export function createStrippedStream(
   const serverSideFallback = options.serverSideFallbackModel
     ? createServerSideFallbackStreamRewriter({
         requestedModel: options.serverSideFallbackModel,
+        maxPendingBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
         onOutcome: options.onServerSideFallbackOutcome,
         onRefusalAfterToolUse: options.onContentFilter
           ? () => invokeContentFilter(true)
@@ -1789,7 +1800,11 @@ export function createStrippedStream(
 
   const updateFinish = (text: string) => {
     if (!sseFinish) return null
-    const update = updateSseFinishState(sseFinish, text)
+    const update = updateSseFinishState(
+      sseFinish,
+      text,
+      NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+    )
     if (update?.type === 'content-filter' && options.onContentFilter) {
       return invokeContentFilter()
         ? retryableFableContentFilterError(options.contentFilterModel)
@@ -1819,6 +1834,9 @@ export function createStrippedStream(
     inputBytes,
     outputBytes,
     pendingChars: pending.length,
+    sseErrorPending: sseErrors.pending.length,
+    sseFinishPending: sseFinish?.pending.length ?? 0,
+    serverFallbackPending: serverSideFallback?.pendingLength() ?? 0,
     rewriteMs: rewriteRoundMs(rewriteMs),
     totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
     ...(sseDiagnostics ? sseDiagnosticStats(sseDiagnostics) : {}),
@@ -1848,13 +1866,13 @@ export function createStrippedStream(
           const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
           if (done) {
             const finalDecoded = decoder.decode()
-            if (sseDiagnostics && options.responseMode !== 'json')
+            if (sseDiagnostics && !jsonMode)
               updateSseDiagnostics(sseDiagnostics, finalDecoded, (summary) => {
                 const message = summary.message
                 if (summary.type === 'message_start' && message)
                   observe(() => options.onMessageStart?.(message))
               })
-            if (options.responseMode === 'json') {
+            if (jsonMode) {
               const finalBytes = encoder.encode(finalDecoded).byteLength
               if (
                 responseTextBytes + finalBytes <=
@@ -1866,7 +1884,7 @@ export function createStrippedStream(
                 responseTextOverflowed = true
               }
             }
-            if (options.responseMode === 'json' && !responseTextOverflowed) {
+            if (jsonMode && !responseTextOverflowed) {
               try {
                 const message = JSON.parse(responseText)
                 if (
@@ -1882,9 +1900,10 @@ export function createStrippedStream(
               ? serverSideFallback.push(finalDecoded) +
                 serverSideFallback.flush()
               : finalDecoded
-            const retryableStreamError =
-              updateSseErrorState(sseErrors, finalDecoded) ??
-              updateFinish(serverRewritten)
+            const retryableStreamError = jsonMode
+              ? updateFinish(serverRewritten)
+              : (updateSseErrorState(sseErrors, finalDecoded) ??
+                updateFinish(serverRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
                 error: retryableStreamError.message,
@@ -1912,7 +1931,7 @@ export function createStrippedStream(
           chunkCount++
           inputBytes += value.byteLength
           const decoded = decoder.decode(value, { stream: true })
-          if (options.responseMode === 'json') {
+          if (jsonMode) {
             const decodedBytes = value.byteLength
             if (
               responseTextBytes + decodedBytes <=
@@ -1924,7 +1943,7 @@ export function createStrippedStream(
               responseTextOverflowed = true
             }
           }
-          if (sseDiagnostics && options.responseMode !== 'json')
+          if (sseDiagnostics && !jsonMode)
             updateSseDiagnostics(sseDiagnostics, decoded, (summary) => {
               const message = summary.message
               if (summary.type === 'message_start' && message)
@@ -1934,9 +1953,10 @@ export function createStrippedStream(
           const serverRewritten = serverSideFallback
             ? serverSideFallback.push(decoded)
             : decoded
-          const retryableStreamError =
-            updateSseErrorState(sseErrors, decoded) ??
-            updateFinish(serverRewritten)
+          const retryableStreamError = jsonMode
+            ? updateFinish(serverRewritten)
+            : (updateSseErrorState(sseErrors, decoded) ??
+              updateFinish(serverRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,
