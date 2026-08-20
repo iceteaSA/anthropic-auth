@@ -507,6 +507,29 @@ describe('createStrippedStream', () => {
     expect(seen).toEqual([message])
   })
 
+  test('captures message_start before disabling diagnostics on an oversized stream tail', async () => {
+    const start = sse('message_start', {
+      type: 'message_start',
+      message: { id: 'msg_stream_start', usage: { input_tokens: 1 } },
+    })
+    const body = `${start}${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+    const seen: unknown[] = []
+    const perf: Array<Record<string, unknown>> = []
+    const response = createStrippedStream(new Response(body), {
+      onMessageStart: (message) => seen.push(message),
+      perf: (_stage, stats) => perf.push(stats ?? {}),
+    })
+
+    expect(await response.text()).toBe(body)
+    expect(seen).toEqual([
+      { id: 'msg_stream_start', usage: { input_tokens: 1 } },
+    ])
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.ssePendingChars ?? 0))),
+    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+    expect(perf.at(-1)?.ssePendingOverflowCount).toBe(1)
+  })
+
   test('observes a split non-streaming message response without changing bytes', async () => {
     const message = {
       id: 'msg_provider_2',
@@ -574,6 +597,53 @@ describe('createStrippedStream', () => {
     expect(rewriter.pendingLength()).toBeLessThanOrEqual(
       NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
     )
+  })
+
+  test('drains complete fallback frames before passing through an oversized tail', async () => {
+    const outcomes: ServerSideFallbackOutcome[] = []
+    const frames = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_overflow', model: 'claude-opus-5' },
+      }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-5' },
+        },
+      }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          iterations: [{ type: 'fallback_message', model: 'claude-opus-5' }],
+        },
+      }),
+    ].join('')
+    const tail = 'unparseable-tail'.repeat(600_000)
+    const body = `${frames}${tail}`
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        serverSideFallbackModel: 'claude-fable-5',
+        onServerSideFallbackOutcome: (outcome) => outcomes.push(outcome),
+      },
+    )
+
+    const text = await response.text()
+    expect(text).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+    expect(text).toContain(tail)
+    expect(outcomes).toHaveLength(1)
   })
 
   test('swallows observation callback errors', async () => {

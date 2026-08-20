@@ -339,19 +339,20 @@ export function createServerSideFallbackStreamRewriter(options: {
     push(text: string) {
       if (passthrough) return text
       const textBytes = new TextEncoder().encode(text).byteLength
+      pending += text
+      pendingBytes += textBytes
+      const output = drain()
       if (
         options.maxPendingBytes !== undefined &&
-        pendingBytes + textBytes > options.maxPendingBytes
+        pendingBytes > options.maxPendingBytes
       ) {
-        const output = pending + text
+        const tail = pending
         pending = ''
         pendingBytes = 0
         passthrough = true
-        return output
+        return output + tail
       }
-      pending += text
-      pendingBytes += textBytes
-      return drain()
+      return output
     },
     flush() {
       if (passthrough) return ''
