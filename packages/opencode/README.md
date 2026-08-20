@@ -412,6 +412,50 @@ Prime marker identities live in `anthropic-auth-state.json`. Plugin-owned refres
 
 Pi exposes `/claude-prime` as a status-only command. Its `on` and `off` arguments are ignored; enable or disable priming from OpenCode.
 
+### Cache diagnostics (beta)
+
+The `cache-diagnosis-2026-04-07` beta is measure-only. It asks Anthropic to report prompt-cache diagnostics; it does not change cache controls or routing. OpenCode captures the provider's top-level response ID as an opaque string and sends it as `diagnostics.previous_message_id` on the next request in the same session. The first request sends `null`.
+
+The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Version `1` contains these fields:
+
+| Field | Type | Source |
+| --- | --- | --- |
+| `v` | `1` | Capture schema |
+| `session_id` | string | OpenCode session affinity |
+| `ts_ms_received` | integer | Local response receipt time |
+| `model` | string | Anthropic response |
+| `is_subagent` | boolean | Original request context |
+| `ttl_sent` | `"1h" \| "5m" \| null` | Last valid cache breakpoint in the sent body |
+| `cache_read` | number | `usage.cache_read_input_tokens` |
+| `cache_creation` | number | `usage.cache_creation_input_tokens` |
+| `input_tokens` | number | `usage.input_tokens` |
+| `ephemeral_5m_tokens` | number | `usage.cache_creation.ephemeral_5m_input_tokens` |
+| `ephemeral_1h_tokens` | number | `usage.cache_creation.ephemeral_1h_input_tokens` |
+| `message_id` | string | Anthropic response top-level `id` |
+| `previous_message_id` | string \| null | Sent `diagnostics.previous_message_id` |
+| `diag_state` | `"absent" \| "server_null" \| "pending" \| "populated"` | Anthropic response envelope |
+| `miss_reason` | string, optional | `diagnostics.cache_miss_reason.type` |
+| `cache_missed_input_tokens` | number, optional | `diagnostics.cache_miss_reason.cache_missed_input_tokens` |
+
+The four diagnostic states are:
+
+| State | Response shape |
+| --- | --- |
+| `absent` | No `diagnostics` property |
+| `server_null` | `diagnostics: null` |
+| `pending` | `diagnostics.cache_miss_reason: null` |
+| `populated` | An object `diagnostics.cache_miss_reason` with a non-empty string `type`, including `"unavailable"` |
+
+Only valid Message envelopes produce an `MC-CACHE-DIAG ` record. Malformed or error responses are not mapped to `absent`; they retain ordinary response handling and dumps. `ttl_sent` is reduced from the last valid breakpoint in the actual body sent. A short-gap `previous_message_not_found` result is also recorded as a canary when the previous provider ID was captured less than five minutes earlier.
+
+`unavailable` is expected when any prompt-affecting parameter changes between requests. This includes the active Anthropic beta-header set; structured-output requests use a different beta set and can therefore produce `unavailable`. Diagnostics are scoped to the provider's cache fingerprint, organization, and workspace. Fingerprints expire, so a later request can miss after a long gap even when the body is unchanged. These records measure the result; they do not guarantee a cache hit.
+
+Diagnostics comparison requires a cacheable prefix. Requests below the model's cacheable minimum or without cache breakpoints return `diagnostics: null` even when the request genuinely changed; consumers must gate interpretation of `null` on observed cache activity.
+
+`diag_state` is always a string and never JSON null: `absent | server_null | pending | populated`.
+
+When request dumps are enabled, each response gets a `.response.json` artifact containing status and parsed response metadata, but no response content. Cache keepalive prewarms are tagged `-prewarm-cachekeep` in dump filenames and metadata. If Prime prewarming is enabled in a build that supports it, those artifacts use `-prewarm-prime`. Treat request bodies and related dump files as sensitive local debugging data.
+
 ## Claude fast mode
 
 Both OpenCode and Pi packages can persistently request Anthropic fast mode for supported Opus models:

@@ -4,6 +4,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Capture Anthropic cache diagnostics in versioned `MC-CACHE-DIAG ` records, preserve provider response IDs across requests and cachekeep prewarms, and write response/request dump artifacts without response content. Document the beta states and known fingerprint, organization, workspace, and beta-set limitations.
+
 ## 1.19.1
 
 ### Patch Changes

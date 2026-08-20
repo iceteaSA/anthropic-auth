@@ -22,10 +22,15 @@ import {
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
+  selectClaudeCodeBetas,
   signRequestBody,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  applyCacheDiagnosticsOptIn,
+  CACHE_DIAGNOSTICS_BETA,
+} from './cache-diagnostics'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
   applyServerSideFallbackToBody,
@@ -33,6 +38,8 @@ import {
   SERVER_SIDE_FALLBACK_BETA,
   type ServerSideFallbackOutcome,
 } from './server-fallback'
+
+export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
@@ -1177,6 +1184,7 @@ export async function rewriteRequestBody(
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
+    cacheDiagnosticsPreviousMessageId?: string | null
   } = {},
 ): Promise<string> {
   try {
@@ -1286,6 +1294,16 @@ export async function rewriteRequestBody(
       delete parsed.speed
     }
 
+    if (
+      options.cacheDiagnosticsPreviousMessageId !== undefined &&
+      selectClaudeCodeBetas(parsed).split(',').includes(CACHE_DIAGNOSTICS_BETA)
+    ) {
+      applyCacheDiagnosticsOptIn(
+        parsed,
+        options.cacheDiagnosticsPreviousMessageId,
+      )
+    }
+
     const metadataStart = rewriteNowMs()
     if (options.identity) applyClaudeCodeMetadata(parsed, options.identity)
     options.perf?.('metadata', {
@@ -1328,10 +1346,13 @@ type SseEventSummary = {
   inputJsonDeltaBytes?: number
   signatureDeltaBytes?: number
   redactedThinkingBytes?: number
+  message?: Record<string, unknown>
 }
 
 type SseDiagnosticState = {
   pending: string
+  pendingOverflowCount: number
+  disabled: boolean
   events: number
   parseErrors: number
   eventCounts: Record<string, number>
@@ -1351,6 +1372,8 @@ const sseDiagnosticEncoder = new TextEncoder()
 function createSseDiagnosticState(): SseDiagnosticState {
   return {
     pending: '',
+    pendingOverflowCount: 0,
+    disabled: false,
     events: 0,
     parseErrors: 0,
     eventCounts: {},
@@ -1472,6 +1495,7 @@ function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
   if (usage) {
     summary.stopReason ??= stringField(message, 'stop_reason')
   }
+  if (summary.type === 'message_start' && message) summary.message = message
 
   return summary
 }
@@ -1484,8 +1508,13 @@ function findSseBoundary(value: string) {
   return { index: crlf, length: 4 }
 }
 
-function updateSseDiagnostics(state: SseDiagnosticState, text: string) {
-  if (!text) return
+function updateSseDiagnostics(
+  state: SseDiagnosticState,
+  text: string,
+  maxPendingBytes: number,
+  onEvent?: (summary: SseEventSummary) => void,
+) {
+  if (!text || state.disabled) return
   state.pending += text
 
   while (true) {
@@ -1508,9 +1537,16 @@ function updateSseDiagnostics(state: SseDiagnosticState, text: string) {
     state.signatureDeltaBytes += summary.signatureDeltaBytes ?? 0
     state.redactedThinkingBytes += summary.redactedThinkingBytes ?? 0
     state.last = summary
+    onEvent?.(summary)
     if (summary.dataBytes > 0 && !summary.type && !summary.event) {
       state.parseErrors++
     }
+  }
+
+  if (sseDiagnosticEncoder.encode(state.pending).byteLength > maxPendingBytes) {
+    state.pending = ''
+    state.disabled = true
+    state.pendingOverflowCount++
   }
 }
 
@@ -1521,6 +1557,7 @@ type SseErrorState = {
 type SseFinishState = {
   pending: string
   completed: boolean
+  disabled: boolean
 }
 
 type SseFinishUpdate =
@@ -1528,14 +1565,22 @@ type SseFinishUpdate =
   | { type: 'complete'; finishReason: string }
 
 function createSseFinishState(): SseFinishState {
-  return { pending: '', completed: false }
+  return { pending: '', completed: false, disabled: false }
 }
 
 function updateSseFinishState(
   state: SseFinishState,
   text: string,
+  maxPendingBytes: number,
 ): SseFinishUpdate | null {
-  if (!text || state.completed) return null
+  if (!text || state.completed || state.disabled) return null
+  if (
+    new TextEncoder().encode(state.pending + text).byteLength > maxPendingBytes
+  ) {
+    state.pending = ''
+    state.disabled = true
+    return null
+  }
   state.pending += text
 
   while (true) {
@@ -1675,6 +1720,7 @@ function sseDiagnosticStats(state: SseDiagnosticState) {
   return {
     sseEvents: state.events,
     ssePendingChars: state.pending.length,
+    ssePendingOverflowCount: state.pendingOverflowCount,
     sseParseErrors: state.parseErrors,
     sseEventCounts: { ...state.eventCounts },
     sseTypeCounts: { ...state.typeCounts },
@@ -1703,6 +1749,9 @@ export function createStrippedStream(
     contentFilterModel?: unknown
     serverSideFallbackModel?: string
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
+    onMessageStart?: (message: Record<string, unknown>) => void
+    onMessageResponse?: (message: Record<string, unknown>) => void
+    responseMode?: 'json'
   } = {},
 ): Response {
   if (!response.body) return response
@@ -1710,6 +1759,7 @@ export function createStrippedStream(
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  const jsonMode = options.responseMode === 'json'
   let pending = ''
   let chunkCount = 0
   let pullCount = 0
@@ -1720,7 +1770,19 @@ export function createStrippedStream(
   let readerReleased = false
   let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
-  const sseDiagnostics = options.perf ? createSseDiagnosticState() : undefined
+  const sseDiagnostics =
+    options.perf || options.onMessageStart
+      ? createSseDiagnosticState()
+      : undefined
+  let responseText = ''
+  let responseTextBytes = 0
+  let responseTextOverflowed = false
+  const observe = (callback: (() => void) | undefined) => {
+    if (!callback) return
+    try {
+      callback()
+    } catch {}
+  }
   const sseErrors = createSseErrorState()
   const sseFinish =
     options.onContentFilter || options.onComplete
@@ -1740,6 +1802,7 @@ export function createStrippedStream(
   const serverSideFallback = options.serverSideFallbackModel
     ? createServerSideFallbackStreamRewriter({
         requestedModel: options.serverSideFallbackModel,
+        maxPendingBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
         onOutcome: options.onServerSideFallbackOutcome,
         onRefusalAfterToolUse: options.onContentFilter
           ? () => invokeContentFilter(true)
@@ -1749,7 +1812,11 @@ export function createStrippedStream(
 
   const updateFinish = (text: string) => {
     if (!sseFinish) return null
-    const update = updateSseFinishState(sseFinish, text)
+    const update = updateSseFinishState(
+      sseFinish,
+      text,
+      NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+    )
     if (update?.type === 'content-filter' && options.onContentFilter) {
       return invokeContentFilter()
         ? retryableFableContentFilterError(options.contentFilterModel)
@@ -1779,6 +1846,9 @@ export function createStrippedStream(
     inputBytes,
     outputBytes,
     pendingChars: pending.length,
+    sseErrorPending: sseErrors.pending.length,
+    sseFinishPending: sseFinish?.pending.length ?? 0,
+    serverFallbackPending: serverSideFallback?.pendingLength() ?? 0,
     rewriteMs: rewriteRoundMs(rewriteMs),
     totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
     ...(sseDiagnostics ? sseDiagnosticStats(sseDiagnostics) : {}),
@@ -1808,16 +1878,49 @@ export function createStrippedStream(
           const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
           if (done) {
             const finalDecoded = decoder.decode()
-            if (sseDiagnostics)
-              updateSseDiagnostics(sseDiagnostics, finalDecoded)
+            if (sseDiagnostics && !jsonMode)
+              updateSseDiagnostics(
+                sseDiagnostics,
+                finalDecoded,
+                NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                (summary) => {
+                  const message = summary.message
+                  if (summary.type === 'message_start' && message)
+                    observe(() => options.onMessageStart?.(message))
+                },
+              )
+            if (jsonMode) {
+              const finalBytes = encoder.encode(finalDecoded).byteLength
+              if (
+                responseTextBytes + finalBytes <=
+                NON_STREAMING_DIAGNOSTICS_MAX_BYTES
+              ) {
+                responseText += finalDecoded
+                responseTextBytes += finalBytes
+              } else {
+                responseTextOverflowed = true
+              }
+            }
+            if (jsonMode && !responseTextOverflowed) {
+              try {
+                const message = JSON.parse(responseText)
+                if (
+                  message &&
+                  typeof message === 'object' &&
+                  !Array.isArray(message)
+                )
+                  observe(() => options.onMessageResponse?.(message))
+              } catch {}
+            }
             const rewriteStart = rewriteNowMs()
             const serverRewritten = serverSideFallback
               ? serverSideFallback.push(finalDecoded) +
                 serverSideFallback.flush()
               : finalDecoded
-            const retryableStreamError =
-              updateSseErrorState(sseErrors, finalDecoded) ??
-              updateFinish(serverRewritten)
+            const retryableStreamError = jsonMode
+              ? updateFinish(serverRewritten)
+              : (updateSseErrorState(sseErrors, finalDecoded) ??
+                updateFinish(serverRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
                 error: retryableStreamError.message,
@@ -1845,14 +1948,37 @@ export function createStrippedStream(
           chunkCount++
           inputBytes += value.byteLength
           const decoded = decoder.decode(value, { stream: true })
-          if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
+          if (jsonMode) {
+            const decodedBytes = value.byteLength
+            if (
+              responseTextBytes + decodedBytes <=
+              NON_STREAMING_DIAGNOSTICS_MAX_BYTES
+            ) {
+              responseText += decoded
+              responseTextBytes += decodedBytes
+            } else {
+              responseTextOverflowed = true
+            }
+          }
+          if (sseDiagnostics && !jsonMode)
+            updateSseDiagnostics(
+              sseDiagnostics,
+              decoded,
+              NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+              (summary) => {
+                const message = summary.message
+                if (summary.type === 'message_start' && message)
+                  observe(() => options.onMessageStart?.(message))
+              },
+            )
           const rewriteStart = rewriteNowMs()
           const serverRewritten = serverSideFallback
             ? serverSideFallback.push(decoded)
             : decoded
-          const retryableStreamError =
-            updateSseErrorState(sseErrors, decoded) ??
-            updateFinish(serverRewritten)
+          const retryableStreamError = jsonMode
+            ? updateFinish(serverRewritten)
+            : (updateSseErrorState(sseErrors, decoded) ??
+              updateFinish(serverRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,

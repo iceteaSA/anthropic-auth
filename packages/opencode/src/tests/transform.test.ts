@@ -8,6 +8,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
+  createServerSideFallbackStreamRewriter,
   SERVER_FALLBACK_MARKER_TEXT,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
@@ -21,6 +22,7 @@ import {
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
+  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
   prefixToolNames,
   prepareFableCacheWarmSource,
   prependClaudeCodeIdentity,
@@ -483,6 +485,190 @@ describe('isInsecure', () => {
 })
 
 describe('createStrippedStream', () => {
+  test('observes a split message_start envelope exactly once', async () => {
+    const message = {
+      id: 'msg_provider_1',
+      usage: { input_tokens: 3 },
+      diagnostics: { cache_miss_reason: null },
+    }
+    const payload = sse('message_start', { type: 'message_start', message })
+    const seen: unknown[] = []
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        controller.enqueue(encoder.encode(payload.slice(0, 17)))
+        controller.enqueue(encoder.encode(payload.slice(17)))
+        controller.close()
+      },
+    })
+    await createStrippedStream(new Response(stream), {
+      onMessageStart: (value) => seen.push(value),
+    }).text()
+    expect(seen).toEqual([message])
+  })
+
+  test('captures message_start before disabling diagnostics on an oversized stream tail', async () => {
+    const start = sse('message_start', {
+      type: 'message_start',
+      message: { id: 'msg_stream_start', usage: { input_tokens: 1 } },
+    })
+    const body = `${start}${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+    const seen: unknown[] = []
+    const perf: Array<Record<string, unknown>> = []
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        onMessageStart: (message) => seen.push(message),
+        perf: (_stage, stats) => perf.push(stats ?? {}),
+      },
+    )
+
+    expect(await response.text()).toBe(body)
+    expect(seen).toEqual([
+      { id: 'msg_stream_start', usage: { input_tokens: 1 } },
+    ])
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.ssePendingChars ?? 0))),
+    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+    expect(perf.at(-1)?.ssePendingOverflowCount).toBe(1)
+  })
+
+  test('observes a split non-streaming message response without changing bytes', async () => {
+    const message = {
+      id: 'msg_provider_2',
+      usage: { input_tokens: 3 },
+      diagnostics: { cache_miss_reason: { type: 'unavailable' } },
+    }
+    const body = JSON.stringify(message)
+    const seen: unknown[] = []
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        controller.enqueue(encoder.encode(body.slice(0, 9)))
+        controller.enqueue(encoder.encode(body.slice(9)))
+        controller.close()
+      },
+    })
+    const response = createStrippedStream(new Response(stream), {
+      responseMode: 'json',
+      onMessageResponse: (value) => seen.push(value),
+    })
+    expect(await response.text()).toBe(body)
+    expect(seen).toEqual([message])
+  })
+
+  test('passes over-cap non-streaming bytes unchanged without observing diagnostics', async () => {
+    const body = JSON.stringify({
+      id: 'msg_provider_over_cap',
+      usage: { input_tokens: 3 },
+      diagnostics: { cache_miss_reason: { type: 'unavailable' } },
+      padding: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2),
+    })
+    const seen: unknown[] = []
+    const perf: Array<Record<string, unknown>> = []
+    const response = createStrippedStream(new Response(body), {
+      responseMode: 'json',
+      serverSideFallbackModel: 'claude-fable-5',
+      onComplete: () => {},
+      onMessageResponse: (value) => seen.push(value),
+      perf: (_stage, stats) => perf.push(stats ?? {}),
+    })
+    expect(await response.text()).toBe(body)
+    expect(seen).toEqual([])
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.ssePendingChars ?? 0))),
+    ).toBe(0)
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.sseErrorPending ?? 0))),
+    ).toBe(0)
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.sseFinishPending ?? 0))),
+    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+    expect(
+      Math.max(
+        ...perf.map((stats) => Number(stats.serverFallbackPending ?? 0)),
+      ),
+    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+  })
+
+  test('bounds server fallback pending state', () => {
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      maxPendingBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+    })
+    rewriter.push('x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2))
+    expect(rewriter.pendingLength()).toBeLessThanOrEqual(
+      NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+    )
+  })
+
+  test('drains complete fallback frames before passing through an oversized tail', async () => {
+    const outcomes: ServerSideFallbackOutcome[] = []
+    const frames = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_overflow', model: 'claude-opus-5' },
+      }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-5' },
+        },
+      }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          iterations: [{ type: 'fallback_message', model: 'claude-opus-5' }],
+        },
+      }),
+    ].join('')
+    const tail = 'unparseable-tail'.repeat(600_000)
+    const body = `${frames}${tail}`
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        serverSideFallbackModel: 'claude-fable-5',
+        onServerSideFallbackOutcome: (outcome) => outcomes.push(outcome),
+      },
+    )
+
+    const text = await response.text()
+    expect(text).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+    expect(text).toContain(tail)
+    expect(outcomes).toHaveLength(1)
+  })
+
+  test('swallows observation callback errors', async () => {
+    const payload = sse('message_start', {
+      type: 'message_start',
+      message: { id: 'msg_provider_3' },
+    })
+    const response = createStrippedStream(new Response(payload), {
+      onMessageStart: () => {
+        throw new Error('observer failure')
+      },
+    })
+    expect(await response.text()).toBe(payload)
+  })
+
   test('strips tool prefixes from streamed response body', async () => {
     const chunks = [
       'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
@@ -1264,6 +1450,58 @@ describe('prependClaudeCodeIdentity', () => {
 })
 
 describe('rewriteRequestBody', () => {
+  test('injects cache diagnostics with a null previous message id', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        { cacheDiagnosticsPreviousMessageId: null },
+      ),
+    )
+    expect(result.diagnostics).toEqual({ previous_message_id: null })
+  })
+
+  test('copies an opaque cache diagnostics message id by identity', async () => {
+    const id = 'msg_opaque_provider_value'
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        { cacheDiagnosticsPreviousMessageId: id },
+      ),
+    )
+    expect(result.diagnostics).toEqual({ previous_message_id: id })
+  })
+
+  test('injects diagnostics for structured output bodies', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          messages: [{ role: 'user', content: 'hi' }],
+          output_config: { format: { type: 'json_schema' } },
+        }),
+        { cacheDiagnosticsPreviousMessageId: null },
+      ),
+    )
+    expect(result.diagnostics).toEqual({ previous_message_id: null })
+  })
+
+  test('does not inject diagnostics when the opt-in is omitted', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+      ),
+    )
+    expect(result.diagnostics).toBeUndefined()
+  })
+
+  test('returns invalid JSON unchanged when diagnostics injection is requested', async () => {
+    const body = '{not json'
+    expect(
+      await rewriteRequestBody(body, {
+        cacheDiagnosticsPreviousMessageId: null,
+      }),
+    ).toBe(body)
+  })
+
   test('prefixes tool names and rewrites system prompt', async () => {
     const body = JSON.stringify({
       tools: [{ name: 'bash', type: 'function' }],
