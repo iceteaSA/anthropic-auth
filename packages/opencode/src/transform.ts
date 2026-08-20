@@ -1515,14 +1515,7 @@ function updateSseDiagnostics(
   onEvent?: (summary: SseEventSummary) => void,
 ) {
   if (!text || state.disabled) return
-  const candidate = state.pending + text
-  if (sseDiagnosticEncoder.encode(candidate).byteLength > maxPendingBytes) {
-    state.pending = ''
-    state.disabled = true
-    state.pendingOverflowCount++
-    return
-  }
-  state.pending = candidate
+  state.pending += text
 
   while (true) {
     const boundary = findSseBoundary(state.pending)
@@ -1548,6 +1541,12 @@ function updateSseDiagnostics(
     if (summary.dataBytes > 0 && !summary.type && !summary.event) {
       state.parseErrors++
     }
+  }
+
+  if (sseDiagnosticEncoder.encode(state.pending).byteLength > maxPendingBytes) {
+    state.pending = ''
+    state.disabled = true
+    state.pendingOverflowCount++
   }
 }
 

@@ -515,10 +515,20 @@ describe('createStrippedStream', () => {
     const body = `${start}${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
     const seen: unknown[] = []
     const perf: Array<Record<string, unknown>> = []
-    const response = createStrippedStream(new Response(body), {
-      onMessageStart: (message) => seen.push(message),
-      perf: (_stage, stats) => perf.push(stats ?? {}),
-    })
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        onMessageStart: (message) => seen.push(message),
+        perf: (_stage, stats) => perf.push(stats ?? {}),
+      },
+    )
 
     expect(await response.text()).toBe(body)
     expect(seen).toEqual([
