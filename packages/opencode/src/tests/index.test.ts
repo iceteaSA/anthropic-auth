@@ -9567,7 +9567,11 @@ describe('cache diagnostics', () => {
       { previous_message_id: 'provider-B' },
     ])
     const lines = records
-      .filter((record) => record.channel === 'cache-diagnostics')
+      .filter(
+        (record) =>
+          record.channel === 'cache-diagnostics' &&
+          record.message.startsWith('MC-CACHE-DIAG '),
+      )
       .map((record) => JSON.parse(record.message.replace('MC-CACHE-DIAG ', '')))
     expect(lines).toHaveLength(4)
     expect(
@@ -9582,6 +9586,11 @@ describe('cache diagnostics', () => {
       ephemeral_1h_tokens: 6,
       session_id: 'ses-diag-A',
       is_subagent: false,
+      v: 2,
+      source: 'turn',
+      synthetic: false,
+      account_id: 'main',
+      betas_hash: expect.stringMatching(/^[0-9a-f]{16}$/),
     })
     expect(
       lines.find((line) => line.message_id === 'provider-B-after'),
@@ -9626,7 +9635,11 @@ describe('cache diagnostics', () => {
     ])
     expect(sentHeaders[0]?.has('x-parent-session-id')).toBe(false)
     const lines = records
-      .filter((record) => record.channel === 'cache-diagnostics')
+      .filter(
+        (record) =>
+          record.channel === 'cache-diagnostics' &&
+          record.message.startsWith('MC-CACHE-DIAG '),
+      )
       .map((record) => JSON.parse(record.message.replace('MC-CACHE-DIAG ', '')))
     expect(lines).toHaveLength(2)
     expect(lines[0]).toMatchObject({
@@ -9642,6 +9655,7 @@ describe('cache diagnostics', () => {
   test('cache diagnostics emits the opt-in beta for normal and structured OAuth requests', async () => {
     const sentBodies: Record<string, unknown>[] = []
     const betaHeaders: string[] = []
+    const records: LogTestRecord[] = []
     globalThis.fetch = mock((_input: any, init: RequestInit) => {
       sentBodies.push(JSON.parse(String(init.body)))
       betaHeaders.push(new Headers(init.headers).get('anthropic-beta') ?? '')
@@ -9649,6 +9663,7 @@ describe('cache diagnostics', () => {
         sseResponse(message(`provider-${sentBodies.length}`)),
       )
     }) as unknown as typeof fetch
+    __setLogTestSink((record) => records.push(record))
 
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(oauthLoader, { models: {} })
@@ -9676,6 +9691,17 @@ describe('cache diagnostics', () => {
     expect(
       betaHeaders.every((beta) => beta.includes('cache-diagnosis-2026-04-07')),
     ).toBe(true)
+    const betaLines = records
+      .filter(
+        (record) =>
+          record.channel === 'cache-diagnostics' &&
+          record.message.startsWith('MC-CACHE-DIAG-BETAS '),
+      )
+      .map((record) =>
+        JSON.parse(record.message.replace('MC-CACHE-DIAG-BETAS ', '')),
+      )
+    expect(betaLines).toHaveLength(2)
+    expect(new Set(betaLines.map((line) => line.hash)).size).toBe(2)
   })
 
   test('cache diagnostics observes non-streaming envelopes and carries their provider id forward', async () => {
@@ -9708,7 +9734,11 @@ describe('cache diagnostics', () => {
       previous_message_id: 'provider-json-A',
     })
     expect(
-      records.filter((record) => record.channel === 'cache-diagnostics'),
+      records.filter(
+        (record) =>
+          record.channel === 'cache-diagnostics' &&
+          record.message.startsWith('MC-CACHE-DIAG '),
+      ),
     ).toHaveLength(2)
   })
 
@@ -9814,6 +9844,10 @@ describe('cache diagnostics', () => {
       is_subagent: false,
       ttl_sent: '1h',
       previous_message_id: 'provider-real-A',
+      source: 'prewarm_cachekeep',
+      synthetic: true,
+      account_id: 'main',
+      betas_hash: expect.stringMatching(/^[0-9a-f]{16}$/),
     })
   })
 

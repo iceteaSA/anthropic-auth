@@ -14,8 +14,22 @@ export type CacheDiagnosticsState =
   | 'pending'
   | 'populated'
 
+export type CacheDiagnosticsSource = string
+
+export const CACHE_DIAGNOSTICS_SOURCE_SYNTHETIC = {
+  turn: false,
+  prewarm_cachekeep: true,
+} as const
+
+export const CACHE_DIAGNOSTICS_BETAS_LIMIT = 1_000
+
 export type CacheDiagnosticsRecord = {
-  v: 1
+  v: 2
+  source: CacheDiagnosticsSource
+  account_id: string
+  synthetic: boolean
+  betas_hash: string
+  requested_model?: string
   session_id: string
   ts_ms_received: number
   model: string
@@ -57,6 +71,19 @@ export class CacheDiagnosticsTracker {
       { messageId, receivedAt },
       CACHE_DIAGNOSTICS_SESSION_LIMIT,
     )
+  }
+}
+
+export class CacheDiagnosticsBetaTracker {
+  private readonly hashes = new Map<string, true>()
+
+  capture(hash: string, betas: string[]): string | null {
+    if (this.hashes.has(hash)) return null
+    setBounded(this.hashes, hash, true, CACHE_DIAGNOSTICS_BETAS_LIMIT)
+    return `MC-CACHE-DIAG-BETAS ${JSON.stringify({
+      hash,
+      betas: [...betas].sort(),
+    })}`
   }
 }
 
@@ -178,6 +205,12 @@ function numericUsage(
 
 export function buildCacheDiagnosticsRecord(input: {
   request: CacheDiagnosticsRequestContext
+  source: CacheDiagnosticsSource
+  accountId: string
+  synthetic: boolean
+  betasHash: string
+  requestedModel?: string
+  onWarning?: (message: string) => void
   message: unknown
   receivedAt: number
 }): {
@@ -185,6 +218,28 @@ export function buildCacheDiagnosticsRecord(input: {
   messageId?: string
   canary?: { messageId: string; previousMessageId: string }
 } {
+  if (
+    typeof input.source !== 'string' ||
+    input.source.length === 0 ||
+    typeof input.accountId !== 'string' ||
+    input.accountId.length === 0 ||
+    typeof input.synthetic !== 'boolean' ||
+    typeof input.betasHash !== 'string' ||
+    input.betasHash.length === 0
+  )
+    return {}
+  const expectedSynthetic =
+    CACHE_DIAGNOSTICS_SOURCE_SYNTHETIC[
+      input.source as keyof typeof CACHE_DIAGNOSTICS_SOURCE_SYNTHETIC
+    ]
+  if (
+    expectedSynthetic !== undefined &&
+    expectedSynthetic !== input.synthetic
+  ) {
+    input.onWarning?.(
+      `cache diagnostics source/synthetic mismatch: source=${input.source} expected=${expectedSynthetic} actual=${input.synthetic}`,
+    )
+  }
   const receivedAt = Math.trunc(input.receivedAt)
   if (!Number.isFinite(input.receivedAt) || receivedAt !== input.receivedAt)
     return {}
@@ -219,7 +274,11 @@ export function buildCacheDiagnosticsRecord(input: {
   if (!diagnostics) return {}
 
   const record: CacheDiagnosticsRecord = {
-    v: 1,
+    v: 2,
+    source: input.source,
+    account_id: input.accountId,
+    synthetic: input.synthetic,
+    betas_hash: input.betasHash,
     session_id: input.request.sessionId,
     ts_ms_received: receivedAt,
     model,
@@ -238,6 +297,8 @@ export function buildCacheDiagnosticsRecord(input: {
     record.miss_reason = diagnostics.missReason
   if (diagnostics.cacheMissedInputTokens !== undefined)
     record.cache_missed_input_tokens = diagnostics.cacheMissedInputTokens
+  if (input.requestedModel !== undefined && input.requestedModel !== model)
+    record.requested_model = input.requestedModel
 
   const canary =
     diagnostics.missReason === 'previous_message_not_found' &&

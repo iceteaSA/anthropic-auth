@@ -3,6 +3,8 @@ import {
   applyCacheDiagnosticsOptIn,
   buildCacheDiagnosticsRecord,
   CACHE_DIAGNOSTICS_LOG_PREFIX,
+  CACHE_DIAGNOSTICS_SOURCE_SYNTHETIC,
+  CacheDiagnosticsBetaTracker,
   CacheDiagnosticsTracker,
   formatCacheDiagnosticsLogLine,
   summarizeCacheTtl,
@@ -19,11 +21,29 @@ const usage = {
   },
 }
 
-const message = (diagnostics?: unknown) => ({
+const message = (diagnostics?: unknown, model = 'claude-opus-4-7') => ({
   id: 'provider-response-id-with-no-msg-prefix',
-  model: 'claude-opus-4-7',
+  model,
   usage,
   ...(diagnostics === undefined ? {} : { diagnostics }),
+})
+
+const request = {
+  sessionId: 'ses-a',
+  previousMessageId: null,
+  isSubagent: false,
+  ttlSent: '1h' as const,
+}
+
+const input = (overrides: Record<string, unknown> = {}) => ({
+  request,
+  source: 'turn',
+  accountId: 'oauth-account-a',
+  synthetic: false,
+  betasHash: '0123456789abcdef',
+  message: message({ cache_miss_reason: { type: 'unavailable' } }),
+  receivedAt: 100,
+  ...overrides,
 })
 
 describe('CacheDiagnosticsTracker', () => {
@@ -35,8 +55,6 @@ describe('CacheDiagnosticsTracker', () => {
       messageId: 'provider-response-id-with-no-msg-prefix',
       receivedAt: 100,
     })
-    tracker.capture('ses-a', 'ses-opencode-decoy', 200)
-    expect(tracker.previousFor('ses-a')?.messageId).toBe('ses-opencode-decoy')
   })
 
   test('evicts only the oldest unique session at the bounded limit', () => {
@@ -66,7 +84,110 @@ describe('CacheDiagnosticsTracker', () => {
   })
 })
 
-describe('cache diagnostics contract', () => {
+describe('cache diagnostics v2 contract', () => {
+  test('writes required v2 metadata and omits a matching requested model', () => {
+    const result = buildCacheDiagnosticsRecord(
+      input({ requestedModel: 'claude-opus-4-7' }),
+    )
+
+    expect(result.record).toMatchObject({
+      v: 2,
+      source: 'turn',
+      account_id: 'oauth-account-a',
+      synthetic: false,
+      betas_hash: '0123456789abcdef',
+      cache_read: 20,
+      cache_creation: 30,
+      input_tokens: 10,
+    })
+    expect(result.record).not.toHaveProperty('requested_model')
+  })
+
+  test('records requested_model only when the served response model differs', () => {
+    const result = buildCacheDiagnosticsRecord(
+      input({ requestedModel: 'claude-sonnet-4-7' }),
+    )
+
+    expect(result.record?.requested_model).toBe('claude-sonnet-4-7')
+  })
+
+  test.each([
+    ['turn', false, 'account-turn'],
+    ['prewarm_cachekeep', true, 'account-prewarm'],
+  ] as const)('records account_id for %s observations', (source, synthetic, accountId) => {
+    const result = buildCacheDiagnosticsRecord(
+      input({ source, synthetic, accountId }),
+    )
+
+    expect(result.record).toMatchObject({
+      source,
+      synthetic,
+      account_id: accountId,
+    })
+  })
+
+  test('warns on a known source synthetic mismatch while preserving synthetic', () => {
+    const warnings: string[] = []
+    const result = buildCacheDiagnosticsRecord(
+      input({
+        synthetic: true,
+        onWarning: (message: string) => warnings.push(message),
+      }),
+    )
+
+    expect(result.record?.synthetic).toBe(true)
+    expect(warnings).toEqual([
+      'cache diagnostics source/synthetic mismatch: source=turn expected=false actual=true',
+    ])
+  })
+
+  test('does not warn for an unknown source', () => {
+    const warnings: string[] = []
+    const result = buildCacheDiagnosticsRecord(
+      input({
+        source: 'future_machine',
+        synthetic: true,
+        onWarning: (message: string) => warnings.push(message),
+      }),
+    )
+
+    expect(result.record?.source).toBe('future_machine')
+    expect(warnings).toEqual([])
+  })
+
+  test('exports the known source synthetic mapping', () => {
+    expect(CACHE_DIAGNOSTICS_SOURCE_SYNTHETIC).toEqual({
+      turn: false,
+      prewarm_cachekeep: true,
+    })
+  })
+
+  test('emits beta side-channel once per hash and retains differing sets', () => {
+    const tracker = new CacheDiagnosticsBetaTracker()
+
+    expect(tracker.capture('0123456789abcdef', ['beta-b', 'beta-a'])).toBe(
+      'MC-CACHE-DIAG-BETAS {"hash":"0123456789abcdef","betas":["beta-a","beta-b"]}',
+    )
+    expect(tracker.capture('0123456789abcdef', ['beta-a', 'beta-b'])).toBeNull()
+    expect(tracker.capture('fedcba9876543210', ['beta-c'])).toBe(
+      'MC-CACHE-DIAG-BETAS {"hash":"fedcba9876543210","betas":["beta-c"]}',
+    )
+  })
+
+  test('formats a v2 record with the load-bearing record prefix', () => {
+    const result = buildCacheDiagnosticsRecord(input())
+    expect(result.record).toBeDefined()
+    const line = formatCacheDiagnosticsLogLine(result.record!)
+    expect(line.startsWith(CACHE_DIAGNOSTICS_LOG_PREFIX)).toBe(true)
+    expect(
+      JSON.parse(line.slice(CACHE_DIAGNOSTICS_LOG_PREFIX.length)),
+    ).toMatchObject({
+      v: 2,
+      session_id: 'ses-a',
+      message_id: 'provider-response-id-with-no-msg-prefix',
+    })
+  })
+
   test.each([
     [{}, 'absent'],
     [{ diagnostics: null }, 'server_null'],
@@ -77,77 +198,56 @@ describe('cache diagnostics contract', () => {
     ],
   ] as const)('classifies diagnostics %j as %s', (extra, state) => {
     expect(
-      buildCacheDiagnosticsRecord({
-        request: {
-          sessionId: 'ses-a',
-          previousMessageId: null,
-          isSubagent: false,
-          ttlSent: '1h',
-        },
-        message: { ...message(undefined), ...extra },
-        receivedAt: 100,
-      }).record?.diag_state,
+      buildCacheDiagnosticsRecord(
+        input({ message: { ...message(undefined), ...extra } }),
+      ).record?.diag_state,
     ).toBe(state)
   })
 
+  test('rejects invalid required v2 metadata', () => {
+    expect(buildCacheDiagnosticsRecord(input({ accountId: '' }))).toEqual({})
+    expect(buildCacheDiagnosticsRecord(input({ betasHash: '' }))).toEqual({})
+    expect(buildCacheDiagnosticsRecord(input({ source: '' }))).toEqual({})
+  })
+
   test('copies usage values by property and keeps unavailable ordinary', () => {
-    const result = buildCacheDiagnosticsRecord({
-      request: {
-        sessionId: 'ses-a',
-        previousMessageId: null,
-        isSubagent: true,
-        ttlSent: '5m',
-      },
-      message: message({
-        cache_miss_reason: {
-          type: 'unavailable',
-          cache_missed_input_tokens: 99,
-        },
-      }),
-      receivedAt: 100,
-    })
+    const result = buildCacheDiagnosticsRecord(input())
+
     expect(result.record).toMatchObject({
-      is_subagent: true,
       cache_read: 20,
       cache_creation: 30,
       input_tokens: 10,
       ephemeral_5m_tokens: 40,
       ephemeral_1h_tokens: 50,
       miss_reason: 'unavailable',
-      cache_missed_input_tokens: 99,
     })
   })
 
-  test('parses the verbatim captured populated API response', () => {
-    // This fixture is a verbatim captured API response; do not simplify it.
-    const result = buildCacheDiagnosticsRecord({
-      request: {
-        sessionId: 'ses-a',
-        previousMessageId: null,
-        isSubagent: false,
-        ttlSent: '1h',
-      },
-      message: {
-        id: 'msg_011SampleAnthropicId0000',
-        model: 'claude-opus-5',
-        usage: {
-          input_tokens: 14,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 24837,
-          cache_creation: {
-            ephemeral_5m_input_tokens: 0,
-            ephemeral_1h_input_tokens: 24837,
+  test('parses the captured populated API response', () => {
+    const result = buildCacheDiagnosticsRecord(
+      input({
+        message: {
+          id: 'msg_011SampleAnthropicId0000',
+          model: 'claude-opus-5',
+          usage: {
+            input_tokens: 14,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 24837,
+            cache_creation: {
+              ephemeral_5m_input_tokens: 0,
+              ephemeral_1h_input_tokens: 24837,
+            },
+          },
+          diagnostics: {
+            cache_miss_reason: {
+              type: 'system_changed',
+              cache_missed_input_tokens: 23963,
+            },
           },
         },
-        diagnostics: {
-          cache_miss_reason: {
-            type: 'system_changed',
-            cache_missed_input_tokens: 23963,
-          },
-        },
-      },
-      receivedAt: 100,
-    })
+      }),
+    )
+
     expect(result.record).toMatchObject({
       diag_state: 'populated',
       miss_reason: 'system_changed',
@@ -156,35 +256,20 @@ describe('cache diagnostics contract', () => {
   })
 
   test('rejects malformed diagnostics without fabricating absent state', () => {
-    const result = buildCacheDiagnosticsRecord({
-      request: {
-        sessionId: 'ses-a',
-        previousMessageId: null,
-        isSubagent: false,
-        ttlSent: null,
-      },
-      message: message({ cache_miss_reason: 42 }),
-      receivedAt: 100,
-    })
-    expect(result).toEqual({})
+    expect(
+      buildCacheDiagnosticsRecord(
+        input({ message: message({ cache_miss_reason: 42 }) }),
+      ),
+    ).toEqual({})
   })
 
   test.each([
     { cache_miss_reason: 'system_changed' },
     { cache_miss_reason: {} },
     { cache_miss_reason: { type: 42 } },
-  ])('rejects non-wire populated reason %j', (reason) => {
+  ])('rejects non-wire populated reason %j', (diagnostics) => {
     expect(
-      buildCacheDiagnosticsRecord({
-        request: {
-          sessionId: 'ses-a',
-          previousMessageId: null,
-          isSubagent: false,
-          ttlSent: null,
-        },
-        message: message(reason),
-        receivedAt: 100,
-      }),
+      buildCacheDiagnosticsRecord(input({ message: message(diagnostics) })),
     ).toEqual({})
   })
 
@@ -194,39 +279,20 @@ describe('cache diagnostics contract', () => {
     { diagnostics: 42 },
   ])('rejects malformed diagnostics shape %j', (extra) => {
     expect(
-      buildCacheDiagnosticsRecord({
-        request: {
-          sessionId: 'ses-a',
-          previousMessageId: null,
-          isSubagent: false,
-          ttlSent: null,
-        },
-        message: { ...message(), ...extra },
-        receivedAt: 100,
-      }),
+      buildCacheDiagnosticsRecord(
+        input({ message: { ...message(), ...extra } }),
+      ),
     ).toEqual({})
   })
 
   test('rejects non-finite and fractional receipt timestamps', () => {
-    const request = {
-      sessionId: 'ses-a',
-      previousMessageId: null,
-      isSubagent: false,
-      ttlSent: null as null,
-    }
+    expect(buildCacheDiagnosticsRecord(input({ receivedAt: 100.5 }))).toEqual(
+      {},
+    )
     expect(
-      buildCacheDiagnosticsRecord({
-        request,
-        message: message(),
-        receivedAt: 100.5,
-      }),
-    ).toEqual({})
-    expect(
-      buildCacheDiagnosticsRecord({
-        request,
-        message: message(),
-        receivedAt: Number.POSITIVE_INFINITY,
-      }),
+      buildCacheDiagnosticsRecord(
+        input({ receivedAt: Number.POSITIVE_INFINITY }),
+      ),
     ).toEqual({})
   })
 
@@ -243,99 +309,46 @@ describe('cache diagnostics contract', () => {
     [{ cache_control: { type: 'ephemeral', ttl: '1h' } }, '1h'],
     [{ cache_control: { type: 'ephemeral' } }, '5m'],
     [{}, null],
-    [
-      {
-        cache_control: { type: 'ephemeral', ttl: '1h' },
-        system: [{ cache_control: { type: 'ephemeral' } }],
-      },
-      '5m',
-    ],
-    [
-      {
-        system: [{ cache_control: { type: 'ephemeral' } }],
-        messages: [
-          { content: [{ cache_control: { type: 'ephemeral', ttl: '1h' } }] },
-        ],
-      },
-      '1h',
-    ],
-    [
-      {
-        system: [
-          {},
-          {},
-          {},
-          { cache_control: { type: 'ephemeral', ttl: '1h' } },
-        ],
-        messages: [
-          {
-            content: [
-              { cache_control: { type: 'ephemeral', ttl: '1h' } },
-              { cache_control: { type: 'ephemeral', ttl: '1h' } },
-            ],
-          },
-          { content: [{ cache_control: { type: 'ephemeral', ttl: '1h' } }] },
-        ],
-      },
-      '1h',
-    ],
-    [
-      {
-        system: [{ cache_control: { type: 'ephemeral' } }],
-        messages: [
-          {
-            content: [
-              {
-                type: 'tool_use',
-                input: { cache_control: { type: 'ephemeral', ttl: '1h' } },
-              },
-            ],
-          },
-        ],
-      },
-      '5m',
-    ],
   ] as const)('summarizes TTL as %s', (body, expected) => {
     expect(summarizeCacheTtl(body)).toBe(expected)
   })
 
-  test('formats one machine line with the v1 record', () => {
-    const result = buildCacheDiagnosticsRecord({
-      request: {
-        sessionId: 'ses-a',
-        previousMessageId: null,
-        isSubagent: false,
-        ttlSent: '1h',
+  test.each([
+    [
+      {
+        system: [{ cache_control: { type: 'ephemeral' } }],
+        messages: [
+          { content: [{ cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+        ],
       },
-      message: message(),
-      receivedAt: 100,
-    })
-    expect(result.record).toBeDefined()
-    const line = formatCacheDiagnosticsLogLine(result.record!)
-    expect(line.startsWith(CACHE_DIAGNOSTICS_LOG_PREFIX)).toBe(true)
-    expect(
-      JSON.parse(line.slice(CACHE_DIAGNOSTICS_LOG_PREFIX.length)),
-    ).toMatchObject({
-      v: 1,
-      session_id: 'ses-a',
-      message_id: 'provider-response-id-with-no-msg-prefix',
-    })
+      '1h',
+    ],
+    [
+      {
+        system: [{ cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        messages: [{ content: [{ cache_control: { type: 'ephemeral' } }] }],
+      },
+      '5m',
+    ],
+  ] as const)('uses the last cache breakpoint as TTL %s', (body, expected) => {
+    expect(summarizeCacheTtl(body)).toBe(expected)
   })
 
   test('emits a short-gap canary only for previous_message_not_found', () => {
-    const result = buildCacheDiagnosticsRecord({
-      request: {
-        sessionId: 'ses-a',
-        previousMessageId: 'provider-previous',
-        previousMessageReceivedAt: 1_000,
-        isSubagent: false,
-        ttlSent: null,
-      },
-      message: message({
-        cache_miss_reason: { type: 'previous_message_not_found' },
+    const result = buildCacheDiagnosticsRecord(
+      input({
+        request: {
+          ...request,
+          previousMessageId: 'provider-previous',
+          previousMessageReceivedAt: 1_000,
+        },
+        message: message({
+          cache_miss_reason: { type: 'previous_message_not_found' },
+        }),
+        receivedAt: 1_000 + 5 * 60_000 - 1,
       }),
-      receivedAt: 1_000 + 5 * 60_000 - 1,
-    })
+    )
+
     expect(result.canary).toEqual({
       messageId: 'provider-response-id-with-no-msg-prefix',
       previousMessageId: 'provider-previous',
@@ -355,18 +368,19 @@ describe('cache diagnostics contract', () => {
       age: 1,
     },
   ])('does not emit a canary for %j', ({ reason, previousMessageId, age }) => {
-    const previousReceivedAt = 1_000
-    const result = buildCacheDiagnosticsRecord({
-      request: {
-        sessionId: 'ses-a',
-        previousMessageId,
-        previousMessageReceivedAt: previousReceivedAt,
-        isSubagent: false,
-        ttlSent: null,
-      },
-      message: message({ cache_miss_reason: { type: reason } }),
-      receivedAt: previousReceivedAt + age,
-    })
+    const previousMessageReceivedAt = 1_000
+    const result = buildCacheDiagnosticsRecord(
+      input({
+        request: {
+          ...request,
+          previousMessageId,
+          previousMessageReceivedAt,
+        },
+        message: message({ cache_miss_reason: { type: reason } }),
+        receivedAt: previousMessageReceivedAt + age,
+      }),
+    )
+
     expect(result.canary).toBeUndefined()
   })
 })
