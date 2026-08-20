@@ -949,6 +949,49 @@ describe('createStrippedStream', () => {
     ).toBe(true)
   })
 
+  test.each([
+    ['LF', '\n\n', 1],
+    ['CRLF', '\r\n\r\n', 2],
+  ])('resyncs retryable stream errors across a split %s boundary', async (_name, delimiter, splitAt) => {
+    const encoder = new TextEncoder()
+    const perf: Array<Record<string, unknown>> = []
+    const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+    const error = sse('error', {
+      type: 'error',
+      error: { type: 'overloaded_error', message: 'temporarily overloaded' },
+    })
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(skipped))
+            controller.enqueue(encoder.encode(delimiter.slice(0, splitAt)))
+            controller.enqueue(
+              encoder.encode(`${delimiter.slice(splitAt)}${error}`),
+            )
+            controller.close()
+          },
+        }),
+      ),
+      { perf: (_stage, stats) => perf.push(stats ?? {}) },
+    )
+
+    let caught: unknown
+    try {
+      await response.text()
+    } catch (error) {
+      caught = error
+    }
+
+    expect((caught as { code?: string }).code).toBe('ECONNRESET')
+    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
+      'overloaded_error',
+    )
+    expect(
+      Math.max(...perf.map((stats) => Number(stats.sseErrorPending ?? 0))),
+    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+  })
+
   test('reports server-side fallback outcomes without turning them into retryable errors', async () => {
     const encoder = new TextEncoder()
     const outcomes: ServerSideFallbackOutcome[] = []

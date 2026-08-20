@@ -1552,6 +1552,8 @@ function updateSseDiagnostics(
 
 type SseErrorState = {
   pending: string
+  disabled: boolean
+  resyncCarry: string
 }
 
 type SseFinishState = {
@@ -1618,7 +1620,7 @@ type RetryableAnthropicStreamError = Error & {
 }
 
 function createSseErrorState(): SseErrorState {
-  return { pending: '' }
+  return { pending: '', disabled: false, resyncCarry: '' }
 }
 
 function isRetryableAnthropicStreamError(
@@ -1713,9 +1715,23 @@ function retryableAnthropicStreamErrorFromRawEvent(
 function updateSseErrorState(
   state: SseErrorState,
   text: string,
+  maxPendingBytes: number,
 ): RetryableAnthropicStreamError | null {
   if (!text) return null
+  if (state.disabled) {
+    const window = state.resyncCarry + text
+    const boundary = findSseBoundary(window)
+    if (!boundary) {
+      state.resyncCarry = window.slice(-3)
+      return null
+    }
+    state.disabled = false
+    state.resyncCarry = ''
+    text = window.slice(boundary.index + boundary.length)
+    if (!text) return null
+  }
   state.pending += text
+  let retryable: RetryableAnthropicStreamError | null = null
 
   while (true) {
     const boundary = findSseBoundary(state.pending)
@@ -1724,10 +1740,15 @@ function updateSseErrorState(
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
     const error = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
-    if (error) return error
+    retryable ??= error
   }
 
-  return null
+  if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
+    state.pending = ''
+    state.disabled = true
+    state.resyncCarry = ''
+  }
+  return retryable
 }
 
 function sseDiagnosticStats(state: SseDiagnosticState) {
@@ -1934,8 +1955,11 @@ export function createStrippedStream(
               : finalDecoded
             const retryableStreamError = jsonMode
               ? updateFinish(serverRewritten)
-              : (updateSseErrorState(sseErrors, finalDecoded) ??
-                updateFinish(serverRewritten))
+              : (updateSseErrorState(
+                  sseErrors,
+                  finalDecoded,
+                  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                ) ?? updateFinish(serverRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
                 error: retryableStreamError.message,
@@ -1992,8 +2016,11 @@ export function createStrippedStream(
             : decoded
           const retryableStreamError = jsonMode
             ? updateFinish(serverRewritten)
-            : (updateSseErrorState(sseErrors, decoded) ??
-              updateFinish(serverRewritten))
+            : (updateSseErrorState(
+                sseErrors,
+                decoded,
+                NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+              ) ?? updateFinish(serverRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,
