@@ -246,6 +246,9 @@ export type AccountStorage = {
   claudeFast?: {
     enabled?: boolean
   }
+  claudeStart?: {
+    enabled?: boolean
+  }
   /**
    * Zero out Anthropic OAuth model costs in the provider hook. Default: enabled
    * (OAuth usage is quota-based, not per-token billed, so costs show as $0).
@@ -736,6 +739,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     claudeCache: isRecord(value.claudeCache) ? value.claudeCache : undefined,
     dump: isRecord(value.dump) ? value.dump : undefined,
     claudeFast: isRecord(value.claudeFast) ? value.claudeFast : undefined,
+    claudeStart: isRecord(value.claudeStart) ? value.claudeStart : undefined,
     costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
@@ -1209,6 +1213,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     dump: storage.dump,
     logging: storage.logging,
     claudeFast: storage.claudeFast,
+    claudeStart: storage.claudeStart,
     costZeroing: storage.costZeroing,
     cacheKeep: storage.cacheKeep,
     relay: storage.relay,
@@ -1979,6 +1984,12 @@ export function isFastModePersistentlyEnabled(storage: AccountStorage | null) {
   return storage?.claudeFast?.enabled === true
 }
 
+export function isStartAutomaticPersistentlyEnabled(
+  storage: AccountStorage | null,
+) {
+  return storage?.claudeStart?.enabled === true
+}
+
 export async function setFastModePersistentEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
@@ -1986,6 +1997,19 @@ export async function setFastModePersistentEnabled(
   const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.claudeFast = {
     ...(storage.claudeFast ?? {}),
+    enabled,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+export async function setStartAutomaticPersistentEnabled(
+  enabled: boolean,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+  storage.claudeStart = {
+    ...(storage.claudeStart ?? {}),
     enabled,
   }
   await saveAccounts(storage, path)
