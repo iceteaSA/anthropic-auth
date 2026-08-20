@@ -1,6 +1,7 @@
 import { resolvePromptContext } from './prompt-context'
 
-export const LANE_START_TEXT = '[lane start]'
+export const LANE_START_TEXT =
+  '[lane start] — automated cache warm; no response needed.'
 export const LANE_START_REQUEST_HEADER = 'x-cortexkit-lane-start'
 
 const MAX_PENDING_MESSAGE_IDS = 1_000

@@ -1603,6 +1603,63 @@ function updateSseFinishState(
   }
 }
 
+type SseLaneStartFinishRewriteState = {
+  pending: string
+  disabled: boolean
+}
+
+function createSseLaneStartFinishRewriteState(): SseLaneStartFinishRewriteState {
+  return { pending: '', disabled: false }
+}
+
+function rewriteLaneStartFinishEvent(rawEvent: string) {
+  const summary = summarizeSseEvent(rawEvent)
+  if (
+    summary?.type !== 'message_delta' ||
+    summary.stopReason !== 'max_tokens'
+  ) {
+    return rawEvent
+  }
+  return rawEvent.replace(/("stop_reason"\s*:\s*)"max_tokens"/, '$1"end_turn"')
+}
+
+function updateSseLaneStartFinishRewriteState(
+  state: SseLaneStartFinishRewriteState,
+  text: string,
+  maxPendingBytes: number,
+  flush = false,
+) {
+  if (!text && !flush) return ''
+  if (state.disabled) return text
+  if (
+    new TextEncoder().encode(state.pending + text).byteLength > maxPendingBytes
+  ) {
+    const passthrough = state.pending + text
+    state.pending = ''
+    state.disabled = true
+    return passthrough
+  }
+  state.pending += text
+  let rewritten = ''
+  while (true) {
+    const boundary = findSseBoundary(state.pending)
+    if (!boundary) break
+    const rawEvent = state.pending.slice(0, boundary.index)
+    const separator = state.pending.slice(
+      boundary.index,
+      boundary.index + boundary.length,
+    )
+    state.pending = state.pending.slice(boundary.index + boundary.length)
+    rewritten += rewriteLaneStartFinishEvent(rawEvent)
+    rewritten += separator
+  }
+  if (flush && state.pending) {
+    rewritten += rewriteLaneStartFinishEvent(state.pending)
+    state.pending = ''
+  }
+  return rewritten
+}
+
 type RetryableAnthropicStreamError = Error & {
   code: 'ECONNRESET'
   syscall: 'anthropic-sse'
@@ -1758,6 +1815,7 @@ export function createStrippedStream(
     onMessageStart?: (message: Record<string, unknown>) => void
     onMessageResponse?: (message: Record<string, unknown>) => void
     responseMode?: 'json'
+    laneStart?: boolean
   } = {},
 ): Response {
   if (!response.body) return response
@@ -1794,6 +1852,9 @@ export function createStrippedStream(
     options.onContentFilter || options.onComplete
       ? createSseFinishState()
       : undefined
+  const laneStartFinish = options.laneStart
+    ? createSseLaneStartFinishRewriteState()
+    : undefined
   let contentFilterInvoked = false
   let contentFilterHandled = false
   const invokeContentFilter = (completedToolUse = false) => {
@@ -1831,6 +1892,15 @@ export function createStrippedStream(
     if (update?.type === 'complete') options.onComplete?.(update.finishReason)
     return null
   }
+  const rewriteLaneStartFinish = (text: string, flush = false) =>
+    laneStartFinish
+      ? updateSseLaneStartFinishRewriteState(
+          laneStartFinish,
+          text,
+          NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+          flush,
+        )
+      : text
 
   const releaseReader = () => {
     if (readerReleased) return
@@ -1923,10 +1993,14 @@ export function createStrippedStream(
               ? serverSideFallback.push(finalDecoded) +
                 serverSideFallback.flush()
               : finalDecoded
+            const laneStartRewritten = rewriteLaneStartFinish(
+              serverRewritten,
+              true,
+            )
             const retryableStreamError = jsonMode
-              ? updateFinish(serverRewritten)
+              ? updateFinish(laneStartRewritten)
               : (updateSseErrorState(sseErrors, finalDecoded) ??
-                updateFinish(serverRewritten))
+                updateFinish(laneStartRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
                 error: retryableStreamError.message,
@@ -1936,7 +2010,7 @@ export function createStrippedStream(
               throw retryableStreamError
             }
             const flushed = splitToolPrefixRewriteBuffer(
-              `${pending}${serverRewritten}`,
+              `${pending}${laneStartRewritten}`,
               true,
             )
             rewriteMs += rewriteNowMs() - rewriteStart
@@ -1981,10 +2055,11 @@ export function createStrippedStream(
           const serverRewritten = serverSideFallback
             ? serverSideFallback.push(decoded)
             : decoded
+          const laneStartRewritten = rewriteLaneStartFinish(serverRewritten)
           const retryableStreamError = jsonMode
-            ? updateFinish(serverRewritten)
+            ? updateFinish(laneStartRewritten)
             : (updateSseErrorState(sseErrors, decoded) ??
-              updateFinish(serverRewritten))
+              updateFinish(laneStartRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,
@@ -1995,7 +2070,7 @@ export function createStrippedStream(
             releaseReader()
             throw retryableStreamError
           }
-          const text = pending + serverRewritten
+          const text = pending + laneStartRewritten
           const rewritten = splitToolPrefixRewriteBuffer(text)
           rewriteMs += rewriteNowMs() - rewriteStart
           pending = rewritten.pending

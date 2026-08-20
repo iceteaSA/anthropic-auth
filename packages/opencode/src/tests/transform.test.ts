@@ -554,6 +554,72 @@ describe('isInsecure', () => {
 })
 
 describe('createStrippedStream', () => {
+  test('rewrites the lane-start max_tokens finish as end_turn before completion', async () => {
+    const finishReasons: string[] = []
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'max_tokens' },
+      usage: { output_tokens: 1 },
+    })
+
+    const splitAt = body.indexOf('max_tokens') + 4
+    const text = await createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder()
+            controller.enqueue(encoder.encode(body.slice(0, splitAt)))
+            controller.enqueue(encoder.encode(body.slice(splitAt)))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        laneStart: true,
+        onComplete: (finishReason) => finishReasons.push(finishReason),
+      },
+    ).text()
+
+    expect(text).toContain('"stop_reason":"end_turn"')
+    expect(text).toContain('"output_tokens":1')
+    expect(finishReasons).toEqual(['end_turn'])
+  })
+
+  test('leaves max_tokens bytes unchanged without the lane-start marker', async () => {
+    const finishReasons: string[] = []
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'max_tokens' },
+      usage: { output_tokens: 1 },
+    })
+
+    const text = await createStrippedStream(new Response(body), {
+      onComplete: (finishReason) => finishReasons.push(finishReason),
+    }).text()
+
+    expect(text).toBe(body)
+    expect(finishReasons).toEqual(['max_tokens'])
+  })
+
+  test('preserves lane-start refusal handling', async () => {
+    let refusals = 0
+    const body = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'refusal' },
+    })
+
+    const text = await createStrippedStream(new Response(body), {
+      laneStart: true,
+      onContentFilter: () => {
+        refusals++
+        return false
+      },
+    }).text()
+
+    expect(text).toBe(body)
+    expect(refusals).toBe(1)
+  })
+
   test('observes a split message_start envelope exactly once', async () => {
     const message = {
       id: 'msg_provider_1',
