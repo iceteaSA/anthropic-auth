@@ -21,6 +21,7 @@ import {
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
+  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
   prefixToolNames,
   prepareFableCacheWarmSource,
   prependClaudeCodeIdentity,
@@ -483,6 +484,84 @@ describe('isInsecure', () => {
 })
 
 describe('createStrippedStream', () => {
+  test('observes a split message_start envelope exactly once', async () => {
+    const message = {
+      id: 'msg_provider_1',
+      usage: { input_tokens: 3 },
+      diagnostics: { cache_miss_reason: null },
+    }
+    const payload = sse('message_start', { type: 'message_start', message })
+    const seen: unknown[] = []
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        controller.enqueue(encoder.encode(payload.slice(0, 17)))
+        controller.enqueue(encoder.encode(payload.slice(17)))
+        controller.close()
+      },
+    })
+    await createStrippedStream(new Response(stream), {
+      onMessageStart: (value) => seen.push(value),
+    }).text()
+    expect(seen).toEqual([message])
+  })
+
+  test('observes a split non-streaming message response without changing bytes', async () => {
+    const message = {
+      id: 'msg_provider_2',
+      usage: { input_tokens: 3 },
+      diagnostics: { cache_miss_reason: { type: 'unavailable' } },
+    }
+    const body = JSON.stringify(message)
+    const seen: unknown[] = []
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        controller.enqueue(encoder.encode(body.slice(0, 9)))
+        controller.enqueue(encoder.encode(body.slice(9)))
+        controller.close()
+      },
+    })
+    const response = createStrippedStream(new Response(stream), {
+      responseMode: 'json',
+      onMessageResponse: (value) => seen.push(value),
+    })
+    expect(await response.text()).toBe(body)
+    expect(seen).toEqual([message])
+  })
+
+  test('passes over-cap non-streaming bytes unchanged without observing diagnostics', async () => {
+    const body = JSON.stringify({
+      id: 'msg_provider_over_cap',
+      usage: { input_tokens: 3 },
+      diagnostics: { cache_miss_reason: { type: 'unavailable' } },
+      padding: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES),
+    })
+    const seen: unknown[] = []
+    const perf: Array<Record<string, unknown>> = []
+    const response = createStrippedStream(new Response(body), {
+      responseMode: 'json',
+      onMessageResponse: (value) => seen.push(value),
+      perf: (_stage, stats) => perf.push(stats ?? {}),
+    })
+    expect(await response.text()).toBe(body)
+    expect(seen).toEqual([])
+    expect(perf.at(-1)?.ssePendingChars).toBe(0)
+  })
+
+  test('swallows observation callback errors', async () => {
+    const payload = sse('message_start', {
+      type: 'message_start',
+      message: { id: 'msg_provider_3' },
+    })
+    const response = createStrippedStream(new Response(payload), {
+      onMessageStart: () => {
+        throw new Error('observer failure')
+      },
+    })
+    expect(await response.text()).toBe(payload)
+  })
+
   test('strips tool prefixes from streamed response body', async () => {
     const chunks = [
       'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
@@ -1264,6 +1343,58 @@ describe('prependClaudeCodeIdentity', () => {
 })
 
 describe('rewriteRequestBody', () => {
+  test('injects cache diagnostics with a null previous message id', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        { cacheDiagnosticsPreviousMessageId: null },
+      ),
+    )
+    expect(result.diagnostics).toEqual({ previous_message_id: null })
+  })
+
+  test('copies an opaque cache diagnostics message id by identity', async () => {
+    const id = 'msg_opaque_provider_value'
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        { cacheDiagnosticsPreviousMessageId: id },
+      ),
+    )
+    expect(result.diagnostics).toEqual({ previous_message_id: id })
+  })
+
+  test('injects diagnostics for structured output bodies', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          messages: [{ role: 'user', content: 'hi' }],
+          output_config: { format: { type: 'json_schema' } },
+        }),
+        { cacheDiagnosticsPreviousMessageId: null },
+      ),
+    )
+    expect(result.diagnostics).toEqual({ previous_message_id: null })
+  })
+
+  test('does not inject diagnostics when the opt-in is omitted', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+      ),
+    )
+    expect(result.diagnostics).toBeUndefined()
+  })
+
+  test('returns invalid JSON unchanged when diagnostics injection is requested', async () => {
+    const body = '{not json'
+    expect(
+      await rewriteRequestBody(body, {
+        cacheDiagnosticsPreviousMessageId: null,
+      }),
+    ).toBe(body)
+  })
+
   test('prefixes tool names and rewrites system prompt', async () => {
     const body = JSON.stringify({
       tools: [{ name: 'bash', type: 'function' }],
