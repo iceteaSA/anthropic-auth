@@ -172,6 +172,19 @@ describe('setting-change INFO logs', () => {
     expect(rec!.payload).toEqual({ enabled: false })
   })
 
+  // -- start ---------------------------------------------------------------
+
+  test('start off emits info log and persists', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-start', 'off')
+    const rec = findCommandsLog('start automatic changed')
+    expect(rec).toBeDefined()
+    expect(rec!.payload).toEqual({ enabled: false })
+    const raw = await readConfigFile()
+    expect(raw.claudeStart?.enabled).toBe(false)
+  })
+
   // -- routing -------------------------------------------------------------
 
   test('routing mode change emits info log and persists', async () => {

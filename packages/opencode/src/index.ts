@@ -2618,6 +2618,7 @@ const anthropicAuthPlugin = async (
     }
     if (action.type === 'off') {
       await setStartAutomaticPersistentEnabled(false, accountStoragePath)
+      logger.info('commands', 'start automatic changed', { enabled: false })
       return executeLaneStartCommand({
         argumentsText,
         automaticEnabled: false,
