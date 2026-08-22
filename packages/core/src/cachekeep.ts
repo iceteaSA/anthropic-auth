@@ -12,8 +12,10 @@ export const CACHE_KEEP_TICK_MS = 60_000
 export const CACHE_KEEP_EXTENDED_TTL_BETA = 'extended-cache-ttl-2025-04-11'
 export const CACHE_KEEP_MAX_TARGETS = 32
 export const CACHE_KEEP_MAX_BODY_BYTES = 16 * 1024 * 1024
-export const CACHE_KEEP_STALE_TARGET_MS = 2 * CACHE_KEEP_TTL_MS
 export const CACHE_KEEP_PREWARM_TIMEOUT_MS = 30_000
+export const CACHE_KEEP_RETRY_BASE_MS = 60_000
+export const CACHE_KEEP_RETRY_MAX_MS = 15 * 60_000
+export const CACHE_KEEP_RETRY_JITTER_MAX_MS = 30_000
 
 const STATUS_TITLE = '## Claude Cache Keep Status'
 const ENABLED_TITLE = '## Claude Cache Keep Enabled'
@@ -327,9 +329,27 @@ export type CacheKeepTarget = {
   headers: Record<string, string>
   bodyText: string
   cacheExpiresAt: number
+  nextPrewarmAt: number
+  consecutiveFailures: number
   dayKey: string
   oauthAccountId?: string
   isSubagent: boolean
+}
+
+function cacheKeepRetryDelayMs(targetId: string, failureCount: number) {
+  const exponential = Math.min(
+    CACHE_KEEP_RETRY_MAX_MS,
+    CACHE_KEEP_RETRY_BASE_MS * 2 ** Math.min(Math.max(failureCount - 1, 0), 8),
+  )
+  let hash = 2_166_136_261
+  for (const character of `${targetId}:${failureCount}`) {
+    hash ^= character.charCodeAt(0)
+    hash = Math.imul(hash, 16_777_619)
+  }
+  const jitter =
+    (hash >>> 0) %
+    (Math.min(CACHE_KEEP_RETRY_JITTER_MAX_MS, exponential / 4) + 1)
+  return exponential + jitter
 }
 
 export type CacheKeepPrewarmResult =
@@ -341,11 +361,12 @@ export type CacheKeepPrewarmResult =
         cache_read_input_tokens?: number
       }
     }
-  | { ok: false; reason: string; status?: number }
+  | { ok: false; reason: string; status?: number; transient?: true }
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
   private timer: ReturnType<typeof setInterval> | null = null
+  private tickPromise: Promise<void> | null = null
 
   constructor(
     private readonly options: {
@@ -411,11 +432,7 @@ export class CacheKeepManager {
       (target) => target.dayKey === today,
     )
     const nextPrewarmAt = targets.length
-      ? Math.min(
-          ...targets.map(
-            (target) => target.cacheExpiresAt - CACHE_KEEP_PREWARM_LEAD_MS,
-          ),
-        )
+      ? Math.min(...targets.map((target) => target.nextPrewarmAt))
       : undefined
     return { trackedSessions: targets.length, nextPrewarmAt }
   }
@@ -425,7 +442,7 @@ export class CacheKeepManager {
       .map((target) => ({
         id: target.id,
         cacheExpiresAt: target.cacheExpiresAt,
-        nextPrewarmAt: target.cacheExpiresAt - CACHE_KEEP_PREWARM_LEAD_MS,
+        nextPrewarmAt: target.nextPrewarmAt,
       }))
       .sort((left, right) => left.id.localeCompare(right.id))
   }
@@ -475,9 +492,7 @@ export class CacheKeepManager {
         this.targets.delete(id)
         continue
       }
-      if (now - target.cacheExpiresAt > CACHE_KEEP_STALE_TARGET_MS) {
-        this.targets.delete(id)
-      }
+      if (now >= target.cacheExpiresAt) this.targets.delete(id)
     }
     while (this.targets.size > CACHE_KEEP_MAX_TARGETS) this.evictOldestTarget()
     while (this.totalBodyBytes() > CACHE_KEEP_MAX_BODY_BYTES) {
@@ -529,6 +544,8 @@ export class CacheKeepManager {
       headers,
       bodyText: input.bodyText,
       cacheExpiresAt: now + CACHE_KEEP_TTL_MS,
+      nextPrewarmAt: now + CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS,
+      consecutiveFailures: 0,
       dayKey: today,
       oauthAccountId: input.oauthAccountId,
       isSubagent: input.isSubagent ?? false,
@@ -557,6 +574,8 @@ export class CacheKeepManager {
       headers,
       bodyText: input.bodyText,
       cacheExpiresAt: this.options.now?.() ?? Date.now(),
+      nextPrewarmAt: this.options.now?.() ?? Date.now(),
+      consecutiveFailures: 0,
       dayKey: '',
       oauthAccountId: input.oauthAccountId,
       isSubagent: input.isSubagent ?? false,
@@ -564,7 +583,17 @@ export class CacheKeepManager {
     return this.sendPrewarm(target)
   }
 
-  async tick() {
+  tick(): Promise<void> {
+    if (this.tickPromise) return this.tickPromise
+    let run: Promise<void>
+    run = this.runTick().finally(() => {
+      if (this.tickPromise === run) this.tickPromise = null
+    })
+    this.tickPromise = run
+    return run
+  }
+
+  private async runTick() {
     const storage = await this.options.loadStorage()
     const window = getCacheKeepWindow(storage)
     const now = this.options.now?.() ?? Date.now()
@@ -590,10 +619,19 @@ export class CacheKeepManager {
     }
 
     logger.debug('cachekeep', 'fired', { targets: this.targets.size })
-    const dueAt = now + CACHE_KEEP_PREWARM_LEAD_MS
     for (const target of this.targets.values()) {
-      if (target.cacheExpiresAt > dueAt) continue
-      await this.prewarm(target, now)
+      if (target.nextPrewarmAt > now) continue
+      try {
+        await this.prewarm(target, now)
+      } catch (error) {
+        logger.warn('cachekeep', 'prewarm failed', {
+          session: target.id,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+        target.consecutiveFailures += 1
+        target.nextPrewarmAt =
+          now + cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
+      }
     }
     this.publishTrackedSessions()
   }
@@ -626,14 +664,23 @@ export class CacheKeepManager {
       : new Headers(target.headers)
     headers.delete('content-length')
     headers.delete('transfer-encoding')
-    const response = await fetchImpl(target.url, {
-      method: 'POST',
-      headers,
-      body: prewarm.bodyText,
-      signal: AbortSignal.timeout(
-        this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
-      ),
-    })
+    let response: Response
+    try {
+      response = await fetchImpl(target.url, {
+        method: 'POST',
+        headers,
+        body: prewarm.bodyText,
+        signal: AbortSignal.timeout(
+          this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
+        ),
+      })
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : String(error),
+        transient: true,
+      }
+    }
     const receivedAt = this.options.now?.() ?? Date.now()
     const raw = await response.text().catch(() => '')
     let data: unknown = null
@@ -694,7 +741,7 @@ export class CacheKeepManager {
   private async prewarm(target: CacheKeepTarget, now: number) {
     const result = await this.sendPrewarm(target)
     if (!result.ok) {
-      if (result.status == null) {
+      if (result.status == null && !result.transient) {
         logger.debug('cachekeep', 'prewarm skipped', {
           session: target.id,
           reason: result.reason,
@@ -706,12 +753,16 @@ export class CacheKeepManager {
           status: result.status,
           reason: result.reason,
         })
-        target.cacheExpiresAt = now + CACHE_KEEP_PREWARM_LEAD_MS + 5 * 60_000
+        target.consecutiveFailures += 1
+        target.nextPrewarmAt =
+          now + cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
       }
       return
     }
 
     target.cacheExpiresAt = now + CACHE_KEEP_TTL_MS
+    target.nextPrewarmAt = target.cacheExpiresAt - CACHE_KEEP_PREWARM_LEAD_MS
+    target.consecutiveFailures = 0
     logger.debug('cachekeep', 'prewarm succeeded', {
       session: target.id,
       ...(result.usage && { usage: result.usage }),

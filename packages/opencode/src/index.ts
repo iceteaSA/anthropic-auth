@@ -58,6 +58,7 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getDefaultCacheKeepRegistryDirectory,
+  getFallbackReauthLabels,
   getKillswitchConfig,
   getKillswitchThresholdsForAccount,
   getOrCreatePrimeAuthLineageId,
@@ -119,6 +120,7 @@ import {
   type QuotaAccountSummary,
   type QuotaEntry,
   QuotaManager,
+  quotaSnapshotCheckedAt,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -430,6 +432,9 @@ type PluginSessionClient = {
   status?: () => Promise<unknown> | unknown
 }
 
+const DESKTOP_NOTICE_PROBE_LIMIT = 4
+const DESKTOP_NOTICE_PROBE_DELAY_MS = 25
+
 type PerfTrace = {
   requestId: string
   start: number
@@ -579,12 +584,7 @@ async function sendIgnoredMessage(
           promptContext.latestUserMessageId,
         )
       : undefined
-    if (!messageID) {
-      throw new Error(
-        'OpenCode assistant ordering is unavailable for the fallback notification.',
-      )
-    }
-    request.body.messageID = messageID
+    if (messageID) request.body.messageID = messageID
   }
   if (promptContext?.agent) request.body.agent = promptContext.agent
   if (promptContext?.model) request.body.model = promptContext.model
@@ -822,7 +822,7 @@ export function primeQuotaSnapshotIsFreshSince(
   quota: OAuthQuotaSnapshot | undefined,
   refreshStartedAt: number,
 ): boolean {
-  return primeQuotaSnapshotCheckedAt(quota) > refreshStartedAt
+  return quotaSnapshotCheckedAt(quota) > refreshStartedAt
 }
 
 type PluginRuntimeTimerOverrides = Partial<{
@@ -913,6 +913,9 @@ const anthropicAuthPlugin = async (
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const desktopNoticeFlushes = new Map<string, Promise<void>>()
+  const desktopNoticePostIdleUpdates = new Set<string>()
+  const desktopNoticeSafeSessions = new Set<string>()
+  const desktopNoticeProbes = new Map<string, number>()
   const stickySessionRouter = new StickySessionRouter({
     path:
       process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
@@ -2306,11 +2309,8 @@ const anthropicAuthPlugin = async (
 
     if (!desktopText || isTuiConnected(notice.sessionId)) return
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
-    // Creating a notification while an assistant is still streaming can race the
-    // active run and enqueue an extra provider turn. Queue it until OpenCode
-    // publishes the assistant's completed message update or becomes idle, then
-    // place it directly before that assistant in ID order. The status probe below
-    // closes the race where both events precede a delayed cache warm/outcome.
+    // OpenCode awaits event handlers before it evaluates the loop exit condition.
+    // Escape the post-idle session update, then probe outside that critical section.
     const queue = pendingDesktopNotices.get(notice.sessionId) ?? []
     queue.push(desktopText)
     if (queue.length > 4) queue.splice(0, queue.length - 4)
@@ -2321,40 +2321,77 @@ const anthropicAuthPlugin = async (
       if (oldest) pendingDesktopNotices.delete(oldest)
       else break
     }
-    void flushDesktopNoticesIfIdle(notice.sessionId)
+    if (desktopNoticeSafeSessions.has(notice.sessionId)) {
+      scheduleDesktopNoticeProbe(notice.sessionId)
+    }
   }
 
-  async function flushDesktopNoticesIfIdle(sessionId: string): Promise<void> {
-    const session = ctx.client.session as PluginSessionClient | undefined
-    if (typeof session?.status !== 'function') return
-
-    try {
-      const response = await Promise.resolve(session.status())
-      const responseRecord =
-        response !== null && typeof response === 'object'
-          ? (response as Record<string, unknown>)
-          : undefined
-      const data =
-        responseRecord && Object.hasOwn(responseRecord, 'data')
-          ? responseRecord.data
-          : responseRecord
-      if (data === null || typeof data !== 'object' || Array.isArray(data))
-        return
-      const status = (data as Record<string, unknown>)[sessionId]
-      if (status === undefined) {
-        await flushDesktopNotices(sessionId)
-        return
-      }
-      if (
-        status !== null &&
-        typeof status === 'object' &&
-        (status as { type?: unknown }).type === 'idle'
-      ) {
-        await flushDesktopNotices(sessionId)
-      }
-    } catch {
-      // Event-driven flushing remains the compatibility path for older hosts.
+  function scheduleDesktopNoticeProbe(sessionId: string, attempt = 0) {
+    if (
+      !pendingDesktopNotices.has(sessionId) ||
+      desktopNoticeProbes.has(sessionId)
+    ) {
+      return
     }
+    desktopNoticeProbes.set(sessionId, attempt)
+    const run = () => {
+      if (desktopNoticeProbes.get(sessionId) !== attempt) return
+      desktopNoticeProbes.delete(sessionId)
+      void flushDesktopNoticesIfIdle(sessionId, attempt)
+    }
+    if (attempt === 0) {
+      setImmediate(run)
+    } else {
+      setTimeout(run, DESKTOP_NOTICE_PROBE_DELAY_MS * attempt)
+    }
+  }
+
+  function rearmDesktopNoticeProbe(sessionId: string, attempt: number) {
+    if (attempt + 1 < DESKTOP_NOTICE_PROBE_LIMIT) {
+      scheduleDesktopNoticeProbe(sessionId, attempt + 1)
+    }
+  }
+
+  async function flushDesktopNoticesIfIdle(sessionId: string, attempt: number) {
+    if (
+      !desktopNoticeSafeSessions.has(sessionId) ||
+      !pendingDesktopNotices.has(sessionId)
+    ) {
+      return
+    }
+    const session = ctx.client.session as PluginSessionClient | undefined
+    if (typeof session?.status === 'function') {
+      try {
+        const response = await Promise.resolve(session.status())
+        const responseRecord =
+          response !== null && typeof response === 'object'
+            ? (response as Record<string, unknown>)
+            : undefined
+        const data =
+          responseRecord && Object.hasOwn(responseRecord, 'data')
+            ? responseRecord.data
+            : responseRecord
+        if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+          rearmDesktopNoticeProbe(sessionId, attempt)
+          return
+        }
+        const status = (data as Record<string, unknown>)[sessionId]
+        // OpenCode 1.17 and 1.18 omit idle sessions from this map.
+        if (
+          status !== undefined &&
+          (!status ||
+            typeof status !== 'object' ||
+            (status as { type?: unknown }).type !== 'idle')
+        ) {
+          rearmDesktopNoticeProbe(sessionId, attempt)
+          return
+        }
+      } catch {
+        rearmDesktopNoticeProbe(sessionId, attempt)
+        return
+      }
+    }
+    await flushDesktopNotices(sessionId)
   }
 
   function flushDesktopNotices(sessionId: string): Promise<void> {
@@ -3221,9 +3258,6 @@ const anthropicAuthPlugin = async (
           info?: {
             id?: string
             sessionID?: string
-            role?: string
-            finish?: string
-            time?: { completed?: number }
           }
           status?: { type?: string }
         }
@@ -3235,24 +3269,41 @@ const anthropicAuthPlugin = async (
 
       if (
         value.type === 'session.status' &&
-        value.properties?.status?.type === 'idle'
+        value.properties?.status?.type !== 'idle'
       ) {
-        await flushDesktopNotices(sessionId)
+        desktopNoticePostIdleUpdates.delete(sessionId)
+        desktopNoticeSafeSessions.delete(sessionId)
+      }
+
+      if (value.type === 'session.idle') {
+        desktopNoticePostIdleUpdates.add(sessionId)
+        while (desktopNoticePostIdleUpdates.size > 128) {
+          const oldest = desktopNoticePostIdleUpdates.values().next().value
+          if (oldest) desktopNoticePostIdleUpdates.delete(oldest)
+          else break
+        }
       }
 
       if (
-        value.type === 'message.updated' &&
-        info?.role === 'assistant' &&
-        info.finish !== 'tool-calls' &&
-        typeof info.time?.completed === 'number'
+        value.type === 'session.updated' &&
+        desktopNoticePostIdleUpdates.delete(sessionId)
       ) {
-        await flushDesktopNotices(sessionId)
+        desktopNoticeSafeSessions.add(sessionId)
+        while (desktopNoticeSafeSessions.size > 128) {
+          const oldest = desktopNoticeSafeSessions.values().next().value
+          if (oldest) desktopNoticeSafeSessions.delete(oldest)
+          else break
+        }
+        scheduleDesktopNoticeProbe(sessionId)
       }
 
       if (value.type === 'session.deleted') {
         laneStartTracker.clearSession(sessionId)
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
+        desktopNoticePostIdleUpdates.delete(sessionId)
+        desktopNoticeSafeSessions.delete(sessionId)
+        desktopNoticeProbes.delete(sessionId)
       }
     },
     config: async (config: { command?: Record<string, unknown> }) => {
@@ -5230,6 +5281,9 @@ const anthropicAuthPlugin = async (
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
                         stickyRoutes.storage?.refresh?.mainLastRefreshError,
+                      fallbackReauthLabels: getFallbackReauthLabels(
+                        stickyRoutes.storage,
+                      ),
                       routeQuotas: stickyRoutes.allRoutes.flatMap((route) =>
                         route.quota ? [route.quota] : [],
                       ),

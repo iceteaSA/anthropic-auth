@@ -171,6 +171,7 @@ export async function sweepDumpDirectory(options: {
       size: number
       mtimeMs: number
       partial: boolean
+      artifactGroup?: string
     }[] = []
 
     await Promise.all(
@@ -187,6 +188,12 @@ export async function sweepDumpDirectory(options: {
             size: stats.size,
             mtimeMs: stats.mtimeMs,
             partial,
+            ...(!partial && {
+              artifactGroup: entry.name.replace(
+                DUMP_ARTIFACT_SUFFIX_PATTERN,
+                '',
+              ),
+            }),
           })
         } catch {
           // Files can disappear while concurrent dump requests finish.
@@ -195,19 +202,9 @@ export async function sweepDumpDirectory(options: {
     )
 
     let totalBytes = files.reduce((total, file) => total + file.size, 0)
-    files.sort(
-      (left, right) =>
-        left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path),
-    )
-
     let removed = 0
     let freedBytes = 0
-    for (const file of files) {
-      if (protectedPaths.has(resolve(file.path))) continue
-      const ageMs = now - file.mtimeMs
-      const stalePartial = file.partial && ageMs >= partialStaleMs
-      if (!stalePartial && totalBytes <= maxBytes) continue
-      if (file.partial ? !stalePartial : ageMs < minAgeMs) continue
+    const removeFile = async (file: (typeof files)[number]) => {
       try {
         await unlink(file.path)
         totalBytes -= file.size
@@ -216,6 +213,49 @@ export async function sweepDumpDirectory(options: {
       } catch {
         // Dump cleanup is best-effort and must not affect request handling.
       }
+    }
+
+    // Partials are not usable dump records. Reclaim stale ones independently,
+    // including while the completed-artifact set is already below the cap.
+    const partials = files
+      .filter((file) => file.partial)
+      .sort(
+        (left, right) =>
+          left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path),
+      )
+    for (const file of partials) {
+      if (protectedPaths.has(resolve(file.path))) continue
+      if (now - file.mtimeMs < partialStaleMs) continue
+      await removeFile(file)
+    }
+
+    const artifactGroups = new Map<
+      string,
+      { files: (typeof files)[number][]; newestMtimeMs: number }
+    >()
+    for (const file of files) {
+      if (file.partial || !file.artifactGroup) continue
+      const group = artifactGroups.get(file.artifactGroup) ?? {
+        files: [],
+        newestMtimeMs: 0,
+      }
+      group.files.push(file)
+      group.newestMtimeMs = Math.max(group.newestMtimeMs, file.mtimeMs)
+      artifactGroups.set(file.artifactGroup, group)
+    }
+
+    const completedGroups = [...artifactGroups.entries()].sort(
+      ([leftName, left], [rightName, right]) =>
+        left.newestMtimeMs - right.newestMtimeMs ||
+        leftName.localeCompare(rightName),
+    )
+    for (const [, group] of completedGroups) {
+      if (totalBytes <= maxBytes) break
+      if (now - group.newestMtimeMs < minAgeMs) continue
+      if (group.files.some((file) => protectedPaths.has(resolve(file.path)))) {
+        continue
+      }
+      for (const file of group.files) await removeFile(file)
     }
 
     if (removed > 0) {

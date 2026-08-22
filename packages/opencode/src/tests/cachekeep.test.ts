@@ -451,7 +451,7 @@ describe('CacheKeepManager', () => {
       prewarmTimeoutMs: 5,
     })
 
-    const result = manager.prewarmNow({
+    const result = await manager.prewarmNow({
       sessionId: 'ses_timeout',
       url: 'https://api.anthropic.com/v1/messages?beta=true',
       headers: new Headers(),
@@ -467,7 +467,10 @@ describe('CacheKeepManager', () => {
       }),
     })
 
-    await expect(result).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected prewarm to fail')
+    expect(result.transient).toBe(true)
+    expect(result.reason).toContain('timed out')
   })
 
   test('passes OAuth account identity to prewarm header refresh', async () => {
@@ -755,8 +758,9 @@ describe('CacheKeepManager', () => {
     manager.stop()
   })
 
-  test('failed prewarm reschedules with backoff', async () => {
-    let now = new Date('2026-05-18T10:00:00').getTime()
+  test('backs off failed prewarms and drops targets once the last successful cache expires', async () => {
+    const trackedAt = new Date('2026-05-18T10:00:00').getTime()
+    let now = trackedAt
     const fetchImpl = mock(
       (_input: string | URL | Request, _init?: RequestInit) => {
         return Promise.resolve(new Response('rate limited', { status: 429 }))
@@ -786,6 +790,154 @@ describe('CacheKeepManager', () => {
     now += 55 * 60_000
     await manager.tick()
     expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(manager.trackedSessions()[0]?.cacheExpiresAt).toBe(
+      trackedAt + 60 * 60_000,
+    )
+
+    // The retry is delayed rather than paid on every scheduler tick.
+    await manager.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+
+    // Once the cache created by the last successful request has expired, another
+    // max_tokens:0 request would be a paid cold cache write and must not be sent.
+    now = trackedAt + 60 * 60_000
+    await manager.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(manager.trackedCount()).toBe(0)
+    manager.stop()
+  })
+
+  test('coalesces overlapping scheduler ticks into one prewarm attempt', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const fetchStarted = Promise.withResolvers<void>()
+    const fetchCanFinish = Promise.withResolvers<Response>()
+    const fetchImpl = mock(() => {
+      fetchStarted.resolve()
+      return fetchCanFinish.promise
+    }) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+    })
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await manager.track({
+      sessionId: 'ses_overlap',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: body,
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+
+    now += 55 * 60_000
+    const firstTick = manager.tick()
+    await fetchStarted.promise
+    const overlappingTick = manager.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+
+    fetchCanFinish.resolve(new Response('{}', { status: 200 }))
+    await Promise.all([firstTick, overlappingTick])
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    manager.stop()
+  })
+
+  test('contains thrown prewarm errors and continues with later targets', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const attempts: string[] = []
+    let publishCount = 0
+    const timeout = new Error('The operation timed out.')
+    timeout.name = 'TimeoutError'
+    const fetchImpl = mock((input: string | URL | Request) => {
+      const url = String(input)
+      attempts.push(url)
+      if (url.endsWith('/A')) throw timeout
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+      onTrackedSessionsChanged: () => {
+        publishCount++
+      },
+    })
+    const body = JSON.stringify({
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+
+    for (const id of ['A', 'B', 'C']) {
+      await manager.track({
+        sessionId: `ses_${id}`,
+        url: `https://api.anthropic.com/v1/messages/${id}`,
+        headers: new Headers(),
+        bodyText: body,
+        storage: hybridStorage(),
+        cacheMode: 'hybrid',
+      })
+    }
+
+    const publishedBeforeTick = publishCount
+    now += 55 * 60_000
+    await manager.tick()
+
+    expect(attempts).toEqual([
+      'https://api.anthropic.com/v1/messages/A',
+      'https://api.anthropic.com/v1/messages/B',
+      'https://api.anthropic.com/v1/messages/C',
+    ])
+    expect(manager.trackedSessions().map((session) => session.id)).toEqual([
+      'ses_A',
+      'ses_B',
+      'ses_C',
+    ])
+    expect(
+      manager.trackedSessions().find((session) => session.id === 'ses_A')
+        ?.cacheExpiresAt,
+    ).toBe(now + 5 * 60_000)
+    expect(publishCount).toBeGreaterThan(publishedBeforeTick)
+
+    attempts.length = 0
+    now += 60_000
+    await manager.tick()
+    expect(attempts).toEqual([])
+    manager.stop()
+  })
+
+  test('deletes a tracked target when its prewarm body is unbuildable', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.track({
+      sessionId: 'ses_unbuildable',
+      url: 'https://api.anthropic.com/v1/messages/unbuildable',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(manager.trackedCount()).toBe(0)
     manager.stop()
   })
 })

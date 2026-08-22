@@ -264,6 +264,39 @@ test('dump sweep deletes oldest files until the directory is under its cap', asy
   expect(await readdir(dumpDir)).toEqual([dumpArtifactName(3, 'request')])
 })
 
+test('evicts complete dump artifact groups instead of orphaning request pairs', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  const oldBody = join(dumpDir, dumpArtifactName(1, 'body'))
+  const oldMeta = join(dumpDir, dumpArtifactName(1, 'meta'))
+  const newBody = join(dumpDir, dumpArtifactName(2, 'body'))
+  const newMeta = join(dumpDir, dumpArtifactName(2, 'meta'))
+  await Promise.all(
+    [oldBody, oldMeta, newBody, newMeta].map((path) =>
+      writeFile(path, '12345678'),
+    ),
+  )
+  await Promise.all([
+    utimes(oldBody, new Date(1_000), new Date(1_000)),
+    utimes(oldMeta, new Date(2_000), new Date(2_000)),
+    utimes(newBody, new Date(3_000), new Date(3_000)),
+    utimes(newMeta, new Date(4_000), new Date(4_000)),
+  ])
+
+  // Removing one file would satisfy this cap but leave an unusable orphan. The
+  // sweep must evict both artifacts belonging to the oldest request instead.
+  expect(await sweepDumpDirectory({ dumpDir, maxBytes: 24 })).toEqual({
+    removed: 2,
+    freedBytes: 16,
+  })
+  expect((await readdir(dumpDir)).sort()).toEqual(
+    [dumpArtifactName(2, 'body'), dumpArtifactName(2, 'meta')].sort(),
+  )
+})
+
 test('sweeps artifacts whose request counter has grown to seven digits', async () => {
   const dumpDir = await mkdtemp(
     join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),

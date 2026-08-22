@@ -1000,7 +1000,8 @@ function accountRuntimeState(account: FallbackAccount) {
   })
 }
 
-function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
+/** Returns the latest timestamp carried by any quota snapshot window. */
+export function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   return Math.max(
     quota?.five_hour?.checkedAt ?? 0,
     quota?.seven_day?.checkedAt ?? 0,
@@ -2470,6 +2471,42 @@ export function formatRefreshBackoffMessage(
   return `Claude OAuth refresh is backed off for ${seconds}s after: ${error.message}`
 }
 
+type RefreshBackoffActiveError = Error & {
+  refreshBackoffError: AccountOperationError
+}
+
+function createRefreshBackoffActiveError(
+  error: AccountOperationError,
+  now: number,
+): RefreshBackoffActiveError {
+  return Object.assign(new Error(formatRefreshBackoffMessage(error, now)), {
+    refreshBackoffError: error,
+  })
+}
+
+function existingRefreshBackoffError(
+  error: unknown,
+): AccountOperationError | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const existing = (error as Partial<RefreshBackoffActiveError>)
+    .refreshBackoffError
+  return existing && typeof existing.message === 'string' ? existing : undefined
+}
+
+export function getFallbackReauthLabels(
+  storage: AccountStorage | null | undefined,
+): string[] {
+  if (!storage) return []
+  return storage.accounts
+    .filter(
+      (account): account is OAuthAccount =>
+        account.enabled !== false &&
+        isOAuthAccount(account) &&
+        isPermanentRefreshError(account.lastRefreshError),
+    )
+    .map((account) => account.label?.trim() || account.id)
+}
+
 export function isQuotaPolicyAuthError(error: unknown) {
   const status = (error as { status?: unknown }).status
   if (status === 403) return true
@@ -3227,6 +3264,11 @@ function recordRefreshError(
   error: unknown,
   now: number,
 ) {
+  const existing = existingRefreshBackoffError(error)
+  if (existing) {
+    account.lastRefreshError = existing
+    return
+  }
   account.lastRefreshError = buildRefreshOperationError({
     error,
     now,
@@ -3240,7 +3282,8 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
-  if (isQuotaPolicyAuthError(error)) return
+  if (isQuotaPolicyAuthError(error) || existingRefreshBackoffError(error))
+    return
   account.lastQuotaRefreshError = buildQuotaOperationError({
     error,
     now,
@@ -3291,10 +3334,7 @@ export class FallbackAccountManager {
   ): void {
     if (!this.quotaManager) return
     if (!account.quota) return
-    const checkedAt = Math.max(
-      account.quota.five_hour?.checkedAt ?? 0,
-      account.quota.seven_day?.checkedAt ?? 0,
-    )
+    const checkedAt = quotaSnapshotCheckedAt(account.quota)
     if (checkedAt <= 0) return
     const existing = this.quotaManager.getFallback(account.id, account.access)
     if (existing && existing.checkedAt >= checkedAt) return
@@ -3361,9 +3401,7 @@ export class FallbackAccountManager {
             refreshError &&
             refreshBackoffActive(refreshError, next.refresh, this.now())
           ) {
-            throw new Error(
-              formatRefreshBackoffMessage(refreshError, this.now()),
-            )
+            throw createRefreshBackoffActiveError(refreshError, this.now())
           }
           next = await this.refreshAccount(next, storage)
           changed = true
@@ -3583,9 +3621,7 @@ export class FallbackAccountManager {
             refreshError &&
             refreshBackoffActive(refreshError, next.refresh, this.now())
           ) {
-            throw new Error(
-              formatRefreshBackoffMessage(refreshError, this.now()),
-            )
+            throw createRefreshBackoffActiveError(refreshError, this.now())
           }
           next = await this.refreshAccount(next, storage)
           changed = true
@@ -3683,7 +3719,7 @@ export class FallbackAccountManager {
         refreshBackoffActive(refreshError, latestAccount.refresh, this.now())
       ) {
         updateStoredAccount(storage, latestAccount)
-        throw new Error(formatRefreshBackoffMessage(refreshError, this.now()))
+        throw createRefreshBackoffActiveError(refreshError, this.now())
       }
     }
     return null
