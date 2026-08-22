@@ -9559,6 +9559,9 @@ describe('claude-start integration', () => {
 
     const client = createMockClient()
     const plugin = await getPlugin(client)
+    // Diagnostics records emit at debug level; enable it after plugin
+    // load so boot-time level application cannot reset it.
+    setLogLevel('debug')
     const headers: Record<string, string> = {}
     await plugin['chat.message'](
       { sessionID: 'ses-start' },
@@ -9630,6 +9633,7 @@ describe('claude-start integration', () => {
       }
     ).mock.calls.at(-1)?.[0]
     expect(latest?.body.parts[0]?.text).toContain('ses-start')
+    setLogLevel('info')
   })
 
   test('claude-start concurrency does not shape an interleaved real turn', async () => {
@@ -10163,6 +10167,7 @@ describe('cache diagnostics', () => {
       ]),
     )
     const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    setLogLevel('debug')
     const request = (sessionId: string) => ({
       method: 'POST',
       headers: { 'x-session-affinity': sessionId },
@@ -10220,6 +10225,7 @@ describe('cache diagnostics', () => {
       previous_message_id: 'provider-B',
       session_id: 'ses-diag-B',
     })
+    setLogLevel('info')
   })
 
   test('cache diagnostics isolates missing affinity and strips the parent header', async () => {
@@ -10237,6 +10243,7 @@ describe('cache diagnostics', () => {
 
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    setLogLevel('debug')
     const body = JSON.stringify({
       model: 'claude-opus-4-8',
       stream: true,
@@ -10272,6 +10279,7 @@ describe('cache diagnostics', () => {
       session_id: 'session-unknown',
       is_subagent: false,
     })
+    setLogLevel('info')
   })
 
   test('cache diagnostics emits the opt-in beta for normal and structured OAuth requests', async () => {
@@ -10287,8 +10295,16 @@ describe('cache diagnostics', () => {
     }) as unknown as typeof fetch
     __setLogTestSink((record) => records.push(record))
 
-    const plugin = await getPlugin()
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-logging',
+        arguments: 'debug',
+        sessionID: 'session-cache-diagnostics',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
     for (const output_config of [
       undefined,
       { format: { type: 'json_schema' } },
@@ -10324,6 +10340,16 @@ describe('cache diagnostics', () => {
       )
     expect(betaLines).toHaveLength(2)
     expect(new Set(betaLines.map((line) => line.hash)).size).toBe(2)
+    expect(
+      records
+        .filter(
+          (record) =>
+            record.channel === 'cache-diagnostics' &&
+            record.message.startsWith('MC-CACHE-DIAG'),
+        )
+        .map((record) => record.level),
+    ).toEqual(['debug', 'debug', 'debug', 'debug'])
+    setLogLevel('info')
   })
 
   test('cache diagnostics observes non-streaming envelopes and carries their provider id forward', async () => {
@@ -10340,6 +10366,7 @@ describe('cache diagnostics', () => {
 
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    setLogLevel('debug')
     const request = {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses-json' },
@@ -10362,6 +10389,7 @@ describe('cache diagnostics', () => {
           record.message.startsWith('MC-CACHE-DIAG '),
       ),
     ).toHaveLength(2)
+    setLogLevel('info')
   })
 
   test('cache diagnostics records cachekeep prewarms and carries their provider id forward', async () => {
@@ -10416,6 +10444,7 @@ describe('cache diagnostics', () => {
 
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    setLogLevel('debug')
     const request = {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses-cachekeep' },
@@ -10471,6 +10500,7 @@ describe('cache diagnostics', () => {
       account_id: 'main',
       betas_hash: expect.stringMatching(/^[0-9a-f]{16}$/),
     })
+    setLogLevel('info')
   })
 
   test('cache diagnostics logs a short-gap previous-message canary but not unavailable', async () => {

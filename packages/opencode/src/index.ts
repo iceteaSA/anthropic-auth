@@ -88,7 +88,6 @@ import {
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
-  isStartAutomaticPersistentlyEnabled,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -151,7 +150,6 @@ import {
   setLogLevelPersistent,
   setPrimePersistentEnabled,
   setRoutingMode,
-  setStartAutomaticPersistentEnabled,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
@@ -1299,7 +1297,7 @@ const anthropicAuthPlugin = async (
         })
         return
       }
-      logger.info(
+      logger.debug(
         'cache-diagnostics',
         formatCacheDiagnosticsLogLine(observed.record),
       )
@@ -1307,7 +1305,7 @@ const anthropicAuthPlugin = async (
         input.betasHash,
         input.betas,
       )
-      if (betaLine) logger.info('cache-diagnostics', betaLine)
+      if (betaLine) logger.debug('cache-diagnostics', betaLine)
       if (observed.canary) {
         logger.warn(
           'cache-diagnostics',
@@ -2603,28 +2601,18 @@ const anthropicAuthPlugin = async (
     sessionId?: string,
   ) {
     const action = parseLaneStartCommandAction(argumentsText)
-    const storage = await loadAccounts(accountStoragePath)
-    const automaticEnabled = isStartAutomaticPersistentlyEnabled(storage)
     if (action.type === 'fire') {
       if (!sessionId) {
         return '## Claude Start Failed\n\n- OpenCode did not provide a session ID.'
       }
       try {
         await fireLaneStart(ctx.client, sessionId)
-        return executeLaneStartCommand({ argumentsText, automaticEnabled }).text
+        return executeLaneStartCommand({ argumentsText }).text
       } catch (error) {
         return `## Claude Start Failed\n\n- ${error instanceof Error ? error.message : String(error)}`
       }
     }
-    if (action.type === 'off') {
-      await setStartAutomaticPersistentEnabled(false, accountStoragePath)
-      logger.info('commands', 'start automatic changed', { enabled: false })
-      return executeLaneStartCommand({
-        argumentsText,
-        automaticEnabled: false,
-      }).text
-    }
-    return executeLaneStartCommand({ argumentsText, automaticEnabled }).text
+    return executeLaneStartCommand({ argumentsText }).text
   }
 
   async function executePersistentRoutingCommand(
@@ -2964,13 +2952,10 @@ const anthropicAuthPlugin = async (
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
     if (command === 'claude-start') {
       const text = await executePersistentStartCommand(args, sessionId)
-      const storage = await loadAccounts(accountStoragePath)
       return {
         command,
         text,
-        knobs: {
-          enabled: isStartAutomaticPersistentlyEnabled(storage),
-        },
+        knobs: {},
       }
     }
     if (command === 'claude-logging') {

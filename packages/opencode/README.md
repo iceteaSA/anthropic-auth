@@ -31,7 +31,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
-- **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline. `/claude-start automatic` is unavailable in the explicit-only v1 build; `/claude-start off` persists the disabled setting.
+- **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
 - **Fable/Opus 5 safety fallback**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
@@ -221,10 +221,6 @@ Example:
 The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
-
-## OpenCode lane-start setting
-
-`claudeStart` stores the explicit-only `/claude-start off` setting in the OpenCode sidecar. `/claude-start automatic` replies exactly: `Automatic lane start is not yet wired in this build; no setting was changed.` and writes nothing.
 
 ## Fallback accounts
 
@@ -426,19 +422,17 @@ Pi exposes `/claude-prime` as a status-only command. Its `on` and `off` argument
 
 ```text
 /claude-start
-/claude-start automatic
-/claude-start off
 ```
 
 The bare command fires immediately. The synthetic prompt uses the session's current model, agent, and variant, then travels through the ordinary quota, routing, cache, relay, signing, and response pipeline. OpenCode shapes that OAuth request to `max_tokens: 1` while keeping streaming enabled, and correlates the request by its synthetic message ID. A queued modal is a request to start the turn, not a provider-success claim.
 
-`/claude-start automatic` is unavailable in the explicit-only v1 build. It replies exactly: `Automatic lane start is not yet wired in this build; no setting was changed.` `/claude-start off` persists `claudeStart.enabled: false` in the OpenCode sidecar. Pi does not expose this command.
+Pi does not expose this command.
 
 ### Cache diagnostics (beta)
 
 The `cache-diagnosis-2026-04-07` beta is measure-only. It asks Anthropic to report prompt-cache diagnostics; it does not change cache controls or routing. OpenCode captures the provider's top-level response ID as an opaque string and sends it as `diagnostics.previous_message_id` on the next request in the same session. The first request sends `null`.
 
-The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Version `2` contains these fields:
+The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Records and their beta side-channel are emitted only at debug level; use `/claude-logging debug` to capture them. Version `2` contains these fields:
 
 | Field | Type | Source |
 | --- | --- | --- |
@@ -482,7 +476,7 @@ Lane-start cache observations therefore appear as ordinary `MC-CACHE-DIAG ` reco
 
 `synthetic` wins on conflict. A disagreement for a known source is an emitter defect: OpenCode writes one warning and still emits the record with the supplied `synthetic` value. Unknown future sources have no mapping and must not be rejected by consumers.
 
-The first observation of each `betas_hash` in a process also writes `MC-CACHE-DIAG-BETAS {"hash":"…","betas":[…]}` on the `cache-diagnostics` logger channel. Its sorted beta list makes an observed hash interpretable without reconstructing headers; repeated hashes do not emit another side-channel line.
+The first observation of each `betas_hash` in a process also writes `MC-CACHE-DIAG-BETAS {"hash":"…","betas":[…]}` at debug level on the `cache-diagnostics` logger channel. Its sorted beta list makes an observed hash interpretable without reconstructing headers; repeated hashes do not emit another side-channel line.
 
 The trailing space in `MC-CACHE-DIAG ` is load-bearing: a record line has a space after `MC-CACHE-DIAG`, while the beta side-channel line has a hyphen. Do not trim the delimiter or write a trimming consumer. `grep -c "MC-CACHE-DIAG"` over-counts because it includes beta lines; count records with `grep -c "MC-CACHE-DIAG "` or an anchored equivalent.
 
