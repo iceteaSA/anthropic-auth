@@ -874,7 +874,7 @@ describe('createStrippedStream', () => {
   test.each([
     ['LF', '\n\n', 1],
     ['CRLF', '\r\n\r\n', 2],
-  ])('resyncs finish detection across a split %s boundary', async (_name, delimiter, splitAt) => {
+  ])('resyncs finish detection after an oversized frame ending in a split %s boundary', async (_name, delimiter, splitAt) => {
     const completed: string[] = []
     const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
     const terminal = sse('message_delta', {
@@ -887,8 +887,9 @@ describe('createStrippedStream', () => {
         new ReadableStream({
           start(controller) {
             const encoder = new TextEncoder()
-            controller.enqueue(encoder.encode(skipped))
-            controller.enqueue(encoder.encode(delimiter.slice(0, splitAt)))
+            controller.enqueue(
+              encoder.encode(`${skipped}${delimiter.slice(0, splitAt)}`),
+            )
             controller.enqueue(
               encoder.encode(`${delimiter.slice(splitAt)}${terminal}`),
             )
@@ -1102,7 +1103,7 @@ describe('createStrippedStream', () => {
   test.each([
     ['LF', '\n\n', 1],
     ['CRLF', '\r\n\r\n', 2],
-  ])('resyncs retryable stream errors across a split %s boundary', async (_name, delimiter, splitAt) => {
+  ])('resyncs retryable stream errors after an oversized frame ending in a split %s boundary', async (_name, delimiter, splitAt) => {
     const encoder = new TextEncoder()
     const perf: Array<Record<string, unknown>> = []
     const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
@@ -1114,8 +1115,9 @@ describe('createStrippedStream', () => {
       new Response(
         new ReadableStream({
           start(controller) {
-            controller.enqueue(encoder.encode(skipped))
-            controller.enqueue(encoder.encode(delimiter.slice(0, splitAt)))
+            controller.enqueue(
+              encoder.encode(`${skipped}${delimiter.slice(0, splitAt)}`),
+            )
             controller.enqueue(
               encoder.encode(`${delimiter.slice(splitAt)}${error}`),
             )

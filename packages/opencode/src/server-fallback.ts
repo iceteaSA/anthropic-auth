@@ -365,7 +365,7 @@ export function createServerSideFallbackStreamRewriter(options: {
         pending = ''
         pendingBytes = 0
         resync = true
-        resyncCarry = ''
+        resyncCarry = tail.slice(-3)
         return output + tail
       }
       return output

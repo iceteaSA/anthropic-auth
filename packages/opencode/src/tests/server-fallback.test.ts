@@ -454,7 +454,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
   test.each([
     ['LF', '\n\n', 1],
     ['CRLF', '\r\n\r\n', 2],
-  ])('resyncs after an oversized frame across a split %s boundary', (_name, delimiter, splitAt) => {
+  ])('resyncs after an oversized frame ending in a split %s boundary', (_name, delimiter, splitAt) => {
     let handled = 0
     const skipped = `data: ${'x'.repeat(256)}`
     const later = [
@@ -493,8 +493,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
     })
 
     const output =
-      rewriter.push(skipped) +
-      rewriter.push(delimiter.slice(0, splitAt)) +
+      rewriter.push(`${skipped}${delimiter.slice(0, splitAt)}`) +
       rewriter.push(`${delimiter.slice(splitAt)}${later}`) +
       rewriter.flush()
 

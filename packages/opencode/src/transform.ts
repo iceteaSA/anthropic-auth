@@ -1612,9 +1612,10 @@ function updateSseFinishState(
         : { type: 'complete', finishReason: summary.stopReason }
   }
   if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
+    const tail = state.pending
     state.pending = ''
     state.disabled = true
-    state.resyncCarry = ''
+    state.resyncCarry = tail.slice(-3)
   }
   return update
 }
@@ -1807,9 +1808,10 @@ function updateSseErrorState(
   }
 
   if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
+    const tail = state.pending
     state.pending = ''
     state.disabled = true
-    state.resyncCarry = ''
+    state.resyncCarry = tail.slice(-3)
   }
   return retryable
 }
