@@ -911,6 +911,7 @@ const anthropicAuthPlugin = async (
   const laneStartTracker = new LaneStartTracker()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
+  const pendingRecoveryDesktopNotices = new Map<string, string>()
   const desktopNoticeFlushes = new Map<string, Promise<void>>()
   const desktopNoticeSafeSessions = new Set<string>()
   const desktopNoticeProbes = new Map<string, number>()
@@ -1270,16 +1271,6 @@ const anthropicAuthPlugin = async (
     dumpWrite?: Promise<void>
   }) {
     try {
-      if (input.dumpWrite) {
-        void input.dumpWrite
-          .then(() =>
-            dumpResponseArtifact(input.dump ?? null, {
-              status: input.status,
-              message: input.message,
-            }),
-          )
-          .catch(() => {})
-      }
       if (!input.request) return
       const observed = buildCacheDiagnosticsRecord({
         request: input.request,
@@ -1338,6 +1329,14 @@ const anthropicAuthPlugin = async (
   ) {
     const context = cacheDiagnosticsResponses.get(response)
     if (!context) return
+    context.dumpWrite = context.dumpWrite
+      .then(() =>
+        dumpResponseArtifact(context.dump, {
+          status: context.status,
+          message,
+        }),
+      )
+      .catch(() => {})
     observeCacheDiagnosticsMessage({
       ...context,
       message,
@@ -2305,22 +2304,26 @@ const anthropicAuthPlugin = async (
       routingAuthoritative: false,
     })
 
-    if (!desktopText || isTuiConnected(notice.sessionId)) return
+    if (desktopText) queueDesktopNotice(notice.sessionId, desktopText)
+  }
+
+  function queueDesktopNotice(sessionId: string, text: string) {
+    if (isTuiConnected(sessionId)) return
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
     // OpenCode awaits event handlers before it evaluates the loop exit condition.
     // Escape the post-idle session update, then probe outside that critical section.
-    const queue = pendingDesktopNotices.get(notice.sessionId) ?? []
-    queue.push(desktopText)
+    const queue = pendingDesktopNotices.get(sessionId) ?? []
+    queue.push(text)
     if (queue.length > 4) queue.splice(0, queue.length - 4)
-    pendingDesktopNotices.delete(notice.sessionId)
-    pendingDesktopNotices.set(notice.sessionId, queue)
+    pendingDesktopNotices.delete(sessionId)
+    pendingDesktopNotices.set(sessionId, queue)
     while (pendingDesktopNotices.size > 128) {
       const oldest = pendingDesktopNotices.keys().next().value
       if (oldest) pendingDesktopNotices.delete(oldest)
       else break
     }
-    if (desktopNoticeSafeSessions.has(notice.sessionId)) {
-      scheduleDesktopNoticeProbe(notice.sessionId)
+    if (desktopNoticeSafeSessions.has(sessionId)) {
+      scheduleDesktopNoticeProbe(sessionId)
     }
   }
 
@@ -3291,6 +3294,11 @@ const anthropicAuthPlugin = async (
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
         desktopNoticeSafeSessions.delete(sessionId)
+        for (const recoveryKey of pendingRecoveryDesktopNotices.keys()) {
+          if (recoveryKey.startsWith(`${sessionId}\0`)) {
+            pendingRecoveryDesktopNotices.delete(recoveryKey)
+          }
+        }
         desktopNoticeProbes.delete(sessionId)
       }
     },
@@ -5022,10 +5030,12 @@ const anthropicAuthPlugin = async (
                       ? {
                           onMessageStart: (message) =>
                             observeCacheDiagnosticsResponse(response, message),
+                          onStreamEnd: () => diagnosticsContext.dumpWrite,
                         }
                       : {
                           onMessageResponse: (message) =>
                             observeCacheDiagnosticsResponse(response, message),
+                          onStreamEnd: () => diagnosticsContext.dumpWrite,
                           responseMode: 'json' as const,
                         }
                     : {}),
@@ -5045,6 +5055,21 @@ const anthropicAuthPlugin = async (
                             fablePlan,
                             fableRequest.warmTarget.oauthAccountId,
                           )
+                          pendingRecoveryDesktopNotices.delete(
+                            fablePlan.recoveryKey,
+                          )
+                          pendingRecoveryDesktopNotices.set(
+                            fablePlan.recoveryKey,
+                            buildSwitchedToOpusNotice(fablePlan.requestedModel),
+                          )
+                          while (pendingRecoveryDesktopNotices.size > 128) {
+                            const oldest = pendingRecoveryDesktopNotices
+                              .keys()
+                              .next().value
+                            if (oldest)
+                              pendingRecoveryDesktopNotices.delete(oldest)
+                            else break
+                          }
                           serverFallbackTargets.delete(fablePlan.recoveryKey)
                           logger.info(
                             'fable-fallback',
@@ -5066,7 +5091,6 @@ const anthropicAuthPlugin = async (
                             },
                             storage,
                             auth,
-                            buildSwitchedToOpusNotice(fablePlan.requestedModel),
                           )
                         },
                       }
@@ -5079,6 +5103,25 @@ const anthropicAuthPlugin = async (
                             fableRequest.opusCacheAnchor,
                           )
                           if (!completed.counted) return
+                          const recoveryDesktopText =
+                            pendingRecoveryDesktopNotices.get(
+                              fablePlan.recoveryKey,
+                            )
+                          if (recoveryDesktopText) {
+                            pendingRecoveryDesktopNotices.delete(
+                              fablePlan.recoveryKey,
+                            )
+                            // Ignore any transient idle event emitted between the
+                            // refused source response and OpenCode's Opus retry.
+                            // Queue only after that retry has completed successfully.
+                            desktopNoticeSafeSessions.delete(
+                              fablePlan.sessionId,
+                            )
+                            queueDesktopNotice(
+                              fablePlan.sessionId,
+                              recoveryDesktopText,
+                            )
+                          }
                           logger.info(
                             'fable-fallback',
                             'Opus 4.8 turn completed',

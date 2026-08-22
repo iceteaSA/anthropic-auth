@@ -8016,6 +8016,19 @@ describe('auth.loader', () => {
       )?.remaining,
     ).toBe(10)
 
+    // OpenCode briefly reports idle after the refused source response while its
+    // internal retry is still pending. Do not insert the Desktop notice there:
+    // that user message would start another provider turn and consume the Opus
+    // retry response.
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    await Bun.sleep(250)
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+
     const firstOpus = await result.fetch(MESSAGES_URL, request)
     await firstOpus.text()
     await plugin.event?.({

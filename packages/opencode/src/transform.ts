@@ -1851,6 +1851,7 @@ export function createStrippedStream(
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
     onMessageStart?: (message: Record<string, unknown>) => void
     onMessageResponse?: (message: Record<string, unknown>) => void
+    onStreamEnd?: () => void | Promise<void>
     responseMode?: 'json'
     laneStart?: boolean
     laneStartOAuthServed?: boolean
@@ -2064,6 +2065,11 @@ export function createStrippedStream(
             }
             logProgress('stream_tool_prefix_rewrite', { readMs })
             releaseReader()
+            if (options.onStreamEnd) {
+              try {
+                await options.onStreamEnd()
+              } catch {}
+            }
             controller.close()
             return
           }

@@ -657,6 +657,26 @@ describe('createStrippedStream', () => {
     expect(seen).toEqual([message])
   })
 
+  test('waits for stream-end observers before completing the response body', async () => {
+    let releaseObserver!: () => void
+    let readCompleted = false
+    const response = createStrippedStream(new Response('payload'), {
+      onStreamEnd: () =>
+        new Promise<void>((resolve) => {
+          releaseObserver = resolve
+        }),
+    })
+    const read = response.text().then((text) => {
+      readCompleted = true
+      return text
+    })
+
+    await Bun.sleep(0)
+    expect(readCompleted).toBe(false)
+    releaseObserver()
+    expect(await read).toBe('payload')
+  })
+
   test('captures message_start before disabling diagnostics on an oversized stream tail', async () => {
     const start = sse('message_start', {
       type: 'message_start',
@@ -874,35 +894,38 @@ describe('createStrippedStream', () => {
   test.each([
     ['LF', '\n\n', 1],
     ['CRLF', '\r\n\r\n', 2],
-  ])('resyncs finish detection after an oversized frame ending in a split %s boundary', async (_name, delimiter, splitAt) => {
-    const completed: string[] = []
-    const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
-    const terminal = sse('message_delta', {
-      type: 'message_delta',
-      delta: { stop_reason: 'end_turn' },
-    })
-    const body = `${skipped}${delimiter}${terminal}`
-    const response = createStrippedStream(
-      new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder()
-            controller.enqueue(
-              encoder.encode(`${skipped}${delimiter.slice(0, splitAt)}`),
-            )
-            controller.enqueue(
-              encoder.encode(`${delimiter.slice(splitAt)}${terminal}`),
-            )
-            controller.close()
-          },
-        }),
-      ),
-      { onComplete: (finishReason) => completed.push(finishReason) },
-    )
+  ])(
+    'resyncs finish detection after an oversized frame ending in a split %s boundary',
+    async (_name, delimiter, splitAt) => {
+      const completed: string[] = []
+      const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+      const terminal = sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+      })
+      const body = `${skipped}${delimiter}${terminal}`
+      const response = createStrippedStream(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              const encoder = new TextEncoder()
+              controller.enqueue(
+                encoder.encode(`${skipped}${delimiter.slice(0, splitAt)}`),
+              )
+              controller.enqueue(
+                encoder.encode(`${delimiter.slice(splitAt)}${terminal}`),
+              )
+              controller.close()
+            },
+          }),
+        ),
+        { onComplete: (finishReason) => completed.push(finishReason) },
+      )
 
-    expect(await response.text()).toBe(body)
-    expect(completed).toEqual(['end_turn'])
-  })
+      expect(await response.text()).toBe(body)
+      expect(completed).toEqual(['end_turn'])
+    },
+  )
 
   test('swallows observation callback errors', async () => {
     const payload = sse('message_start', {
@@ -1103,46 +1126,49 @@ describe('createStrippedStream', () => {
   test.each([
     ['LF', '\n\n', 1],
     ['CRLF', '\r\n\r\n', 2],
-  ])('resyncs retryable stream errors after an oversized frame ending in a split %s boundary', async (_name, delimiter, splitAt) => {
-    const encoder = new TextEncoder()
-    const perf: Array<Record<string, unknown>> = []
-    const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
-    const error = sse('error', {
-      type: 'error',
-      error: { type: 'overloaded_error', message: 'temporarily overloaded' },
-    })
-    const response = createStrippedStream(
-      new Response(
-        new ReadableStream({
-          start(controller) {
-            controller.enqueue(
-              encoder.encode(`${skipped}${delimiter.slice(0, splitAt)}`),
-            )
-            controller.enqueue(
-              encoder.encode(`${delimiter.slice(splitAt)}${error}`),
-            )
-            controller.close()
-          },
-        }),
-      ),
-      { perf: (_stage, stats) => perf.push(stats ?? {}) },
-    )
+  ])(
+    'resyncs retryable stream errors after an oversized frame ending in a split %s boundary',
+    async (_name, delimiter, splitAt) => {
+      const encoder = new TextEncoder()
+      const perf: Array<Record<string, unknown>> = []
+      const skipped = `data: ${'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES * 2)}`
+      const error = sse('error', {
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'temporarily overloaded' },
+      })
+      const response = createStrippedStream(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(`${skipped}${delimiter.slice(0, splitAt)}`),
+              )
+              controller.enqueue(
+                encoder.encode(`${delimiter.slice(splitAt)}${error}`),
+              )
+              controller.close()
+            },
+          }),
+        ),
+        { perf: (_stage, stats) => perf.push(stats ?? {}) },
+      )
 
-    let caught: unknown
-    try {
-      await response.text()
-    } catch (error) {
-      caught = error
-    }
+      let caught: unknown
+      try {
+        await response.text()
+      } catch (error) {
+        caught = error
+      }
 
-    expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
-      'overloaded_error',
-    )
-    expect(
-      Math.max(...perf.map((stats) => Number(stats.sseErrorPending ?? 0))),
-    ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
-  })
+      expect((caught as { code?: string }).code).toBe('ECONNRESET')
+      expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
+        'overloaded_error',
+      )
+      expect(
+        Math.max(...perf.map((stats) => Number(stats.sseErrorPending ?? 0))),
+      ).toBeLessThanOrEqual(NON_STREAMING_DIAGNOSTICS_MAX_BYTES)
+    },
+  )
 
   test('reports server-side fallback outcomes without turning them into retryable errors', async () => {
     const encoder = new TextEncoder()

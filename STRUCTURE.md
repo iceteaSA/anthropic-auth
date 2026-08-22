@@ -56,7 +56,7 @@ anthropic-auth/
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
 - Contains: Extension entry point, command registration, request building, streaming provider
-- Key files: `index.ts` (provider registration), `stream.ts` (streaming request handling), `commands.ts` (slash command registration), `convert.ts` (request body conversion), `paths.ts` (Pi-specific path resolution)
+- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic and relay servers

@@ -114,17 +114,20 @@ describe('cache diagnostics v2 contract', () => {
   test.each([
     ['turn', false, 'account-turn'],
     ['prewarm_cachekeep', true, 'account-prewarm'],
-  ] as const)('records account_id for %s observations', (source, synthetic, accountId) => {
-    const result = buildCacheDiagnosticsRecord(
-      input({ source, synthetic, accountId }),
-    )
+  ] as const)(
+    'records account_id for %s observations',
+    (source, synthetic, accountId) => {
+      const result = buildCacheDiagnosticsRecord(
+        input({ source, synthetic, accountId }),
+      )
 
-    expect(result.record).toMatchObject({
-      source,
-      synthetic,
-      account_id: accountId,
-    })
-  })
+      expect(result.record).toMatchObject({
+        source,
+        synthetic,
+        account_id: accountId,
+      })
+    },
+  )
 
   test('warns on a known source synthetic mismatch while preserving synthetic', () => {
     const warnings: string[] = []
