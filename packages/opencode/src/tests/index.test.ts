@@ -7796,14 +7796,6 @@ describe('auth.loader', () => {
         properties: { sessionID: 'ses_server_fallback' },
       },
     })
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-
-    await plugin.event?.({
-      event: {
-        type: 'session.updated',
-        properties: { sessionID: 'ses_server_fallback' },
-      },
-    })
     await waitForMockCall(mockClient.session.promptAsync)
     expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
@@ -7821,8 +7813,8 @@ describe('auth.loader', () => {
 
     const restoredResponse = await result.fetch(MESSAGES_URL, request)
     // OpenCode can publish the assistant-completed event before the wrapped
-    // response emits its final fallback outcome. The post-idle session update must
-    // flush a notice queued after that completion event without starting another turn.
+    // response emits its final fallback outcome. The idle event must flush a notice
+    // queued after that completion event without requiring a later session update.
     await plugin.event?.({
       event: {
         type: 'message.updated',
@@ -7852,12 +7844,6 @@ describe('auth.loader', () => {
     await plugin.event?.({
       event: {
         type: 'session.idle',
-        properties: { sessionID: 'ses_server_fallback' },
-      },
-    })
-    await plugin.event?.({
-      event: {
-        type: 'session.updated',
         properties: { sessionID: 'ses_server_fallback' },
       },
     })

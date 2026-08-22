@@ -222,6 +222,9 @@ The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
+## OpenCode lane-start setting
+
+
 ## Fallback accounts
 
 Fallback accounts are separate Claude OAuth accounts or Anthropic-compatible API-key routes managed by this plugin. By default, the main account is tried first unless quota policy says it is currently unusable. Fallbacks are then tried in sidecar order when the primary request returns a configured fallback status.
@@ -432,7 +435,7 @@ Pi does not expose this command.
 
 The `cache-diagnosis-2026-04-07` beta is measure-only. It asks Anthropic to report prompt-cache diagnostics; it does not change cache controls or routing. OpenCode captures the provider's top-level response ID as an opaque string and sends it as `diagnostics.previous_message_id` on the next request in the same session. The first request sends `null`.
 
-The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Records and their beta side-channel are emitted only at debug level; use `/claude-logging debug` to capture them. Version `2` contains these fields:
+The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Records and their beta side-channel are emitted only at debug level; use `/claude-logging debug` to capture them. Because emission is gated on the runtime log level, an empty record stream is ambiguous between a quiet system and a level below debug — liveness checks must cross-reference an independent activity witness (billing, usage rows, or dumps) instead of reading silence as absence of cache traffic. Version `2` contains these fields:
 
 | Field | Type | Source |
 | --- | --- | --- |
