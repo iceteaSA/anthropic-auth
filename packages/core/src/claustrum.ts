@@ -70,12 +70,12 @@ export async function detectClaustrumConnection(
   try {
     raw = await fs.readFile(path, 'utf8')
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
+    const code = errorCode(error)
     if (code === 'ENOENT') return { status: 'absent', path }
     return {
       status: 'malformed',
       path,
-      reason: `unreadable (${code ?? 'unknown'})`,
+      reason: `unreadable (${code})`,
     }
   }
 
@@ -323,7 +323,7 @@ function validateManifestParent(
 }
 
 export class CustodyHandleManifestReader {
-  private cache:
+  #cache:
     | {
         mtimeMs: number
         size: number
@@ -334,21 +334,28 @@ export class CustodyHandleManifestReader {
       }
     | undefined
 
-  constructor(
-    private readonly options: {
-      path: string
-      provider: 'anthropic'
-      serve: 'anthropic-auth'
-      expectedUid?: number
-    },
-  ) {}
+  readonly #options: {
+    path: string
+    provider: 'anthropic'
+    serve: 'anthropic-auth'
+    expectedUid?: number
+  }
+
+  constructor(options: {
+    path: string
+    provider: 'anthropic'
+    serve: 'anthropic-auth'
+    expectedUid?: number
+  }) {
+    this.#options = options
+  }
 
   async read(): Promise<CustodyHandleManifestReadResult> {
     const expectedUid =
-      this.options.expectedUid ?? process.getuid?.() ?? userInfo().uid
+      this.#options.expectedUid ?? process.getuid?.() ?? userInfo().uid
     let pathStats: Awaited<ReturnType<typeof fs.lstat>>
     try {
-      pathStats = await fs.lstat(this.options.path)
+      pathStats = await fs.lstat(this.#options.path)
     } catch (error) {
       if (errorCode(error) === 'ENOENT') return { status: 'absent' }
       return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
@@ -359,7 +366,7 @@ export class CustodyHandleManifestReader {
 
     try {
       const parentReason = validateManifestParent(
-        await fs.lstat(dirname(this.options.path)),
+        await fs.lstat(dirname(this.#options.path)),
         expectedUid,
       )
       if (parentReason) return { status: 'invalid', reason: parentReason }
@@ -368,23 +375,21 @@ export class CustodyHandleManifestReader {
     }
 
     if (
-      this.cache?.mtimeMs === pathStats.mtimeMs &&
-      this.cache.size === pathStats.size
+      this.#cache?.mtimeMs === pathStats.mtimeMs &&
+      this.#cache.size === pathStats.size
     ) {
-      return this.cache.result
+      return this.#cache.result
     }
 
     let handle: fs.FileHandle | undefined
     try {
       handle = await fs.open(
-        this.options.path,
+        this.#options.path,
         fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
       )
       // The validated descriptor, not the path, is the authority for content and metadata after open.
-      const openedFileReason = validateManifestFile(
-        await handle.stat(),
-        expectedUid,
-      )
+      const openedStats = await handle.stat()
+      const openedFileReason = validateManifestFile(openedStats, expectedUid)
       if (openedFileReason)
         return { status: 'invalid', reason: openedFileReason }
 
@@ -410,15 +415,15 @@ export class CustodyHandleManifestReader {
       try {
         parsed = readCustodyHandles(
           json,
-          this.options.provider,
-          this.options.serve,
+          this.#options.provider,
+          this.#options.serve,
         )
       } catch (error) {
         if (error instanceof CustodyManifestSelectionError) {
           const result = { status: 'ignored', reason: error.reason } as const
-          this.cache = {
-            mtimeMs: pathStats.mtimeMs,
-            size: pathStats.size,
+          this.#cache = {
+            mtimeMs: openedStats.mtimeMs,
+            size: openedStats.size,
             result,
           }
           return result
@@ -431,13 +436,17 @@ export class CustodyHandleManifestReader {
 
       const manifest: CustodyHandleManifest = {
         version: parsed.version,
-        provider: this.options.provider,
-        serve: this.options.serve,
+        provider: this.#options.provider,
+        serve: this.#options.serve,
         accounts: parsed.accounts,
         superseded: parsed.superseded,
       }
       const result = { status: 'ready', manifest } as const
-      this.cache = { mtimeMs: pathStats.mtimeMs, size: pathStats.size, result }
+      this.#cache = {
+        mtimeMs: openedStats.mtimeMs,
+        size: openedStats.size,
+        result,
+      }
       return result
     } catch (error) {
       return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }

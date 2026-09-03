@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
+import { constants as fsConstants } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -6,28 +7,10 @@ import {
   CustodyHandleManifestReader,
   readCustodyHandles,
 } from '@cortexkit/anthropic-auth-core'
+import { loadGoldenCustodyManifest } from './custody-handle-manifest.fixture.ts'
 
-const fixturePath = join(
-  import.meta.dir,
-  'fixtures',
-  'claustrum-golden',
-  'handles.json',
-)
-const fixtureText = await fs.readFile(fixturePath, 'utf8')
-const fixture = JSON.parse(fixtureText) as {
-  version: number
-  providers: Array<{
-    provider: string
-    serve: string
-    accounts: Array<{
-      label: string
-      handle: string
-      credential_id: string
-      superseded?: string[]
-      [key: string]: unknown
-    }>
-  }>
-}
+const { text: fixtureText, manifest: fixture } =
+  await loadGoldenCustodyManifest()
 
 async function withTempDirectory<T>(
   callback: (directory: string) => Promise<T>,
@@ -51,6 +34,7 @@ async function withManifest<T>(
     await fs.chmod(parent, 0o700)
     await fs.writeFile(path, content)
     await fs.chmod(path, 0o600)
+    await fs.lstat(path)
     return callback(path)
   })
 }
@@ -241,6 +225,27 @@ describe('CustodyHandleManifestReader', () => {
     await withManifest(fixtureText, async (path) => {
       await fs.chmod(path, 0o644)
       await expectInvalid(reader(path).read(), 'manifest mode must be 0600')
+    })
+  })
+
+  test('rejects a manifest with restrictive but non-0600 mode', async () => {
+    await withManifest(fixtureText, async (path) => {
+      await fs.chmod(path, 0o400)
+      await fs.lstat(path)
+      await expectInvalid(reader(path).read(), 'manifest mode must be 0600')
+    })
+  })
+
+  test('opens a validated manifest with O_NOFOLLOW', async () => {
+    await withManifest(fixtureText, async (path) => {
+      const openSpy = spyOn(fs, 'open')
+
+      await expect(reader(path).read()).resolves.toMatchObject({
+        status: 'ready',
+      })
+
+      const [, flags] = openSpy.mock.calls[0] ?? []
+      expect((Number(flags) & fsConstants.O_NOFOLLOW) !== 0).toBe(true)
     })
   })
 
