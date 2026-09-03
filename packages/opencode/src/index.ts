@@ -1720,14 +1720,19 @@ const anthropicAuthPlugin = async (
   const custodyHandleResolutionWarnings = new Set<string>()
   let claustrumConnectBackoffUntil = 0
 
-  function warnCustodyResolutionOnce(accountId: string, reason: string) {
+  function claimCustodyWarningSlot(accountId: string, reason: string) {
     const key = `${accountId}\0${reason}`
-    if (custodyHandleResolutionWarnings.has(key)) return
+    if (custodyHandleResolutionWarnings.has(key)) return false
     if (custodyHandleResolutionWarnings.size >= 256) {
       const oldest = custodyHandleResolutionWarnings.values().next().value
       if (oldest) custodyHandleResolutionWarnings.delete(oldest)
     }
     custodyHandleResolutionWarnings.add(key)
+    return true
+  }
+
+  function warnCustodyResolutionOnce(accountId: string, reason: string) {
+    if (!claimCustodyWarningSlot(accountId, reason)) return
     logger.warn('claustrum', 'custody handle resolution fallback', {
       id: accountId,
       reason,
@@ -1779,6 +1784,34 @@ const anthropicAuthPlugin = async (
       warnCustodyResolutionOnce(account.id, 'legacy')
     }
     return resolution
+  }
+
+  async function clearManifestResolvedLegacyHandle(
+    account: OAuthAccount,
+    resolution: CustodyHandleResolution,
+  ) {
+    if (
+      resolution.status !== 'resolved' ||
+      resolution.source !== 'manifest' ||
+      !account.claustrumHandle
+    ) {
+      return
+    }
+    await clearClaustrumHandlePersistent({
+      id: account.id,
+      path: accountStoragePath,
+    })
+    delete account.claustrumHandle
+  }
+
+  function warnManifestStateHandleClearOnce(accountId: string) {
+    const reason = 'manifest-state-clear-failed'
+    if (!claimCustodyWarningSlot(accountId, reason)) return
+    logger.warn(
+      'claustrum',
+      'failed to clear legacy custody handle after manifest resolution',
+      { id: accountId, reason },
+    )
   }
 
   function claustrumAccounts(storage: AccountStorage): OAuthAccount[] {
@@ -2124,6 +2157,11 @@ const anthropicAuthPlugin = async (
         cache &&
         usableClaustrumAccessToken(cache.peek(handle), claustrumNow())
       ) {
+        try {
+          await clearManifestResolvedLegacyHandle(account, custodyHandle)
+        } catch {
+          warnManifestStateHandleClearOnce(account.id)
+        }
         continue
       }
       const sidecarNearExpiry =
@@ -2183,6 +2221,11 @@ const anthropicAuthPlugin = async (
             await custodyOverrideRefresh('vault credential unavailable')
           }
         } else {
+          try {
+            await clearManifestResolvedLegacyHandle(account, custodyHandle)
+          } catch {
+            warnManifestStateHandleClearOnce(account.id)
+          }
           await markClaustrumCredentialReady(account.id, handle)
         }
         sidebarChanged = true
@@ -4313,6 +4356,10 @@ const anthropicAuthPlugin = async (
                   }
                 }
               }
+              await clearManifestResolvedLegacyHandle(
+                account,
+                custodyResolution,
+              )
               if (changed === 'unchanged') {
                 return {
                   text: `Custody already on for ${account.id}.`,

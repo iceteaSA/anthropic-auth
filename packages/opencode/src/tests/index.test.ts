@@ -1629,6 +1629,97 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'clears a crash-left state handle when custody on resolves from the manifest',
+    async () => {
+      const label = 'manifest-state-cleanup'
+      await useTempAccountFile(manifestStorage({ label, gate: true }))
+      await writeManifest([{ label, handle: manifestHandle }])
+      const restore = await configureClaustrumConnection()
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([[manifestHandle, 'manifest-state-cleanup-access']]),
+        ),
+      })
+      try {
+        await plugin.__fallbackRefreshReady
+        const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const storage = JSON.parse(await readFile(path, 'utf8')) as {
+          accounts: Array<Record<string, unknown>>
+        }
+        const account = storage.accounts.find(
+          (candidate) => candidate.id === 'fallback-1',
+        )!
+        account.claustrumHandle = legacyHandle
+        await writeFile(path, JSON.stringify(storage))
+        expect(await readFile(path, 'utf8')).toContain(legacyHandle)
+
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'manifest-state-cleanup',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toBe('Custody already on for fallback-1.')
+        expect(await readFile(path, 'utf8')).not.toContain(legacyHandle)
+      } finally {
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
+    'clears a crash-left manifest-resolved state handle on the custody tick',
+    async () => {
+      const label = 'manifest-tick-cleanup'
+      await useTempAccountFile(manifestStorage({ label, gate: true }))
+      await writeManifest([{ label, handle: manifestHandle }])
+      const restore = await configureClaustrumConnection()
+      const intervalHandlers: Array<() => void> = []
+      const plugin = await getPlugin(undefined, undefined, {
+        setInterval: mock((handler: () => void) => {
+          intervalHandlers.push(handler)
+          return { unref() {} }
+        }) as unknown as typeof setInterval,
+        clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([[manifestHandle, 'manifest-tick-cleanup-access']]),
+        ),
+      })
+      try {
+        await plugin.__fallbackRefreshReady
+        const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const storage = JSON.parse(await readFile(path, 'utf8')) as {
+          accounts: Array<Record<string, unknown>>
+        }
+        const account = storage.accounts.find(
+          (candidate) => candidate.id === 'fallback-1',
+        )!
+        account.claustrumHandle = legacyHandle
+        delete account.access
+        delete account.expires
+        await writeFile(path, JSON.stringify(storage))
+        expect(await readFile(path, 'utf8')).toContain(legacyHandle)
+
+        expect(intervalHandlers.length).toBeGreaterThan(0)
+        for (const handler of intervalHandlers) handler()
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if (!(await readFile(path, 'utf8')).includes(legacyHandle)) break
+          await Bun.sleep(10)
+        }
+        expect(await readFile(path, 'utf8')).not.toContain(legacyHandle)
+      } finally {
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
     'skips an invalid-label legacy migration without disabling custody',
     async () => {
       await useTempAccountFile(

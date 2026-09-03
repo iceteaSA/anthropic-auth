@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   __setCustodyManifestLockTestOptions,
+  __setLogTestSink,
+  CUSTODY_MANIFEST_LOCK_TTL_MS,
   CustodyHandleManifestReader,
   readCustodyHandles,
   resolveCustodyHandle,
@@ -790,6 +792,62 @@ describe('withCustodyManifestLock', () => {
       })
     },
   )
+
+  test.serial(
+    'keeps an expired owner lock for the next claimant to evict',
+    async () => {
+      await withTempDirectory(async (directory) => {
+        const path = join(directory, 'handles.json')
+        const lockPath = `${path}.lock`
+        const originalNow = Date.now
+        let now = 0
+        const logs: Array<{
+          level?: string
+          channel?: string
+          message?: string
+          payload?: Record<string, unknown>
+        }> = []
+        Date.now = () => now
+        __setCustodyManifestLockTestOptions({
+          ttlMs: 100,
+          retryMinMs: 5,
+          retryMaxMs: 5,
+          renewalIntervalMs: 1_000,
+        } as never)
+        __setLogTestSink((record) => logs.push(record))
+        try {
+          await withCustodyManifestLock(path, async () => {
+            now = 101
+          })
+          await expect(fs.lstat(lockPath)).resolves.toBeDefined()
+          expect(logs).toContainEqual({
+            level: 'warn',
+            channel: 'claustrum',
+            message: 'manifest lock lease lost, not releasing',
+            payload: { id: path },
+          })
+
+          await withCustodyManifestLock(path, async () => {})
+          await expect(fs.lstat(lockPath)).rejects.toMatchObject({
+            code: 'ENOENT',
+          })
+        } finally {
+          __setLogTestSink(null)
+          Date.now = originalNow
+        }
+      })
+    },
+  )
+
+  test('pins renewal cadence within one third of the lease', async () => {
+    const core = (await import('@cortexkit/anthropic-auth-core')) as {
+      CUSTODY_MANIFEST_LOCK_RENEW_MS?: number
+    }
+    expect(core.CUSTODY_MANIFEST_LOCK_RENEW_MS).toBeDefined()
+    expect(
+      (core.CUSTODY_MANIFEST_LOCK_RENEW_MS ?? Infinity) * 3,
+    ).toBeLessThanOrEqual(CUSTODY_MANIFEST_LOCK_TTL_MS)
+  })
 })
 
 describe('resolveCustodyHandle', () => {

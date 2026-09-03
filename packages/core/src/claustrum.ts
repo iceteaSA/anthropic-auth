@@ -562,6 +562,7 @@ export type CustodyHandleManifestWriteResult =
   | { status: 'refused'; reason: string }
 
 export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
+export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
 export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
 export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
 
@@ -695,24 +696,31 @@ export async function withCustodyManifestLock<T>(
     () => {
       void writeOwner(now()).catch(() => {})
     },
-    custodyManifestLockTestOptions?.renewalIntervalMs ?? Math.floor(ttlMs / 3),
+    custodyManifestLockTestOptions?.renewalIntervalMs ??
+      Math.min(CUSTODY_MANIFEST_LOCK_RENEW_MS, Math.floor(ttlMs / 3)),
   )
   if ('unref' in renewal) renewal.unref()
   try {
     return await fn()
   } finally {
     clearInterval(renewal)
+    let ownsCurrentLease = false
     try {
       const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
-      if (
+      ownsCurrentLease =
         isRecord(owner) &&
         owner.pid === process.pid &&
-        owner.nonce === nonce
-      ) {
-        await fs.rm(lockPath, { recursive: true, force: true })
-      }
-    } catch {
-      // Another claimant may have evicted this lease before release.
+        owner.nonce === nonce &&
+        typeof owner.claimed_at_ms === 'number' &&
+        Number.isFinite(owner.claimed_at_ms) &&
+        now() - owner.claimed_at_ms < ttlMs
+    } catch {}
+    if (!ownsCurrentLease) {
+      logger.warn('claustrum', 'manifest lock lease lost, not releasing', {
+        id: path,
+      })
+    } else {
+      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
     }
   }
 }
