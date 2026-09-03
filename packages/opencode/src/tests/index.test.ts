@@ -1362,6 +1362,73 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'reports a warmed manifest-only handle as vault served',
+    async () => {
+      await useTempAccountFile(manifestStorage({ label: 'manifest-served' }))
+      await writeManifest([
+        { label: 'manifest-served', handle: manifestHandle },
+      ])
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([[manifestHandle, 'manifest-served-access']]),
+        ),
+      })
+      await plugin.__fallbackRefreshReady
+      const payload = await runCustodyCommand(plugin, 'manifest-served', '')
+      const accounts = payload?.knobs.accounts as Array<{
+        id: string
+        vaultServed: boolean
+      }>
+      expect(
+        accounts.find((account) => account.id === 'fallback-1')?.vaultServed,
+      ).toBe(true)
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'keeps an eligible manifest-only fallback off the local refresh path',
+    async () => {
+      await useTempAccountFile(manifestStorage({ label: 'manifest-enabled' }))
+      await writeManifest([
+        { label: 'manifest-enabled', handle: manifestHandle },
+      ])
+      let tokenRequests = 0
+      globalThis.fetch = mock((input: unknown) => {
+        if (extractUrl(input as string | URL | Request) === TOKEN_URL)
+          tokenRequests += 1
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: async () => {
+          throw new Error('vault offline')
+        },
+      })
+      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+      const current = (await loadAccounts(path))!
+      const fallback = current.accounts.find(
+        (account): account is OAuthAccount =>
+          account.id === 'fallback-1' && isOAuthAccount(account),
+      )!
+      fallback.expires = Date.now() + 60_000
+      await saveAccounts(current, path)
+      const result = await plugin.auth.loader(
+        async () => ({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 5 * 60 * 60_000,
+        }),
+        { models: {} },
+      )
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(tokenRequests).toBe(0)
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
     'writes the manifest before clearing a migrated legacy handle',
     async () => {
       await useTempAccountFile(
@@ -1410,6 +1477,60 @@ describe('fallback Claustrum credential resolution', () => {
       } finally {
         rename.mockRestore()
         restore()
+      }
+    },
+  )
+
+  test.serial(
+    'uses legacy when a manifest has no anthropic provider',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({ label: 'missing-provider', legacy: legacyHandle }),
+      )
+      await fs.writeFile(
+        join(tempConfigDir!, 'handles.json'),
+        JSON.stringify({
+          version: 1,
+          providers: [
+            {
+              provider: 'foreign',
+              serve: 'anthropic-auth',
+              accounts: [],
+            },
+          ],
+        }),
+      )
+      const manifestPath = join(tempConfigDir!, 'handles.json')
+      await fs.chmod(manifestPath, 0o600)
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+      const calls: CredentialCall[] = []
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      try {
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: manifestConnector(
+            calls,
+            new Map([[legacyHandle, 'missing-provider-access']]),
+          ),
+        })
+        await plugin.__fallbackRefreshReady
+        expect(
+          calls.filter(
+            (call) =>
+              call.method === 'credential.get' &&
+              call.params.handle === legacyHandle,
+          ),
+        ).toHaveLength(1)
+        expect(
+          logs.filter(
+            (record) =>
+              record.message === 'custody handle resolution fallback' &&
+              record.payload?.reason === 'legacy',
+          ),
+        ).toHaveLength(1)
+        await plugin.dispose?.()
+      } finally {
+        __setLogTestSink(null)
       }
     },
   )
