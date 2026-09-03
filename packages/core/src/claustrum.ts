@@ -246,9 +246,17 @@ function legacyOrUnresolved(
   return { status: 'unresolved', reason }
 }
 
+/**
+ * | manifest state | legacy handle | result |
+ * | --- | --- | --- |
+ * | matching ready entry | any | manifest handle |
+ * | absent or invalid | present | legacy handle |
+ * | no matching ready entry | present | legacy handle |
+ * | foreign serve | any | unresolved |
+ */
 export function resolveCustodyHandle(input: {
   account: OAuthAccount
-  manifest?: CustodyHandleManifest
+  manifest: CustodyHandleManifest | undefined
   duplicateOAuthLabels?: ReadonlySet<string>
 }): CustodyHandleResolution {
   const { account, manifest, duplicateOAuthLabels } = input
@@ -262,14 +270,15 @@ export function resolveCustodyHandle(input: {
   if (duplicateOAuthLabels?.has(account.label)) {
     return legacyOrUnresolved(account, 'duplicate-label')
   }
+  if (!manifest) return legacyOrUnresolved(account, 'missing-entry')
 
-  const entry = manifest?.accounts.find(
+  const entry = manifest.accounts.find(
     (candidate) =>
       candidate.label === account.label &&
       candidate.credentialId === `oauth:anthropic:${account.label}`,
   )
   if (!entry) return legacyOrUnresolved(account, 'missing-entry')
-  if (manifest?.superseded.has(entry.handle)) {
+  if (manifest.superseded.has(entry.handle)) {
     return { status: 'unresolved', reason: 'superseded' }
   }
   return { status: 'resolved', source: 'manifest', handle: entry.handle }
@@ -452,13 +461,6 @@ export class CustodyHandleManifestReader {
       return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
     }
 
-    if (
-      this.#cache?.mtimeMs === pathStats.mtimeMs &&
-      this.#cache.size === pathStats.size
-    ) {
-      return this.#cache.result
-    }
-
     let handle: fs.FileHandle | undefined
     try {
       handle = await fs.open(
@@ -470,6 +472,13 @@ export class CustodyHandleManifestReader {
       const openedFileReason = validateManifestFile(openedStats, expectedUid)
       if (openedFileReason)
         return { status: 'invalid', reason: openedFileReason }
+
+      if (
+        this.#cache?.mtimeMs === openedStats.mtimeMs &&
+        this.#cache.size === openedStats.size
+      ) {
+        return this.#cache.result
+      }
 
       const bytes = new Uint8Array(MAX_CUSTODY_MANIFEST_BYTES + 1)
       const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, 0)

@@ -315,9 +315,26 @@ describe('CustodyHandleManifestReader', () => {
     })
   })
 
-  test('caches parsed content by metadata while rechecking file mode', async () => {
+  test('keys parsed-content cache hits to validated descriptor metadata', async () => {
     await withManifest(fixtureText, async (path) => {
-      const openSpy = spyOn(fs, 'open')
+      const originalLstat = fs.lstat
+      const originalOpen = fs.open
+      const readSpies: Array<ReturnType<typeof spyOn>> = []
+      let manifestLstatCalls = 0
+      spyOn(fs, 'lstat').mockImplementation(async (target) => {
+        const stats = await originalLstat(target)
+        if (target !== path || ++manifestLstatCalls !== 2) return stats
+        return Object.assign(Object.create(stats), {
+          mtimeMs: stats.mtimeMs + 1,
+        })
+      })
+      const openSpy = spyOn(fs, 'open').mockImplementation(
+        async (...arguments_) => {
+          const handle = await originalOpen(...arguments_)
+          readSpies.push(spyOn(handle, 'read'))
+          return handle
+        },
+      )
       const manifestReader = reader(path)
       await expect(manifestReader.read()).resolves.toMatchObject({
         status: 'ready',
@@ -325,11 +342,12 @@ describe('CustodyHandleManifestReader', () => {
       await expect(manifestReader.read()).resolves.toMatchObject({
         status: 'ready',
       })
-      expect(openSpy).toHaveBeenCalledTimes(1)
+      expect(openSpy).toHaveBeenCalledTimes(2)
+      expect(readSpies.flatMap((readSpy) => readSpy.mock.calls)).toHaveLength(1)
 
       await fs.chmod(path, 0o644)
       await expectInvalid(manifestReader.read(), 'manifest mode must be 0600')
-      expect(openSpy).toHaveBeenCalledTimes(1)
+      expect(openSpy).toHaveBeenCalledTimes(2)
     })
   })
 })
@@ -422,6 +440,21 @@ describe('resolveCustodyHandle', () => {
     })
 
     expectResolvedSource(result, 'legacy')
+  })
+
+  test('falls back to legacy when the reader rejects an invalid manifest', async () => {
+    await withManifest('{', async (path) => {
+      const result = await reader(path).read()
+      expect(result.status).toBe('invalid')
+
+      expectResolvedSource(
+        resolveCustodyHandle({
+          account: account({ label: 'alice', claustrumHandle: legacyHandle }),
+          manifest: result.status === 'ready' ? result.manifest : undefined,
+        }),
+        'legacy',
+      )
+    })
   })
 
   test('returns unresolved for a missing label without a legacy handle', () => {
