@@ -24,6 +24,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
+  __setCustodyManifestLockTestOptions,
   __setLogTestSink,
   type AccountStorage,
   acquireRefreshFileLock,
@@ -1074,17 +1075,20 @@ describe('fallback Claustrum credential resolution', () => {
   }
 
   function manifestStorage(input: {
+    id?: string
     label: string
     enabled?: boolean
     legacy?: string
     gate?: boolean
   }) {
+    const id = input.id ?? 'fallback-1'
     return fallbackWithClaustrum({
+      id,
       label: input.label,
       enabled: true,
       ...(input.legacy && { claustrumHandle: input.legacy }),
       claustrum: {
-        accounts: { 'fallback-1': { enabled: input.gate ?? true } },
+        accounts: { [id]: { enabled: input.gate ?? true } },
       },
       ...(input.enabled === false && { enabled: false }),
     })
@@ -1354,6 +1358,353 @@ describe('fallback Claustrum credential resolution', () => {
         calls.filter((call) => call.method === 'credential.get'),
       ).toHaveLength(1)
       await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'writes the manifest before clearing a migrated legacy handle',
+    async () => {
+      await useTempAccountFile(
+        fallbackWithClaustrum({
+          label: 'migration-order',
+          enabled: true,
+          claustrumHandle: legacyHandle,
+        }),
+      )
+      const manifestPath = await writeManifest([])
+      const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+      const accountStatePath = getAccountStatePath(accountPath)
+      const restore = await configureClaustrumConnection()
+      const originalRename = fs.rename
+      let stateAtManifestWrite: string | undefined
+      const rename = spyOn(fs, 'rename').mockImplementation(
+        async (from, to) => {
+          if (to === manifestPath)
+            stateAtManifestWrite = await readFile(accountStatePath, 'utf8')
+          return originalRename(from, to)
+        },
+      )
+      try {
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: manifestConnector(
+            [],
+            new Map([[legacyHandle, 'migration-order-access']]),
+          ),
+        })
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'migration-order',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toContain('Custody on')
+        expect(stateAtManifestWrite).toContain(legacyHandle)
+        expect(await readFile(accountStatePath, 'utf8')).not.toContain(
+          legacyHandle,
+        )
+        expect(await readFile(accountPath, 'utf8')).not.toContain(legacyHandle)
+        expect(await readFile(manifestPath, 'utf8')).toContain(legacyHandle)
+        await plugin.dispose?.()
+      } finally {
+        rename.mockRestore()
+        restore()
+      }
+    },
+  )
+
+  async function withShortManifestLockTiming<T>(fn: () => Promise<T>) {
+    __setCustodyManifestLockTestOptions({
+      ttlMs: 150,
+      retryMinMs: 5,
+      retryMaxMs: 5,
+    })
+    try {
+      return await fn()
+    } finally {
+      __setCustodyManifestLockTestOptions()
+    }
+  }
+
+  async function createLegacyMigrationPlugin(input: {
+    id?: string
+    label: string
+    handle: string
+    connector?: (
+      calls: CredentialCall[],
+    ) => PluginRuntimeOverrides['claustrumConnector']
+  }) {
+    await useTempAccountFile(
+      fallbackWithClaustrum({
+        id: input.id ?? 'fallback-1',
+        label: input.label,
+        enabled: true,
+        claustrumHandle: input.handle,
+      }),
+    )
+    const manifestPath = await writeManifest([])
+    const restore = await configureClaustrumConnection()
+    const calls: CredentialCall[] = []
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector:
+        input.connector?.(calls) ??
+        manifestConnector(
+          calls,
+          new Map([[input.handle, `${input.label}-access`]]),
+        ),
+    })
+    return { calls, manifestPath, plugin, restore }
+  }
+
+  test.serial(
+    'refuses a fresh manifest lock after its bounded wait and keeps the legacy handle',
+    async () => {
+      await withShortManifestLockTiming(async () => {
+        const { manifestPath, plugin, restore } =
+          await createLegacyMigrationPlugin({
+            label: 'fresh-lock',
+            handle: legacyHandle,
+          })
+        const lockPath = `${manifestPath}.lock`
+        await mkdir(lockPath, { mode: 0o700 })
+        await writeFile(
+          join(lockPath, 'owner'),
+          `${JSON.stringify({ claimed_at_ms: Date.now(), tenant: 'test' })}\n`,
+        )
+        const logs: LogTestRecord[] = []
+        __setLogTestSink((record) => logs.push(record))
+        const startedAt = Date.now()
+        try {
+          const payload = await Promise.race([
+            runCustodyCommand(plugin, 'fresh-lock', 'custody fallback-1 on'),
+            Bun.sleep(1_000).then(() => {
+              throw new Error('manifest lock busy did not respect its deadline')
+            }),
+          ])
+          const elapsedMs = Date.now() - startedAt
+          expect(elapsedMs).toBeGreaterThanOrEqual(120)
+          expect(elapsedMs).toBeLessThan(1_000)
+          expect(payload?.text).toContain('Custody on')
+          expect(
+            logs.some(
+              (record) =>
+                record.message === 'custody manifest write failed' &&
+                record.payload?.reason === 'manifest lock busy',
+            ),
+          ).toBe(true)
+          expect(
+            await readFile(
+              getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+              'utf8',
+            ),
+          ).toContain(legacyHandle)
+        } finally {
+          __setLogTestSink(null)
+          await plugin.dispose?.()
+          restore()
+        }
+      })
+    },
+  )
+
+  test.serial('renames a stale manifest lock before writing', async () => {
+    await withShortManifestLockTiming(async () => {
+      const { manifestPath, plugin, restore } =
+        await createLegacyMigrationPlugin({
+          label: 'stale-lock',
+          handle: legacyHandle,
+        })
+      const lockPath = `${manifestPath}.lock`
+      await mkdir(lockPath, { mode: 0o700 })
+      await writeFile(
+        join(lockPath, 'owner'),
+        `${JSON.stringify({ claimed_at_ms: Date.now() - 1_000, tenant: 'test' })}\n`,
+      )
+      const originalRename = fs.rename
+      const staleRenames: string[] = []
+      const rename = spyOn(fs, 'rename').mockImplementation(
+        async (from, to) => {
+          if (from === lockPath) staleRenames.push(String(to))
+          return originalRename(from, to)
+        },
+      )
+      try {
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'stale-lock',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toContain('Custody on')
+        expect(staleRenames).toHaveLength(1)
+        expect(staleRenames[0]).toStartWith(`${lockPath}.`)
+        expect(staleRenames[0]).toEndWith('.stale')
+      } finally {
+        rename.mockRestore()
+        await plugin.dispose?.()
+        restore()
+      }
+    })
+  })
+
+  test.serial(
+    'records manifest lock ownership during a migration write',
+    async () => {
+      const { manifestPath, plugin, restore } =
+        await createLegacyMigrationPlugin({
+          label: 'lock-owner',
+          handle: legacyHandle,
+        })
+      const lockPath = `${manifestPath}.lock`
+      const originalRename = fs.rename
+      let owner: Record<string, unknown> | undefined
+      const rename = spyOn(fs, 'rename').mockImplementation(
+        async (from, to) => {
+          if (to === manifestPath)
+            owner = JSON.parse(await readFile(join(lockPath, 'owner'), 'utf8'))
+          return originalRename(from, to)
+        },
+      )
+      try {
+        await runCustodyCommand(plugin, 'lock-owner', 'custody fallback-1 on')
+        expect(owner).toMatchObject({ tenant: 'anthropic-auth' })
+        expect(typeof owner?.claimed_at_ms).toBe('number')
+        await expect(fs.stat(lockPath)).rejects.toThrow()
+      } finally {
+        rename.mockRestore()
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
+    'preserves two concurrent legacy migrations in one manifest',
+    async () => {
+      await withShortManifestLockTiming(async () => {
+        const storageA = fallbackWithClaustrum({
+          id: 'fallback-a',
+          label: 'migration-a',
+          enabled: true,
+          claustrumHandle: `ckh_${'A'.repeat(43)}`,
+        })
+        await useTempAccountFile(storageA)
+        const accountPathA = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const manifestPath = await writeManifest([])
+        const restore = await configureClaustrumConnection()
+        const entered = deferred()
+        const release = deferred()
+        let credentialGets = 0
+        const concurrentCalls: CredentialCall[] = []
+        const concurrentConnector = connectorFor(
+          concurrentCalls,
+          async (method, params) => {
+            if (method !== 'credential.get')
+              throw new Error(`unexpected method: ${method}`)
+            credentialGets += 1
+            if (credentialGets === 2) entered.resolve()
+            await release.promise
+            return credentialResponse(
+              `migration-${String(params.handle).at(-1)}-access`,
+              1,
+            )
+          },
+        )
+        const pluginA = await getPlugin(undefined, undefined, {
+          claustrumConnector: concurrentConnector,
+        })
+
+        const accountPathB = join(tempConfigDir!, 'anthropic-auth-b.json')
+        const storageB = fallbackWithClaustrum({
+          id: 'fallback-b',
+          label: 'migration-b',
+          enabled: true,
+          claustrumHandle: `ckh_${'B'.repeat(43)}`,
+        })
+        await saveAccounts(storageB, accountPathB)
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
+        process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+          tempConfigDir!,
+          'sidebar-state-b.json',
+        )
+        const pluginB = await getPlugin(undefined, undefined, {
+          claustrumConnector: concurrentConnector,
+        })
+        const originalRename = fs.rename
+        const secondManifestRename = deferred()
+        let manifestRenames = 0
+        const rename = spyOn(fs, 'rename').mockImplementation(
+          async (from, to) => {
+            if (to === manifestPath) {
+              manifestRenames += 1
+              if (manifestRenames === 2) secondManifestRename.resolve()
+              if (manifestRenames === 1)
+                await Promise.race([
+                  secondManifestRename.promise,
+                  Bun.sleep(100),
+                ])
+            }
+            return originalRename(from, to)
+          },
+        )
+        try {
+          const commandA = runCustodyCommand(
+            pluginA,
+            'migration-a',
+            'custody fallback-a on',
+          )
+          const commandB = runCustodyCommand(
+            pluginB,
+            'migration-b',
+            'custody fallback-b on',
+          )
+          await Promise.race([
+            entered.promise,
+            Bun.sleep(1_000).then(() => {
+              throw new Error(
+                `concurrent credential calls did not both start (${credentialGets})`,
+              )
+            }),
+          ])
+          release.resolve()
+          const payloads = await Promise.race([
+            Promise.all([commandA, commandB]),
+            Bun.sleep(1_000).then(() => {
+              throw new Error('concurrent migrations did not finish')
+            }),
+          ])
+          expect(payloads.map((payload) => payload?.text)).toEqual([
+            'Custody on for fallback-a (vault-served).',
+            'Custody on for fallback-b (vault-served).',
+          ])
+          const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
+            providers: Array<{
+              provider: string
+              accounts: Array<{ label: string }>
+            }>
+          }
+          expect(
+            manifest.providers
+              .find((provider) => provider.provider === 'anthropic')
+              ?.accounts.map((account) => account.label)
+              .sort(),
+          ).toEqual(['migration-a', 'migration-b'])
+          expect(
+            await readFile(getAccountStatePath(accountPathA), 'utf8'),
+          ).not.toContain('ckh_A')
+          expect(
+            await readFile(getAccountStatePath(accountPathB), 'utf8'),
+          ).not.toContain('ckh_B')
+        } finally {
+          rename.mockRestore()
+          await pluginA.dispose?.()
+          await pluginB.dispose?.()
+          restore()
+        }
+      })
     },
   )
 

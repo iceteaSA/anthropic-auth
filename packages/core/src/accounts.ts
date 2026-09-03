@@ -1571,22 +1571,40 @@ export async function clearClaustrumHandlePersistent(input: {
 }): Promise<'updated' | 'missing' | 'ineligible'> {
   const path = input.path ?? getAccountStoragePath()
   return enqueueSave(async () => {
-    const lock = await acquireAccountConfigWriteLock(path)
+    const configLock = await acquireAccountConfigWriteLock(path)
     try {
-      const storage = await loadAccounts(path)
-      if (!storage) return 'missing'
-      const account = storage.accounts.find(
-        (candidate) => candidate.id === input.id,
-      )
-      if (!account) return 'missing'
-      if (!isOAuthAccount(account)) return 'ineligible'
-      if (!account.claustrumHandle) return 'updated'
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = await loadAccounts(path)
+        if (!storage) return 'missing'
+        const account = storage.accounts.find(
+          (candidate) => candidate.id === input.id,
+        )
+        if (!account) return 'missing'
+        if (!isOAuthAccount(account)) return 'ineligible'
+        if (!account.claustrumHandle) return 'updated'
 
-      delete account.claustrumHandle
-      await saveAccountsWithConfigLock(storage, path, {})
-      return 'updated'
+        delete account.claustrumHandle
+        const existing = await loadExistingTopLevelFields(path)
+        await writeJsonAtomic(path, {
+          ...existing,
+          ...configFromStorage(storage),
+        })
+        const statePath = getAccountStatePath(path)
+        const state = (await readJsonIfPresent(statePath)).value
+        if (isRecord(state) && isRecord(state.accounts)) {
+          const stateAccount = state.accounts[input.id]
+          if (isRecord(stateAccount) && 'claustrumHandle' in stateAccount) {
+            delete stateAccount.claustrumHandle
+            await writeJsonAtomic(statePath, pruneUndefined(state))
+          }
+        }
+        return 'updated'
+      } finally {
+        await stateLock.release()
+      }
     } finally {
-      await lock.release()
+      await configLock.release()
     }
   })
 }

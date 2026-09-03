@@ -558,7 +558,27 @@ export type CustodyHandleManifestWriteResult =
   | { status: 'written' | 'unchanged' }
   | { status: 'refused'; reason: string }
 
-const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
+export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
+export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
+export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
+
+let custodyManifestLockTestOptions:
+  | Partial<{
+      ttlMs: number
+      retryMinMs: number
+      retryMaxMs: number
+    }>
+  | undefined
+
+export function __setCustodyManifestLockTestOptions(
+  options?: Partial<{
+    ttlMs: number
+    retryMinMs: number
+    retryMaxMs: number
+  }>,
+) {
+  custodyManifestLockTestOptions = options
+}
 
 class CustodyManifestLockBusyError extends Error {}
 
@@ -568,6 +588,15 @@ export async function withCustodyManifestLock<T>(
 ): Promise<T> {
   const lockPath = `${path}.lock`
   const now = Date.now
+  const ttlMs =
+    custodyManifestLockTestOptions?.ttlMs ?? CUSTODY_MANIFEST_LOCK_TTL_MS
+  const retryMinMs =
+    custodyManifestLockTestOptions?.retryMinMs ??
+    CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS
+  const retryMaxMs =
+    custodyManifestLockTestOptions?.retryMaxMs ??
+    CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS
+  const startedAt = now()
 
   async function claim() {
     try {
@@ -588,19 +617,31 @@ export async function withCustodyManifestLock<T>(
     return true
   }
 
-  let claimed = await claim()
-  if (!claimed) {
-    let current: Awaited<ReturnType<typeof fs.stat>> | undefined
+  const deadline = startedAt + ttlMs
+  let claimed = false
+  while (!claimed) {
+    claimed = await claim()
+    if (claimed) break
+
+    let ownerClaimedAtMs: number | undefined
     try {
-      current = await fs.stat(lockPath)
+      const owner = JSON.parse(
+        await fs.readFile(join(lockPath, 'owner'), 'utf8'),
+      )
+      if (
+        isRecord(owner) &&
+        typeof owner.claimed_at_ms === 'number' &&
+        Number.isFinite(owner.claimed_at_ms)
+      ) {
+        ownerClaimedAtMs = owner.claimed_at_ms
+      }
     } catch (error) {
-      if (errorCode(error) === 'ENOENT') claimed = await claim()
-      else throw error
+      if (errorCode(error) === 'ENOENT') continue
+      throw error
     }
     if (
-      !claimed &&
-      current &&
-      Number(current.mtimeMs) + CUSTODY_MANIFEST_LOCK_TTL_MS <= now()
+      ownerClaimedAtMs !== undefined &&
+      ownerClaimedAtMs + ttlMs <= startedAt
     ) {
       const claimedPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.stale`
       try {
@@ -609,10 +650,14 @@ export async function withCustodyManifestLock<T>(
         if (errorCode(error) !== 'ENOENT') throw error
       }
       await fs.rm(claimedPath, { recursive: true, force: true }).catch(() => {})
-      claimed = await claim()
+      continue
     }
+    if (now() >= deadline)
+      throw new CustodyManifestLockBusyError('manifest lock busy')
+    const retryMs =
+      retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
+    await Bun.sleep(Math.min(retryMs, Math.max(1, deadline - now())))
   }
-  if (!claimed) throw new CustodyManifestLockBusyError('manifest lock busy')
 
   const renewal = setInterval(
     () => {
