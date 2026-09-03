@@ -4,11 +4,14 @@ import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
+  __setCustodyManifestLockTestOptions,
   CustodyHandleManifestReader,
   readCustodyHandles,
   resolveCustodyHandle,
+  withCustodyManifestLock,
   writeCustodyHandleManifestEntry,
 } from '@cortexkit/anthropic-auth-core'
+
 import { loadGoldenCustodyManifest } from './custody-handle-manifest.fixture.ts'
 
 const { text: fixtureText, manifest: fixture } =
@@ -372,6 +375,27 @@ describe('CustodyHandleManifestReader', () => {
 })
 
 describe('writeCustodyHandleManifestEntry', () => {
+  test('refuses an entry that the manifest reader would reject', async () => {
+    await withTempDirectory(async (directory) => {
+      const parent = join(directory, 'manifest')
+      const path = join(parent, 'handles.json')
+      await fs.mkdir(parent)
+      await fs.chmod(parent, 0o700)
+
+      await expect(
+        writeCustodyHandleManifestEntry({
+          path,
+          entry: {
+            label: 'Work',
+            handle: writerHandle,
+            credentialId: 'oauth:anthropic:Work',
+          },
+        }),
+      ).resolves.toEqual({ status: 'refused', reason: 'invalid entry' })
+      await expect(fs.lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+  })
+
   test('round-trips foreign provider blocks without changing their serialized JSON', async () => {
     await withManifest(fixtureText, async (path) => {
       const before = fixture.providers
@@ -688,6 +712,84 @@ describe('writeCustodyHandleManifestEntry', () => {
       },
     )
   })
+})
+
+describe('withCustodyManifestLock', () => {
+  afterEach(() => {
+    __setCustodyManifestLockTestOptions()
+  })
+
+  test.serial(
+    'does not evict a holder whose owner record is renewed',
+    async () => {
+      await withTempDirectory(async (directory) => {
+        const path = join(directory, 'handles.json')
+        __setCustodyManifestLockTestOptions({
+          ttlMs: 100,
+          retryMinMs: 5,
+          retryMaxMs: 5,
+          renewalIntervalMs: 30,
+        } as never)
+        const order: string[] = []
+        const firstEntered = Promise.withResolvers<void>()
+        const releaseFirst = Promise.withResolvers<void>()
+        const first = withCustodyManifestLock(path, async () => {
+          order.push('first-enter')
+          firstEntered.resolve()
+          await releaseFirst.promise
+          order.push('first-exit')
+        })
+        await firstEntered.promise
+        await Bun.sleep(130)
+        const second = withCustodyManifestLock(path, async () => {
+          order.push('second-enter')
+        })
+
+        await Bun.sleep(50)
+        expect(order).toEqual(['first-enter'])
+        releaseFirst.resolve()
+        await Promise.all([first, second])
+        expect(order).toEqual(['first-enter', 'first-exit', 'second-enter'])
+      })
+    },
+  )
+
+  test.serial(
+    'does not remove a successor lock after its own expired lease is evicted',
+    async () => {
+      await withTempDirectory(async (directory) => {
+        const path = join(directory, 'handles.json')
+        const lockPath = `${path}.lock`
+        __setCustodyManifestLockTestOptions({
+          ttlMs: 100,
+          retryMinMs: 5,
+          retryMaxMs: 5,
+          renewalIntervalMs: 1_000,
+        } as never)
+        const firstEntered = Promise.withResolvers<void>()
+        const releaseFirst = Promise.withResolvers<void>()
+        const secondEntered = Promise.withResolvers<void>()
+        const releaseSecond = Promise.withResolvers<void>()
+        const first = withCustodyManifestLock(path, async () => {
+          firstEntered.resolve()
+          await releaseFirst.promise
+        })
+        await firstEntered.promise
+        await Bun.sleep(130)
+        const second = withCustodyManifestLock(path, async () => {
+          secondEntered.resolve()
+          await releaseSecond.promise
+        })
+        await secondEntered.promise
+
+        releaseFirst.resolve()
+        await first
+        await expect(fs.lstat(lockPath)).resolves.toBeDefined()
+        releaseSecond.resolve()
+        await second
+      })
+    },
+  )
 })
 
 describe('resolveCustodyHandle', () => {

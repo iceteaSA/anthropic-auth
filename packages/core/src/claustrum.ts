@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
@@ -17,7 +18,9 @@ import {
   type SubscribeOptions,
   type Subscription,
 } from '@cortexkit/subc-client'
+
 import type { ClaustrumConfig, OAuthAccount } from './accounts.ts'
+import { CUSTODY_HANDLE_PATTERN } from './constants.ts'
 import { parseJsonRedacted } from './json'
 import { logger } from './logger'
 
@@ -222,11 +225,9 @@ type ParsedCustodyHandleManifest = {
 }
 
 const CUSTODY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
-// The suffix is base64url for 256 CSPRNG bits; its charset is not fixture-derived.
-const CUSTODY_HANDLE_PATTERN = /^ckh_[A-Za-z0-9_-]{43}$/
 const RESERVED_CUSTODY_IDS = new Set(['__proto__', 'constructor', 'prototype'])
 
-function isCustodyId(value: unknown): value is string {
+export function isValidCustodyLabel(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     CUSTODY_ID_PATTERN.test(value) &&
@@ -236,6 +237,10 @@ function isCustodyId(value: unknown): value is string {
 
 export function isValidCustodyHandle(value: unknown): value is string {
   return typeof value === 'string' && CUSTODY_HANDLE_PATTERN.test(value)
+}
+
+function isValidCustodyCredentialId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
 }
 
 function legacyOrUnresolved(
@@ -259,6 +264,7 @@ function legacyOrUnresolved(
  * | absent or invalid | present | legacy handle |
  * | no matching ready entry | present | legacy handle |
  * | foreign serve | any | unresolved |
+ * | superseded matching entry | any | unresolved |
  */
 export function resolveCustodyHandle(input: {
   account: OAuthAccount
@@ -270,7 +276,7 @@ export function resolveCustodyHandle(input: {
     return { status: 'unresolved', reason: 'foreign-serve' }
   }
   if (!account.label) return legacyOrUnresolved(account, 'missing-label')
-  if (!isCustodyId(account.label)) {
+  if (!isValidCustodyLabel(account.label)) {
     return legacyOrUnresolved(account, 'invalid-label')
   }
   if (duplicateOAuthLabels?.has(account.label)) {
@@ -300,7 +306,7 @@ export function readCustodyHandles(
   provider: string,
   serve: string,
 ): ParsedCustodyHandleManifest {
-  if (!isCustodyId(provider)) {
+  if (!isValidCustodyLabel(provider)) {
     throw new Error('invalid manifest provider')
   }
   if (
@@ -341,7 +347,7 @@ export function readCustodyHandles(
         !Object.hasOwn(entry, 'handle') ||
         !Object.hasOwn(entry, 'credential_id') ||
         typeof entry.label !== 'string' ||
-        !isCustodyId(entry.label)
+        !isValidCustodyLabel(entry.label)
       )
         throw new Error('invalid account label')
       if (
@@ -350,10 +356,7 @@ export function readCustodyHandles(
       ) {
         throw new Error('invalid account handle')
       }
-      if (
-        typeof entry.credential_id !== 'string' ||
-        entry.credential_id.length === 0
-      ) {
+      if (!isValidCustodyCredentialId(entry.credential_id)) {
         throw new Error('invalid account credential id')
       }
       if (Object.hasOwn(entry, 'superseded')) {
@@ -567,6 +570,7 @@ let custodyManifestLockTestOptions:
       ttlMs: number
       retryMinMs: number
       retryMaxMs: number
+      renewalIntervalMs: number
     }>
   | undefined
 
@@ -575,6 +579,7 @@ export function __setCustodyManifestLockTestOptions(
     ttlMs: number
     retryMinMs: number
     retryMaxMs: number
+    renewalIntervalMs: number
   }>,
 ) {
   custodyManifestLockTestOptions = options
@@ -597,6 +602,38 @@ export async function withCustodyManifestLock<T>(
     custodyManifestLockTestOptions?.retryMaxMs ??
     CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS
   const startedAt = now()
+  const nonce = randomUUID()
+  const ownerPath = join(lockPath, 'owner')
+
+  async function writeOwner(claimedAtMs: number) {
+    const temporaryOwnerPath = join(
+      lockPath,
+      `owner.${process.pid}.${randomUUID()}.tmp`,
+    )
+    let handle: fs.FileHandle | undefined
+    try {
+      handle = await fs.open(
+        temporaryOwnerPath,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+        0o600,
+      )
+      await handle.writeFile(
+        `${JSON.stringify({
+          tenant: 'anthropic-auth',
+          pid: process.pid,
+          claimed_at_ms: claimedAtMs,
+          nonce,
+        })}\n`,
+      )
+      await handle.sync()
+      await handle.close()
+      handle = undefined
+      await fs.rename(temporaryOwnerPath, ownerPath)
+    } finally {
+      await handle?.close().catch(() => {})
+      await fs.unlink(temporaryOwnerPath).catch(() => {})
+    }
+  }
 
   async function claim() {
     try {
@@ -605,15 +642,12 @@ export async function withCustodyManifestLock<T>(
       if (errorCode(error) !== 'EEXIST') throw error
       return false
     }
-    await fs.writeFile(
-      join(lockPath, 'owner'),
-      `${JSON.stringify({
-        tenant: 'anthropic-auth',
-        pid: process.pid,
-        claimed_at_ms: now(),
-      })}\n`,
-      { encoding: 'utf8', mode: 0o600 },
-    )
+    try {
+      await writeOwner(now())
+    } catch (error) {
+      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+      throw error
+    }
     return true
   }
 
@@ -625,9 +659,7 @@ export async function withCustodyManifestLock<T>(
 
     let ownerClaimedAtMs: number | undefined
     try {
-      const owner = JSON.parse(
-        await fs.readFile(join(lockPath, 'owner'), 'utf8'),
-      )
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
       if (
         isRecord(owner) &&
         typeof owner.claimed_at_ms === 'number' &&
@@ -661,16 +693,27 @@ export async function withCustodyManifestLock<T>(
 
   const renewal = setInterval(
     () => {
-      void fs.utimes(lockPath, new Date(), new Date()).catch(() => {})
+      void writeOwner(now()).catch(() => {})
     },
-    Math.floor(CUSTODY_MANIFEST_LOCK_TTL_MS / 3),
+    custodyManifestLockTestOptions?.renewalIntervalMs ?? Math.floor(ttlMs / 3),
   )
   if ('unref' in renewal) renewal.unref()
   try {
     return await fn()
   } finally {
     clearInterval(renewal)
-    await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+    try {
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+      if (
+        isRecord(owner) &&
+        owner.pid === process.pid &&
+        owner.nonce === nonce
+      ) {
+        await fs.rm(lockPath, { recursive: true, force: true })
+      }
+    } catch {
+      // Another claimant may have evicted this lease before release.
+    }
   }
 }
 
@@ -697,6 +740,13 @@ function isOurManifestBlock(value: unknown): value is Record<string, unknown> {
 export async function writeCustodyHandleManifestEntry(
   input: CustodyHandleManifestWriteInput,
 ): Promise<CustodyHandleManifestWriteResult> {
+  if (
+    !isValidCustodyLabel(input.entry.label) ||
+    !isValidCustodyHandle(input.entry.handle) ||
+    !isValidCustodyCredentialId(input.entry.credentialId)
+  ) {
+    return refusal('invalid entry')
+  }
   try {
     return await withCustodyManifestLock(input.path, () =>
       writeCustodyHandleManifestEntryLocked(input),

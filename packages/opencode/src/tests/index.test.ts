@@ -1579,6 +1579,115 @@ describe('fallback Claustrum credential resolution', () => {
   }
 
   test.serial(
+    're-migrates a legacy handle after a crash leaves custody already on',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({
+          label: 'retry-migration',
+          legacy: legacyHandle,
+          gate: true,
+        }),
+      )
+      const manifestPath = await writeManifest([])
+      const restore = await configureClaustrumConnection()
+      const calls: CredentialCall[] = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          calls,
+          new Map([[legacyHandle, 'retry-migration-access']]),
+        ),
+      })
+      try {
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'retry-migration',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toBe('Custody already on for fallback-1.')
+        expect(
+          JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
+            .accounts,
+        ).toContainEqual({
+          label: 'retry-migration',
+          handle: legacyHandle,
+          credential_id: 'oauth:anthropic:retry-migration',
+        })
+        expect(
+          await readFile(
+            getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+            'utf8',
+          ),
+        ).not.toContain(legacyHandle)
+      } finally {
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
+    'skips an invalid-label legacy migration without disabling custody',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({
+          label: 'Work',
+          legacy: legacyHandle,
+          gate: false,
+        }),
+      )
+      const manifestPath = await writeManifest([])
+      const restore = await configureClaustrumConnection()
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([[legacyHandle, 'invalid-label-access']]),
+        ),
+      })
+      try {
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'invalid-label-migration',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toBe('Custody on for fallback-1 (vault-served).')
+        expect(
+          JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
+            .accounts,
+        ).toEqual([])
+        expect(
+          await readFile(
+            getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+            'utf8',
+          ),
+        ).toContain(legacyHandle)
+        expect(
+          (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
+        ).toBe(true)
+        expect(
+          logs.some(
+            (record) =>
+              record.message === 'custody manifest migration skipped' &&
+              record.payload?.id === 'fallback-1' &&
+              record.payload?.reason === 'invalid-label',
+          ),
+        ).toBe(true)
+      } finally {
+        __setLogTestSink(null)
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
     'refuses a fresh manifest lock after its bounded wait and keeps the legacy handle',
     async () => {
       await withShortManifestLockTiming(async () => {

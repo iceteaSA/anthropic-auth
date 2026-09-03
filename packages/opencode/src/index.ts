@@ -112,6 +112,7 @@ import {
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
+  isValidCustodyLabel,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
@@ -2174,10 +2175,9 @@ const anthropicAuthPlugin = async (
           continue
         }
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
-          log('[refresh] vault fallback credential unusable', {
-            accountId: account.id,
-            handle,
-            minTtlMs,
+          logger.debug('refresh', 'vault fallback credential unusable', {
+            id: account.id,
+            reason: 'unusable',
           })
           if (sidecarNearExpiry) {
             await custodyOverrideRefresh('vault credential unavailable')
@@ -4275,38 +4275,48 @@ const anthropicAuthPlugin = async (
                   'Custody requires an OAuth fallback account.',
                 )
               }
-              if (changed === 'unchanged') {
-                return {
-                  text: `Custody already on for ${account.id}.`,
-                  changed: false,
-                }
-              }
               // Keep the account lock until both persistence layers agree on the
               // handle's owner: account refresh → manifest → config.
               if (
                 custodyResolution.status === 'resolved' &&
-                custodyResolution.source === 'legacy' &&
-                account.label
+                custodyResolution.source === 'legacy'
               ) {
-                const write = await writeCustodyHandleManifestEntry({
-                  path: custodyHandleManifestPath,
-                  entry: {
-                    label: account.label,
-                    handle,
-                    credentialId: `oauth:anthropic:${account.label}`,
-                  },
-                })
-                if (write.status === 'written') {
-                  await clearClaustrumHandlePersistent({
-                    id: account.id,
-                    path: accountStoragePath,
+                if (!isValidCustodyLabel(account.label)) {
+                  logger.warn(
+                    'commands',
+                    'custody manifest migration skipped',
+                    {
+                      id: account.id,
+                      reason: 'invalid-label',
+                    },
+                  )
+                } else {
+                  const write = await writeCustodyHandleManifestEntry({
+                    path: custodyHandleManifestPath,
+                    entry: {
+                      label: account.label,
+                      handle,
+                      credentialId: `oauth:anthropic:${account.label}`,
+                    },
                   })
-                  await refreshCustodyHandleManifest()
-                } else if (write.status === 'refused') {
-                  logger.warn('commands', 'custody manifest write failed', {
-                    id: account.id,
-                    reason: write.reason,
-                  })
+                  if (write.status === 'written') {
+                    await clearClaustrumHandlePersistent({
+                      id: account.id,
+                      path: accountStoragePath,
+                    })
+                    await refreshCustodyHandleManifest()
+                  } else if (write.status === 'refused') {
+                    logger.warn('commands', 'custody manifest write failed', {
+                      id: account.id,
+                      reason: write.reason,
+                    })
+                  }
+                }
+              }
+              if (changed === 'unchanged') {
+                return {
+                  text: `Custody already on for ${account.id}.`,
+                  changed: false,
                 }
               }
               await markClaustrumCredentialReady(account.id, handle)
