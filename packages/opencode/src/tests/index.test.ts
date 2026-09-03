@@ -5,9 +5,11 @@ import {
   describe,
   expect,
   mock,
+  spyOn,
   test,
 } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import * as fs from 'node:fs/promises'
 import {
   chmod,
   mkdir,
@@ -16,6 +18,7 @@ import {
   readFile,
   rm,
   stat,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -49,6 +52,7 @@ import {
   resetFastModeState,
   saveAccountState,
   saveAccounts,
+  setClaustrumAccountGatePersistent,
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -127,6 +131,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await cleanupTempConfigDirs()
+  delete process.env.CLAUSTRUM_OPENCODE_HANDLES
 })
 
 afterAll(async () => {
@@ -1033,6 +1038,321 @@ describe('fallback Claustrum credential resolution', () => {
         process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = previous
     }
   }
+
+  const manifestHandle = `ckh_${'M'.repeat(43)}`
+  const legacyHandle = `ckh_${'L'.repeat(43)}`
+
+  async function writeManifest(
+    entries: Array<{ label: string; handle: string }>,
+    serve = 'anthropic-auth',
+  ) {
+    const path = join(tempConfigDir!, 'handles.json')
+    await fs.writeFile(
+      path,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve,
+            accounts: entries.map(({ label, handle }) => ({
+              label,
+              handle,
+              credential_id: `oauth:anthropic:${label}`,
+            })),
+          },
+        ],
+      }),
+    )
+    await fs.chmod(path, 0o600)
+    await fs.lstat(path)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = path
+    return path
+  }
+
+  function manifestStorage(input: {
+    label: string
+    enabled?: boolean
+    legacy?: string
+    gate?: boolean
+  }) {
+    return fallbackWithClaustrum({
+      label: input.label,
+      enabled: true,
+      ...(input.legacy && { claustrumHandle: input.legacy }),
+      claustrum: {
+        accounts: { 'fallback-1': { enabled: input.gate ?? true } },
+      },
+      ...(input.enabled === false && { enabled: false }),
+    })
+  }
+
+  function manifestConnector(
+    calls: CredentialCall[],
+    credentials: ReadonlyMap<string, string>,
+  ) {
+    return connectorFor(calls, (method, params) => {
+      if (method !== 'credential.get') return { result: {} }
+      return credentialResponse(
+        credentials.get(String(params.handle)) ?? 'other',
+        1,
+      )
+    })
+  }
+
+  test.serial('warms a manifest-only handle at startup', async () => {
+    await useTempAccountFile(manifestStorage({ label: 'manifest-start' }))
+    await writeManifest([{ label: 'manifest-start', handle: manifestHandle }])
+    const calls: CredentialCall[] = []
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: manifestConnector(
+        calls,
+        new Map([[manifestHandle, 'startup-access']]),
+      ),
+    })
+    expect(
+      calls.filter((call) => call.method === 'credential.get'),
+    ).toHaveLength(1)
+    await plugin.dispose?.()
+  })
+
+  test.serial('enables custody from a manifest-only handle', async () => {
+    await useTempAccountFile(
+      manifestStorage({ label: 'manifest-on', gate: false }),
+    )
+    await writeManifest([{ label: 'manifest-on', handle: manifestHandle }])
+    const restore = await configureClaustrumConnection()
+    const calls: CredentialCall[] = []
+    try {
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          calls,
+          new Map([[manifestHandle, 'on-access']]),
+        ),
+      })
+      expect(
+        (
+          await runCustodyCommand(
+            plugin,
+            'manifest-on',
+            'custody fallback-1 on',
+          )
+        )?.text,
+      ).toContain('Custody on')
+      expect(
+        calls.filter((call) => call.method === 'credential.get'),
+      ).toHaveLength(1)
+      await plugin.dispose?.()
+    } finally {
+      restore()
+    }
+  })
+
+  test.serial(
+    'prefers a manifest handle over a stale legacy handle',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({ label: 'manifest-wins', legacy: legacyHandle }),
+      )
+      await writeManifest([{ label: 'manifest-wins', handle: manifestHandle }])
+      const calls: CredentialCall[] = []
+      const headers: string[] = []
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        headers.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          calls,
+          new Map([
+            [manifestHandle, 'manifest-access'],
+            [legacyHandle, 'legacy-access'],
+          ]),
+        ),
+      })
+      const result = await plugin.auth.loader(
+        async () => ({
+          type: 'oauth' as const,
+          access: 'main',
+          refresh: 'main',
+          expires: Date.now() + 60_000,
+        }),
+        { models: {} },
+      )
+      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(headers).toContain('Bearer manifest-access')
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'picks up a handle minted after boot on the next tick',
+    async () => {
+      await useTempAccountFile(manifestStorage({ label: 'minted' }))
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = join(
+        tempConfigDir!,
+        'handles.json',
+      )
+      const handlers: Array<() => unknown> = []
+      const calls: CredentialCall[] = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          calls,
+          new Map([[manifestHandle, 'minted-access']]),
+        ),
+        setInterval: mock((handler: () => unknown) => {
+          handlers.push(handler)
+          return { unref() {} } as never
+        }) as never,
+      })
+      const path = await writeManifest([
+        { label: 'minted', handle: manifestHandle },
+      ])
+      await utimes(path, new Date(), new Date(Date.now() + 1_000))
+      await Promise.all(handlers.map((handler) => handler()))
+      for (let attempt = 0; attempt < 50 && calls.length === 0; attempt++) {
+        await Bun.sleep(10)
+      }
+      expect(
+        calls.filter((call) => call.method === 'credential.get'),
+      ).toHaveLength(1)
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial('does not read the manifest during a request', async () => {
+    await useTempAccountFile(manifestStorage({ label: 'resident' }))
+    await writeManifest([{ label: 'resident', handle: manifestHandle }])
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: manifestConnector(
+        [],
+        new Map([[manifestHandle, 'resident-access']]),
+      ),
+    })
+    await plugin.__fallbackRefreshReady
+    const open = spyOn(fs, 'open')
+    const result = await plugin.auth.loader(
+      async () => ({
+        type: 'oauth' as const,
+        access: 'main',
+        refresh: 'main',
+        expires: Date.now() + 60_000,
+      }),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(open).not.toHaveBeenCalled()
+    open.mockRestore()
+    await plugin.dispose?.()
+  })
+
+  test.serial(
+    'keeps a foreign manifest on sidecar and warns once',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({ label: 'foreign', legacy: legacyHandle }),
+      )
+      await writeManifest(
+        [{ label: 'foreign', handle: manifestHandle }],
+        'foreign',
+      )
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      const calls: CredentialCall[] = []
+      const handlers: Array<() => unknown> = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(calls, new Map()),
+        setInterval: mock((handler: () => unknown) => {
+          handlers.push(handler)
+          return { unref() {} } as never
+        }) as never,
+      })
+      for (let tick = 0; tick < 3; tick++) await handlers.at(-1)?.()
+      expect(
+        calls.filter((call) => call.method === 'credential.get'),
+      ).toHaveLength(0)
+      expect(
+        logs.filter(
+          (record) =>
+            record.message === 'custody handle resolution fallback' &&
+            record.payload?.reason === 'foreign-serve',
+        ),
+      ).toHaveLength(1)
+      await plugin.dispose?.()
+      __setLogTestSink(null)
+    },
+  )
+
+  test.serial('uses legacy on an invalid manifest and warns once', async () => {
+    await useTempAccountFile(
+      manifestStorage({ label: 'invalid', legacy: legacyHandle }),
+    )
+    const path = join(tempConfigDir!, 'handles.json')
+    await fs.writeFile(path, '{')
+    await fs.chmod(path, 0o600)
+    await fs.lstat(path)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = path
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+    const calls: CredentialCall[] = []
+    const handlers: Array<() => unknown> = []
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: manifestConnector(
+        calls,
+        new Map([[legacyHandle, 'legacy-access']]),
+      ),
+      setInterval: mock((handler: () => unknown) => {
+        handlers.push(handler)
+        return { unref() {} } as never
+      }) as never,
+    })
+    for (let tick = 0; tick < 3; tick++) await handlers.at(-1)?.()
+    expect(
+      calls.filter((call) => call.method === 'credential.get').length,
+    ).toBeGreaterThan(0)
+    expect(
+      logs.filter(
+        (record) =>
+          record.message === 'custody handle resolution fallback' &&
+          record.payload?.reason === 'invalid-manifest',
+      ),
+    ).toHaveLength(1)
+    await plugin.dispose?.()
+    __setLogTestSink(null)
+  })
+
+  test.serial(
+    'warms a manifest handle when its gate turns on after boot',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({ label: 'gate-after', gate: false }),
+      )
+      await writeManifest([{ label: 'gate-after', handle: manifestHandle }])
+      const handlers: Array<() => unknown> = []
+      const calls: CredentialCall[] = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          calls,
+          new Map([[manifestHandle, 'gate-access']]),
+        ),
+        setInterval: mock((handler: () => unknown) => {
+          handlers.push(handler)
+          return { unref() {} } as never
+        }) as never,
+      })
+      expect(calls).toHaveLength(0)
+      await setClaustrumAccountGatePersistent({
+        id: 'fallback-1',
+        enabled: true,
+      })
+      await handlers.at(-1)?.()
+      await waitForMockCall({ mock: { calls } })
+      expect(
+        calls.filter((call) => call.method === 'credential.get'),
+      ).toHaveLength(1)
+      await plugin.dispose?.()
+    },
+  )
 
   async function runCustodyCommand(
     plugin: any,
