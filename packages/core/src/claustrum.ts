@@ -1,7 +1,7 @@
 import { constants as fsConstants } from 'node:fs'
 import * as fs from 'node:fs/promises'
-import { userInfo } from 'node:os'
-import { dirname } from 'node:path'
+import { homedir, userInfo } from 'node:os'
+import { dirname, isAbsolute, join } from 'node:path'
 import {
   type BindIdentity,
   type CatalogEntry,
@@ -17,6 +17,7 @@ import {
   type SubscribeOptions,
   type Subscription,
 } from '@cortexkit/subc-client'
+import type { ClaustrumConfig, OAuthAccount } from './accounts.ts'
 import { parseJsonRedacted } from './json'
 import { logger } from './logger'
 
@@ -45,6 +46,27 @@ export type ClaustrumDetection =
 export function getDefaultClaustrumConnectionPath(): string {
   const uid = process.getuid?.() ?? userInfo().uid
   return `/run/user/${uid}/subc-connection.json`
+}
+
+type CustodyHandlesEnvironment = Readonly<Record<string, string | undefined>>
+
+export function resolveCustodyHandlesPath(
+  config: Pick<ClaustrumConfig, 'handlesFile'> | undefined,
+  env: CustodyHandlesEnvironment,
+): string {
+  const configuredPath = config?.handlesFile?.trim()
+  if (configuredPath) return configuredPath
+
+  const environmentPath = env.CLAUSTRUM_OPENCODE_HANDLES
+  if (environmentPath && isAbsolute(environmentPath)) return environmentPath
+
+  const configHome =
+    env.XDG_CONFIG_HOME?.trim() || join(env.HOME || homedir(), '.config')
+  return join(configHome, 'cortexkit', 'opencode-handles.json')
+}
+
+export function getDefaultClaustrumHandlesPath(): string {
+  return resolveCustodyHandlesPath(undefined, process.env)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -172,6 +194,19 @@ export type CustodyHandleManifest = {
   superseded: ReadonlySet<string>
 }
 
+export type CustodyHandleResolution =
+  | { status: 'resolved'; source: 'manifest' | 'legacy'; handle: string }
+  | {
+      status: 'unresolved'
+      reason:
+        | 'missing-label'
+        | 'invalid-label'
+        | 'duplicate-label'
+        | 'missing-entry'
+        | 'foreign-serve'
+        | 'superseded'
+    }
+
 type ParsedCustodyHandleManifest = {
   version: 1
   provider: string
@@ -195,6 +230,49 @@ function isCustodyId(value: unknown): value is string {
 
 export function isValidCustodyHandle(value: unknown): value is string {
   return typeof value === 'string' && CUSTODY_HANDLE_PATTERN.test(value)
+}
+
+function legacyOrUnresolved(
+  account: OAuthAccount,
+  reason: Extract<CustodyHandleResolution, { status: 'unresolved' }>['reason'],
+): CustodyHandleResolution {
+  if (account.claustrumHandle) {
+    return {
+      status: 'resolved',
+      source: 'legacy',
+      handle: account.claustrumHandle,
+    }
+  }
+  return { status: 'unresolved', reason }
+}
+
+export function resolveCustodyHandle(input: {
+  account: OAuthAccount
+  manifest?: CustodyHandleManifest
+  duplicateOAuthLabels?: ReadonlySet<string>
+}): CustodyHandleResolution {
+  const { account, manifest, duplicateOAuthLabels } = input
+  if (manifest && manifest.serve !== 'anthropic-auth') {
+    return { status: 'unresolved', reason: 'foreign-serve' }
+  }
+  if (!account.label) return legacyOrUnresolved(account, 'missing-label')
+  if (!isCustodyId(account.label)) {
+    return legacyOrUnresolved(account, 'invalid-label')
+  }
+  if (duplicateOAuthLabels?.has(account.label)) {
+    return legacyOrUnresolved(account, 'duplicate-label')
+  }
+
+  const entry = manifest?.accounts.find(
+    (candidate) =>
+      candidate.label === account.label &&
+      candidate.credentialId === `oauth:anthropic:${account.label}`,
+  )
+  if (!entry) return legacyOrUnresolved(account, 'missing-entry')
+  if (manifest?.superseded.has(entry.handle)) {
+    return { status: 'unresolved', reason: 'superseded' }
+  }
+  return { status: 'resolved', source: 'manifest', handle: entry.handle }
 }
 
 export function readCustodyHandles(

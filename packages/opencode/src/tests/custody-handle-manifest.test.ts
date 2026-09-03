@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import {
   CustodyHandleManifestReader,
   readCustodyHandles,
+  resolveCustodyHandle,
 } from '@cortexkit/anthropic-auth-core'
 import { loadGoldenCustodyManifest } from './custody-handle-manifest.fixture.ts'
 
@@ -330,5 +331,229 @@ describe('CustodyHandleManifestReader', () => {
       await expectInvalid(manifestReader.read(), 'manifest mode must be 0600')
       expect(openSpy).toHaveBeenCalledTimes(1)
     })
+  })
+})
+
+describe('resolveCustodyHandle', () => {
+  const activeHandle = `ckh_${'A'.repeat(43)}`
+  const legacyHandle = `ckh_${'B'.repeat(43)}`
+  const otherHandle = `ckh_${'C'.repeat(43)}`
+
+  function account(
+    input: { id?: string; label?: string; claustrumHandle?: string } = {},
+  ) {
+    return {
+      id: input.id ?? 'uuid-not-a-label',
+      type: 'oauth' as const,
+      refresh: 'refresh-token',
+      ...input,
+    }
+  }
+
+  function manifest(input: { accounts?: Array<Record<string, unknown>> } = {}) {
+    const parsed = readCustodyHandles(
+      {
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: input.accounts ?? [
+              {
+                label: 'alice',
+                handle: activeHandle,
+                credential_id: 'oauth:anthropic:alice',
+              },
+            ],
+          },
+        ],
+      },
+      'anthropic',
+      'anthropic-auth',
+    )
+    return {
+      version: 1 as const,
+      provider: 'anthropic' as const,
+      serve: 'anthropic-auth' as const,
+      accounts: parsed.accounts,
+      superseded: parsed.superseded,
+    }
+  }
+
+  function expectResolvedSource(
+    result: ReturnType<typeof resolveCustodyHandle>,
+    source: 'manifest' | 'legacy',
+  ) {
+    expect(result.status).toBe('resolved')
+    if (result.status !== 'resolved')
+      throw new Error('expected resolved handle')
+    expect(result.source).toBe(source)
+  }
+
+  function expectUnresolvedReason(
+    result: ReturnType<typeof resolveCustodyHandle>,
+    reason:
+      | 'missing-label'
+      | 'invalid-label'
+      | 'duplicate-label'
+      | 'missing-entry'
+      | 'foreign-serve'
+      | 'superseded',
+  ) {
+    expect(result.status).toBe('unresolved')
+    if (result.status !== 'unresolved')
+      throw new Error('expected unresolved handle')
+    expect(result.reason).toBe(reason)
+  }
+
+  test('prefers a matching manifest handle over a legacy handle', () => {
+    const result = resolveCustodyHandle({
+      account: account({ label: 'alice', claustrumHandle: legacyHandle }),
+      manifest: manifest(),
+    })
+
+    expectResolvedSource(result, 'manifest')
+  })
+
+  test('falls back to legacy only when a valid label has no manifest entry', () => {
+    const result = resolveCustodyHandle({
+      account: account({ label: 'bob', claustrumHandle: legacyHandle }),
+      manifest: manifest(),
+    })
+
+    expectResolvedSource(result, 'legacy')
+  })
+
+  test('returns unresolved for a missing label without a legacy handle', () => {
+    expectUnresolvedReason(
+      resolveCustodyHandle({ account: account(), manifest: manifest() }),
+      'missing-label',
+    )
+  })
+
+  test('falls back to legacy for a missing label', () => {
+    expectResolvedSource(
+      resolveCustodyHandle({
+        account: account({ claustrumHandle: legacyHandle }),
+        manifest: manifest(),
+      }),
+      'legacy',
+    )
+  })
+
+  test('returns unresolved for an invalid label without a legacy handle', () => {
+    expectUnresolvedReason(
+      resolveCustodyHandle({
+        account: account({ label: 'Alice' }),
+        manifest: manifest(),
+      }),
+      'invalid-label',
+    )
+  })
+
+  test('falls back to legacy for an invalid label', () => {
+    expectResolvedSource(
+      resolveCustodyHandle({
+        account: account({ label: 'Alice', claustrumHandle: legacyHandle }),
+        manifest: manifest(),
+      }),
+      'legacy',
+    )
+  })
+
+  test('returns unresolved for a duplicate OAuth label without a legacy handle', () => {
+    expectUnresolvedReason(
+      resolveCustodyHandle({
+        account: account({ label: 'alice' }),
+        manifest: manifest(),
+        duplicateOAuthLabels: new Set(['alice']),
+      }),
+      'duplicate-label',
+    )
+  })
+
+  test('falls back to legacy for a duplicate OAuth label', () => {
+    expectResolvedSource(
+      resolveCustodyHandle({
+        account: account({ label: 'alice', claustrumHandle: legacyHandle }),
+        manifest: manifest(),
+        duplicateOAuthLabels: new Set(['alice']),
+      }),
+      'legacy',
+    )
+  })
+
+  test('requires the canonical OAuth credential ID rather than the UUID', () => {
+    const result = resolveCustodyHandle({
+      account: account({ id: 'uuid-not-a-label', label: 'alice' }),
+      manifest: manifest({
+        accounts: [
+          {
+            label: 'alice',
+            handle: activeHandle,
+            credential_id: 'uuid-not-a-label',
+          },
+        ],
+      }),
+    })
+
+    expectUnresolvedReason(result, 'missing-entry')
+  })
+
+  test('never falls back to legacy for a foreign serve', () => {
+    const foreign = Object.assign(manifest(), {
+      serve: 'foreign-serve',
+    })
+
+    expectUnresolvedReason(
+      resolveCustodyHandle({
+        account: account({ label: 'alice', claustrumHandle: legacyHandle }),
+        manifest: foreign as never,
+      }),
+      'foreign-serve',
+    )
+  })
+
+  test('rejects a matching active handle recorded as superseded', () => {
+    expectUnresolvedReason(
+      resolveCustodyHandle({
+        account: account({ label: 'alice', claustrumHandle: legacyHandle }),
+        manifest: manifest({
+          accounts: [
+            {
+              label: 'alice',
+              handle: activeHandle,
+              credential_id: 'oauth:anthropic:alice',
+              superseded: [activeHandle],
+            },
+          ],
+        }),
+      }),
+      'superseded',
+    )
+  })
+
+  test('rejects an active handle superseded by another manifest entry', () => {
+    expectUnresolvedReason(
+      resolveCustodyHandle({
+        account: account({ label: 'alice' }),
+        manifest: manifest({
+          accounts: [
+            {
+              label: 'alice',
+              handle: activeHandle,
+              credential_id: 'oauth:anthropic:alice',
+            },
+            {
+              label: 'bob',
+              handle: otherHandle,
+              credential_id: 'oauth:anthropic:bob',
+              superseded: [activeHandle],
+            },
+          ],
+        }),
+      }),
+      'superseded',
+    )
   })
 })
