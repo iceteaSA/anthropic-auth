@@ -1840,7 +1840,11 @@ describe('fallback Claustrum credential resolution', () => {
       await mkdir(lockPath, { mode: 0o700 })
       await writeFile(
         join(lockPath, 'owner'),
-        `${JSON.stringify({ claimed_at_ms: Date.now() - 1_000, tenant: 'test' })}\n`,
+        `${JSON.stringify({
+          claimed_at_ms: Date.now() - 1_000,
+          nonce: 'stale-test',
+          tenant: 'test',
+        })}\n`,
       )
       const originalRename = fs.rename
       const staleRenames: string[] = []

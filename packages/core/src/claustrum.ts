@@ -572,6 +572,7 @@ let custodyManifestLockTestOptions:
       retryMinMs: number
       retryMaxMs: number
       renewalIntervalMs: number
+      afterStaleOwnerRead: () => void | Promise<void>
     }>
   | undefined
 
@@ -581,6 +582,7 @@ export function __setCustodyManifestLockTestOptions(
     retryMinMs: number
     retryMaxMs: number
     renewalIntervalMs: number
+    afterStaleOwnerRead: () => void | Promise<void>
   }>,
 ) {
   custodyManifestLockTestOptions = options
@@ -660,27 +662,33 @@ export async function withCustodyManifestLock<T>(
     if (claimed) break
 
     let ownerClaimedAtMs: number | undefined
+    let ownerNonce: string | undefined
     try {
       const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
       if (
         isRecord(owner) &&
         typeof owner.claimed_at_ms === 'number' &&
-        Number.isFinite(owner.claimed_at_ms)
+        Number.isFinite(owner.claimed_at_ms) &&
+        typeof owner.nonce === 'string' &&
+        /^[A-Za-z0-9_-]+$/.test(owner.nonce)
       ) {
         ownerClaimedAtMs = owner.claimed_at_ms
+        ownerNonce = owner.nonce
+        await custodyManifestLockTestOptions?.afterStaleOwnerRead?.()
       }
     } catch {}
     if (
       ownerClaimedAtMs !== undefined &&
+      ownerNonce !== undefined &&
       ownerClaimedAtMs + ttlMs <= startedAt
     ) {
-      const claimedPath = `${lockPath}.stale-${ownerClaimedAtMs}-${randomUUID()}`
+      const claimedPath = `${lockPath}.stale-${ownerClaimedAtMs}-${ownerNonce}`
       try {
         await fs.rename(lockPath, claimedPath)
       } catch (error) {
-        if (errorCode(error) !== 'ENOENT') throw error
+        if (!['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(errorCode(error)))
+          throw error
       }
-      await fs.rm(claimedPath, { recursive: true, force: true }).catch(() => {})
       continue
     }
     if (now() >= deadline)
