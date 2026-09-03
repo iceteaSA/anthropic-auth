@@ -131,7 +131,10 @@ beforeEach(() => {
 
 afterEach(async () => {
   await cleanupTempConfigDirs()
-  delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+  process.env.CLAUSTRUM_OPENCODE_HANDLES = join(
+    process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR!,
+    'handles.json',
+  )
 })
 
 afterAll(async () => {

@@ -1712,6 +1712,10 @@ const anthropicAuthPlugin = async (
   let custodyHandleManifest: CustodyHandleManifest | undefined
   let custodyHandleManifestStatus: 'ready' | 'absent' | 'ignored' | 'invalid' =
     'absent'
+  let custodyHandleManifestIgnoredReason:
+    | 'foreign-serve'
+    | 'missing-provider'
+    | undefined
   const custodyHandleResolutionWarnings = new Set<string>()
   let claustrumConnectBackoffUntil = 0
 
@@ -1732,6 +1736,8 @@ const anthropicAuthPlugin = async (
   async function refreshCustodyHandleManifest(): Promise<void> {
     const result = await custodyHandleManifestReader.read()
     custodyHandleManifestStatus = result.status
+    custodyHandleManifestIgnoredReason =
+      result.status === 'ignored' ? result.reason : undefined
     custodyHandleManifest =
       result.status === 'ready' ? result.manifest : undefined
   }
@@ -1757,7 +1763,10 @@ const anthropicAuthPlugin = async (
       custodyHandleResolutionWarnings.delete(`${account.id}\0legacy`)
       return resolution
     }
-    if (custodyHandleManifestStatus === 'ignored') {
+    if (
+      custodyHandleManifestStatus === 'ignored' &&
+      custodyHandleManifestIgnoredReason === 'foreign-serve'
+    ) {
       warnCustodyResolutionOnce(account.id, 'foreign-serve')
       return { status: 'unresolved', reason: 'foreign-serve' }
     } else if (custodyHandleManifestStatus === 'invalid') {
