@@ -1861,8 +1861,7 @@ describe('fallback Claustrum credential resolution', () => {
           )?.text,
         ).toContain('Custody on')
         expect(staleRenames).toHaveLength(1)
-        expect(staleRenames[0]).toStartWith(`${lockPath}.`)
-        expect(staleRenames[0]).toEndWith('.stale')
+        expect(staleRenames[0]).toMatch(/\.lock\.stale-\d+-[A-Za-z0-9_-]+$/)
       } finally {
         rename.mockRestore()
         await plugin.dispose?.()

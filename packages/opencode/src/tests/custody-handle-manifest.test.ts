@@ -398,6 +398,29 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('refuses dangling and resolved manifest symlinks without replacing them', async () => {
+    for (const target of ['missing-target.json', 'real-target.json']) {
+      await withTempDirectory(async (directory) => {
+        const parent = join(directory, 'manifest')
+        const path = join(parent, 'handles.json')
+        await fs.mkdir(parent)
+        await fs.chmod(parent, 0o700)
+        if (target === 'real-target.json')
+          await fs.writeFile(join(parent, target), fixtureText)
+        await fs.symlink(target, path)
+
+        await expect(
+          writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toEqual({
+          status: 'refused',
+          reason: 'manifest is a symlink',
+        })
+        expect((await fs.lstat(path)).isSymbolicLink()).toBe(true)
+        expect(await fs.readlink(path)).toBe(target)
+      })
+    }
+  })
+
   test('round-trips foreign provider blocks without changing their serialized JSON', async () => {
     await withManifest(fixtureText, async (path) => {
       const before = fixture.providers
@@ -641,6 +664,115 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test.serial('aborts publication after a renewal failure', async () => {
+    await withManifest(fixtureText, async (path) => {
+      const before = await fs.readFile(path, 'utf8')
+      const lockPath = `${path}.lock`
+      const ownerPath = join(lockPath, 'owner')
+      const originalOpen = fs.open
+      const originalRename = fs.rename
+      let ownerRenames = 0
+      __setCustodyManifestLockTestOptions({
+        ttlMs: 100,
+        retryMinMs: 5,
+        retryMaxMs: 5,
+        renewalIntervalMs: 10,
+      } as never)
+      spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        if (String(to) === ownerPath && ++ownerRenames > 1)
+          throw Object.assign(new Error('renewal failed'), { code: 'EIO' })
+        return originalRename(from, to)
+      })
+      spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await originalOpen(...args)
+        if (
+          String(args[0]).endsWith('.tmp') &&
+          !String(args[0]).startsWith(`${lockPath}/`)
+        ) {
+          await Bun.sleep(40)
+        }
+        return handle
+      })
+
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({
+        status: 'refused',
+        reason: 'manifest lock renewal failed; write aborted',
+      })
+      expect(await fs.readFile(path, 'utf8')).toBe(before)
+      expect(await temporaryFiles(dirname(path))).toEqual([])
+    })
+  })
+
+  test.serial(
+    'aborts publication when a successor replaces its lock',
+    async () => {
+      await withManifest(fixtureText, async (path) => {
+        const before = await fs.readFile(path, 'utf8')
+        const lockPath = `${path}.lock`
+        const ownerPath = join(lockPath, 'owner')
+        const stalePath = `${lockPath}.stale-0-foreign`
+        const originalOpen = fs.open
+        const originalRename = fs.rename
+        const successorClaimed = Promise.withResolvers<void>()
+        let scheduledSuccessor = false
+        __setCustodyManifestLockTestOptions({
+          ttlMs: 100,
+          retryMinMs: 5,
+          retryMaxMs: 5,
+          renewalIntervalMs: 1_000,
+        } as never)
+        spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+          const result = await originalRename(from, to)
+          if (String(to) === ownerPath && !scheduledSuccessor) {
+            scheduledSuccessor = true
+            setTimeout(() => {
+              void (async () => {
+                await originalRename(lockPath, stalePath)
+                await fs.mkdir(lockPath, { mode: 0o700 })
+                await fs.writeFile(
+                  ownerPath,
+                  `${JSON.stringify({
+                    tenant: 'foreign-tenant',
+                    pid: process.pid,
+                    claimed_at_ms: Date.now(),
+                    nonce: 'foreign-nonce',
+                  })}\n`,
+                )
+                successorClaimed.resolve()
+              })().catch(successorClaimed.reject)
+            }, 5)
+          }
+          return result
+        })
+        spyOn(fs, 'open').mockImplementation(async (...args) => {
+          const handle = await originalOpen(...args)
+          if (
+            String(args[0]).endsWith('.tmp') &&
+            !String(args[0]).startsWith(`${lockPath}/`)
+          ) {
+            await Bun.sleep(40)
+          }
+          return handle
+        })
+
+        await expect(
+          writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toEqual({
+          status: 'refused',
+          reason: 'manifest lock renewal failed; write aborted',
+        })
+        await successorClaimed.promise
+        expect(await fs.readFile(path, 'utf8')).toBe(before)
+        expect(await temporaryFiles(dirname(path))).toEqual([])
+        expect(JSON.parse(await fs.readFile(ownerPath, 'utf8'))).toMatchObject({
+          nonce: 'foreign-nonce',
+        })
+      })
+    },
+  )
+
   test('opens a 0600 temporary file before atomically writing a 0600 target', async () => {
     await withManifest(fixtureText, async (path) => {
       const originalOpen = fs.open
@@ -836,6 +968,45 @@ describe('withCustodyManifestLock', () => {
           Date.now = originalNow
         }
       })
+    },
+  )
+
+  test.serial(
+    'treats missing and unparseable owner locks as busy without evicting them',
+    async () => {
+      for (const owner of [undefined, 'not json']) {
+        await withTempDirectory(async (directory) => {
+          const path = join(directory, 'handles.json')
+          const lockPath = `${path}.lock`
+          await fs.mkdir(lockPath, { mode: 0o700 })
+          if (owner !== undefined)
+            await fs.writeFile(join(lockPath, 'owner'), owner)
+          __setCustodyManifestLockTestOptions({
+            ttlMs: 30,
+            retryMinMs: 5,
+            retryMaxMs: 5,
+            renewalIntervalMs: 1_000,
+          } as never)
+
+          await expect(
+            writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+          ).resolves.toEqual({
+            status: 'refused',
+            reason: 'manifest lock busy',
+          })
+          expect(await fs.lstat(lockPath)).toBeDefined()
+          if (owner === undefined)
+            await expect(
+              fs.lstat(join(lockPath, 'owner')),
+            ).rejects.toMatchObject({
+              code: 'ENOENT',
+            })
+          else
+            expect(await fs.readFile(join(lockPath, 'owner'), 'utf8')).toBe(
+              owner,
+            )
+        })
+      }
     },
   )
 

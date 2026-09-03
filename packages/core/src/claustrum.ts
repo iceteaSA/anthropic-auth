@@ -587,10 +587,11 @@ export function __setCustodyManifestLockTestOptions(
 }
 
 class CustodyManifestLockBusyError extends Error {}
+class CustodyManifestLockLeaseLostError extends Error {}
 
 export async function withCustodyManifestLock<T>(
   path: string,
-  fn: () => Promise<T>,
+  fn: (assertLease: () => Promise<void>) => Promise<T>,
 ): Promise<T> {
   const lockPath = `${path}.lock`
   const now = Date.now
@@ -668,15 +669,12 @@ export async function withCustodyManifestLock<T>(
       ) {
         ownerClaimedAtMs = owner.claimed_at_ms
       }
-    } catch (error) {
-      if (errorCode(error) === 'ENOENT') continue
-      throw error
-    }
+    } catch {}
     if (
       ownerClaimedAtMs !== undefined &&
       ownerClaimedAtMs + ttlMs <= startedAt
     ) {
-      const claimedPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.stale`
+      const claimedPath = `${lockPath}.stale-${ownerClaimedAtMs}-${randomUUID()}`
       try {
         await fs.rename(lockPath, claimedPath)
       } catch (error) {
@@ -692,30 +690,46 @@ export async function withCustodyManifestLock<T>(
     await Bun.sleep(Math.min(retryMs, Math.max(1, deadline - now())))
   }
 
-  const renewal = setInterval(
-    () => {
-      void writeOwner(now()).catch(() => {})
-    },
-    custodyManifestLockTestOptions?.renewalIntervalMs ??
-      Math.min(CUSTODY_MANIFEST_LOCK_RENEW_MS, Math.floor(ttlMs / 3)),
-  )
-  if ('unref' in renewal) renewal.unref()
-  try {
-    return await fn()
-  } finally {
-    clearInterval(renewal)
-    let ownsCurrentLease = false
+  let renewalFailed = false
+  let renewalInFlight: Promise<void> | undefined
+  async function ownsCurrentLease(): Promise<boolean> {
+    if (renewalFailed) return false
     try {
       const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
-      ownsCurrentLease =
+      return (
         isRecord(owner) &&
         owner.pid === process.pid &&
         owner.nonce === nonce &&
         typeof owner.claimed_at_ms === 'number' &&
         Number.isFinite(owner.claimed_at_ms) &&
         now() - owner.claimed_at_ms < ttlMs
-    } catch {}
-    if (!ownsCurrentLease) {
+      )
+    } catch {
+      return false
+    }
+  }
+  async function assertLease(): Promise<void> {
+    await renewalInFlight
+    if (!(await ownsCurrentLease()))
+      throw new CustodyManifestLockLeaseLostError(
+        'manifest lock renewal failed; write aborted',
+      )
+  }
+  const renewal = setInterval(
+    () => {
+      renewalInFlight = writeOwner(now()).catch(() => {
+        renewalFailed = true
+      })
+    },
+    custodyManifestLockTestOptions?.renewalIntervalMs ??
+      Math.min(CUSTODY_MANIFEST_LOCK_RENEW_MS, Math.floor(ttlMs / 3)),
+  )
+  if ('unref' in renewal) renewal.unref()
+  try {
+    return await fn(assertLease)
+  } finally {
+    clearInterval(renewal)
+    if (!(await ownsCurrentLease())) {
       logger.warn('claustrum', 'manifest lock lease lost, not releasing', {
         id: path,
       })
@@ -756,12 +770,15 @@ export async function writeCustodyHandleManifestEntry(
     return refusal('invalid entry')
   }
   try {
-    return await withCustodyManifestLock(input.path, () =>
-      writeCustodyHandleManifestEntryLocked(input),
+    return await withCustodyManifestLock(input.path, (assertLease) =>
+      writeCustodyHandleManifestEntryLocked(input, assertLease),
     )
   } catch (error) {
     if (error instanceof CustodyManifestLockBusyError) {
       return refusal('manifest lock busy')
+    }
+    if (error instanceof CustodyManifestLockLeaseLostError) {
+      return refusal('manifest lock renewal failed; write aborted')
     }
     return refusal(`unreadable (${errorCode(error)})`)
   }
@@ -769,6 +786,7 @@ export async function writeCustodyHandleManifestEntry(
 
 async function writeCustodyHandleManifestEntryLocked(
   input: CustodyHandleManifestWriteInput,
+  assertLease: () => Promise<void>,
 ): Promise<CustodyHandleManifestWriteResult> {
   const expectedUid = input.expectedUid ?? process.getuid?.() ?? userInfo().uid
   const parent = dirname(input.path)
@@ -910,9 +928,11 @@ async function writeCustodyHandleManifestEntryLocked(
     await temporaryHandle.sync()
     await temporaryHandle.close()
     temporaryHandle = undefined
+    await assertLease()
     await fs.rename(temporaryPath, input.path)
     return { status: 'written' }
   } catch (error) {
+    if (error instanceof CustodyManifestLockLeaseLostError) throw error
     return refusal(`unreadable (${errorCode(error)})`)
   } finally {
     await temporaryHandle?.close().catch(() => {})
