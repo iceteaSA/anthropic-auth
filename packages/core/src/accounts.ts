@@ -387,6 +387,7 @@ export type AccountStateSaveScope = {
   mainRefresh?: boolean
   mainPrime?: boolean
   accounts?: true | string[]
+  setClaustrumHandleAccountIds?: readonly string[]
 }
 
 type OAuthUsageWindow = {
@@ -1365,30 +1366,33 @@ export function mergeHeaderQuotaForPersistence(
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
+  setClaustrumHandle = false,
 ): AccountRuntimeEntry {
   if (!isRecord(existing)) return incoming
+  const incomingForMerge = { ...incoming }
+  if (!setClaustrumHandle) delete incomingForMerge.claustrumHandle
   const existingEntry = existing as AccountRuntimeEntry
   const tokenChanged = Boolean(
     (existingEntry.access &&
-      incoming.access &&
-      existingEntry.access !== incoming.access) ||
+      incomingForMerge.access &&
+      existingEntry.access !== incomingForMerge.access) ||
       (existingEntry.refresh &&
-        incoming.refresh &&
-        existingEntry.refresh !== incoming.refresh),
+        incomingForMerge.refresh &&
+        existingEntry.refresh !== incomingForMerge.refresh),
   )
   const mergesHeaderQuota = Boolean(
-    !tokenChanged && incoming.quota?.source === 'headers',
+    !tokenChanged && incomingForMerge.quota?.source === 'headers',
   )
   const effectiveIncoming =
-    mergesHeaderQuota && incoming.quota
+    mergesHeaderQuota && incomingForMerge.quota
       ? {
-          ...incoming,
+          ...incomingForMerge,
           quota: mergeHeaderQuotaForPersistence(
             existingEntry.quota,
-            incoming.quota,
+            incomingForMerge.quota,
           ),
         }
-      : incoming
+      : incomingForMerge
   const preferredRefreshError = (() => {
     const existingError = existingEntry.lastRefreshError
     const incomingError = effectiveIncoming.lastRefreshError
@@ -1645,6 +1649,7 @@ export interface SaveAccountsOptions {
   removedAccountIds?: readonly string[]
   /** Preserve disk order when a stale snapshot is missing newer accounts. */
   preserveExistingAccountOrder?: boolean
+  setClaustrumHandleAccountIds?: readonly string[]
 }
 
 function sameAccountIdentity(
@@ -1814,6 +1819,7 @@ async function saveAccountsWithConfigLock(
       mainQuota: true,
       mainRefresh: true,
       accounts: true,
+      setClaustrumHandleAccountIds: options.setClaustrumHandleAccountIds,
     })
   } finally {
     await stateLock.release()
@@ -2253,6 +2259,9 @@ async function saveAccountStateUnlocked(
 
   if (scope.accounts) {
     const ids = scope.accounts === true ? null : new Set(scope.accounts)
+    const setClaustrumHandleAccountIds = new Set(
+      scope.setClaustrumHandleAccountIds ?? [],
+    )
     const config = (await readJsonIfPresent(path)).value
     const configuredIds = (() => {
       if (!isRecord(config) || !Array.isArray(config.accounts)) return null
@@ -2310,6 +2319,8 @@ async function saveAccountStateUnlocked(
       next.accounts[accountId] = mergeAccountRuntimeState(
         existingAccount,
         accountRuntimeState(account),
+        setClaustrumHandleAccountIds.has(account.id) ||
+          setClaustrumHandleAccountIds.has(accountId),
       )
     }
     if (configuredIds) {
@@ -3482,7 +3493,12 @@ export async function addAccountPersistent(
 ) {
   const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   upsertAccount(storage, account)
-  await saveAccounts(storage, path)
+  await saveAccounts(storage, path, {
+    setClaustrumHandleAccountIds:
+      account.type === 'oauth' && account.claustrumHandle
+        ? [account.id]
+        : undefined,
+  })
 }
 
 export function getQuotaNextRefreshAt(
