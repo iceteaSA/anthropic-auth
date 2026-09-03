@@ -39,6 +39,7 @@ import {
   type CustodyHandleResolution,
   type CustodyStatusState,
   CustodyTombstoneRefreshError,
+  clearClaustrumHandlePersistent,
   clearClaustrumRefreshErrorPersistent,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
@@ -188,6 +189,7 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
   tokenFingerprint,
+  writeCustodyHandleManifestEntry,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 
@@ -1851,12 +1853,12 @@ const anthropicAuthPlugin = async (
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     options?: { warm?: boolean },
   ): ClaustrumAccessResolution {
+    if (!storage) return { accessToken: account.access }
     const custodyHandle = resolveAccountCustodyHandle(account, storage)
     const handle =
       custodyHandle.status === 'resolved' ? custodyHandle.handle : undefined
     if (
       !handle ||
-      !storage ||
       !isClaustrumEnabledForAccount(storage, account.id) ||
       claustrumBlockedAccounts.has(account.id)
     ) {
@@ -4226,7 +4228,7 @@ const anthropicAuthPlugin = async (
                     return refuse(
                       'credential',
                       error.errorClass,
-                      `Vault credential needs re-login (ck auth login --id oauth:anthropic:${account.label ?? account.id}).`,
+                      `Vault credential needs re-login (ck auth login --id ${custodyResolution.status === 'resolved' && custodyResolution.source === 'manifest' ? custodyResolution.credentialId : `oauth:anthropic:${account.label ?? account.id}`}).`,
                     )
                   }
                   return refuse(
@@ -4267,6 +4269,34 @@ const anthropicAuthPlugin = async (
                 return {
                   text: `Custody already on for ${account.id}.`,
                   changed: false,
+                }
+              }
+              // Keep the account lock until both persistence layers agree on the
+              // handle's owner: account refresh → manifest → config.
+              if (
+                custodyResolution.status === 'resolved' &&
+                custodyResolution.source === 'legacy' &&
+                account.label
+              ) {
+                const write = await writeCustodyHandleManifestEntry({
+                  path: custodyHandleManifestPath,
+                  entry: {
+                    label: account.label,
+                    handle,
+                    credentialId: `oauth:anthropic:${account.label}`,
+                  },
+                })
+                if (write.status === 'written') {
+                  await clearClaustrumHandlePersistent({
+                    id: account.id,
+                    path: accountStoragePath,
+                  })
+                  await refreshCustodyHandleManifest()
+                } else if (write.status === 'refused') {
+                  logger.warn('commands', 'custody manifest write failed', {
+                    id: account.id,
+                    reason: write.reason,
+                  })
                 }
               }
               await markClaustrumCredentialReady(account.id, handle)

@@ -195,7 +195,13 @@ export type CustodyHandleManifest = {
 }
 
 export type CustodyHandleResolution =
-  | { status: 'resolved'; source: 'manifest' | 'legacy'; handle: string }
+  | {
+      status: 'resolved'
+      source: 'manifest'
+      handle: string
+      credentialId: string
+    }
+  | { status: 'resolved'; source: 'legacy'; handle: string }
   | {
       status: 'unresolved'
       reason:
@@ -281,7 +287,12 @@ export function resolveCustodyHandle(input: {
   if (manifest.superseded.has(entry.handle)) {
     return { status: 'unresolved', reason: 'superseded' }
   }
-  return { status: 'resolved', source: 'manifest', handle: entry.handle }
+  return {
+    status: 'resolved',
+    source: 'manifest',
+    handle: entry.handle,
+    credentialId: entry.credentialId,
+  }
 }
 
 export function readCustodyHandles(
@@ -547,6 +558,77 @@ export type CustodyHandleManifestWriteResult =
   | { status: 'written' | 'unchanged' }
   | { status: 'refused'; reason: string }
 
+const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
+
+class CustodyManifestLockBusyError extends Error {}
+
+export async function withCustodyManifestLock<T>(
+  path: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${path}.lock`
+  const now = Date.now
+
+  async function claim() {
+    try {
+      await fs.mkdir(lockPath, { mode: 0o700 })
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error
+      return false
+    }
+    await fs.writeFile(
+      join(lockPath, 'owner'),
+      `${JSON.stringify({
+        tenant: 'anthropic-auth',
+        pid: process.pid,
+        claimed_at_ms: now(),
+      })}\n`,
+      { encoding: 'utf8', mode: 0o600 },
+    )
+    return true
+  }
+
+  let claimed = await claim()
+  if (!claimed) {
+    let current: Awaited<ReturnType<typeof fs.stat>> | undefined
+    try {
+      current = await fs.stat(lockPath)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') claimed = await claim()
+      else throw error
+    }
+    if (
+      !claimed &&
+      current &&
+      Number(current.mtimeMs) + CUSTODY_MANIFEST_LOCK_TTL_MS <= now()
+    ) {
+      const claimedPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.stale`
+      try {
+        await fs.rename(lockPath, claimedPath)
+      } catch (error) {
+        if (errorCode(error) !== 'ENOENT') throw error
+      }
+      await fs.rm(claimedPath, { recursive: true, force: true }).catch(() => {})
+      claimed = await claim()
+    }
+  }
+  if (!claimed) throw new CustodyManifestLockBusyError('manifest lock busy')
+
+  const renewal = setInterval(
+    () => {
+      void fs.utimes(lockPath, new Date(), new Date()).catch(() => {})
+    },
+    Math.floor(CUSTODY_MANIFEST_LOCK_TTL_MS / 3),
+  )
+  if ('unref' in renewal) renewal.unref()
+  try {
+    return await fn()
+  } finally {
+    clearInterval(renewal)
+    await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
 type CustodyHandleManifestWriteInput = {
   path: string
   entry: CustodyHandleAccount
@@ -568,6 +650,21 @@ function isOurManifestBlock(value: unknown): value is Record<string, unknown> {
 }
 
 export async function writeCustodyHandleManifestEntry(
+  input: CustodyHandleManifestWriteInput,
+): Promise<CustodyHandleManifestWriteResult> {
+  try {
+    return await withCustodyManifestLock(input.path, () =>
+      writeCustodyHandleManifestEntryLocked(input),
+    )
+  } catch (error) {
+    if (error instanceof CustodyManifestLockBusyError) {
+      return refusal('manifest lock busy')
+    }
+    return refusal(`unreadable (${errorCode(error)})`)
+  }
+}
+
+async function writeCustodyHandleManifestEntryLocked(
   input: CustodyHandleManifestWriteInput,
 ): Promise<CustodyHandleManifestWriteResult> {
   const expectedUid = input.expectedUid ?? process.getuid?.() ?? userInfo().uid

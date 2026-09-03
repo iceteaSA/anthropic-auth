@@ -1565,6 +1565,32 @@ export async function setClaustrumAccountGatePersistent(input: {
   })
 }
 
+export async function clearClaustrumHandlePersistent(input: {
+  id: string
+  path?: string
+}): Promise<'updated' | 'missing' | 'ineligible'> {
+  const path = input.path ?? getAccountStoragePath()
+  return enqueueSave(async () => {
+    const lock = await acquireAccountConfigWriteLock(path)
+    try {
+      const storage = await loadAccounts(path)
+      if (!storage) return 'missing'
+      const account = storage.accounts.find(
+        (candidate) => candidate.id === input.id,
+      )
+      if (!account) return 'missing'
+      if (!isOAuthAccount(account)) return 'ineligible'
+      if (!account.claustrumHandle) return 'updated'
+
+      delete account.claustrumHandle
+      await saveAccountsWithConfigLock(storage, path, {})
+      return 'updated'
+    } finally {
+      await lock.release()
+    }
+  })
+}
+
 // ---------------------------------------------------------------------------
 // In-process save mutex — serializes all account-store writes so concurrent
 // read-modify-write callers (background timers that call saveAccountState with
