@@ -854,7 +854,56 @@ describe('withCustodyManifestLock', () => {
   })
 
   test.serial(
-    'does not evict a holder whose owner record is renewed',
+    'evicts an owner that crashes after the contender starts',
+    async () => {
+      await withTempDirectory(async (directory) => {
+        const path = join(directory, 'handles.json')
+        const lockPath = `${path}.lock`
+        const ownerPath = join(lockPath, 'owner')
+        const ttlMs = 2_000
+        const crashedOwnerNonce = 'crashed-owner'
+        const originalNow = Date.now
+        let now = 0
+        let ownerReads = 0
+        Date.now = () => now
+        __setCustodyManifestLockTestOptions({
+          ttlMs,
+          retryMinMs: 1,
+          retryMaxMs: 1,
+          renewalIntervalMs: 1_000,
+          afterStaleOwnerRead: () => {
+            ownerReads += 1
+            now = ownerReads === 1 ? ttlMs + 1 : ttlMs + 500
+          },
+        } as never)
+        try {
+          await fs.mkdir(lockPath, { mode: 0o700 })
+          await fs.writeFile(
+            ownerPath,
+            `${JSON.stringify({
+              tenant: 'anthropic-auth',
+              pid: process.pid,
+              claimed_at_ms: now,
+              nonce: crashedOwnerNonce,
+            })}\n`,
+          )
+          now = 500
+
+          expect(
+            await withCustodyManifestLock(path, async () => 'acquired'),
+          ).toBe('acquired')
+          await expect(
+            fs.lstat(`${lockPath}.stale-0-${crashedOwnerNonce}`),
+          ).resolves.toBeDefined()
+        } finally {
+          Date.now = originalNow
+        }
+      })
+    },
+  )
+
+  test.serial(
+    'does not evict a holder whose owner record is renewed across multiple leases',
     async () => {
       await withTempDirectory(async (directory) => {
         const path = join(directory, 'handles.json')
@@ -874,7 +923,7 @@ describe('withCustodyManifestLock', () => {
           order.push('first-exit')
         })
         await firstEntered.promise
-        await Bun.sleep(130)
+        await Bun.sleep(350)
         const second = withCustodyManifestLock(path, async () => {
           order.push('second-enter')
         })

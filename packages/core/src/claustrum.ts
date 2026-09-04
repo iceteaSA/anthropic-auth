@@ -680,7 +680,7 @@ export async function withCustodyManifestLock<T>(
     if (
       ownerClaimedAtMs !== undefined &&
       ownerNonce !== undefined &&
-      ownerClaimedAtMs + ttlMs <= startedAt
+      now() - ownerClaimedAtMs >= ttlMs
     ) {
       const claimedPath = `${lockPath}.stale-${ownerClaimedAtMs}-${ownerNonce}`
       try {
