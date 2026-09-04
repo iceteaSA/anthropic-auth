@@ -559,7 +559,11 @@ export class CustodyHandleManifestReader {
 
 export type CustodyHandleManifestWriteResult =
   | { status: 'written' | 'unchanged' }
-  | { status: 'refused'; reason: string }
+  | {
+      status: 'refused'
+      reason: string
+      code?: CustodyManifestLockErrorCode
+    }
 
 export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
 export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
@@ -588,8 +592,57 @@ export function __setCustodyManifestLockTestOptions(
   custodyManifestLockTestOptions = options
 }
 
-class CustodyManifestLockBusyError extends Error {}
-class CustodyManifestLockLeaseLostError extends Error {}
+export const CUSTODY_MANIFEST_LOCK_ERROR_CODES = [
+  'lock_busy',
+  'owner_invalid',
+  'renewal_failed',
+] as const
+
+export type CustodyManifestLockErrorCode =
+  (typeof CUSTODY_MANIFEST_LOCK_ERROR_CODES)[number]
+
+export class CustodyManifestLockError extends Error {
+  constructor(
+    message: string,
+    readonly code: CustodyManifestLockErrorCode,
+  ) {
+    super(message)
+  }
+}
+
+export class CustodyManifestLockBusyError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'lock_busy')
+  }
+}
+
+export class CustodyManifestLockOwnerInvalidError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'owner_invalid')
+  }
+}
+
+export class CustodyManifestLockLeaseLostError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'renewal_failed')
+  }
+}
+
+function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
+  // A reader that rejects an upgraded writer's nonce cannot evict its dead lock and wedges itself; vendor this negative check in all three tenants before widening the nonce alphabet.
+  for (const character of nonce) {
+    const code = character.charCodeAt(0)
+    if (code < 0x20 || code === 0x7f) return false
+  }
+  return (
+    nonce.length > 0 &&
+    nonce.length <= 128 &&
+    nonce !== '.' &&
+    nonce !== '..' &&
+    !/[\\/:*?"<>|]/.test(nonce) &&
+    !/[. ]$/.test(nonce)
+  )
+}
 
 export async function withCustodyManifestLock<T>(
   path: string,
@@ -663,6 +716,7 @@ export async function withCustodyManifestLock<T>(
 
     let ownerClaimedAtMs: number | undefined
     let ownerNonce: string | undefined
+    let ownerInvalid = false
     try {
       const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
       if (
@@ -670,13 +724,15 @@ export async function withCustodyManifestLock<T>(
         typeof owner.claimed_at_ms === 'number' &&
         Number.isFinite(owner.claimed_at_ms) &&
         typeof owner.nonce === 'string' &&
-        /^[A-Za-z0-9_-]+$/.test(owner.nonce)
+        isEvictableCustodyManifestLockNonce(owner.nonce)
       ) {
         ownerClaimedAtMs = owner.claimed_at_ms
         ownerNonce = owner.nonce
         await custodyManifestLockTestOptions?.afterStaleOwnerRead?.()
-      }
-    } catch {}
+      } else ownerInvalid = true
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') ownerInvalid = true
+    }
     if (
       ownerClaimedAtMs !== undefined &&
       ownerNonce !== undefined &&
@@ -691,6 +747,10 @@ export async function withCustodyManifestLock<T>(
       }
       continue
     }
+    if (now() >= deadline && ownerInvalid)
+      throw new CustodyManifestLockOwnerInvalidError(
+        'manifest lock owner invalid',
+      )
     if (now() >= deadline)
       throw new CustodyManifestLockBusyError('manifest lock busy')
     const retryMs =
@@ -755,8 +815,11 @@ type CustodyHandleManifestWriteInput = {
 
 function refusal(
   reason: string,
+  code?: CustodyManifestLockErrorCode,
 ): Extract<CustodyHandleManifestWriteResult, { status: 'refused' }> {
-  return { status: 'refused', reason }
+  return code === undefined
+    ? { status: 'refused', reason }
+    : { status: 'refused', reason, code }
 }
 
 function isOurManifestBlock(value: unknown): value is Record<string, unknown> {
@@ -783,10 +846,13 @@ export async function writeCustodyHandleManifestEntry(
     )
   } catch (error) {
     if (error instanceof CustodyManifestLockBusyError) {
-      return refusal('manifest lock busy')
+      return refusal('manifest lock busy', error.code)
+    }
+    if (error instanceof CustodyManifestLockOwnerInvalidError) {
+      return refusal('manifest lock owner invalid', error.code)
     }
     if (error instanceof CustodyManifestLockLeaseLostError) {
-      return refusal('manifest lock renewal failed; write aborted')
+      return refusal('manifest lock renewal failed; write aborted', error.code)
     }
     return refusal(`unreadable (${errorCode(error)})`)
   }

@@ -1779,7 +1779,7 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
-    'refuses a fresh manifest lock after its bounded wait and keeps the legacy handle',
+    'reports a corrupt manifest lock after its bounded wait and keeps the legacy handle',
     async () => {
       await withShortManifestLockTiming(async () => {
         const { manifestPath, plugin, restore } =
@@ -1811,7 +1811,7 @@ describe('fallback Claustrum credential resolution', () => {
             logs.some(
               (record) =>
                 record.message === 'custody manifest write failed' &&
-                record.payload?.reason === 'manifest lock busy',
+                record.payload?.reason === 'manifest lock owner invalid',
             ),
           ).toBe(true)
           expect(
