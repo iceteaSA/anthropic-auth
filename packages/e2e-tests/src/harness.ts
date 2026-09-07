@@ -1,7 +1,11 @@
 import { join } from 'node:path'
 import { MockAnthropicServer, type MockResponse } from './mock-anthropic.ts'
 import { MockRelayServer } from './mock-relay.ts'
-import { type SpawnedOpencode, spawnOpencode } from './opencode-runner.ts'
+import {
+  type IsolatedEnv,
+  type SpawnedOpencode,
+  spawnOpencode,
+} from './opencode-runner.ts'
 
 type SdkClient = {
   session: {
@@ -30,6 +34,8 @@ export type E2EHarnessOptions = {
   hybridCache?: boolean
   fallbackMode?: 'server' | 'legacy'
   childTmpDir?: string
+  childEnv?: Record<string, string | undefined>
+  beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
 }
 
 export class E2EHarness {
@@ -77,6 +83,8 @@ export class E2EHarness {
       fallbackMode: options.fallbackMode,
       childTmpDir: options.childTmpDir,
       quotaFeed: options.quotaFeed,
+      childEnv: options.childEnv,
+      beforeSpawn: options.beforeSpawn,
     })
     const sdk = await import('@opencode-ai/sdk')
     const client = sdk.createOpencodeClient({

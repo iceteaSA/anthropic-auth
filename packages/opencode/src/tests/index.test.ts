@@ -1401,6 +1401,41 @@ describe('fallback Claustrum credential resolution', () => {
     )
 
     test.serial(
+      'fallback-first reports the fallback vault record after its 401',
+      async () => {
+        const fixture = await bootVaultMain({
+          routing: { mode: 'fallback-first' },
+          responseStatuses: [401, 200],
+        })
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(200)
+        expect(fixture.authorizations).toEqual([
+          'Bearer vault-fallback-access',
+          'Bearer vault-main-access',
+        ])
+        expect(fixture.calls).toContainEqual({
+          method: 'credential.report_auth_failure',
+          params: {
+            handle: fallbackHandle,
+            provider_status: 401,
+            record_version: 29,
+            reporter_source: 'direct',
+          },
+        })
+        expect(fixture.calls).not.toContainEqual({
+          method: 'credential.report_auth_failure',
+          params: {
+            handle: manifestHandle,
+            provider_status: 401,
+            record_version: 17,
+            reporter_source: 'direct',
+          },
+        })
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
       'served main quota identity comes from the vault account id',
       async () => {
         const fixture = await bootVaultMain({
