@@ -163,6 +163,7 @@ globalThis.fetch = guardedFetch
 
 const testDir = mkdtempSync(join(tmpdir(), 'anthropic-auth-opencode-test-'))
 const testManifestPath = join(testDir, 'handles.json')
+const testClaustrumConnectionPath = join(testDir, 'claustrum-connection.json')
 
 afterAll(async () => {
   await rm(testDir, { recursive: true, force: true }).catch(() => {})
@@ -170,6 +171,8 @@ afterAll(async () => {
 
 process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = testDir
 process.env.CLAUSTRUM_OPENCODE_HANDLES = testManifestPath
+process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
+  testClaustrumConnectionPath
 const resolvedTestManifestPath = resolveCustodyHandlesPath(
   undefined,
   process.env,

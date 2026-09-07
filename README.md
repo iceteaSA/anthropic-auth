@@ -122,7 +122,7 @@ OpenCode keeps its native `anthropic` entry as the main account. In `local` mode
 /connect anthropic
 ```
 
-Before the main account can enter Claustrum custody, the operator must migrate it with `ck auth migrate-plugin --allow-main`. The plugin does not run that command, import credentials, migrate credentials, or start `ck`. It also never writes OpenCode's host `auth.json` slot.
+Before the main account can enter Claustrum custody, the operator onboards it into the vault with Claustrum's tooling. Until the dedicated import tooling lands, use the interim path in the custody state machine's §8, “Adding a new account today.” The plugin never runs `ck`, never imports or migrates credentials, and never writes the host auth slot.
 
 Verify the migration gate against the installed `ck-auth` binary, not an announcement or a claimed deployment revision. In an isolated scratch data directory, a production-shaped tombstone import must refuse with `refusing Claustrum tombstone material` and leave the audit chain unchanged; in the same run, a real-material import with `--replace` must succeed. The refusal alone is not enough because a broken import path also refuses. The exact tombstone write is:
 
@@ -191,9 +191,6 @@ Example:
   },
   "quotaHeaderFeed": {
     "enabled": false
-  },
-  "claustrum": {
-    "accounts": {}
   },
   "killswitch": {
     "enabled": false,
@@ -297,7 +294,7 @@ Claustrum custody is global. `/claude-account claustrum` enters custody, `/claud
 
 Entering custody preflights every enabled OAuth account. A refusal changes nothing, and the command reports every refusal in account order. The main account must already have been migrated by the operator. The plugin does not create or import vault records during this check.
 
-In custody, every enabled OAuth route is served from the vault, including the main account. If the main vault record is cold at boot, startup returns a typed refusal and holds every OAuth route until the next viable boot. If the main record goes cold after a warm boot, requests receive a typed provider-unavailable error. The plugin does not fall back to sidecar credentials or send a tombstone as a bearer token. A cold fallback is excluded only for that request, so other warm routes can still serve.
+In custody, every enabled OAuth route is served from the vault, including the main account. A cold main vault record returns a typed startup refusal and holds every OAuth route until the next viable boot; after a warm boot, it returns a typed provider-unavailable error. The plugin does not fall back to sidecar credentials or send a tombstone as a bearer token. A cold fallback is excluded only for that request, so other warm routes can still serve.
 
 Leaving custody puts the main account back into interactive OpenCode sign-in. A fallback binding clears only after a login completed through the plugin's own login flow observes new credential material. To enter custody again for that fallback, the operator must import the new material into the vault with `--replace`; until then, `/claude-account claustrum` refuses with `binding_missing`. API-key routes are unaffected.
 ## Quota-aware routing

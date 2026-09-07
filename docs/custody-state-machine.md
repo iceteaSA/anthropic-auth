@@ -168,8 +168,8 @@ vault-owned family.
 | # | binding | local | vault | verdict | serve | local refresh | durable writes | retry | operator |
 |---|---|---|---|---|---|---|---|---|---|
 | C1 | VALID | INERT | USABLE | `CUSTODY_SERVE` | vault | inert | none | — | none |
-| C2 | VALID | REAL, fingerprint **matches** | USABLE | fallback: `RESUME_TAKEOVER` · main: `TAKEOVER_INCOMPLETE_MAIN_REAL` (§13.1) | fallback: vault, after its commit · main: **no** | inert | fallback → drop refresh material under its lock · main → **none** | fallback: immediate · main: none | main: `ck auth migrate-plugin --allow-main` |
-| C2′ | VALID | REAL, fingerprint **differs or absent** | any | `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` (for main under §13.1 this is the *classification* of the `TAKEOVER_INCOMPLETE_MAIN_REAL` refusal: material the barrier did not read, versus C2's crash-left material it did) | **no** | inert | **none** | none | **unresolved** (§12.2): `ck auth migrate-plugin --replace` then re-enter is consistent with every rule; "exit to `local` and the login stands" is not |
+| C2 | VALID | REAL, fingerprint **matches** | USABLE | fallback: `RESUME_TAKEOVER` · main: `TAKEOVER_INCOMPLETE_MAIN_REAL` (§13.1) | fallback: vault, after its commit · main: **no** | inert | fallback → drop refresh material under its lock · main → **none** | fallback: immediate · main: none | main: onboard into the vault with Claustrum's tooling |
+| C2′ | VALID | REAL, fingerprint **differs or absent** | any | `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` (for main under §13.1 this is the *classification* of the `TAKEOVER_INCOMPLETE_MAIN_REAL` refusal: material the barrier did not read, versus C2's crash-left material it did) | **no** | inert | **none** | none | **unresolved** (§12.2): vault import with Claustrum's tooling, then re-enter, is consistent with every rule; "exit to `local` and the login stands" is not |
 | C3 | VALID | INERT | COLD | `CUSTODY_UNAVAILABLE` | **no** (typed provider-unavailable) | inert | none | bounded custody retry on vault availability | none |
 | C3′ | VALID | REAL | COLD | `TAKEOVER_INCOMPLETE_VAULT_UNAVAILABLE` | **no** | inert | **none**: no rollback, no drop. The destructive commit waits for `USABLE` (→ C2) because dropping material without proof the vault holds the family is destruction without evidence | on vault availability | none required; `local` + re-login only to abandon custody |
 | C4 | VALID | any | REAUTH | `CUSTODY_CREDENTIAL_LATCHED` | **no** | inert | none | **none**: retry cannot fix a latched record | re-import into the vault; resumes without a mode change |
@@ -177,7 +177,7 @@ vault-owned family.
 | C6 | ABSENT | REAL | N/A | `NOT_ENROLLED` | **no** | **no** (this mode has no local refreshers) | none | none | `ck auth bind` after import, or `local` |
 | C7 | ABSENT | INERT | N/A | `ORPHAN_TOMBSTONE` (main) / `ORPHAN_INERT` (fallback) | **no** | nothing to refresh | none | none | `bind`, or `local` + re-login |
 | C8 | INVALID | any | N/A | `CORRUPT_BINDING` | **no** | **inert** | **none**: never auto-repair a manifest entry | none | `ck auth bind --replace`, or `local` |
-| C9 | VALID | GONE (main) | USABLE · COLD · REAUTH | `TAKEOVER_INCOMPLETE_SLOT_ABSENT` | **no** | inert | **none** (plugin-side install into an absent slot is **withdrawn**, see below) | next boot | `ck auth migrate-plugin` restores the slot; or the host, once a fenced write exists |
+| C9 | VALID | GONE (main) | USABLE · COLD · REAUTH | `TAKEOVER_INCOMPLETE_SLOT_ABSENT` | **no** | inert | **none** (plugin-side install into an absent slot is **withdrawn**, see below) | next boot | vault import restores the slot; or the host, once a fenced write exists |
 | C10 | VALID | GONE (fallback = `ROW_UNPARSEABLE`) | any | `CORRUPT_ROW` | **no** | inert | **none**; state secrets retained | next reconcile | repair the row, or remove + re-discover |
 
 At the loader, `evidence` means the main-slot vault evidence only. Fallback residency is route-local: a cold bound fallback is excluded for that request while other routes, including a resident main, continue to serve. Structural fallback dimensions (`R`/`M`) still produce `RESUME_TAKEOVER` or a binding-missing refusal independently of loader evidence.
@@ -197,7 +197,7 @@ Invariants pinning the combinations not rowed:
   non-atomic host write, and the torn-read amplifier (§12.1), an install into an "absent" slot is
   the highest-blast-radius write this plugin could issue (it can wipe every provider's credentials),
   and its payoff was a typed verdict in place of the host's generic not-logged-in. The absent slot is
-  named in status and restored by `ck auth migrate-plugin` or by the host once a fenced write lands
+  named in status and restored by vault import or by the host once a fenced write lands
   (#46128). Two rules bind **any** host-slot write the plugin ever issues: (1) read
   `client.auth.all()` first and, if it is EMPTY, abort the write, warn once, retry next tick, since an
   empty map on a machine with any configured provider is a torn read until proven otherwise; (2)
@@ -282,7 +282,7 @@ aggregate state exists.
 
 **Adding a new account today.** No verb on Claustrum master writes our provider block
 (`mint-handle` prints a handle; `migrate-opencode` writes an OpenCode-shaped entry even under
-`--serve-by anthropic-auth`; `migrate-plugin --serve anthropic-auth` writes our block but takes a
+`--serve-by anthropic-auth`; Claustrum's follow-up plugin tooling writes our block but takes a
 plugin-**exported** file, so it migrates accounts we already hold). Two paths:
 
 - direct, once it lands: `ck auth bind --serve anthropic-auth --label <label> --id <credential_id>`
@@ -291,8 +291,8 @@ plugin-**exported** file, so it migrates accounts we already hold). Two paths:
   mint**. Refuses an existing label without `--replace`; refuses a credential id outside the tenant's
   allowed prefix; never touches our account rows. Chosen over a plugin-side verb because a handle
   must never sit at rest between two commands when one can mint-and-persist with revoke-on-failure.
-- interim (every step exists): `/claude-account local` → `/login` →
-  `ck auth migrate-plugin --from <export> --replace` → `/claude-account claustrum`.
+- interim (every step exists): `/claude-account local` → `/login` → vault import with
+  Claustrum's tooling → `/claude-account claustrum`.
 
 **Exit-edge dependency.** The verified-login clear requires the manifest writer (Slice 2,
 `feat/custody-manifest`), which lands before this transition. It is plugin-side in the same phase.
@@ -413,7 +413,8 @@ same-process race because both sides are our code; (2) a post-write readback aft
 write, so ordering A is detected in the same run rather than on the next boot; (3) the cross-process
 residual (a login in another OpenCode window) **declared** in the transition's confirmation text,
 never hidden; (4) a **convergent write** for the main-slot install, proposed by the Claustrum seat on
-the #196 thread and buildable inside `ck auth migrate-plugin --allow-main` where the imported bytes
+the #196 thread and buildable inside Claustrum's follow-up import tooling (verb pending: not in any
+deployed build as of 2026-09-07) where the imported bytes
 are already in hand: import first → write the tombstone → settle → re-read; a slot **byte-equal to
 the imported material** means a clobber by an env-snapshot child (rewrite, bounded retries), while
 **different real material** means a newer family landed (refuse loud, never overwrite). The residual
@@ -456,14 +457,14 @@ rotated.
 
 ### 12.4 A cold main handle at boot holds warm fallbacks
 
-`C|T|T|N` is a global verdict. A cold or latched main handle at boot blocks a healthy, bound fallback even when the daemon is healthy and that fallback could serve.
+`C|T|T|N` is a global verdict for a cold main handle at boot. It blocks a healthy, bound fallback even when the daemon is healthy and that fallback could serve. A latched main record is `C|T|T|V` with reauth status; today its route refuses that account rather than treating it as `N`. That describes current behavior, not a resolution of the cold-at-boot question.
 
 Two directions remain open:
 
 1. Keep the global refusal. The operator re-imports the main record before the next boot.
 2. Serve fallbacks only. The main route returns a typed refusal while healthy fallbacks remain route-local, matching §5's fallback residency rule.
 
-Unresolved. This document does not choose between them.
+Unresolved for the cold-at-boot global-hold question. This document does not choose between these directions.
 ## 13. Implementation constraints (binding, from the 06:04Z go-ahead)
 
 1. **The host-write race stays open and the unsafe transition stays BLOCKED.** The main-slot
@@ -471,10 +472,10 @@ Unresolved. This document does not choose between them.
    `Auth.set`, and plugin-side restoration into an absent slot is withdrawn outright (C9, §12.1).
    **What the command does today, under the block:** the plugin issues **no** main-slot write at
    all. Main's tombstone is written by the operator-driven vault import
-   (`ck auth migrate-plugin --allow-main`, the settled ownership of main import), and the barrier
+   (the settled ownership of main import, verb pending: Claustrum follow-up; not in any deployed build as of 2026-09-07), and the barrier
    treats "main's slot already holds the recognise-set" as a **precondition**: at step 2, main
    classifies C1 only if the slot is already INERT; a REAL main slot is a typed refusal
-   (`main is still local; run ck auth migrate-plugin --allow-main first`) issued **before** step 3,
+   (`main is still local; onboard main into the vault with Claustrum's tooling first`) issued **before** step 3,
    so no mode write and no fallback commit happens (the barrier is all-or-nothing readiness).
    Consequently C2 (`RESUME_TAKEOVER`) applies to **fallbacks only**; a REAL main under
    `mode=claustrum` is refused as `TAKEOVER_INCOMPLETE_MAIN_REAL` in both fingerprint cases (no

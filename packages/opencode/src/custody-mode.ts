@@ -252,7 +252,7 @@ export async function preflightClaustrumTakeover(
       reason === 'TAKEOVER_INCOMPLETE_MAIN_REAL'
         ? {
             guidance:
-              'Run ck auth migrate-plugin --allow-main before retrying.',
+              "Onboard the main account into the Claustrum vault with Claustrum's tooling (see its runbook) before retrying.",
           }
         : {}),
     })

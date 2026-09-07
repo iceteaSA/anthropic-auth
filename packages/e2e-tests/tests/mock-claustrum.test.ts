@@ -2,9 +2,19 @@
 
 import { afterEach, describe, expect, it } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { createConnection, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SubcClient } from '@cortexkit/subc-client'
+import {
+  buildFlags,
+  buildFrame,
+  decodeHeader,
+  encodeFrame,
+  FrameType,
+  HEADER_LEN,
+  Priority,
+  SubcClient,
+} from '@cortexkit/subc-client'
 import { startFakeClaustrumDaemon } from '../src/mock-claustrum.ts'
 
 const roots: string[] = []
@@ -54,4 +64,86 @@ describe('fake Claustrum daemon', () => {
       },
     })
   })
+
+  it('rejects credential requests on an unassigned route channel', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-claustrum-'))
+    roots.push(root)
+    const daemon = await startFakeClaustrumDaemon({
+      directory: root,
+      credentials: {
+        ckh_main: {
+          payload: JSON.stringify({ access_token: 'vault-main' }),
+          account_id: 'account-main',
+          record_version: 7,
+          expires_at_ms: Date.now() + 60 * 60 * 1000,
+        },
+      },
+    })
+    daemons.push(daemon)
+    const socket = await connectRawDaemon(daemon.connectionFile)
+    try {
+      const response = nextSocketData(socket)
+      const request = buildFrame(
+        FrameType.Request,
+        buildFlags(false, Priority.Interactive, false),
+        8,
+        1,
+        1n,
+        Buffer.from(
+          JSON.stringify({
+            method: 'credential.get',
+            params: { handle: 'ckh_main' },
+          }),
+        ),
+      )
+      socket.write(Buffer.from(encodeFrame(request)))
+
+      const frame = await response
+      const header = decodeHeader(frame)
+      expect(header.ty).toBe(FrameType.Error)
+      expect(
+        JSON.parse(
+          frame
+            .subarray(HEADER_LEN, HEADER_LEN + header.len)
+            .toString('utf8'),
+        ),
+      ).toEqual({ code: 'unknown_channel' })
+    } finally {
+      socket.destroy()
+    }
+  })
 })
+
+async function connectRawDaemon(connectionFile: string): Promise<Socket> {
+  const connection = (await Bun.file(connectionFile).json()) as {
+    endpoints: Array<{ host: string; port: number }>
+  }
+  const endpoint = connection.endpoints[0]!
+  const socket = createConnection(endpoint.port, endpoint.host)
+  await new Promise<void>((resolve, reject) => {
+    socket.once('connect', resolve)
+    socket.once('error', reject)
+  })
+
+  const hello = nextSocketData(socket)
+  writeHandshakeMessage(socket, {
+    client_nonce: Array.from({ length: 32 }, (_, index) => index),
+  })
+  await hello
+  writeHandshakeMessage(socket, { client_auth: [] })
+  return socket
+}
+
+function nextSocketData(socket: Socket): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    socket.once('data', (chunk) => resolve(Buffer.from(chunk)))
+    socket.once('error', reject)
+  })
+}
+
+function writeHandshakeMessage(socket: Socket, value: unknown): void {
+  const body = Buffer.from(JSON.stringify(value), 'utf8')
+  const prefix = Buffer.alloc(4)
+  prefix.writeUInt32LE(body.length)
+  socket.write(Buffer.concat([prefix, body]))
+}

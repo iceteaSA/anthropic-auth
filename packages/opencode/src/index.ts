@@ -2015,7 +2015,7 @@ const anthropicAuthPlugin = async (
               code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
               retryable: false,
               message:
-                'Claustrum main binding is not active while local main material remains; run ck auth migrate-plugin --allow-main.',
+                "Claustrum main binding is not active while local main material remains; onboard main into the vault with Claustrum's tooling first.",
             }
           : state === 'identity-mismatch'
             ? {
@@ -2160,7 +2160,7 @@ const anthropicAuthPlugin = async (
           handle,
           recordVersion: cached.recordVersion,
         },
-        credentialAccountId: cached.accountId as ProviderAccountUuid,
+        credentialAccountId: asProviderAccountUuid(cached.accountId),
       }
     }
 
@@ -7372,8 +7372,9 @@ const anthropicAuthPlugin = async (
                     auth.expires = Number.MAX_SAFE_INTEGER
                     requestMainClaustrum = {
                       accessToken,
-                      credentialAccountId:
-                        cached.accountId as ProviderAccountUuid,
+                      credentialAccountId: asProviderAccountUuid(
+                        cached.accountId,
+                      ),
                       served: {
                         accountId: 'main',
                         handle,

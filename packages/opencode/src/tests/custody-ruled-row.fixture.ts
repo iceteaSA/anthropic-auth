@@ -49,6 +49,20 @@ function requireRuledRowDependency<T>(
 
 export const ruledMainHandle = `ckh_${'Z'.repeat(43)}`
 
+export async function withCustodyManifestPath<T>(
+  path: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = process.env.CLAUSTRUM_OPENCODE_HANDLES
+  process.env.CLAUSTRUM_OPENCODE_HANDLES = path
+  try {
+    return await fn()
+  } finally {
+    if (previous === undefined) delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+    else process.env.CLAUSTRUM_OPENCODE_HANDLES = previous
+  }
+}
+
 export function credentialResponse(
   accessToken: string,
   recordVersion: number,

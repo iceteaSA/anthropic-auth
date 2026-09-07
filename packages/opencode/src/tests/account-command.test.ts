@@ -7,7 +7,7 @@ import {
   mock,
   test,
 } from 'bun:test'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -26,6 +26,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
 import { drainNotifications } from '../rpc/notifications'
+import { connectorFor } from './custody-ruled-row.fixture'
 import { DEFAULT_FETCH_MOCK, installDefaultFetchMock } from './test-fetch'
 import {
   createTimerTracking,
@@ -710,7 +711,10 @@ describe('account command INFO logs (via plugin)', () => {
     }
   }
 
-  async function getPlugin(timerOverrides?: PluginTimerOverrides) {
+  async function getPlugin(
+    timerOverrides?: PluginTimerOverrides,
+    runtimeOverrides: Record<string, unknown> = {},
+  ) {
     const defaultTimerOverrides = disabledPluginTimerOverrides()
     const plugin = (await (
       AnthropicAuthPlugin as unknown as (
@@ -722,7 +726,7 @@ describe('account command INFO logs (via plugin)', () => {
         // @ts-expect-error: minimal mock for testing
         client: createMockClient(),
       },
-      { ...defaultTimerOverrides, ...timerOverrides },
+      { ...defaultTimerOverrides, ...timerOverrides, ...runtimeOverrides },
     )) as any
     await plugin.__fallbackRefreshReady
     return plugin
@@ -865,32 +869,56 @@ describe('account command INFO logs (via plugin)', () => {
   test('claustrum command refuses a real main with migration guidance and zero writes', async () => {
     const storage = baseStorage()
     await saveAccounts(storage, accountPath)
-    const plugin = await getPlugin()
-    await plugin.auth.loader(
-      async () => ({
-        type: 'oauth',
-        access: 'real-main-access',
-        refresh: 'real-main-refresh',
-        expires: Date.now() + 60_000,
+    const connectionFile = join(tempDir, 'claustrum-connection.json')
+    await writeFile(
+      connectionFile,
+      JSON.stringify({
+        schema: 1,
+        wire_version: 1,
+        endpoints: [{ host: '127.0.0.1', port: 1 }],
       }),
-      { models: {} },
     )
-    const before = await readFile(accountPath, 'utf8')
-    drainNotifications(0, 'ses_test')
+    const previousConnectionFile =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
+      connectionFile
 
-    await executeCommand(plugin, 'claude-account', 'claustrum')
+    try {
+      const plugin = await getPlugin(undefined, {
+        claustrumConnector: connectorFor([], () => ({ result: {} })),
+      })
+      await plugin.auth.loader(
+        async () => ({
+          type: 'oauth',
+          access: 'real-main-access',
+          refresh: 'real-main-refresh',
+          expires: Date.now() + 60_000,
+        }),
+        { models: {} },
+      )
+      const before = await readFile(accountPath, 'utf8')
+      drainNotifications(0, 'ses_test')
 
-    const text = drainNotifications(0, 'ses_test').at(-1)?.payload.text
-    expect(text).toBe(
-      [
-        'Custody takeover refused:',
-        'main: TAKEOVER_INCOMPLETE_MAIN_REAL — Run ck auth migrate-plugin --allow-main before retrying.',
-        'Work account: binding_missing',
-        'Personal account: binding_missing',
-      ].join('\n'),
-    )
-    expect(await readFile(accountPath, 'utf8')).toBe(before)
-    expect(findCommandsLog('account enabled')).toBeUndefined()
+      await executeCommand(plugin, 'claude-account', 'claustrum')
+
+      const text = drainNotifications(0, 'ses_test').at(-1)?.payload.text
+      expect(text).toBe(
+        [
+          'Custody takeover refused:',
+          "main: TAKEOVER_INCOMPLETE_MAIN_REAL — Onboard the main account into the Claustrum vault with Claustrum's tooling (see its runbook) before retrying.",
+          'Work account: binding_missing',
+          'Personal account: binding_missing',
+        ].join('\n'),
+      )
+      expect(await readFile(accountPath, 'utf8')).toBe(before)
+      expect(findCommandsLog('account enabled')).toBeUndefined()
+    } finally {
+      if (previousConnectionFile === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+      else
+        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
+          previousConnectionFile
+    }
   })
 
   test('does not retain a background interval unless the helper opts in', async () => {

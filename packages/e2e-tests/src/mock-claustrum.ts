@@ -27,6 +27,7 @@ export type FakeClaustrumCredential = {
 
 export type FakeClaustrumAuthFailure = {
   handle?: string
+  provider_status?: number
   record_version?: number
   reporter_source?: string
 }
@@ -50,6 +51,7 @@ export async function startFakeClaustrumDaemon(input: {
     socket.on('error', () => {})
     let buffer = Buffer.alloc(0)
     let phase: 'hello' | 'auth' | 'frames' = 'hello'
+    let routeChannel: number | undefined
 
     socket.on('data', (chunk) => {
       buffer = Buffer.concat([
@@ -100,9 +102,24 @@ export async function startFakeClaustrumDaemon(input: {
         if (header.ty !== FrameType.Request) continue
         const request = JSON.parse(body.toString('utf8')) as {
           method?: string
+          op?: string
           params?: Record<string, unknown>
         }
-        if (header.channel !== 0 && request.method === 'credential.get') {
+        if (header.channel === 0) {
+          if (request.op === 'route.open') routeChannel = 7
+          writeResponse(socket, header, { route_channel: 7, route_epoch: 1 })
+          continue
+        }
+        if (header.channel !== routeChannel) {
+          writeResponse(
+            socket,
+            header,
+            { code: 'unknown_channel' },
+            FrameType.Error,
+          )
+          continue
+        }
+        if (request.method === 'credential.get') {
           const handle = request.params?.handle
           const credential =
             typeof handle === 'string' ? input.credentials[handle] : undefined
@@ -124,14 +141,15 @@ export async function startFakeClaustrumDaemon(input: {
           })
           continue
         }
-        if (
-          header.channel !== 0 &&
-          request.method === 'credential.report_auth_failure'
-        ) {
+        if (request.method === 'credential.report_auth_failure') {
           reportAuthFailures.push({
             handle:
               typeof request.params?.handle === 'string'
                 ? request.params.handle
+                : undefined,
+            provider_status:
+              typeof request.params?.provider_status === 'number'
+                ? request.params.provider_status
                 : undefined,
             record_version:
               typeof request.params?.record_version === 'number'
@@ -143,13 +161,7 @@ export async function startFakeClaustrumDaemon(input: {
                 : undefined,
           })
         }
-        writeResponse(
-          socket,
-          header,
-          header.channel === 0
-            ? { route_channel: 7, route_epoch: 1 }
-            : { result: {} },
-        )
+        writeResponse(socket, header, { result: {} })
       }
     })
   })
@@ -188,9 +200,10 @@ function writeResponse(
   socket: Socket,
   header: ReturnType<typeof decodeHeader>,
   value: unknown,
+  type: FrameType = FrameType.Response,
 ): void {
   const frame = buildFrame(
-    FrameType.Response,
+    type,
     buildFlags(false, Priority.Interactive, false),
     header.channel,
     header.epoch,

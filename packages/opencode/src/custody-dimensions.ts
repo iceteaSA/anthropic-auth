@@ -5,6 +5,7 @@ import {
   type CustodyHandleResolution,
   type CustodyStatusState,
   getClaustrumMode,
+  hasNoLocalCredential,
   isCustodyTombstoneOAuth,
   isOAuthAccount,
   isOAuthAccountVaultOwned,
@@ -86,8 +87,7 @@ export function fallbackCustodyDimensions(
         { type: 'oauth', access: account.access, refresh: account.refresh },
         'anthropic',
       ) ||
-      (!account.access &&
-        !account.refresh &&
+      (hasNoLocalCredential(account) &&
         isOAuthAccountVaultOwned(storage, account, bindings[index])),
   )
     ? ('T' as const)

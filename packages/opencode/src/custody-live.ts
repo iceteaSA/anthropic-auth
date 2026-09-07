@@ -1,4 +1,5 @@
-import { readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import {
   type ClaustrumTakeoverPlan,
@@ -59,6 +60,7 @@ async function acquireLocalExitMainLock(
   storagePath: string,
   now: () => number,
 ): Promise<Lock> {
+  await mkdir(dirname(storagePath), { recursive: true })
   for (;;) {
     const lock = await core.acquireRefreshFileLock({
       name: OPENCODE_MAIN_OAUTH_REFRESH_LOCK,

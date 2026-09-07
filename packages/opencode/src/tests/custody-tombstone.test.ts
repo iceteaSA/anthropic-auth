@@ -24,6 +24,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
 import { setOAuthHeaders } from '../transform'
+import { withCustodyManifestPath } from './custody-ruled-row.fixture'
 import { extractUrl, TOKEN_URL } from './test-fetch'
 
 const fixtureDir = join(import.meta.dir, 'fixtures', 'claustrum-golden')
@@ -55,6 +56,7 @@ const handlesFixture = JSON.parse(
 const oauthFixture = tombstoneFixture.fixtures.oauth
 const apiFixture = tombstoneFixture.fixtures.api
 const originalFetch = globalThis.fetch
+const originalManifestPath = process.env.CLAUSTRUM_OPENCODE_HANDLES
 
 function createMockClient() {
   return {
@@ -82,7 +84,10 @@ async function createTempStorage<T>(
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = path
   try {
     await saveAccounts(storage as never, path)
-    return await callback(path)
+    return await withCustodyManifestPath(
+      process.env.CLAUSTRUM_OPENCODE_HANDLES!,
+      () => callback(path),
+    )
   } finally {
     if (previous === undefined) delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
     else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = previous
@@ -738,6 +743,10 @@ describe('Claustrum custody tombstones', () => {
       await plugin.dispose?.()
     })
     expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
+  })
+
+  test('restores the shared custody manifest after temporary cleanup', () => {
+    expect(process.env.CLAUSTRUM_OPENCODE_HANDLES).toBe(originalManifestPath)
   })
 
   test('reconciles a real main without a resolved binding before serving OAuth', async () => {

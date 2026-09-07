@@ -12,9 +12,9 @@ const productionFiles = [
 ]
 
 const allowedGuidance = [
-  'Run ck auth migrate-plugin --allow-main before retrying.',
+  "Onboard the main account into the Claustrum vault with Claustrum's tooling (see its runbook) before retrying.",
   'Claustrum main credential requires re-import; run ck auth import --replace.',
-  'Claustrum main binding is not active while local main material remains; run ck auth migrate-plugin --allow-main.',
+  "Claustrum main binding is not active while local main material remains; onboard main into the vault with Claustrum's tooling first.",
   'Claustrum main credential identity differs from the persisted main identity; run ck auth set-identity.',
 ]
 const forbidden = [
@@ -23,7 +23,6 @@ const forbidden = [
   /Bun\.\$/u,
   /execa/u,
   /ck auth/u,
-  /migrate-plugin/u,
 ]
 
 describe('custody production dependencies', () => {

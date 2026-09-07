@@ -578,6 +578,72 @@ afterEach(async () => {
   mock.restore()
 })
 
+describe('fallback quota polling', () => {
+  test('skips an account held by custody verification in another manager', async () => {
+    await saveAccounts(
+      {
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 60 * 60 * 1_000,
+          },
+        ],
+      },
+      accountPath,
+    )
+
+    let quotaRequests = 0
+    const verifying = new FallbackAccountManager({ configPath: accountPath })
+    const polling = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl: (async () => {
+        quotaRequests += 1
+        return Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 10 },
+        })
+      }) as unknown as typeof fetch,
+    })
+    const lockEntered = deferred()
+    const releaseLock = deferred()
+    const verification = verifying.withAccountRefreshLock('work', async () => {
+      lockEntered.resolve()
+      await releaseLock.promise
+    })
+    await lockEntered.promise
+
+    const lockedStorage = (await loadAccounts(accountPath))!
+    const skipped = await polling.refreshAccountQuota(
+      expectOAuthAccount(lockedStorage.accounts[0]),
+      lockedStorage,
+    )
+    if (skipped.changed) await polling.save(lockedStorage)
+    expect(skipped.fetched).toBe(false)
+    expect(quotaRequests).toBe(0)
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0]).quota,
+    ).toBeUndefined()
+
+    releaseLock.resolve()
+    await verification
+    const unlockedStorage = (await loadAccounts(accountPath))!
+    const fetched = await polling.refreshAccountQuota(
+      expectOAuthAccount(unlockedStorage.accounts[0]),
+      unlockedStorage,
+    )
+    if (fetched.changed) await polling.save(unlockedStorage)
+    expect(fetched.fetched).toBe(true)
+    expect(quotaRequests).toBe(1)
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0]).quota,
+    ).toBeDefined()
+  })
+})
+
 describe('OAuth account profiles', () => {
   const mainCapture = {
     account: { has_claude_max: true },
@@ -3902,6 +3968,7 @@ describe('FallbackAccountManager', () => {
       await entered.promise
 
       await manager.refreshDueAccounts()
+      await manager.refreshQuotaForDueAccounts()
 
       expect(fetchImpl).not.toHaveBeenCalled()
       expect(logs).toContainEqual(

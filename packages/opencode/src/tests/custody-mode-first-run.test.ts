@@ -11,6 +11,7 @@ import {
   setRoutingMode,
 } from '@cortexkit/anthropic-auth-core'
 import { login } from '../cli'
+import { runClaustrumTakeoverCommand } from '../custody-live'
 import { AnthropicAuthPlugin } from '../index'
 import {
   buildAccountDialogL1,
@@ -542,6 +543,15 @@ describe('exit and terminating re-login', () => {
   test.serial(
     'leaves custody before refusing a tombstoned main without refreshing',
     async () => {
+      const root = await createFirstRunRoot()
+      const missingParentPath = join(root, 'missing', 'anthropic-auth.json')
+      await runClaustrumTakeoverCommand(
+        { storagePath: missingParentPath, now: () => 1_000 } as never,
+        'local',
+      )
+      expect(
+        JSON.parse(await readFile(missingParentPath, 'utf8')).claustrum?.mode,
+      ).toBe('local')
       let tokenRequests = 0
       let localPlugin: any
       const fixture = await bootRuled({

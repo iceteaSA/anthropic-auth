@@ -7,6 +7,7 @@ import {
   type AccountStorage,
   createEmptyStorage,
   FallbackAccountManager,
+  hasNoLocalCredential,
   loadAccounts,
   type OAuthAccount,
   saveAccounts,
@@ -20,6 +21,13 @@ afterEach(async () => {
       .splice(0)
       .map((directory) => rm(directory, { recursive: true, force: true })),
   )
+})
+
+test('recognizes an OAuth account with no local credential', () => {
+  expect(hasNoLocalCredential({})).toBe(true)
+  expect(hasNoLocalCredential({ refresh: '' })).toBe(true)
+  expect(hasNoLocalCredential({ refresh: 'refresh' })).toBe(false)
+  expect(hasNoLocalCredential({ access: '' })).toBe(false)
 })
 
 test('preserves the Claustrum mode when a save supplies only handlesFile', async () => {

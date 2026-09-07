@@ -57,6 +57,9 @@ export type AccountBase = {
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
+  // Persisted under this name on both fallback accounts and the main profile because the
+  // quota feed schema owns the anthropicAccountUuid key; only the branded type and the
+  // request-scoped identity variables use the provider-neutral providerAccountUuid name.
   anthropicAccountUuid?: ProviderAccountUuid
   claustrumHandle?: string
   access?: string
@@ -72,6 +75,16 @@ export type OAuthAccount = AccountBase & {
    * (scoped under `accounts[id].prime`) and never in `anthropic-auth.json`.
    */
   prime?: PrimeUsageCounters
+}
+
+export function hasNoLocalCredential(account: {
+  access?: unknown
+  refresh?: unknown
+}): boolean {
+  return (
+    account.access == null &&
+    (account.refresh == null || account.refresh === '')
+  )
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -566,8 +579,7 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     Boolean(value.id.trim()) &&
     typeof value.label === 'string' &&
     Boolean(value.label.trim()) &&
-    value.access == null &&
-    (value.refresh == null || value.refresh === '')
+    hasNoLocalCredential(value)
   if (!refresh.trim() && !rosterOnly) return null
 
   return {
@@ -1615,8 +1627,9 @@ export async function setClaustrumModePersistent(
   return enqueueSave(async () => {
     const lock = await acquireAccountConfigWriteLock(path)
     try {
-      const storage = (await loadAccounts(path)) ?? createEmptyStorage()
-      if (getClaustrumMode(storage) === mode) return 'unchanged'
+      const existing = await loadAccounts(path)
+      const storage = existing ?? createEmptyStorage()
+      if (existing && getClaustrumMode(storage) === mode) return 'unchanged'
       storage.claustrum = { ...storage.claustrum, mode }
       await saveAccountsWithConfigLock(storage, path, {
         [WRITE_CLAUSTRUM_MODE]: true,
@@ -3948,6 +3961,10 @@ export function upsertAccount(
       }),
     }
     if (lineageChanged && updated.type === 'oauth') {
+      logger.debug(
+        'accounts',
+        'cleared provider UUID after auth lineage change',
+      )
       delete updated.anthropicAccountUuid
     }
     storage.accounts[index] = updated
@@ -4237,8 +4254,7 @@ export class FallbackAccountManager {
       if (this.isFallbackAccountVaultEnabled(account.id, storage)) {
         if (!this.isFallbackAccountVaultServed(account.id, storage)) continue
         if (
-          !account.access &&
-          !account.refresh &&
+          hasNoLocalCredential(account) &&
           !storage.quota?.minimumRemaining &&
           !isKillswitchEnabled(storage)
         ) {
@@ -4443,6 +4459,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (this.custodyVerificationAccounts.has(account.id)) continue
       let next = account
       try {
         if (
@@ -4753,6 +4770,21 @@ export class FallbackAccountManager {
         changed,
       }
     }
+    let quotaPollLock = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName(target.id),
+      ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+      path: this.configPath,
+      now: this.now,
+    })
+    if (!quotaPollLock) {
+      log('[quota] fallback quota poll skipped refresh lock', {
+        accountId: target.id,
+      })
+      return { account: target, fetched: false, changed }
+    }
+    await using _quotaPollLock = {
+      [Symbol.asyncDispose]: async () => quotaPollLock?.release(),
+    }
     // Unify on the shared QuotaManager when present: it adds inflight
     // deduplication and 429 backoff gating around the same quota API. Fall back
     // to a direct fetch only when no QuotaManager is wired (e.g. in isolation).
@@ -4783,6 +4815,8 @@ export class FallbackAccountManager {
       ) {
         throw error
       }
+      await quotaPollLock.release()
+      quotaPollLock = null
       target = await this.refreshAccount(account, storage, {
         force: true,
       })
@@ -4800,6 +4834,18 @@ export class FallbackAccountManager {
           fetched: false,
           changed,
         }
+      }
+      quotaPollLock = await acquireRefreshFileLock({
+        name: fallbackRefreshLockName(target.id),
+        ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+        path: this.configPath,
+        now: this.now,
+      })
+      if (!quotaPollLock) {
+        log('[quota] fallback quota poll skipped refresh lock', {
+          accountId: target.id,
+        })
+        return { account: target, fetched: false, changed }
       }
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
       const result = await fetchSnapshot(access.token)

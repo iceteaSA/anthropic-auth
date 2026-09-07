@@ -321,7 +321,12 @@ describe('custody mode', () => {
       'Bearer vault-fallback',
     )
     expect(daemon.reportAuthFailures).toEqual([
-      { handle: fallbackHandle, record_version: 41, reporter_source: 'direct' },
+      {
+        handle: fallbackHandle,
+        provider_status: 401,
+        record_version: 41,
+        reporter_source: 'direct',
+      },
     ])
   }, 120_000)
 })
