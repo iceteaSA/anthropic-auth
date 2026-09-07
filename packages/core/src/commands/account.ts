@@ -161,6 +161,7 @@ export type CustodyStatusState =
   | 'on-vault-served'
   | 'on-vault-reauth'
   | 'on-cold'
+  | 'unknown-identity'
   | 'on-identity-mismatch'
   | 'on-corrupt-binding'
 
@@ -176,6 +177,8 @@ export function custodyStatusLabel(state: CustodyStatusState): string {
       return 'vault reauth'
     case 'on-cold':
       return 'vault cold'
+    case 'unknown-identity':
+      return 'unknown identity'
     case 'on-identity-mismatch':
       return 'identity mismatch'
     case 'on-corrupt-binding':
@@ -293,7 +296,7 @@ export async function executeAccountCommand(input: {
         : a.id !== mainId &&
             storedAccount &&
             isOAuthAccountVaultOwned(input.storage, storedAccount, binding)
-          ? 'vault cold'
+          ? custodyStatusLabel('on-cold')
           : 'local'
       lines.push(
         `- **${a.label}** [${a.role}]${tier}${status}${pct} · ${custody}`,

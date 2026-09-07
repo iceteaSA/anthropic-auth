@@ -683,6 +683,7 @@ type FableRequestContext = {
 
 type ClaustrumAccessResolution = {
   accessToken?: string
+  credentialAccountId?: string
   served?: {
     accountId: string
     handle: string
@@ -1840,26 +1841,36 @@ const anthropicAuthPlugin = async (
   }
 
   function claustrumMainRefusal(
-    state: 'cold' | 'reauth' | 'takeover-incomplete',
+    state: 'cold' | 'reauth' | 'takeover-incomplete' | 'identity-mismatch',
   ): Response {
     const error =
       state === 'reauth'
         ? {
             code: 'claustrum_main_reauth',
+            retryable: false,
             message:
               'Claustrum main credential requires re-import; run ck auth import --replace.',
           }
         : state === 'takeover-incomplete'
           ? {
               code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
+              retryable: false,
               message:
                 'Claustrum main binding is not active while local main material remains; run ck auth migrate-plugin --allow-main.',
             }
-          : {
-              code: 'claustrum_main_unavailable',
-              message:
-                'Claustrum main credential is cold; run /claude-account local to leave custody and sign in again.',
-            }
+          : state === 'identity-mismatch'
+            ? {
+                code: 'claustrum_main_identity_mismatch',
+                retryable: false,
+                message:
+                  'Claustrum main credential identity differs from the persisted main identity; run ck auth set-identity.',
+              }
+            : {
+                code: 'claustrum_main_unavailable',
+                retryable: true,
+                message:
+                  'Claustrum main credential is cold; retry or run /claude-account local to leave custody and sign in again.',
+              }
     return new Response(
       JSON.stringify({ type: 'error', error: { type: 'api_error', ...error } }),
       {
@@ -1933,7 +1944,32 @@ const anthropicAuthPlugin = async (
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     vaultServed = isFallbackAccountVaultServed(account.id, storage),
   ): CustodyStatusState => {
-    if (account.role === 'main') return 'na'
+    if (account.role === 'main') {
+      if (!storage || getClaustrumMode(storage) !== 'claustrum') return 'na'
+      const mainHandle = custodyHandleManifest?.accounts.find(
+        (entry) => entry.label === 'main',
+      )?.handle
+      const cached = mainHandle
+        ? claustrumCredentialCache?.peek(mainHandle)
+        : undefined
+      const persistedIdentity = mainAccountId ?? storage.mainAccountId
+      const credentialIdentity = cached?.accountId
+      if (
+        (persistedIdentity === undefined) !==
+        (credentialIdentity === undefined)
+      )
+        return 'unknown-identity'
+      if (
+        persistedIdentity !== undefined &&
+        credentialIdentity !== undefined &&
+        persistedIdentity !== credentialIdentity
+      )
+        return 'on-identity-mismatch'
+      if (claustrumReauthAccounts.has('main')) return 'on-vault-reauth'
+      if (cached && usableClaustrumAccessToken(cached, claustrumNow()))
+        return 'on-vault-served'
+      return 'on-cold'
+    }
     if (!storage) return 'off'
     const stored = storage.accounts.find(
       (candidate): candidate is OAuthAccount =>
@@ -4894,12 +4930,11 @@ const anthropicAuthPlugin = async (
         const auth = await getAuth()
         if (auth.type === 'oauth') {
           const custodyStorage = await loadAccounts(accountStoragePath)
+          const mainCustody = mainCustodyAccount(auth)
+          mainCustody.anthropicAccountUuid = custodyStorage?.mainAccountId
           const mainBinding =
             getClaustrumMode(custodyStorage) === 'claustrum' && custodyStorage
-              ? resolveAccountCustodyHandle(
-                  mainCustodyAccount(auth),
-                  custodyStorage,
-                )
+              ? resolveAccountCustodyHandle(mainCustody, custodyStorage)
               : undefined
           if (
             mainBinding?.status === 'resolved' &&
@@ -4928,7 +4963,10 @@ const anthropicAuthPlugin = async (
                     claustrumNow(),
                   )
                   if (accessToken && cached && handle) {
-                    return sendWithAccessToken(
+                    if (hasClaustrumIdentityMismatch(mainCustody, cached)) {
+                      return claustrumMainRefusal('identity-mismatch')
+                    }
+                    const response = await sendWithAccessToken(
                       input,
                       init,
                       accessToken,
@@ -4942,6 +4980,7 @@ const anthropicAuthPlugin = async (
                       undefined,
                       {
                         accessToken,
+                        credentialAccountId: cached.accountId,
                         served: {
                           accountId: 'main',
                           handle,
@@ -4949,6 +4988,14 @@ const anthropicAuthPlugin = async (
                         },
                       },
                     )
+                    return createStrippedStream(response, {
+                      onRelayUpstreamError: ({ status, source }) => {
+                        if (status !== 401) return
+                        const served = claustrumServedCredentials.get(response)
+                        if (served)
+                          void reportClaustrumAuthFailure(served, source)
+                      },
+                    })
                   }
                   return claustrumMainRefusal(
                     claustrumReauthAccounts.has('main') ? 'reauth' : 'cold',
@@ -5854,7 +5901,9 @@ const anthropicAuthPlugin = async (
             const identity = await resolveClaudeCodeIdentity(
               accessToken,
               modelForIdentity,
-              oauthAccountId === 'main' ? mainAccountId : oauthAccountId,
+              oauthAccountId === 'main'
+                ? (claustrumResolution?.credentialAccountId ?? mainAccountId)
+                : oauthAccountId,
             )
             if (oauthAccountId !== 'main' && identity.accountUuid) {
               void persistFallbackAnthropicAccountUuid(
@@ -6152,6 +6201,12 @@ const anthropicAuthPlugin = async (
                 response,
                 servedClaustrumCredential,
               )
+              if (response.status === 401) {
+                await reportClaustrumAuthFailure(
+                  servedClaustrumCredential,
+                  'direct',
+                )
+              }
             }
             return response
           }
@@ -6347,6 +6402,9 @@ const anthropicAuthPlugin = async (
                 order: 0,
               })
             }
+            const usableFallbacksById = new Map(
+              usableFallbacks.map((candidate) => [candidate.id, candidate]),
+            )
             for (const [index, stored] of (
               latestStorage?.accounts ?? []
             ).entries()) {
@@ -6357,10 +6415,7 @@ const anthropicAuthPlugin = async (
                 isLocalManifestBoundFallback(stored, latestStorage)
               )
                 continue
-              const account =
-                usableFallbacks.find(
-                  (candidate) => candidate.id === stored.id,
-                ) ?? stored
+              const account = usableFallbacksById.get(stored.id) ?? stored
               const credential = resolveClaustrumAccess(account, latestStorage)
               const servedByClaustrum = Boolean(credential.served)
               if (

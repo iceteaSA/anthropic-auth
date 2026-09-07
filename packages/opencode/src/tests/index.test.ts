@@ -31,6 +31,7 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   CustodyHandleManifestReader,
+  CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
   custodyTombstoneOAuth,
@@ -1197,6 +1198,274 @@ describe('fallback Claustrum credential resolution', () => {
         ]),
       )
       await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'a main 401 after a concurrent vault refresh is suppressed rather than blamed on the new record',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      await writeManifest([{ label: 'main', handle: manifestHandle }])
+      const calls: CredentialCall[] = []
+      const authorizations: string[] = []
+      let recordVersion = 7
+      let releaseFirstResponse!: () => void
+      const firstResponse = new Promise<Response>((resolve) => {
+        releaseFirstResponse = () =>
+          resolve(new Response('denied', { status: 401 }))
+      })
+      let firstRequestStarted!: () => void
+      const firstRequestStartedPromise = new Promise<void>((resolve) => {
+        firstRequestStarted = resolve
+      })
+      let messageRequests = 0
+      let claustrumNow = 0
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        messageRequests += 1
+        if (messageRequests === 1) {
+          firstRequestStarted()
+          return firstResponse
+        }
+        return Promise.resolve(new Response('denied', { status: 401 }))
+      }) as unknown as typeof fetch
+      const ticks: Array<() => unknown> = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connectorFor(calls, (method) => {
+          if (method === 'credential.get') {
+            return credentialResponse(
+              `main-vault-access-v${recordVersion}`,
+              recordVersion,
+              claustrumNow + 1_000,
+            )
+          }
+          return { result: {} }
+        }),
+        claustrumNow: () => claustrumNow,
+        setInterval: mock((handler: () => unknown) => {
+          ticks.push(handler)
+          return { unref() {} } as never
+        }) as never,
+      })
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+
+      const staleResponse = result.fetch(MESSAGES_URL, EMPTY_POST)
+      await firstRequestStartedPromise
+      claustrumNow = 2_000
+      recordVersion = 8
+      await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+      releaseFirstResponse()
+
+      expect((await staleResponse).status).toBe(401)
+      expect(
+        calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toEqual([])
+
+      const currentResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(currentResponse.status).toBe(401)
+      expect(authorizations).toEqual([
+        'Bearer main-vault-access-v7',
+        'Bearer main-vault-access-v8',
+      ])
+      expect(
+        calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          params: expect.objectContaining({
+            handle: manifestHandle,
+            provider_status: 401,
+            record_version: 8,
+            reporter_source: 'direct',
+          }),
+        }),
+      ])
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'refuses a main vault credential whose identity differs from the persisted main identity',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          mainAccountId: 'persisted-main-identity',
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      await writeManifest([{ label: 'main', handle: manifestHandle }])
+      const calls: CredentialCall[] = []
+      let messageSends = 0
+      globalThis.fetch = mock(() => {
+        messageSends += 1
+        return Promise.resolve(new Response('unexpected', { status: 200 }))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connectorFor(calls, (method) => {
+          if (method === 'credential.get')
+            return credentialResponse(
+              'main-vault-access',
+              8,
+              Date.now() + 60_000,
+              'different-vault-identity',
+            )
+          return { result: {} }
+        }),
+      })
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(503)
+      expect(await response.json()).toMatchObject({
+        error: { code: 'claustrum_main_identity_mismatch' },
+      })
+      expect(messageSends).toBe(0)
+      expect(
+        calls.filter((call) => call.method === 'credential.get'),
+      ).not.toHaveLength(0)
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'unknown-identity is visible when either main identity side is absent',
+    async () => {
+      for (const fixture of [
+        {
+          name: 'persisted',
+          mainAccountId: undefined,
+          credentialAccountId: 'vault-main',
+        },
+        {
+          name: 'vault',
+          mainAccountId: 'persisted-main',
+          credentialAccountId: undefined,
+        },
+      ]) {
+        await useTempAccountFile(
+          createFallbackStorage({
+            claustrum: { mode: 'claustrum' },
+            mainAccountId: fixture.mainAccountId,
+            quota: { enabled: false },
+            accounts: [],
+          }),
+        )
+        await writeManifest([{ label: 'main', handle: manifestHandle }])
+        const client = createMockClient()
+        globalThis.fetch = mock(() =>
+          Promise.resolve(new Response('{}', { status: 200 })),
+        ) as unknown as typeof fetch
+        const plugin = await getPlugin(client, undefined, {
+          claustrumConnector: connectorFor([], (method) => {
+            if (method === 'credential.get')
+              return credentialResponse(
+                `sk-ant-oat01-main-vault-access-${fixture.name}`,
+                1,
+                Date.now() + 60_000,
+                fixture.credentialAccountId,
+              )
+            return { result: {} }
+          }),
+        })
+        const result = await plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+          { models: {} },
+        )
+
+        const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        expect(response.status).toBe(200)
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: '',
+            sessionID: `unknown-main-identity-${fixture.name}`,
+          }),
+        )
+        const text = (client.session.promptAsync as any).mock.calls.at(-1)?.[0]
+          ?.body.parts[0]?.text
+        expect(text).toContain('unknown identity')
+        await plugin.dispose?.()
+      }
+    },
+  )
+
+  test.serial(
+    'main reauth refusal is non-retryable while cold remains retryable',
+    async () => {
+      for (const fixture of [
+        {
+          name: 'reauth',
+          errorClass: 'auth_required',
+          code: 'claustrum_main_reauth',
+          retryable: false,
+          guidance: 'ck auth import --replace',
+        },
+        {
+          name: 'cold',
+          errorClass: 'transient',
+          code: 'claustrum_main_unavailable',
+          retryable: true,
+          guidance: 'retry',
+        },
+      ] as const) {
+        await useTempAccountFile(
+          createFallbackStorage({
+            claustrum: { mode: 'claustrum' },
+            quota: { enabled: false },
+            accounts: [],
+          }),
+        )
+        await writeManifest([{ label: 'main', handle: manifestHandle }])
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: connectorFor([], (method) => {
+            if (method === 'credential.get')
+              return {
+                result: {
+                  error: { class: fixture.errorClass, code: 'latched' },
+                },
+              }
+            return { result: {} }
+          }),
+        })
+        const result = await plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+          { models: {} },
+        )
+        const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        const body = await response.json()
+        expect(response.status).toBe(503)
+        expect(body).toMatchObject({
+          error: {
+            code: fixture.code,
+            retryable: fixture.retryable,
+            message: expect.stringContaining(fixture.guidance),
+          },
+        })
+        await plugin.dispose?.()
+      }
     },
   )
 
@@ -13273,6 +13542,77 @@ describe('auth.loader', () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200])
     expect(tokenRefreshCount).toBe(1)
     expect(secondRefreshWait).not.toHaveBeenCalled()
+  })
+
+  test('sticky 401 retry refuses a foreign-provider tombstone before the token endpoint', async () => {
+    const checkedAt = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            checkedAt,
+            five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
+            seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
+          },
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('live-main-access'),
+        },
+      }),
+    )
+    let currentAuth: Record<string, unknown> = {
+      type: 'oauth',
+      access: 'live-main-access',
+      refresh: 'live-main-refresh',
+      expires: checkedAt + 8 * 60 * 60_000,
+    }
+    const messageAuthorizations: string[] = []
+    const tokenEndpointCalls: string[] = []
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        tokenEndpointCalls.push(url)
+        return Promise.resolve(new Response('unexpected', { status: 200 }))
+      }
+      if (url.includes('/v1/messages')) {
+        messageAuthorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        currentAuth = {
+          ...custodyTombstoneOAuth('openai'),
+          access: 'claustrum-tombstone:v1:openai',
+          expires: 0,
+        }
+        return Promise.resolve(new Response('unauthorized', { status: 401 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(currentAuth as never),
+      { models: {} },
+    )
+
+    await expect(
+      result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'tombstone-sticky-401' },
+        body: JSON.stringify({
+          model: 'claude-opus-5',
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      }),
+    ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+    expect(messageAuthorizations).toEqual(['Bearer live-main-access'])
+    expect(tokenEndpointCalls).toEqual([])
+    await plugin.dispose?.()
   })
 
   test('sticky 401 retries with a concurrently rotated main access token', async () => {
