@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
@@ -7,8 +7,10 @@ import { createLiveCustodyDeps } from '../custody-live.ts'
 import {
   acquireCustodyTransitionLocks,
   CustodyLockBusyError,
+  CustodyPreflightRefusedError,
   CustodyStateMismatchError,
   executeClaustrumTakeover,
+  executeLocalExit,
   preflightClaustrumTakeover,
   reconcileCustodyStartup,
 } from '../custody-mode.ts'
@@ -163,6 +165,70 @@ describe('custody mode', () => {
           handle: manifestHandle,
           minTtlMs: core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000,
         },
+      ])
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('custody: live adapter skips identity comparison when the vault supplies no credential id', async () => {
+    const get = async () => core.custodyTombstoneOAuth('anthropic')
+    const manifestHandle = `ckh_${'A'.repeat(43)}`
+    const storage: core.AccountStorage = {
+      version: 1,
+      accounts: [],
+      claustrum: { handlesFile: '/resolved-handles.json' },
+      refresh: { refreshBeforeExpiryMinutes: 5 },
+    }
+    const directory = await mkdtemp(join(tmpdir(), 'custody-live-adapter-'))
+    const storagePath = join(directory, 'storage.json')
+    const manifestPath = join(directory, 'handles.json')
+    const debugMessages: string[] = []
+    try {
+      await expect(
+        core.writeCustodyHandleManifestEntry({
+          path: manifestPath,
+          entry: {
+            label: 'main',
+            handle: manifestHandle,
+            credentialId: 'oauth:anthropic:main',
+          },
+        }),
+      ).resolves.toEqual({ status: 'written' })
+      await core.saveAccounts(
+        {
+          ...storage,
+          claustrum: { handlesFile: manifestPath },
+        },
+        storagePath,
+      )
+      const deps = createLiveCustodyDeps({
+        storagePath,
+        cache: {
+          get: async (_handle, minTtlMs) => ({
+            payload: JSON.stringify({
+              access_token: 'vault-access',
+              refresh_token: 'vault-refresh',
+            }),
+            expiresAtMs: now + (minTtlMs ?? 0) + 1,
+            recordVersion: 1,
+            accountId: 'vault-account',
+          }),
+        },
+        latestGetAuth: get,
+        now,
+        debug: (message: string) => debugMessages.push(message),
+      })
+
+      const input = await deps.preflightInput(
+        { id: 'main', label: 'main', enabled: true },
+        [],
+      )
+      input.bindings[0]!.credentialId = 'oauth:anthropic:x'
+      const plan = await preflightClaustrumTakeover(input)
+      expect(plan).toMatchObject({ accounts: [{ id: 'main' }] })
+      expect(debugMessages).toEqual([
+        'custody identity check skipped: vault supplied no credential id',
       ])
     } finally {
       await rm(directory, { recursive: true, force: true })
@@ -352,6 +418,68 @@ describe('custody mode', () => {
     })
   })
 
+  test('custody: preflight reports every fallback refusal in account order', async () => {
+    const input = preflightInput({
+      fallbacks: [route('work'), route('personal')],
+      bindings: [
+        {
+          accountId: 'main',
+          label: 'main',
+          handle: 'handle-main',
+          credentialId: 'oauth:anthropic:main',
+        },
+        {
+          accountId: 'work',
+          label: 'work',
+          handle: 'handle-work',
+          credentialId: 'oauth:anthropic:work',
+        },
+        {
+          accountId: 'personal',
+          label: 'personal',
+          handle: 'handle-personal',
+          credentialId: 'oauth:anthropic:personal',
+        },
+      ],
+      cache: {
+        get: async (handle: string) =>
+          handle === 'handle-work'
+            ? { state: 'reauth' }
+            : handle === 'handle-personal'
+              ? { state: 'timeout' }
+              : {
+                  credentialId: 'oauth:anthropic:main',
+                  recordVersion: 4,
+                  access: 'vault-access',
+                  refresh: 'vault-refresh',
+                  expiresAt: Number.MAX_SAFE_INTEGER,
+                  state: 'usable' as const,
+                },
+      },
+    })
+
+    const error = await preflightClaustrumTakeover(input).catch(
+      (error: unknown) => error,
+    )
+    expect(error).toBeInstanceOf(CustodyPreflightRefusedError)
+    expect((error as CustodyPreflightRefusedError).toJSON()).toMatchObject({
+      ok: false,
+      accountId: 'work',
+      reason: 'credential_reauth',
+      refusals: [
+        { label: 'work', reason: 'credential_reauth' },
+        { label: 'personal', reason: 'credential_timeout' },
+      ],
+    })
+    const printable = JSON.stringify(error)
+    for (const token of [
+      ...fixtureTokens,
+      ...fixtureHandles,
+      'handle-personal',
+    ])
+      expect(printable).not.toContain(token)
+  })
+
   test('custody: startup matrix verdicts', () => {
     const expected = new Map<string, string>([
       ['L|R|R|V', 'LOCAL_SERVE'],
@@ -506,6 +634,7 @@ describe('custody mode', () => {
         config: config.slice(),
         state: state.slice(),
       }),
+      writeManifestBindings: async () => {},
       writeSidecarAccount: async (account) => {
         writes.push(account.id)
         config = new TextEncoder().encode(`{"bound":"${account.id}"}\n`)
@@ -513,9 +642,10 @@ describe('custody mode', () => {
         state = new TextEncoder().encode(`{"inert":"${account.id}"}\n`)
       },
       verifyTarget: async () => true,
+      verifyCommitted: async () => true,
       restoreSidecars: async (snapshot) => {
-        config = snapshot.config.slice()
-        state = snapshot.state.slice()
+        config = snapshot.config!.slice()
+        state = snapshot.state!.slice()
       },
       verifyRollback: async () =>
         JSON.stringify(config) === JSON.stringify(before.config) &&
@@ -531,10 +661,294 @@ describe('custody mode', () => {
       stage: 'write_sidecar',
       accountId: 'work',
     })
-    expect(writes).toEqual(['main', 'work'])
+    expect(writes).toEqual(['work'])
     expect(config).toEqual(before.config)
     expect(state).toEqual(before.state)
     expect(mode).toBe('local')
     expect(JSON.stringify(error)).not.toContain('access-work-secret')
+  })
+
+  test('custody: failed committed readback reverts mode before restoring sidecars', async () => {
+    const plan = await preflightClaustrumTakeover(preflightInput())
+    const before = {
+      config: new TextEncoder().encode('{"access":"access-work-secret"}\n'),
+      state: new TextEncoder().encode('{"refresh":"refresh-work-secret"}\n'),
+    }
+    let config = before.config.slice()
+    let state = before.state.slice()
+    let mode: 'local' | 'claustrum' = 'local'
+
+    const error = await executeClaustrumTakeover(plan, {
+      locks: {
+        storagePath: '/storage.json',
+        manifestPath: '/handles.json',
+        fallbackAccountIds: ['work'],
+        acquireTransition: async () => ({ release: async () => {} }),
+        acquireManifest: async () => ({ release: async () => {} }),
+        acquireRefresh: async () => ({ release: async () => {} }),
+      },
+      getLocalAuth: async (accountId) =>
+        accountId === 'main'
+          ? core.custodyTombstoneOAuth('anthropic')
+          : real('access-work-secret', 'refresh-work-secret'),
+      isCommitted: async () => false,
+      snapshotSidecars: async () => ({
+        config: config.slice(),
+        state: state.slice(),
+      }),
+      writeManifestBindings: async () => {},
+      writeSidecarAccount: async () => {
+        config = new TextEncoder().encode('{"access":""}\n')
+        state = new TextEncoder().encode('{"refresh":"claustrum-tombstone"}\n')
+      },
+      verifyTarget: async () => true,
+      verifyCommitted: async () => false,
+      restoreSidecars: async (snapshot) => {
+        expect(mode).toBe('local')
+        config = snapshot.config!.slice()
+        state = snapshot.state!.slice()
+      },
+      verifyRollback: async () =>
+        JSON.stringify(config) === JSON.stringify(before.config) &&
+        JSON.stringify(state) === JSON.stringify(before.state),
+      setMode: async (target: 'local' | 'claustrum') => {
+        mode = target
+        return 'changed'
+      },
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({
+      code: 'custody_transition_failed',
+      stage: 'post_commit_readback',
+    })
+    expect(mode).toBe('local')
+    expect(config).toEqual(before.config)
+    expect(state).toEqual(before.state)
+  })
+
+  test('custody: failed committed readback leaves sidecars tombstoned when mode revert fails', async () => {
+    const plan = await preflightClaustrumTakeover(preflightInput())
+    let mode: 'local' | 'claustrum' = 'local'
+    let restored = false
+
+    const error = await executeClaustrumTakeover(plan, {
+      locks: {
+        storagePath: '/storage.json',
+        manifestPath: '/handles.json',
+        fallbackAccountIds: ['work'],
+        acquireTransition: async () => ({ release: async () => {} }),
+        acquireManifest: async () => ({ release: async () => {} }),
+        acquireRefresh: async () => ({ release: async () => {} }),
+      },
+      getLocalAuth: async (accountId) =>
+        accountId === 'main'
+          ? core.custodyTombstoneOAuth('anthropic')
+          : real('access-work-secret', 'refresh-work-secret'),
+      isCommitted: async () => false,
+      snapshotSidecars: async () => ({ config: null, state: null }),
+      writeManifestBindings: async () => {},
+      writeSidecarAccount: async () => {},
+      verifyTarget: async () => true,
+      verifyCommitted: async () => false,
+      restoreSidecars: async () => {
+        restored = true
+      },
+      verifyRollback: async () => true,
+      setMode: async (target: 'local' | 'claustrum') => {
+        if (target === 'local') throw new Error('disk full')
+        mode = target
+        return 'changed'
+      },
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({
+      code: 'custody_transition_failed',
+      stage: 'post_commit_readback',
+    })
+    expect(String(error)).toContain('mode is claustrum and unverified')
+    expect(mode).toBe('claustrum')
+    expect(restored).toBe(false)
+  })
+
+  test('custody: takeover refuses changed local material before any write', async () => {
+    const plan = await preflightClaustrumTakeover(preflightInput())
+    let snapshots = 0
+    let writes = 0
+    const error = await executeClaustrumTakeover(plan, {
+      locks: {
+        storagePath: '/storage.json',
+        manifestPath: '/handles.json',
+        fallbackAccountIds: ['work'],
+        acquireTransition: async () => ({ release: async () => {} }),
+        acquireManifest: async () => ({ release: async () => {} }),
+        acquireRefresh: async () => ({ release: async () => {} }),
+      },
+      getLocalAuth: async (accountId) =>
+        accountId === 'main'
+          ? core.custodyTombstoneOAuth('anthropic')
+          : real('changed-access', 'changed-refresh'),
+      isCommitted: async () => false,
+      snapshotSidecars: async () => {
+        snapshots++
+        return { config: null, state: null }
+      },
+      writeManifestBindings: async () => {
+        writes++
+      },
+      writeSidecarAccount: async () => {
+        writes++
+      },
+      verifyTarget: async () => true,
+      verifyCommitted: async () => true,
+      restoreSidecars: async () => {},
+      verifyRollback: async () => true,
+      setMode: async () => 'changed',
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({
+      code: 'custody_transition_failed',
+      stage: 'reverify_fingerprint',
+      accountId: 'work',
+    })
+    expect(snapshots).toBe(0)
+    expect(writes).toBe(0)
+  })
+
+  test('custody: live takeover tombstones fallback refresh and commits mode last', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'custody-live-takeover-'))
+    const storagePath = join(directory, 'accounts.json')
+    const manifestPath = join(directory, 'handles.json')
+    const mainHandle = `ckh_${'M'.repeat(43)}`
+    const workHandle = `ckh_${'W'.repeat(43)}`
+    const hostReads: string[] = []
+    const cacheModes: string[] = []
+    const manifestWrites: string[] = []
+    let modeAtFinalVerification = 'local'
+    try {
+      await core.saveAccounts(
+        {
+          version: 1,
+          claustrum: { handlesFile: manifestPath, mode: 'local' },
+          accounts: [
+            {
+              id: 'work',
+              label: 'work',
+              type: 'oauth',
+              access: 'access-work-secret',
+              refresh: 'refresh-work-secret',
+              expires: now + 60_000,
+              claustrumHandle: workHandle,
+              enabled: true,
+            },
+          ],
+        },
+        storagePath,
+      )
+      await expect(
+        core.writeCustodyHandleManifestEntry({
+          path: manifestPath,
+          entry: {
+            label: 'main',
+            handle: mainHandle,
+            credentialId: core.custodyCredentialId('main'),
+          },
+        }),
+      ).resolves.toEqual({ status: 'written' })
+      const cache = {
+        get: async (handle: string, minTtlMs = 0) => {
+          cacheModes.push(
+            core.getClaustrumMode(await core.loadAccounts(storagePath)),
+          )
+          return {
+            credentialId:
+              handle === mainHandle
+                ? core.custodyCredentialId('main')
+                : core.custodyCredentialId('work'),
+            recordVersion: 7,
+            access: 'vault-access',
+            refresh: 'vault-refresh',
+            expiresAt: now + minTtlMs + 1,
+            state: 'usable' as const,
+          }
+        },
+      }
+      const fallbackManager = {
+        withAccountRefreshLock: async <T>(_id: string, fn: () => Promise<T>) =>
+          fn(),
+      }
+      const deps = createLiveCustodyDeps({
+        storagePath,
+        cache,
+        latestGetAuth: async () => {
+          hostReads.push('get')
+          return core.custodyTombstoneOAuth('anthropic')
+        },
+        now,
+        fallbackManager: fallbackManager as never,
+        writeManifestEntryLocked: async (...args) => {
+          manifestWrites.push(args[0].entry.label)
+          return core.writeCustodyHandleManifestEntryLocked(...args)
+        },
+      })
+      const storage = await core.loadAccounts(storagePath)
+      const plan = await preflightClaustrumTakeover(
+        await deps.preflightInput(
+          { id: 'main', label: 'main', enabled: true },
+          storage?.accounts ?? [],
+        ),
+      )
+
+      await expect(
+        executeClaustrumTakeover(plan, deps.takeoverDeps(plan)),
+      ).resolves.toBe('changed')
+
+      const committed = await core.loadAccounts(storagePath)
+      const work = committed?.accounts.find((account) => account.id === 'work')
+      expect(work).toMatchObject({
+        access: '',
+        refresh: core.custodyTombstoneKey('anthropic'),
+        expires: 0,
+      })
+      expect(committed?.claustrum?.mode).toBe('claustrum')
+      modeAtFinalVerification = committed?.claustrum?.mode ?? 'local'
+      expect(modeAtFinalVerification).toBe('claustrum')
+      expect(cacheModes.slice(-4)).toEqual([
+        'local',
+        'local',
+        'claustrum',
+        'claustrum',
+      ])
+      expect(manifestWrites).toEqual(['work'])
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+      expect(manifest.providers[0].accounts).toEqual([
+        {
+          label: 'main',
+          handle: mainHandle,
+          credential_id: core.custodyCredentialId('main'),
+        },
+        {
+          label: 'work',
+          handle: workHandle,
+          credential_id: core.custodyCredentialId('work'),
+        },
+      ])
+      expect(hostReads.length).toBeGreaterThan(1)
+      expect(deps.hostAuth).not.toHaveProperty('set')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('custody: local exit changes only the persisted mode', async () => {
+    const calls: string[] = []
+    await expect(
+      executeLocalExit({
+        setMode: async (mode) => {
+          calls.push(mode)
+          return 'changed'
+        },
+      }),
+    ).resolves.toBe('changed')
+    expect(calls).toEqual(['local'])
   })
 })

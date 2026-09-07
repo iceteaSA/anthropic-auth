@@ -1,6 +1,7 @@
 import {
   getRefreshBeforeExpiryMs,
   isCustodyTombstoneOAuth,
+  setClaustrumModePersistent,
 } from '@cortexkit/anthropic-auth-core'
 
 import {
@@ -18,7 +19,7 @@ type Lock = { release: () => Promise<void> }
 export const OPENCODE_MAIN_OAUTH_REFRESH_LOCK = 'opencode-main-oauth-refresh'
 
 export type CustodyCacheCredential = {
-  credentialId: string
+  credentialId?: string
   recordVersion: number
   access: string
   refresh: string
@@ -29,14 +30,22 @@ export type CustodyCacheCredential = {
 export type ClaustrumTakeoverPlan = {
   accounts: Array<{
     id: string
+    label: string
     handle: string
     credentialId: string
     recordVersion: number
+    bindingPersisted: boolean
     localAuthFingerprint: string
     cacheCredential: CustodyCacheCredential
   }>
   toJSON: () => unknown
   toString: () => string
+}
+
+export type CustodyPreflightRefusal = {
+  label: string
+  reason: string
+  guidance?: string
 }
 
 export class CustodyPreflightRefusedError extends Error {
@@ -45,12 +54,21 @@ export class CustodyPreflightRefusedError extends Error {
   constructor(
     readonly accountId: string,
     readonly reason: string,
+    readonly refusals: CustodyPreflightRefusal[] = [
+      { label: accountId, reason },
+    ],
   ) {
     super(`custody preflight refused for account ${accountId}: ${reason}`)
   }
 
   toJSON() {
-    return { code: this.code, accountId: this.accountId, reason: this.reason }
+    return {
+      ok: false,
+      code: this.code,
+      accountId: this.accountId,
+      reason: this.reason,
+      refusals: this.refusals,
+    }
   }
 }
 
@@ -99,6 +117,7 @@ type PreflightBinding = {
   label: string
   handle: string
   credentialId: string
+  source?: 'manifest' | 'legacy'
 }
 
 export type PreflightClaustrumTakeoverInput = {
@@ -120,6 +139,7 @@ export type PreflightClaustrumTakeoverInput = {
       options: { minTtlMs: number },
     ) => Promise<CustodyCacheCredential | { state: string; expiresAt?: number }>
   }
+  debug?: (message: string) => void
 }
 
 function localOAuthMaterial(
@@ -185,45 +205,78 @@ function isUsableCredential(
   return credential.state === 'usable' && 'recordVersion' in credential
 }
 
+type CollectedPreflightRefusal = CustodyPreflightRefusal & {
+  accountId: string
+}
+
 export async function preflightClaustrumTakeover(
   input: PreflightClaustrumTakeoverInput,
 ): Promise<ClaustrumTakeoverPlan> {
   const mainAuth = await input.hostAuth.get()
-  if (!isCustodyTombstoneOAuth(mainAuth, 'anthropic'))
-    throw new CustodyPreflightRefusedError(
-      input.main.id,
-      'TAKEOVER_INCOMPLETE_MAIN_REAL',
-    )
+  const mainIsTombstoned = isCustodyTombstoneOAuth(mainAuth, 'anthropic')
 
   const minTtlMs =
     getRefreshBeforeExpiryMs(input.storage as never) + 30 * 60_000
   const accounts: ClaustrumTakeoverPlan['accounts'] = []
+  const refusals: CollectedPreflightRefusal[] = []
+  const refuse = (route: PreflightRoute, reason: string) => {
+    refusals.push({
+      accountId: route.id,
+      label: route.label ?? route.id,
+      reason,
+      ...(route.id === input.main.id &&
+      reason === 'TAKEOVER_INCOMPLETE_MAIN_REAL'
+        ? {
+            guidance:
+              'Run ck auth migrate-plugin --allow-main before retrying.',
+          }
+        : {}),
+    })
+  }
+  if (!mainIsTombstoned)
+    refuse({ ...input.main, type: 'oauth' }, 'TAKEOVER_INCOMPLETE_MAIN_REAL')
+
   for (const route of enabledOAuthRoutes(input, mainAuth)) {
+    if (route.id === input.main.id && !mainIsTombstoned) continue
     const binding = findStrictBinding(route, input.bindings)
-    if (!binding)
-      throw new CustodyPreflightRefusedError(
-        route.id,
+    if (!binding) {
+      refuse(
+        route,
         route.id === input.main.id
           ? 'TAKEOVER_INCOMPLETE_MAIN_BINDING'
           : 'binding_missing',
       )
+      continue
+    }
     const credential = await input.cache.get(binding.handle, { minTtlMs })
-    if (credential.state === 'revoked')
-      throw new CustodyPreflightRefusedError(route.id, 'credential_revoked')
-    if (credential.state === 'reauth')
-      throw new CustodyPreflightRefusedError(route.id, 'credential_reauth')
-    if (credential.state === 'timeout')
-      throw new CustodyPreflightRefusedError(route.id, 'credential_timeout')
+    if (credential.state === 'revoked') {
+      refuse(route, 'credential_revoked')
+      continue
+    }
+    if (credential.state === 'reauth') {
+      refuse(route, 'credential_reauth')
+      continue
+    }
+    if (credential.state === 'timeout') {
+      refuse(route, 'credential_timeout')
+      continue
+    }
     if (
       !isUsableCredential(credential) ||
       credential.expiresAt < input.now + minTtlMs
-    )
-      throw new CustodyPreflightRefusedError(route.id, 'credential_unusable')
-    if (credential.credentialId !== binding.credentialId)
-      throw new CustodyPreflightRefusedError(
-        route.id,
-        'credential_identity_mismatch',
+    ) {
+      refuse(route, 'credential_unusable')
+      continue
+    }
+    // Without a vault id, a same-account wrong-record response remains possible; C5's account_id-vs-persisted-anthropicAccountUuid fence is the live protection.
+    if (credential.credentialId === undefined)
+      input.debug?.(
+        'custody identity check skipped: vault supplied no credential id',
       )
+    else if (credential.credentialId !== binding.credentialId) {
+      refuse(route, 'credential_identity_mismatch')
+      continue
+    }
     if (
       !custodyPreflightDivergenceCheck(
         {
@@ -234,27 +287,41 @@ export async function preflightClaustrumTakeover(
           typeof custodyPreflightDivergenceCheck
         >[1],
       ).ok
-    )
-      throw new CustodyPreflightRefusedError(route.id, 'divergence_fenced')
+    ) {
+      refuse(route, 'divergence_fenced')
+      continue
+    }
     const local =
       route.id === input.main.id
         ? oauthFingerprintMaterial(route.local)
         : localOAuthMaterial(route.local)
-    if (!local)
-      throw new CustodyPreflightRefusedError(
-        route.id,
+    if (!local) {
+      refuse(
+        route,
         route.id === input.main.id
           ? 'TAKEOVER_INCOMPLETE_MAIN_SLOT'
           : 'local_credential_unavailable',
       )
+      continue
+    }
     accounts.push({
       id: route.id,
+      label: binding.label,
       handle: binding.handle,
       credentialId: binding.credentialId,
       recordVersion: credential.recordVersion,
+      bindingPersisted: binding.source !== 'legacy',
       localAuthFingerprint: localAuthFingerprint(local.access, local.refresh),
       cacheCredential: credential,
     })
+  }
+  const first = refusals.at(0)
+  if (first) {
+    throw new CustodyPreflightRefusedError(
+      first.accountId,
+      first.reason,
+      refusals.map(({ accountId: _, ...refusal }) => refusal),
+    )
   }
   return {
     accounts,
@@ -412,20 +479,30 @@ export class CustodyTransitionError extends Error {
   constructor(
     readonly stage:
       | 'reverify_fingerprint'
+      | 'write_manifest'
       | 'write_sidecar'
       | 'readback'
-      | 'mode_commit',
+      | 'mode_commit'
+      | 'post_commit_readback',
     readonly accountId?: string,
+    readonly guidance?: string,
   ) {
     super(
-      accountId
-        ? `custody transition failed at ${stage} for account ${accountId}`
-        : `custody transition failed at ${stage}`,
+      `${
+        accountId
+          ? `custody transition failed at ${stage} for account ${accountId}`
+          : `custody transition failed at ${stage}`
+      }${guidance ? ` — ${guidance}` : ''}`,
     )
   }
 
   toJSON() {
-    return { code: this.code, stage: this.stage, accountId: this.accountId }
+    return {
+      code: this.code,
+      stage: this.stage,
+      accountId: this.accountId,
+      guidance: this.guidance,
+    }
   }
 }
 
@@ -442,8 +519,9 @@ export class CustodyTransitionRollbackError extends Error {
 }
 
 export type CustodySidecarSnapshot = {
-  config: Uint8Array
-  state: Uint8Array
+  config: Uint8Array | null
+  state: Uint8Array | null
+  manifest?: Uint8Array | null
 }
 
 export type ExecuteClaustrumTakeoverDeps = {
@@ -451,13 +529,19 @@ export type ExecuteClaustrumTakeoverDeps = {
   getLocalAuth: (accountId: string) => Promise<unknown>
   isCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
   snapshotSidecars: () => Promise<CustodySidecarSnapshot>
+  writeManifestBindings: (plan: ClaustrumTakeoverPlan) => Promise<void>
   writeSidecarAccount: (
     account: ClaustrumTakeoverPlan['accounts'][number],
   ) => Promise<void>
   verifyTarget: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
+  verifyCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
   restoreSidecars: (snapshot: CustodySidecarSnapshot) => Promise<void>
   verifyRollback: (snapshot: CustodySidecarSnapshot) => Promise<boolean>
-  setMode: (mode: 'claustrum') => Promise<'changed' | 'unchanged'>
+  setMode: (mode: 'claustrum' | 'local') => Promise<'changed' | 'unchanged'>
+}
+
+export function commitClaustrumMode(path: string) {
+  return setClaustrumModePersistent('claustrum', path)
 }
 
 export async function executeClaustrumTakeover(
@@ -485,8 +569,15 @@ export async function executeClaustrumTakeover(
 
     const snapshot = await deps.snapshotSidecars()
     let accountId: string | undefined
+    let modeCommitted = false
     try {
+      try {
+        await deps.writeManifestBindings(plan)
+      } catch {
+        throw new CustodyTransitionError('write_manifest')
+      }
       for (const account of plan.accounts) {
+        if (account.id === 'main') continue
         accountId = account.id
         await deps.writeSidecarAccount(account)
       }
@@ -495,11 +586,30 @@ export async function executeClaustrumTakeover(
       }
       try {
         await deps.setMode('claustrum')
+        modeCommitted = true
       } catch {
         throw new CustodyTransitionError('mode_commit')
       }
+      if (!(await deps.verifyCommitted(plan))) {
+        throw new CustodyTransitionError('post_commit_readback')
+      }
       return 'changed'
     } catch (error) {
+      if (
+        modeCommitted &&
+        error instanceof CustodyTransitionError &&
+        error.stage === 'post_commit_readback'
+      ) {
+        try {
+          await deps.setMode('local')
+        } catch {
+          throw new CustodyTransitionError(
+            'post_commit_readback',
+            undefined,
+            'mode is claustrum and unverified — run `/claude-account local`',
+          )
+        }
+      }
       try {
         await deps.restoreSidecars(snapshot)
         if (!(await deps.verifyRollback(snapshot))) {
@@ -516,4 +626,13 @@ export async function executeClaustrumTakeover(
   } finally {
     await locks.release()
   }
+}
+
+export function executeLocalExit(deps: {
+  path?: string
+  setMode?: (mode: 'local') => Promise<'changed' | 'unchanged'>
+}) {
+  return deps.setMode
+    ? deps.setMode('local')
+    : setClaustrumModePersistent('local', deps.path)
 }
