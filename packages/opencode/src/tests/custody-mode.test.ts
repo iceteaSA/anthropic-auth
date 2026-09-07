@@ -668,7 +668,7 @@ describe('custody mode', () => {
     expect(JSON.stringify(error)).not.toContain('access-work-secret')
   })
 
-  test('custody: failed committed readback reverts mode before restoring sidecars', async () => {
+  test('custody: throwing committed verifier reverts mode before restoring sidecars', async () => {
     const plan = await preflightClaustrumTakeover(preflightInput())
     const before = {
       config: new TextEncoder().encode('{"access":"access-work-secret"}\n'),
@@ -702,7 +702,9 @@ describe('custody mode', () => {
         state = new TextEncoder().encode('{"refresh":"claustrum-tombstone"}\n')
       },
       verifyTarget: async () => true,
-      verifyCommitted: async () => false,
+      verifyCommitted: async () => {
+        throw new Error('cache read failed')
+      },
       restoreSidecars: async (snapshot) => {
         expect(mode).toBe('local')
         config = snapshot.config!.slice()
@@ -719,7 +721,7 @@ describe('custody mode', () => {
 
     expect(error).toMatchObject({
       code: 'custody_transition_failed',
-      stage: 'post_commit_readback',
+      stage: 'write_sidecar',
     })
     expect(mode).toBe('local')
     expect(config).toEqual(before.config)

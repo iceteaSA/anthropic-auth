@@ -1972,6 +1972,7 @@ const anthropicAuthPlugin = async (
         if (result === 'cleared') await refreshCustodyHandleManifest()
         return
       }
+      if (result === 'refused-transient') return
       if (attempt + 1 < maxAttempts) {
         await new Promise<void>((resolve) => {
           const timer = runtimeTimers.setTimeout(resolve, intervalMs)

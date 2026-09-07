@@ -36,10 +36,7 @@ test('saveAccounts cannot persist a Claustrum mode change', async () => {
   const storage = createEmptyStorage()
 
   await saveAccounts({ ...storage, claustrum: { mode: 'claustrum' } }, path)
-  // @ts-expect-error Persistent custody mode changes have a private capability.
-  await saveAccounts({ ...storage, claustrum: { mode: 'local' } }, path, {
-    writeClaustrumMode: true,
-  })
+  await saveAccounts({ ...storage, claustrum: { mode: 'local' } }, path)
 
   await expect(loadAccounts(path)).resolves.toMatchObject({
     claustrum: { mode: 'claustrum' },

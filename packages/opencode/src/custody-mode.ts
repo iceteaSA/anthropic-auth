@@ -616,11 +616,7 @@ export async function executeClaustrumTakeover(
       }
       return 'changed'
     } catch (error) {
-      if (
-        modeCommitted &&
-        error instanceof CustodyTransitionError &&
-        error.stage === 'post_commit_readback'
-      ) {
+      if (modeCommitted) {
         try {
           await deps.setMode('local')
         } catch {

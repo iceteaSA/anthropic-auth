@@ -7518,7 +7518,7 @@ describe('AnthropicAuthPlugin', () => {
     installDefaultFetchMock()
   })
 
-  test('main acknowledge retries a transient manifest refusal', async () => {
+  test('main acknowledge defers a transient manifest refusal to the next loader', async () => {
     const access = 'local-login-retry-access'
     const refresh = 'local-login-retry-refresh'
     const manifestHandle = `ckh_${'S'.repeat(43)}`
@@ -7604,6 +7604,17 @@ describe('AnthropicAuthPlugin', () => {
         { models: {} },
       )
 
+      expect(removalAttempts).toBe(1)
+      await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access,
+            refresh,
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
       expect(removalAttempts).toBe(2)
       expect(
         JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
