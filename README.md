@@ -116,15 +116,21 @@ Override the path with `PI_ANTHROPIC_AUTH_FILE`. The package also respects `PI_A
 
 ## Primary account authentication
 
-Each integration keeps the host agent's normal Anthropic login as the primary account.
-
-For OpenCode, use OpenCode's Anthropic auth flow:
+OpenCode keeps its native `anthropic` entry as the main account. In `local` mode, sign in through OpenCode:
 
 ```text
 /connect anthropic
 ```
 
-The primary account remains OpenCode's built-in `anthropic` auth entry. The OpenCode plugin intercepts final Anthropic requests and supplies the OAuth headers and request transforms needed for Claude Pro/Max access.
+Before the main account can enter Claustrum custody, the operator must migrate it with `ck auth migrate-plugin --allow-main`. The plugin does not run that command, import credentials, migrate credentials, or start `ck`. It also never writes OpenCode's host `auth.json` slot.
+
+Verify the migration gate against the installed `ck-auth` binary, not an announcement or a claimed deployment revision. In an isolated scratch data directory, a production-shaped tombstone import must refuse with `refusing Claustrum tombstone material` and leave the audit chain unchanged; in the same run, a real-material import with `--replace` must succeed. The refusal alone is not enough because a broken import path also refuses. The exact tombstone write is:
+
+```json
+{ "type": "oauth", "access": "", "refresh": "claustrum-tombstone:v1:anthropic", "expires": 0 }
+```
+
+`access` is empty so the sealer's shape gate rejects the material by construction.
 
 OpenCode's upstream authentication options are still supported:
 
@@ -233,8 +239,6 @@ The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-
 
 `quotaHeaderFeed.enabled` is an OpenCode-only, restart-required opt-in. It publishes only allowlisted quota-window values, an opaque account reference, an observation timestamp, and the configured OAuth-account count; it never publishes tokens, raw headers, request bodies, model IDs, or refresh errors. Per-process lease files use owner-only permissions under `$TMPDIR/opencode-anthropic-auth/quota-header-feed`, expire after three minutes, and can be redirected with `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR`.
 
-`claustrum.accounts.<fallback-account-id>.enabled` is transition-only compatibility state. In the ruled global model, `/claude-account claustrum` and `/claude-account local` select service mode; a binding present in the manifest decides which OAuth accounts are vault-served. Handles are bearer credentials and must not be copied into the public config file.
-
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. `sticky-balanced` session assignments use a separate `anthropic-auth-routing-state.json`; session IDs are SHA-256 hashed in that file. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
 ## OpenCode lane-start setting
@@ -289,15 +293,13 @@ If Anthropic reports `invalid_grant`, that account must be logged in again. `/cl
 
 ### Claustrum manifest service (OpenCode)
 
-In global Claustrum mode, `/claude-account claustrum` serves bound OAuth routes from a local [Claustrum](https://github.com/cortexkit/claustrum) vault; `/claude-account local` returns authority to local OAuth refresh. Account membership is decided by a binding present in Claustrum's shared handle manifest, not by a per-account switch.
+Claustrum custody is global. `/claude-account claustrum` enters custody, `/claude-account local` returns to local authentication, and bare `/claude-account` shows status. There are no per-account custody switches. Claustrum uses a handle manifest written by Claustrum tooling.
 
-The plugin resolves the `provider: "anthropic"`, `serve: "anthropic-auth"` block and matches `credential_id` to `oauth:anthropic:<label>`. Set `$CLAUSTRUM_OPENCODE_HANDLES` to override the manifest path; otherwise it is `${XDG_CONFIG_HOME:-~/.config}/cortexkit/opencode-handles.json`. `claustrum.handlesFile` in `anthropic-auth.json` overrides both. Fallback labels must be unique and match `^[a-z0-9][a-z0-9._-]{0,63}$`.
+Entering custody preflights every enabled OAuth account. A refusal changes nothing, and the command reports every refusal in account order. The main account must already have been migrated by the operator. The plugin does not create or import vault records during this check.
 
-Claustrum writes bindings shaped `{label, handle, credential_id}` under the shared lock. The in-memory type uses `credentialId`. The plugin discovers bindings and removes only its own binding. A legacy state-file `claustrumHandle` is migrated on startup when no manifest binding exists. A foreign `serve` block is ignored with one warning. The manifest must be a user-owned regular file with mode `0600`, a safe parent, and no more than 256 KiB. An unsafe or unparseable manifest is reported as `invalid` with one warning, and the account falls back to its stored legacy handle. Writers serialize through `<manifest>.lock`, shared with Claustrum's CLI.
+In custody, every enabled OAuth route is served from the vault, including the main account. If the main vault record is cold at boot, startup returns a typed refusal and holds every OAuth route until the next viable boot. If the main record goes cold after a warm boot, requests receive a typed provider-unavailable error. The plugin does not fall back to sidecar credentials or send a tombstone as a bearer token. A cold fallback is excluded only for that request, so other warm routes can still serve.
 
-The request path reads only a resident in-memory credential. Startup warming and periodic reconciliation perform vault I/O and keep idle credentials refreshed; a cold or unavailable vault returns the typed provider-unavailable refusal rather than falling back to sidecar credentials. This behavior lands with the cold-route task. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the OpenCode account modal show whether a manifest binding is present, current vault service, and vault reauthentication state without exposing capability handles.
-
-For a vault-latched account, recover it with `ck auth login --id oauth:anthropic:<label>`. API-key routes are unaffected.
+Leaving custody puts the main account back into interactive OpenCode sign-in. A fallback binding clears only after a login completed through the plugin's own login flow observes new credential material. To enter custody again for that fallback, the operator must import the new material into the vault with `--replace`; until then, `/claude-account claustrum` refuses with `binding_missing`. API-key routes are unaffected.
 ## Quota-aware routing
 
 When `quota.enabled` is true, the plugin checks Anthropic's OAuth usage endpoint and applies the configured remaining-quota thresholds to both main and fallback accounts.

@@ -102,6 +102,19 @@ Evaluated independently for main and for **each enabled OAuth fallback**.
 | `local` | `REAL` · `INERT` · `GONE` | main: `REAL` = usable material, `INERT` = recognise-set tombstone, `GONE` = slot absent **as observed through the SDK**. An unparseable main slot is unobservable: `Auth.all()` runs `Record.filterMap(decode)` (`auth/index.ts:65-66`), so a slot failing the `Info` schema reads as `undefined` and any later host write rewrites the file without it; for main, `GONE ≡ SLOT_ABSENT`. Fallback: `REAL` = usable refresh material, `INERT` = refresh material absent, row otherwise valid, `GONE` = `ROW_UNPARSEABLE` (our own store, so the distinction survives there; a row that is *absent* while a binding exists is the discovery operation, §7, not a coordinate) |
 | `vault` | `USABLE` · `COLD` · `REAUTH` · `N/A` | resolved through the binding's handle. `COLD` = daemon unreachable or credential not resident (transient). `REAUTH` = record latched `needs_reauth`. `N/A` ⇔ `binding ∈ {ABSENT, INVALID}` |
 
+The startup matrix in §5 uses a compact four-letter form: `mode|main|fallbacks|evidence`.
+
+| letter | meaning |
+|---|---|
+| `C` | global `claustrum` mode |
+| `L` | global `local` mode |
+| `R` | real local OAuth material is present |
+| `T` | local material is tombstoned or absent while a binding resolves |
+| `X` | the main host slot is absent or cannot be observed as a valid OAuth slot |
+| `M` | a fallback binding is missing |
+| `V` | main vault evidence is verified at startup |
+| `N` | main vault evidence is not verified at startup |
+
 Two facts about `GONE` for main, both from OpenCode source (`339536bc22`), change what it means:
 
 - an absent slot never reaches `auth.loader`, so any reconciliation that must observe main's slot
@@ -440,6 +453,17 @@ rotated.
 - The `enable` precondition under `claustrum` requires `USABLE`; whether a `REAUTH`-latched account
   may be enabled-but-dark (so it resumes without a second operator action after re-import) is
   unstated.
+
+### 12.4 A cold main handle at boot holds warm fallbacks
+
+`C|T|T|N` is a global verdict. A cold or latched main handle at boot blocks a healthy, bound fallback even when the daemon is healthy and that fallback could serve.
+
+Two directions remain open:
+
+1. Keep the global refusal. The operator re-imports the main record before the next boot.
+2. Serve fallbacks only. The main route returns a typed refusal while healthy fallbacks remain route-local, matching §5's fallback residency rule.
+
+Unresolved. This document does not choose between them.
 ## 13. Implementation constraints (binding, from the 06:04Z go-ahead)
 
 1. **The host-write race stays open and the unsafe transition stays BLOCKED.** The main-slot
