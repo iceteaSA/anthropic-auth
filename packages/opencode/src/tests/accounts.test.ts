@@ -19,6 +19,7 @@ import {
   buildQuotaOperationError,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
+  clearClaustrumHandlePersistent,
   FallbackAccountManager,
   fetchOAuthAccountProfile,
   fetchOAuthQuotaSnapshot,
@@ -3798,7 +3799,8 @@ describe('FallbackAccountManager', () => {
         expect.objectContaining({
           level: 'debug',
           channel: 'refresh',
-          message: 'fallback oauth background skipped custody verification',
+          message:
+            'fallback OAuth background skipped vault-service verification',
         }),
       )
       expect(
@@ -6864,6 +6866,79 @@ describe('setClaustrumAccountGatePersistent', () => {
   })
 })
 
+describe('clearClaustrumHandlePersistent', () => {
+  test('clears a handle from a whitespace-padded runtime state key', async () => {
+    const accountId = 'work-alt'
+    const handle = 'padded-state-handle'
+    await saveAccounts(baseStorage(), accountPath)
+    await addAccountPersistent(
+      {
+        id: accountId,
+        type: 'oauth',
+        refresh: 'refresh',
+        claustrumHandle: handle,
+      },
+      accountPath,
+    )
+    const statePath = getAccountStatePath(accountPath)
+    const state = JSON.parse(await readFile(statePath, 'utf8'))
+    state.accounts[' work-alt'] = state.accounts[accountId]
+    delete state.accounts[accountId]
+    await writeFile(statePath, JSON.stringify(state))
+
+    expect(
+      await clearClaustrumHandlePersistent({
+        id: accountId,
+        path: accountPath,
+      }),
+    ).toBe('updated')
+    expect(await readFile(statePath, 'utf8')).not.toContain(handle)
+  })
+
+  test('does not resurrect a cleared handle when a stale writer rotates tokens', async () => {
+    const accountId = 'custody-handle-fence'
+    const handle = 'custody-handle-fence-secret'
+    await saveAccounts(baseStorage(), accountPath)
+    await addAccountPersistent(
+      {
+        id: accountId,
+        type: 'oauth',
+        access: 'original-access',
+        refresh: 'original-refresh',
+        expires: 1_000,
+        claustrumHandle: handle,
+      },
+      accountPath,
+    )
+    const staleWriterStorage = (await loadAccounts(accountPath))!
+    const statePath = getAccountStatePath(accountPath)
+    expect(await readFile(statePath, 'utf8')).toContain(handle)
+
+    expect(
+      await clearClaustrumHandlePersistent({
+        id: accountId,
+        path: accountPath,
+      }),
+    ).toBe('updated')
+
+    const staleAccount = expectOAuthAccount(
+      staleWriterStorage.accounts.find((account) => account.id === accountId),
+    )
+    staleAccount.access = 'rotated-access'
+    staleAccount.refresh = 'rotated-refresh'
+    staleAccount.expires = 2_000
+    await saveAccountState(staleWriterStorage, accountPath, { accounts: true })
+
+    const stateBytes = await readFile(statePath, 'utf8')
+    expect(stateBytes).not.toContain(handle)
+    expect(JSON.parse(stateBytes).accounts?.[accountId]).toMatchObject({
+      access: 'rotated-access',
+      refresh: 'rotated-refresh',
+      expires: 2_000,
+    })
+  })
+})
+
 describe('addAccountPersistent', () => {
   test('adds a new account and persists', async () => {
     const storage = baseStorage()
@@ -7501,7 +7576,7 @@ describe('vault-served fallback refresh gating', () => {
         expect.objectContaining({
           level: 'warn',
           channel: 'refresh',
-          message: 'custody override: local fallback refresh',
+          message: 'vault service: local fallback refresh',
           payload: {
             accountId: 'vault-unavailable',
             reason: 'vault credential unavailable',

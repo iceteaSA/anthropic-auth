@@ -79,6 +79,7 @@ export type ClaustrumAccountGate = {
 }
 
 export type ClaustrumConfig = {
+  handlesFile?: string
   accounts?: Record<string, ClaustrumAccountGate>
 }
 
@@ -386,6 +387,7 @@ export type AccountStateSaveScope = {
   mainRefresh?: boolean
   mainPrime?: boolean
   accounts?: true | string[]
+  setClaustrumHandleAccountIds?: readonly string[]
 }
 
 type OAuthUsageWindow = {
@@ -894,23 +896,35 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 }
 
 function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
-  if (!isRecord(value) || !isRecord(value.accounts)) return undefined
-  const accounts = Object.fromEntries(
-    Object.entries(value.accounts).flatMap(([id, entry]) => {
-      if (!isRecord(entry)) return []
-      return [
-        [
-          id,
-          {
-            ...(typeof entry.enabled === 'boolean' && {
-              enabled: entry.enabled,
-            }),
-          },
-        ],
-      ]
-    }),
-  )
-  return Object.keys(accounts).length > 0 ? { accounts } : undefined
+  if (!isRecord(value)) return undefined
+  const handlesFile =
+    typeof value.handlesFile === 'string' && value.handlesFile.trim()
+      ? value.handlesFile.trim()
+      : undefined
+  const accounts = isRecord(value.accounts)
+    ? Object.fromEntries(
+        Object.entries(value.accounts).flatMap(([id, entry]) => {
+          if (!isRecord(entry)) return []
+          return [
+            [
+              id,
+              {
+                ...(typeof entry.enabled === 'boolean' && {
+                  enabled: entry.enabled,
+                }),
+              },
+            ],
+          ]
+        }),
+      )
+    : undefined
+  if (!handlesFile && (!accounts || Object.keys(accounts).length === 0)) {
+    return undefined
+  }
+  return {
+    ...(handlesFile && { handlesFile }),
+    ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
+  }
 }
 
 async function readJsonIfPresent(path: string): Promise<{
@@ -1352,30 +1366,33 @@ export function mergeHeaderQuotaForPersistence(
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
+  setClaustrumHandle = false,
 ): AccountRuntimeEntry {
   if (!isRecord(existing)) return incoming
+  const incomingForMerge = { ...incoming }
+  if (!setClaustrumHandle) delete incomingForMerge.claustrumHandle
   const existingEntry = existing as AccountRuntimeEntry
   const tokenChanged = Boolean(
     (existingEntry.access &&
-      incoming.access &&
-      existingEntry.access !== incoming.access) ||
+      incomingForMerge.access &&
+      existingEntry.access !== incomingForMerge.access) ||
       (existingEntry.refresh &&
-        incoming.refresh &&
-        existingEntry.refresh !== incoming.refresh),
+        incomingForMerge.refresh &&
+        existingEntry.refresh !== incomingForMerge.refresh),
   )
   const mergesHeaderQuota = Boolean(
-    !tokenChanged && incoming.quota?.source === 'headers',
+    !tokenChanged && incomingForMerge.quota?.source === 'headers',
   )
   const effectiveIncoming =
-    mergesHeaderQuota && incoming.quota
+    mergesHeaderQuota && incomingForMerge.quota
       ? {
-          ...incoming,
+          ...incomingForMerge,
           quota: mergeHeaderQuotaForPersistence(
             existingEntry.quota,
-            incoming.quota,
+            incomingForMerge.quota,
           ),
         }
-      : incoming
+      : incomingForMerge
   const preferredRefreshError = (() => {
     const existingError = existingEntry.lastRefreshError
     const incomingError = effectiveIncoming.lastRefreshError
@@ -1552,6 +1569,65 @@ export async function setClaustrumAccountGatePersistent(input: {
   })
 }
 
+export async function clearClaustrumHandlePersistent(input: {
+  id: string
+  path?: string
+}): Promise<'updated' | 'missing' | 'ineligible'> {
+  const path = input.path ?? getAccountStoragePath()
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = await loadAccounts(path)
+        if (!storage) return 'missing'
+        const statePath = getAccountStatePath(path)
+        const state = (await readJsonIfPresent(statePath)).value
+        const stateAccounts =
+          isRecord(state) && isRecord(state.accounts)
+            ? state.accounts
+            : undefined
+        const matchingStateKeys = Object.keys(stateAccounts ?? {}).filter(
+          (key) => key.trim() === input.id.trim(),
+        )
+        const account = storage.accounts.find(
+          (candidate) => candidate.id === input.id,
+        )
+        if (!account) {
+          if (matchingStateKeys.length === 0) return 'missing'
+          for (const key of matchingStateKeys) {
+            const stateAccount = stateAccounts?.[key]
+            if (isRecord(stateAccount)) delete stateAccount.claustrumHandle
+          }
+          await writeJsonAtomic(statePath, pruneUndefined(state))
+          return 'updated'
+        }
+        if (!isOAuthAccount(account)) return 'ineligible'
+        if (!account.claustrumHandle) return 'updated'
+
+        delete account.claustrumHandle
+        const existing = await loadExistingTopLevelFields(path)
+        await writeJsonAtomic(path, {
+          ...existing,
+          ...configFromStorage(storage),
+        })
+        if (matchingStateKeys.length > 0) {
+          for (const key of matchingStateKeys) {
+            const stateAccount = stateAccounts?.[key]
+            if (isRecord(stateAccount)) delete stateAccount.claustrumHandle
+          }
+          await writeJsonAtomic(statePath, pruneUndefined(state))
+        }
+        return 'updated'
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
+}
+
 // ---------------------------------------------------------------------------
 // In-process save mutex — serializes all account-store writes so concurrent
 // read-modify-write callers (background timers that call saveAccountState with
@@ -1588,6 +1664,7 @@ export interface SaveAccountsOptions {
   removedAccountIds?: readonly string[]
   /** Preserve disk order when a stale snapshot is missing newer accounts. */
   preserveExistingAccountOrder?: boolean
+  setClaustrumHandleAccountIds?: readonly string[]
 }
 
 function sameAccountIdentity(
@@ -1757,6 +1834,7 @@ async function saveAccountsWithConfigLock(
       mainQuota: true,
       mainRefresh: true,
       accounts: true,
+      setClaustrumHandleAccountIds: options.setClaustrumHandleAccountIds,
     })
   } finally {
     await stateLock.release()
@@ -2196,6 +2274,9 @@ async function saveAccountStateUnlocked(
 
   if (scope.accounts) {
     const ids = scope.accounts === true ? null : new Set(scope.accounts)
+    const setClaustrumHandleAccountIds = new Set(
+      scope.setClaustrumHandleAccountIds ?? [],
+    )
     const config = (await readJsonIfPresent(path)).value
     const configuredIds = (() => {
       if (!isRecord(config) || !Array.isArray(config.accounts)) return null
@@ -2253,6 +2334,8 @@ async function saveAccountStateUnlocked(
       next.accounts[accountId] = mergeAccountRuntimeState(
         existingAccount,
         accountRuntimeState(account),
+        setClaustrumHandleAccountIds.has(account.id) ||
+          setClaustrumHandleAccountIds.has(accountId),
       )
     }
     if (configuredIds) {
@@ -3425,7 +3508,12 @@ export async function addAccountPersistent(
 ) {
   const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   upsertAccount(storage, account)
-  await saveAccounts(storage, path)
+  await saveAccounts(storage, path, {
+    setClaustrumHandleAccountIds:
+      account.type === 'oauth' && account.claustrumHandle
+        ? [account.id]
+        : undefined,
+  })
 }
 
 export function getQuotaNextRefreshAt(
@@ -4011,7 +4099,7 @@ export class FallbackAccountManager {
           !this.isFallbackAccountVaultServed(next.id, storage)
         ) {
           if (this.isFallbackAccountVaultEnabled(next.id, storage)) {
-            logger.warn('refresh', 'custody override: local fallback refresh', {
+            logger.warn('refresh', 'vault service: local fallback refresh', {
               accountId: next.id,
               reason: 'vault credential unavailable',
             })
@@ -4149,7 +4237,7 @@ export class FallbackAccountManager {
       if (this.custodyVerificationAccounts.has(account.id)) {
         logger.debug(
           'refresh',
-          'fallback oauth background skipped custody verification',
+          'fallback OAuth background skipped vault-service verification',
           {
             accountId: account.id,
           },
