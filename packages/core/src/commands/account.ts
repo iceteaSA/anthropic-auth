@@ -1,9 +1,13 @@
 import type {
   AccountStorage,
+  ClaustrumMode,
   FallbackAccount,
-  OAuthAccount,
 } from '../accounts.ts'
-import { isClaustrumEnabledForAccount, isOAuthAccount } from '../accounts.ts'
+import {
+  getClaustrumMode,
+  isOAuthAccountVaultOwned,
+  setClaustrumModePersistent,
+} from '../accounts.ts'
 import type { ClaustrumDetection } from '../claustrum.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
@@ -11,7 +15,7 @@ export const CLAUDE_ACCOUNT_COMMAND_NAME = 'claude-account'
 
 export type AccountCommandAction =
   | { type: 'status' }
-  | { type: 'custody'; id: string; enabled: boolean }
+  | { type: 'claustrum-mode'; mode: ClaustrumMode }
   | { type: 'enable'; id: string }
   | { type: 'disable'; id: string }
   | { type: 'remove'; id: string }
@@ -29,33 +33,20 @@ export type AccountCommandAction =
   | { type: 'add-oauth-finish'; code: string; label?: string }
   | { type: 'usage' }
 
-export type AccountCustodyCapability =
-  | {
-      platform: 'opencode'
-      set(input: {
-        account: OAuthAccount
-        storage: AccountStorage
-        enabled: boolean
-      }): Promise<{ text: string; changed: boolean }>
-    }
-  | { platform: 'unsupported'; reason: string }
-
 export type AccountCommandResult = {
   text: string
   updated?: {
     id: string
-    action:
-      | 'enable'
-      | 'disable'
-      | 'remove'
-      | 'reorder'
-      | 'reset-backoff'
-      | 'custody'
+    action: 'enable' | 'disable' | 'remove' | 'reorder' | 'reset-backoff'
     enabled?: boolean
     previousOrder?: string[]
     newOrder?: string[]
   }
 }
+
+export type ClaustrumModeTransition = (
+  mode: ClaustrumMode,
+) => Promise<AccountCommandResult>
 
 export function parseAccountCommandAction(
   argumentsText: string,
@@ -72,21 +63,12 @@ export function parseAccountCommandAction(
   if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
   if (action === 'reset-backoff' && !rest) return { type: 'reset-backoff' }
-  const custodyId = parts[1]
-  const custodyState = parts[2]
-  if (
-    action === 'custody' &&
-    parts.length === 3 &&
-    custodyId !== undefined &&
-    (custodyState === 'on' || custodyState === 'off')
-  ) {
-    return {
-      type: 'custody',
-      id: custodyId,
-      enabled: custodyState === 'on',
-    }
+  if (action === 'claustrum' && !rest) {
+    return { type: 'claustrum-mode', mode: 'claustrum' }
   }
-
+  if (action === 'local' && !rest) {
+    return { type: 'claustrum-mode', mode: 'local' }
+  }
   if (action === 'add-apikey' && rest) {
     let remaining = rest
     let baseURL: string | undefined
@@ -194,13 +176,14 @@ export function custodyStatusLabel(state: CustodyStatusState): string {
 
 export type AccountCommandStatusProjection = {
   claustrumDetection: string
+  custodyMode?: 'local' | 'claustrum'
+  custodyModeKnown?: boolean
   accounts: Array<
     AccountListItem & {
       claustrumGate: 'on' | 'off' | 'na'
       vaultServed: boolean
       vaultReauth: boolean
       custodyState: CustodyStatusState
-      custodyEligible: boolean
     }
   >
 }
@@ -245,7 +228,8 @@ const USAGE_TEXT = [
   '  /claude-account enable <id>           Enable a fallback account',
   '  /claude-account disable <id>          Disable a fallback account',
   '  /claude-account remove <id>           Remove a fallback account',
-  '  /claude-account custody <id> on|off    Set fallback custody gate',
+  '  /claude-account claustrum             Enable Claustrum mode',
+  '  /claude-account local                 Enable local mode',
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
   '  /claude-account reset-backoff          Clear main OAuth refresh and quota backoff',
@@ -258,8 +242,9 @@ export async function executeAccountCommand(input: {
   argumentsText: string
   storage: AccountStorage
   claustrum?: ClaustrumDetection
-  custody?: AccountCustodyCapability
   statusProjection?: AccountCommandStatusProjection
+  path?: string
+  transition?: ClaustrumModeTransition
 }): Promise<AccountCommandResult> {
   const action = parseAccountCommandAction(input.argumentsText)
   const accounts = input.storage.accounts
@@ -272,7 +257,13 @@ export async function executeAccountCommand(input: {
       input.statusProjection?.claustrumDetection ??
       input.claustrum?.status ??
       'unknown'
-    const lines = ['## Claude Accounts', '', `- Claustrum: ${detection}`, '']
+    const lines = [
+      '## Claude Accounts',
+      '',
+      `- Custody mode: ${getClaustrumMode(input.storage)}`,
+      `- Claustrum: ${detection}`,
+      '',
+    ]
     for (const a of list) {
       const pct =
         a.quotaPercent != null ? ` ${Math.round(a.quotaPercent)}%` : ''
@@ -281,16 +272,19 @@ export async function executeAccountCommand(input: {
       const projected = input.statusProjection?.accounts.find(
         (account) => account.id === a.id,
       )
-      const custody = custodyStatusLabel(
-        projected?.custodyState ??
-          (a.id === mainId
-            ? 'na'
-            : isClaustrumEnabledForAccount(input.storage, a.id)
-              ? 'on-cold'
-              : 'off'),
+      const storedAccount = input.storage.accounts.find(
+        (account) => account.id === a.id,
       )
+      const custody =
+        a.id !== mainId &&
+        storedAccount &&
+        isOAuthAccountVaultOwned(input.storage, storedAccount, undefined)
+          ? 'vault-bound'
+          : projected?.claustrumGate === 'on'
+            ? 'vault-bound'
+            : 'local'
       lines.push(
-        `- **${a.label}** [${a.role}]${tier}${status}${pct} · manifest ${custody}`,
+        `- **${a.label}** [${a.role}]${tier}${status}${pct} · ${custody}`,
       )
     }
     lines.push('', USAGE_TEXT)
@@ -299,6 +293,21 @@ export async function executeAccountCommand(input: {
 
   if (action.type === 'usage') {
     return { text: USAGE_TEXT }
+  }
+
+  if (action.type === 'claustrum-mode') {
+    const transition =
+      input.transition ??
+      (async (mode) => {
+        const result = await setClaustrumModePersistent(mode, input.path)
+        return {
+          text:
+            result === 'changed'
+              ? `Claustrum mode set to ${mode}.`
+              : `Claustrum mode already ${mode}.`,
+        }
+      })
+    return transition(action.mode)
   }
 
   if (action.type === 'add-apikey') {
@@ -314,45 +323,6 @@ export async function executeAccountCommand(input: {
     return {
       text: 'Main OAuth refresh and quota backoff cleared.',
       updated: { id: 'main', action: 'reset-backoff' },
-    }
-  }
-
-  if (action.type === 'custody') {
-    const target = accounts.find((account) => account.id === action.id)
-    if (!target) return { text: `Account "${action.id}" not found.` }
-    if (target.id === mainId) {
-      return {
-        text: 'Vault service is not available for the main account.',
-      }
-    }
-    if (!isOAuthAccount(target)) {
-      return { text: 'Vault service requires an OAuth fallback account.' }
-    }
-    if (action.enabled && !target.enabled) {
-      return {
-        text: `Cannot verify vault service for disabled account "${action.id}".`,
-      }
-    }
-    if (input.custody?.platform !== 'opencode') {
-      return {
-        text: 'Claustrum manifest service is OpenCode-only in this version.',
-      }
-    }
-
-    const result = await input.custody.set({
-      account: target,
-      storage: input.storage,
-      enabled: action.enabled,
-    })
-    return {
-      text: result.text,
-      ...(result.changed && {
-        updated: {
-          id: action.id,
-          action: 'custody' as const,
-          enabled: action.enabled,
-        },
-      }),
     }
   }
 

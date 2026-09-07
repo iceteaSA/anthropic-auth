@@ -25,12 +25,13 @@ export interface AccountDialogAccount {
   vaultServed: boolean
   vaultReauth: boolean
   custodyState: 'na' | 'off' | 'on-vault-served' | 'on-vault-reauth' | 'on-cold'
-  custodyEligible: boolean
 }
 
 export interface AccountDialogKnobs {
   accounts: AccountDialogAccount[]
   claustrumDetection: string
+  custodyMode?: 'local' | 'claustrum'
+  custodyModeKnown?: boolean
   [key: string]: unknown
 }
 

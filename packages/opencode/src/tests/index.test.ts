@@ -17,7 +17,6 @@ import {
   readdir,
   readFile,
   rm,
-  stat,
   utimes,
   writeFile,
 } from 'node:fs/promises'
@@ -54,7 +53,6 @@ import {
   resetFastModeState,
   saveAccountState,
   saveAccounts,
-  setClaustrumAccountGatePersistent,
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -592,6 +590,26 @@ async function waitForAccountStorage(
   throw new Error(`Account storage did not match: ${JSON.stringify(storage)}`)
 }
 
+async function waitForSidecarHandlesAbsent(
+  entries: Array<{ path: string; handle: string }>,
+) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const sidecars = await Promise.all(
+      entries.map(({ path }) => readFile(path, 'utf8')),
+    )
+    if (
+      sidecars.every(
+        (sidecar, index) => !sidecar.includes(entries[index]!.handle),
+      )
+    )
+      return
+    await Bun.sleep(10)
+  }
+  throw new Error(
+    `Legacy handles remained in sidecars: ${entries.map(({ handle }) => handle).join(', ')}`,
+  )
+}
+
 async function seedSidebarRouting(
   activeId: string,
   route: string,
@@ -973,6 +991,17 @@ describe('fallback Claustrum credential resolution', () => {
 
   function fallbackWithClaustrum(overrides?: Record<string, unknown>) {
     const { claustrum, ...accountOverrides } = overrides ?? {}
+    const claustrumConfig =
+      claustrum && typeof claustrum === 'object'
+        ? (() => {
+            const { accounts: _legacyAccounts, ...config } =
+              claustrum as Record<string, unknown>
+            // An explicit mode wins; only an unspecified mode defaults to claustrum.
+            return { mode: 'claustrum', ...config }
+          })()
+        : claustrum === null
+          ? { mode: 'local' }
+          : { mode: 'claustrum' }
     const account = {
       id: 'fallback-1',
       type: 'oauth' as const,
@@ -984,7 +1013,7 @@ describe('fallback Claustrum credential resolution', () => {
     return createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: claustrum as AccountStorage['claustrum'],
+      claustrum: claustrumConfig as AccountStorage['claustrum'],
       accounts: [account as OAuthAccount],
     })
   }
@@ -1088,9 +1117,7 @@ describe('fallback Claustrum credential resolution', () => {
       label: input.label,
       enabled: true,
       ...(input.legacy && { claustrumHandle: input.legacy }),
-      claustrum: {
-        accounts: { [id]: { enabled: input.gate ?? true } },
-      },
+      claustrum: { mode: input.gate === false ? 'local' : 'claustrum' },
       ...(input.enabled === false && { enabled: false }),
     })
   }
@@ -1122,38 +1149,6 @@ describe('fallback Claustrum credential resolution', () => {
       calls.filter((call) => call.method === 'credential.get'),
     ).toHaveLength(1)
     await plugin.dispose?.()
-  })
-
-  test.serial('enables custody from a manifest-only handle', async () => {
-    await useTempAccountFile(
-      manifestStorage({ label: 'manifest-on', gate: false }),
-    )
-    await writeManifest([{ label: 'manifest-on', handle: manifestHandle }])
-    const restore = await configureClaustrumConnection()
-    const calls: CredentialCall[] = []
-    try {
-      const plugin = await getPlugin(undefined, undefined, {
-        claustrumConnector: manifestConnector(
-          calls,
-          new Map([[manifestHandle, 'on-access']]),
-        ),
-      })
-      expect(
-        (
-          await runCustodyCommand(
-            plugin,
-            'manifest-on',
-            'custody fallback-1 on',
-          )
-        )?.text,
-      ).toContain('Vault service active')
-      expect(
-        calls.filter((call) => call.method === 'credential.get'),
-      ).toHaveLength(1)
-      await plugin.dispose?.()
-    } finally {
-      restore()
-    }
   })
 
   test.serial(
@@ -1330,7 +1325,7 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test.serial(
-    'warms a manifest handle when its gate turns on after boot',
+    'warms a manifest handle when claustrum mode turns on after boot',
     async () => {
       await useTempAccountFile(
         manifestStorage({ label: 'gate-after', gate: false }),
@@ -1349,10 +1344,7 @@ describe('fallback Claustrum credential resolution', () => {
         }) as never,
       })
       expect(calls).toHaveLength(0)
-      await setClaustrumAccountGatePersistent({
-        id: 'fallback-1',
-        enabled: true,
-      })
+      await runCustodyCommand(plugin, 'gate-after', 'claustrum')
       await handlers.at(-1)?.()
       await waitForMockCall({ mock: { calls } })
       expect(
@@ -1433,10 +1425,9 @@ describe('fallback Claustrum credential resolution', () => {
     'writes the manifest before clearing a migrated legacy handle',
     async () => {
       await useTempAccountFile(
-        fallbackWithClaustrum({
+        manifestStorage({
           label: 'migration-order',
-          enabled: true,
-          claustrumHandle: legacyHandle,
+          legacy: legacyHandle,
         }),
       )
       const manifestPath = await writeManifest([])
@@ -1459,15 +1450,6 @@ describe('fallback Claustrum credential resolution', () => {
             new Map([[legacyHandle, 'migration-order-access']]),
           ),
         })
-        expect(
-          (
-            await runCustodyCommand(
-              plugin,
-              'migration-order',
-              'custody fallback-1 on',
-            )
-          )?.text,
-        ).toContain('Vault service active')
         expect(stateAtManifestWrite).toContain(legacyHandle)
         expect(await readFile(accountStatePath, 'utf8')).not.toContain(
           legacyHandle,
@@ -1553,7 +1535,6 @@ describe('fallback Claustrum credential resolution', () => {
     id?: string
     label: string
     handle: string
-    gate?: boolean
     connector?: (
       calls: CredentialCall[],
     ) => PluginRuntimeOverrides['claustrumConnector']
@@ -1564,11 +1545,7 @@ describe('fallback Claustrum credential resolution', () => {
         label: input.label,
         enabled: true,
         claustrumHandle: input.handle,
-        ...(input.gate && {
-          claustrum: {
-            accounts: { [input.id ?? 'fallback-1']: { enabled: true } },
-          },
-        }),
+        claustrum: { mode: 'claustrum' },
       }),
     )
     const manifestPath = await writeManifest([])
@@ -1592,7 +1569,6 @@ describe('fallback Claustrum credential resolution', () => {
         await createLegacyMigrationPlugin({
           label: 'startup-migration',
           handle: legacyHandle,
-          gate: true,
         })
       try {
         expect(
@@ -1614,13 +1590,12 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
-    're-migrates a legacy handle after a crash leaves custody already on',
+    're-migrates a legacy handle after a crash when the mode is already claustrum',
     async () => {
       await useTempAccountFile(
         manifestStorage({
           label: 'retry-migration',
           legacy: legacyHandle,
-          gate: true,
         }),
       )
       const manifestPath = await writeManifest([])
@@ -1633,15 +1608,7 @@ describe('fallback Claustrum credential resolution', () => {
         ),
       })
       try {
-        expect(
-          (
-            await runCustodyCommand(
-              plugin,
-              'retry-migration',
-              'custody fallback-1 on',
-            )
-          )?.text,
-        ).toBe('Vault service already active for fallback-1.')
+        await plugin.__fallbackRefreshReady
         expect(
           JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
             .accounts,
@@ -1664,12 +1631,15 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
-    'clears a crash-left state handle when custody on resolves from the manifest',
+    'clears a crash-left state handle when startup resolves from the manifest',
     async () => {
       const label = 'manifest-state-cleanup'
-      await useTempAccountFile(manifestStorage({ label, gate: true }))
+      await useTempAccountFile(manifestStorage({ label, legacy: legacyHandle }))
       await writeManifest([{ label, handle: manifestHandle }])
       const restore = await configureClaustrumConnection()
+      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+      const statePath = getAccountStatePath(path)
+      expect(await readFile(statePath, 'utf8')).toContain(legacyHandle)
       const plugin = await getPlugin(undefined, undefined, {
         claustrumConnector: manifestConnector(
           [],
@@ -1678,27 +1648,7 @@ describe('fallback Claustrum credential resolution', () => {
       })
       try {
         await plugin.__fallbackRefreshReady
-        const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-        const storage = JSON.parse(await readFile(path, 'utf8')) as {
-          accounts: Array<Record<string, unknown>>
-        }
-        const account = storage.accounts.find(
-          (candidate) => candidate.id === 'fallback-1',
-        )!
-        account.claustrumHandle = legacyHandle
-        await writeFile(path, JSON.stringify(storage))
-        expect(await readFile(path, 'utf8')).toContain(legacyHandle)
-
-        expect(
-          (
-            await runCustodyCommand(
-              plugin,
-              'manifest-state-cleanup',
-              'custody fallback-1 on',
-            )
-          )?.text,
-        ).toBe('Vault service already active for fallback-1.')
-        expect(await readFile(path, 'utf8')).not.toContain(legacyHandle)
+        expect(await readFile(statePath, 'utf8')).not.toContain(legacyHandle)
       } finally {
         await plugin.dispose?.()
         restore()
@@ -1755,13 +1705,12 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
-    'skips an invalid-label legacy migration without disabling custody',
+    'skips an invalid-label legacy migration without leaving claustrum mode',
     async () => {
       await useTempAccountFile(
         manifestStorage({
           label: 'Work',
           legacy: legacyHandle,
-          gate: false,
         }),
       )
       const manifestPath = await writeManifest([])
@@ -1776,15 +1725,6 @@ describe('fallback Claustrum credential resolution', () => {
       })
       try {
         expect(
-          (
-            await runCustodyCommand(
-              plugin,
-              'invalid-label-migration',
-              'custody fallback-1 on',
-            )
-          )?.text,
-        ).toBe('Vault service active for fallback-1 (vault-served).')
-        expect(
           JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
             .accounts,
         ).toEqual([])
@@ -1794,17 +1734,7 @@ describe('fallback Claustrum credential resolution', () => {
             'utf8',
           ),
         ).toContain(legacyHandle)
-        expect(
-          (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
-        ).toBe(true)
-        expect(
-          logs.some(
-            (record) =>
-              record.message === 'manifest migration skipped' &&
-              record.payload?.id === 'fallback-1' &&
-              record.payload?.reason === 'invalid-label',
-          ),
-        ).toBe(true)
+        expect((await loadAccounts())?.claustrum?.mode).toBe('claustrum')
       } finally {
         __setLogTestSink(null)
         await plugin.dispose?.()
@@ -1817,11 +1747,11 @@ describe('fallback Claustrum credential resolution', () => {
     'reports a corrupt manifest lock after its bounded wait and keeps the legacy handle',
     async () => {
       await withShortManifestLockTiming(async () => {
-        const { manifestPath, plugin, restore } =
-          await createLegacyMigrationPlugin({
-            label: 'fresh-lock',
-            handle: legacyHandle,
-          })
+        await useTempAccountFile(
+          manifestStorage({ label: 'fresh-lock', legacy: legacyHandle }),
+        )
+        const manifestPath = await writeManifest([])
+        const restore = await configureClaustrumConnection()
         const lockPath = `${manifestPath}.lock`
         await mkdir(lockPath, { mode: 0o700 })
         await writeFile(
@@ -1831,17 +1761,33 @@ describe('fallback Claustrum credential resolution', () => {
         const logs: LogTestRecord[] = []
         __setLogTestSink((record) => logs.push(record))
         const startedAt = Date.now()
+        let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
         try {
-          const payload = await Promise.race([
-            runCustodyCommand(plugin, 'fresh-lock', 'custody fallback-1 on'),
+          plugin = await Promise.race([
+            getPlugin(undefined, undefined, {
+              claustrumConnector: manifestConnector(
+                [],
+                new Map([[legacyHandle, 'fresh-lock-access']]),
+              ),
+            }),
             Bun.sleep(1_000).then(() => {
               throw new Error('manifest lock busy did not respect its deadline')
             }),
           ])
+          for (let attempt = 0; attempt < 100; attempt++) {
+            if (
+              logs.some(
+                (record) =>
+                  record.message === 'manifest write failed' &&
+                  record.payload?.reason === 'manifest lock owner invalid',
+              )
+            )
+              break
+            await Bun.sleep(10)
+          }
           const elapsedMs = Date.now() - startedAt
           expect(elapsedMs).toBeGreaterThanOrEqual(120)
           expect(elapsedMs).toBeLessThan(1_000)
-          expect(payload?.text).toContain('Vault service active')
           expect(
             logs.some(
               (record) =>
@@ -1857,7 +1803,7 @@ describe('fallback Claustrum credential resolution', () => {
           ).toContain(legacyHandle)
         } finally {
           __setLogTestSink(null)
-          await plugin.dispose?.()
+          await plugin?.dispose?.()
           restore()
         }
       })
@@ -1866,11 +1812,11 @@ describe('fallback Claustrum credential resolution', () => {
 
   test.serial('renames a stale manifest lock before writing', async () => {
     await withShortManifestLockTiming(async () => {
-      const { manifestPath, plugin, restore } =
-        await createLegacyMigrationPlugin({
-          label: 'stale-lock',
-          handle: legacyHandle,
-        })
+      await useTempAccountFile(
+        manifestStorage({ label: 'stale-lock', legacy: legacyHandle }),
+      )
+      const manifestPath = await writeManifest([])
+      const restore = await configureClaustrumConnection()
       const lockPath = `${manifestPath}.lock`
       await mkdir(lockPath, { mode: 0o700 })
       await writeFile(
@@ -1890,20 +1836,17 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        expect(
-          (
-            await runCustodyCommand(
-              plugin,
-              'stale-lock',
-              'custody fallback-1 on',
-            )
-          )?.text,
-        ).toContain('Vault service active')
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: manifestConnector(
+            [],
+            new Map([[legacyHandle, 'stale-lock-access']]),
+          ),
+        })
         expect(staleRenames).toHaveLength(1)
         expect(staleRenames[0]).toMatch(/\.lock\.stale-\d+-[A-Za-z0-9_-]+$/)
+        await plugin.dispose?.()
       } finally {
         rename.mockRestore()
-        await plugin.dispose?.()
         restore()
       }
     })
@@ -1912,11 +1855,11 @@ describe('fallback Claustrum credential resolution', () => {
   test.serial(
     'records manifest lock ownership during a migration write',
     async () => {
-      const { manifestPath, plugin, restore } =
-        await createLegacyMigrationPlugin({
-          label: 'lock-owner',
-          handle: legacyHandle,
-        })
+      await useTempAccountFile(
+        manifestStorage({ label: 'lock-owner', legacy: legacyHandle }),
+      )
+      const manifestPath = await writeManifest([])
+      const restore = await configureClaustrumConnection()
       const lockPath = `${manifestPath}.lock`
       const originalRename = fs.rename
       let owner: Record<string, unknown> | undefined
@@ -1928,18 +1871,24 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        await runCustodyCommand(plugin, 'lock-owner', 'custody fallback-1 on')
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: manifestConnector(
+            [],
+            new Map([[legacyHandle, 'lock-owner-access']]),
+          ),
+        })
         expect(owner).toMatchObject({ tenant: 'anthropic-auth' })
         expect(typeof owner?.claimed_at_ms).toBe('number')
         await expect(fs.stat(lockPath)).rejects.toThrow()
+        await plugin.dispose?.()
       } finally {
         rename.mockRestore()
-        await plugin.dispose?.()
         restore()
       }
     },
   )
 
+  // Concurrent startup migrations must converge on both manifest entries and clear both legacy sidecars.
   test.serial(
     'preserves two concurrent legacy migrations in one manifest',
     async () => {
@@ -1949,6 +1898,7 @@ describe('fallback Claustrum credential resolution', () => {
           label: 'migration-a',
           enabled: true,
           claustrumHandle: `ckh_${'A'.repeat(43)}`,
+          claustrum: { mode: 'claustrum' },
         })
         await useTempAccountFile(storageA)
         const accountPathA = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
@@ -1982,6 +1932,7 @@ describe('fallback Claustrum credential resolution', () => {
           label: 'migration-b',
           enabled: true,
           claustrumHandle: `ckh_${'B'.repeat(43)}`,
+          claustrum: { mode: 'claustrum' },
         })
         await saveAccounts(storageB, accountPathB)
         process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
@@ -1999,27 +1950,14 @@ describe('fallback Claustrum credential resolution', () => {
           async (from, to) => {
             if (to === manifestPath) {
               manifestRenames += 1
-              if (manifestRenames === 2) secondManifestRename.resolve()
-              if (manifestRenames === 1)
-                await Promise.race([
-                  secondManifestRename.promise,
-                  Bun.sleep(100),
-                ])
             }
-            return originalRename(from, to)
+            const result = await originalRename(from, to)
+            if (to === manifestPath && manifestRenames === 2)
+              secondManifestRename.resolve()
+            return result
           },
         )
         try {
-          const commandA = runCustodyCommand(
-            pluginA,
-            'migration-a',
-            'custody fallback-a on',
-          )
-          const commandB = runCustodyCommand(
-            pluginB,
-            'migration-b',
-            'custody fallback-b on',
-          )
           await Promise.race([
             entered.promise,
             Bun.sleep(1_000).then(() => {
@@ -2029,15 +1967,11 @@ describe('fallback Claustrum credential resolution', () => {
             }),
           ])
           release.resolve()
-          const payloads = await Promise.race([
-            Promise.all([commandA, commandB]),
+          await Promise.race([
+            secondManifestRename.promise,
             Bun.sleep(1_000).then(() => {
               throw new Error('concurrent migrations did not finish')
             }),
-          ])
-          expect(payloads.map((payload) => payload?.text)).toEqual([
-            'Vault service active for fallback-a (vault-served).',
-            'Vault service active for fallback-b (vault-served).',
           ])
           const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
             providers: Array<{
@@ -2051,12 +1985,10 @@ describe('fallback Claustrum credential resolution', () => {
               ?.accounts.map((account) => account.label)
               .sort(),
           ).toEqual(['migration-a', 'migration-b'])
-          expect(
-            await readFile(getAccountStatePath(accountPathA), 'utf8'),
-          ).not.toContain('ckh_A')
-          expect(
-            await readFile(getAccountStatePath(accountPathB), 'utf8'),
-          ).not.toContain('ckh_B')
+          await waitForSidecarHandlesAbsent([
+            { path: getAccountStatePath(accountPathA), handle: 'ckh_A' },
+            { path: getAccountStatePath(accountPathB), handle: 'ckh_B' },
+          ])
         } finally {
           rename.mockRestore()
           await pluginA.dispose?.()
@@ -2150,7 +2082,7 @@ describe('fallback Claustrum credential resolution', () => {
       await useTempAccountFile(
         fallbackWithClaustrum({
           claustrumHandle: 'terminal-route-open',
-          claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+          claustrum: { mode: 'claustrum' },
         }),
       )
       const logs: LogTestRecord[] = []
@@ -2225,7 +2157,7 @@ describe('fallback Claustrum credential resolution', () => {
       await useTempAccountFile(
         fallbackWithClaustrum({
           claustrumHandle: 'latched-warm-backoff',
-          claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+          claustrum: { mode: 'claustrum' },
         }),
       )
       let now = 0
@@ -2288,7 +2220,7 @@ describe('fallback Claustrum credential resolution', () => {
   test('background refresh leaves a live vault account untouched while refreshing a plain control', async () => {
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-live-refresh-gate',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     const vaultAccount = storage.accounts[0] as OAuthAccount
     vaultAccount.expires = Date.now() - 1
@@ -2361,7 +2293,7 @@ describe('fallback Claustrum credential resolution', () => {
     const handle = 'handle-routing-race'
     const storage = createFallbackStorage({
       routing: { mode: 'main-first' },
-      claustrum: { accounts: { [accountId]: { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: accountId,
@@ -2403,7 +2335,7 @@ describe('fallback Claustrum credential resolution', () => {
     const accountId = 'credential-race'
     const handle = 'handle-credential-race'
     const storage = createFallbackStorage({
-      claustrum: { accounts: { [accountId]: { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: accountId,
@@ -2451,7 +2383,7 @@ describe('fallback Claustrum credential resolution', () => {
     const handle = 'handle-clear-control'
     await useTempAccountFile(
       createFallbackStorage({
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             id: accountId,
@@ -2491,7 +2423,7 @@ describe('fallback Claustrum credential resolution', () => {
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
         quota: { enabled: false, failClosedOnUnknownQuota: false },
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             id: accountId,
@@ -2596,7 +2528,7 @@ describe('fallback Claustrum credential resolution', () => {
     const controlError = persistedRefreshError(controlId)
     await useTempAccountFile(
       createFallbackStorage({
-        claustrum: { accounts: { [controlId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             id: plainId,
@@ -2663,7 +2595,7 @@ describe('fallback Claustrum credential resolution', () => {
     const now = Date.now()
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-rotated-sidecar',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     const account = storage.accounts[0] as OAuthAccount
     account.expires = now - 1
@@ -2725,7 +2657,7 @@ describe('fallback Claustrum credential resolution', () => {
     let claustrumClock = 0
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-expired-resident',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     const account = storage.accounts[0] as OAuthAccount
     account.expires = Date.now() - 1
@@ -2822,7 +2754,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { 'vault-recovered': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-recovered',
@@ -2949,7 +2881,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { [accountId]: { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: accountId,
@@ -3124,12 +3056,12 @@ describe('fallback Claustrum credential resolution', () => {
     return { authorizations, plugin, result }
   }
 
-  test('disabled gate does not connect and uses the stored token', async () => {
+  test('local mode does not connect and uses the stored token', async () => {
     const calls: CredentialCall[] = []
     let connectorCalls = 0
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-disabled',
-      claustrum: undefined,
+      claustrum: { mode: 'local' },
     })
     const connector = async () => {
       connectorCalls += 1
@@ -3199,7 +3131,7 @@ describe('fallback Claustrum credential resolution', () => {
     const sessionID = 'account-modal-projection'
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'ckh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     await useTempAccountFile(storage)
     const connectionFile = join(tempConfigDir!, 'configured-claustrum.json')
@@ -3238,13 +3170,6 @@ describe('fallback Claustrum credential resolution', () => {
         { models: {} },
       )
       drainNotifications(0, sessionID)
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude-account',
-          arguments: 'custody fallback-1 on',
-          sessionID,
-        }),
-      )
       await drainSidebarWrites()
       const sidebarState = await getSidebarState()
       await expectHandledCommandResponse(
@@ -3267,10 +3192,11 @@ describe('fallback Claustrum credential resolution', () => {
           | 'on-vault-served'
           | 'on-vault-reauth'
           | 'on-cold'
-        custodyEligible: boolean
       }>
       expect(payload?.command).toBe('claude-account')
       expect(payload?.knobs.claustrumDetection).toBe('available')
+      expect(payload?.knobs.custodyMode).toBe('claustrum')
+      expect(payload?.knobs.custodyModeKnown).toBe(true)
       expect(
         accounts.find((account) => account.id === 'main')?.claustrumGate,
       ).toBe('na')
@@ -3293,730 +3219,69 @@ describe('fallback Claustrum credential resolution', () => {
         sidebarState.fallbacks.find((account) => account.id === 'fallback-1')
           ?.custodyState,
       ).toBe(dialogCustodyState === 'na' ? undefined : dialogCustodyState)
-      expect(
-        accounts.find((account) => account.id === 'fallback-1')
-          ?.custodyEligible,
-      ).toBe(true)
       const payloadBytes = JSON.stringify(payload)
       expect(payloadBytes).not.toContain(
         'ckh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
       )
 
-      storage.claustrum = { accounts: { 'fallback-1': { enabled: false } } }
-      await saveAccounts(storage)
-      const offSessionID = 'account-modal-projection-off'
-      drainNotifications(0, offSessionID)
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude-account',
-          arguments: '',
-          sessionID: offSessionID,
-        }),
-      )
-      const offPayload = drainNotifications(0, offSessionID).at(-1)?.payload
-      const offAccounts = offPayload?.knobs.accounts as Array<{
+      await plugin.dispose?.()
+    } finally {
+      if (previousConnectionFile === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+      else
+        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
+          previousConnectionFile
+    }
+  })
+
+  test.serial(
+    'does not route a manifest-resolved account through a legacy per-account flag',
+    async () => {
+      const calls: CredentialCall[] = []
+      const storage = createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        quota: { enabled: false, failClosedOnUnknownQuota: false },
+        accounts: [
+          {
+            id: 'work-alt',
+            label: 'work-alt',
+            type: 'oauth',
+            access: 'stored-fallback-access',
+            refresh: 'stored-fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      })
+      await useTempAccountFile(storage)
+      const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+      const config = JSON.parse(await readFile(accountPath, 'utf8'))
+      config.claustrum = { accounts: { 'work-alt': { enabled: true } } }
+      await writeFile(accountPath, JSON.stringify(config))
+      await writeManifest([{ label: 'work-alt', handle: manifestHandle }])
+      const { authorizations, plugin, result } =
+        await loadFallbackWithConnector(
+          storage,
+          manifestConnector(calls, new Map([[manifestHandle, 'vault-access']])),
+          new Response('{}', { status: 200 }),
+        )
+      const payload = await runCustodyCommand(plugin, 'legacy-flag', '')
+      const accounts = payload?.knobs.accounts as Array<{
         id: string
         claustrumGate: string
       }>
+
       expect(
-        offAccounts.find((account) => account.id === 'fallback-1')
-          ?.claustrumGate,
+        accounts.find((account) => account.id === 'work-alt')?.claustrumGate,
       ).toBe('off')
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(response.status).toBe(200)
+      expect(authorizations).toContain('Bearer stored-fallback-access')
+      expect(calls.filter((call) => call.method === 'credential.get')).toEqual(
+        [],
+      )
       await plugin.dispose?.()
-    } finally {
-      if (previousConnectionFile === undefined)
-        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-      else
-        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
-          previousConnectionFile
-    }
-  })
-
-  test('custody command verifies, persists, and invalidates its resident credential on off', async () => {
-    const sessionID = 'custody-command'
-    const handle = 'ckh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: handle,
-      enabled: true,
-    })
-    await useTempAccountFile(storage)
-    const connectionFile = join(tempConfigDir!, 'configured-claustrum.json')
-    await writeFile(
-      connectionFile,
-      JSON.stringify({
-        schema: 1,
-        wire_version: 1,
-        endpoints: [{ host: '127.0.0.1', port: 1234 }],
-      }),
-    )
-    const previousConnectionFile =
-      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
-      connectionFile
-    const calls: CredentialCall[] = []
-
-    try {
-      resetNotificationsForTest()
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method === 'credential.get') {
-            return credentialResponse(
-              'vault-access-token',
-              1,
-              Date.now() + 24 * 60 * 60_000,
-            )
-          }
-          throw new Error(`unexpected method: ${method}`)
-        }),
-      })
-      drainNotifications(0, sessionID)
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude-account',
-          arguments: 'custody fallback-1 on',
-          sessionID,
-        }),
-      )
-      const onPayload = drainNotifications(0, sessionID).at(-1)?.payload
-      expect(onPayload?.text).toBe(
-        'Vault service active for fallback-1 (vault-served).',
-      )
-      expect(
-        calls.filter((call) => call.method === 'credential.get'),
-      ).toHaveLength(1)
-      expect(
-        (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
-      ).toBe(true)
-      expect(JSON.stringify(onPayload)).not.toContain(handle)
-      expect(JSON.stringify(onPayload)).not.toContain('vault-access-token')
-
-      drainNotifications(0, sessionID)
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude-account',
-          arguments: 'custody fallback-1 off',
-          sessionID,
-        }),
-      )
-      expect(drainNotifications(0, sessionID).at(-1)?.payload.text).toBe(
-        'Vault service inactive for fallback-1; manifest bindings are unchanged.',
-      )
-      expect(
-        (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
-      ).toBe(false)
-
-      drainNotifications(0, sessionID)
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude-account',
-          arguments: 'custody fallback-1 on',
-          sessionID,
-        }),
-      )
-      expect(
-        calls.filter((call) => call.method === 'credential.get'),
-      ).toHaveLength(2)
-      await plugin.dispose?.()
-    } finally {
-      if (previousConnectionFile === undefined)
-        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-      else
-        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
-          previousConnectionFile
-    }
-  })
-
-  test('custody on refuses without a handle before contacting the vault', async () => {
-    await useTempAccountFile(fallbackWithClaustrum({ enabled: true }))
-    let connectorCalls = 0
-    const calls: CredentialCall[] = []
-    const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-      claustrumConnector: async () => {
-        connectorCalls += 1
-        return connectorFor(calls, () => ({ result: {} }))()
-      },
-    })
-    const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-    const before = await readFile(path, 'utf8')
-    const beforeStat = await stat(path)
-
-    const payload = await runCustodyCommand(
-      plugin,
-      'custody-no-handle',
-      'custody fallback-1 on',
-    )
-
-    expect(payload?.text).toBe(
-      'No manifest binding or legacy handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
-    )
-    expect(connectorCalls).toBe(0)
-    expect(
-      calls.filter((call) => call.method === 'credential.get'),
-    ).toHaveLength(0)
-    expect(await readFile(path, 'utf8')).toBe(before)
-    expect((await stat(path)).mtimeMs).toBe(beforeStat.mtimeMs)
-    await plugin.dispose?.()
-  })
-
-  test('custody on refuses when the Claustrum connection is unavailable', async () => {
-    const handle = 'ckh_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
-    await useTempAccountFile(
-      fallbackWithClaustrum({ claustrumHandle: handle, enabled: true }),
-    )
-    const previous =
-      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
-      tempConfigDir!,
-      'missing-claustrum.json',
-    )
-    let connectorCalls = 0
-    const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-      claustrumConnector: async () => {
-        connectorCalls += 1
-        return connectorFor([], () => ({ result: {} }))()
-      },
-    })
-    const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-    const before = await readFile(path, 'utf8')
-    const beforeStat = await stat(path)
-
-    try {
-      const payload = await runCustodyCommand(
-        plugin,
-        'custody-no-connection',
-        'custody fallback-1 on',
-      )
-
-      expect(payload?.text).toBe(
-        'Claustrum is not available (connection file absent).',
-      )
-      expect(connectorCalls).toBe(0)
-      expect(await readFile(path, 'utf8')).toBe(before)
-      expect((await stat(path)).mtimeMs).toBe(beforeStat.mtimeMs)
-    } finally {
-      if (previous === undefined)
-        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-      else
-        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = previous
-      await plugin.dispose?.()
-    }
-  })
-
-  test('custody on refuses an auth-required vault credential without changing config', async () => {
-    const handle = 'ckh_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'
-    await useTempAccountFile(
-      fallbackWithClaustrum({ claustrumHandle: handle, enabled: true }),
-    )
-    const restoreConnection = await configureClaustrumConnection()
-    const calls: CredentialCall[] = []
-    try {
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method === 'credential.get') {
-            return {
-              result: {
-                error: { class: 'auth_required', code: 'reauth_required' },
-              },
-            }
-          }
-          throw new Error(`unexpected method: ${method}`)
-        }),
-      })
-      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const before = await readFile(path, 'utf8')
-      const beforeStat = await stat(path)
-
-      const payload = await runCustodyCommand(
-        plugin,
-        'custody-auth-required',
-        'custody fallback-1 on',
-      )
-
-      expect(payload?.text).toBe(
-        'Vault credential needs re-login (ck auth login --id oauth:anthropic:fallback-1).',
-      )
-      expect(
-        calls.filter((call) => call.method === 'credential.get'),
-      ).toHaveLength(1)
-      expect(await readFile(path, 'utf8')).toBe(before)
-      expect((await stat(path)).mtimeMs).toBe(beforeStat.mtimeMs)
-      await plugin.dispose?.()
-    } finally {
-      restoreConnection()
-    }
-  })
-
-  test('custody on refuses a transient vault error without changing config', async () => {
-    const handle = 'ckh_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-    await useTempAccountFile(
-      fallbackWithClaustrum({ claustrumHandle: handle, enabled: true }),
-    )
-    const restoreConnection = await configureClaustrumConnection()
-    const calls: CredentialCall[] = []
-    try {
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method === 'credential.get') throw new Error('transport failed')
-          throw new Error(`unexpected method: ${method}`)
-        }),
-      })
-      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const before = await readFile(path, 'utf8')
-      const beforeStat = await stat(path)
-
-      const payload = await runCustodyCommand(
-        plugin,
-        'custody-transient',
-        'custody fallback-1 on',
-      )
-
-      expect(payload?.text).toBe('Vault unavailable: transient. Retry.')
-      expect(
-        calls.filter((call) => call.method === 'credential.get'),
-      ).toHaveLength(1)
-      expect(await readFile(path, 'utf8')).toBe(before)
-      expect((await stat(path)).mtimeMs).toBe(beforeStat.mtimeMs)
-      await plugin.dispose?.()
-    } finally {
-      restoreConnection()
-    }
-  })
-
-  test('custody on refuses an expired vault credential at the command clock', async () => {
-    const handle = 'ckh_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD'
-    const commandNow = 1_000_000
-    await useTempAccountFile(
-      fallbackWithClaustrum({ claustrumHandle: handle, enabled: true }),
-    )
-    const restoreConnection = await configureClaustrumConnection()
-    const calls: CredentialCall[] = []
-    try {
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        claustrumNow: () => commandNow,
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method === 'credential.get')
-            return credentialResponse('vault-expired', 1, commandNow)
-          throw new Error(`unexpected method: ${method}`)
-        }),
-      })
-      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const before = await readFile(path, 'utf8')
-      const beforeStat = await stat(path)
-
-      const payload = await runCustodyCommand(
-        plugin,
-        'custody-expired',
-        'custody fallback-1 on',
-      )
-
-      expect(payload?.text).toBe('Vault unavailable: unusable. Retry.')
-      expect(await readFile(path, 'utf8')).toBe(before)
-      expect((await stat(path)).mtimeMs).toBe(beforeStat.mtimeMs)
-      await plugin.dispose?.()
-    } finally {
-      restoreConnection()
-    }
-  })
-
-  test('custody on holds the fallback refresh lock while vault verification is pending', async () => {
-    const handle = 'ckh_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE'
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: handle,
-      enabled: true,
-    })
-    storage.refresh = { enabled: true, refreshBeforeExpiryMinutes: 30 }
-    await useTempAccountFile(storage)
-    const restoreConnection = await configureClaustrumConnection()
-    const intervalHandlers: Array<() => void> = []
-    const setIntervalMock = mock((handler: () => void) => {
-      intervalHandlers.push(handler)
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-    let resolveCredential!: (value: unknown) => void
-    let signalCredentialGet!: () => void
-    const credentialPending = new Promise<unknown>((resolve) => {
-      resolveCredential = resolve
-    })
-    const credentialGetStarted = new Promise<void>((resolve) => {
-      signalCredentialGet = resolve
-    })
-    let tokenEndpointCalls = 0
-    globalThis.fetch = mock((input: unknown) => {
-      if (extractUrl(input as string | URL | Request) === TOKEN_URL) {
-        tokenEndpointCalls += 1
-        return Promise.resolve(
-          Response.json({
-            access_token: 'local-refresh-access',
-            refresh_token: 'local-refresh-token',
-            expires_in: 3_600,
-          }),
-        )
-      }
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-    const calls: CredentialCall[] = []
-
-    try {
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        setInterval: setIntervalMock,
-        clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method !== 'credential.get')
-            throw new Error(`unexpected method: ${method}`)
-          signalCredentialGet()
-          return credentialPending
-        }),
-      })
-      await plugin.__fallbackRefreshReady
-      await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth' as const,
-            access: 'main-access',
-            refresh: 'main-refresh',
-            expires: Date.now() + 5 * 60 * 60_000,
-          }),
-        { models: {} },
-      )
-      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const current = (await loadAccounts(path))!
-      const account = current.accounts.find(
-        (candidate) => candidate.id === 'fallback-1',
-      ) as OAuthAccount
-      account.expires = Date.now() + 60_000
-      await saveAccounts(current, path)
-
-      const command = runCustodyCommand(
-        plugin,
-        'custody-refresh-race',
-        'custody fallback-1 on',
-      )
-      await credentialGetStarted
-      expect(intervalHandlers.length).toBeGreaterThanOrEqual(1)
-      for (const handler of intervalHandlers) handler()
-      for (let turn = 0; turn < 20; turn++) await Promise.resolve()
-      expect(tokenEndpointCalls).toBe(0)
-
-      resolveCredential(credentialResponse('vault-race-access', 1))
-      const payload = await command
-      await drainSidebarWrites()
-      expect(payload?.text).toBe(
-        'Vault service active for fallback-1 (vault-served).',
-      )
-      expect(
-        (await loadAccounts(path))?.claustrum?.accounts?.['fallback-1']
-          ?.enabled,
-      ).toBe(true)
-      expect(
-        (await getSidebarState()).fallbacks.find(
-          (fallback) => fallback.id === 'fallback-1',
-        )?.vaultServed,
-      ).toBe(true)
-      expect(tokenEndpointCalls).toBe(0)
-      await plugin.dispose?.()
-    } finally {
-      restoreConnection()
-    }
-  })
-
-  test('custody on times out vault verification, releases the refresh lock, and leaves config untouched', async () => {
-    const handle = 'ckh_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: handle,
-      enabled: true,
-    })
-    storage.refresh = { enabled: true, refreshBeforeExpiryMinutes: 30 }
-    await useTempAccountFile(storage)
-    const restoreConnection = await configureClaustrumConnection()
-    const intervalHandlers: Array<() => void> = []
-    const timeoutHandlers: Array<{ handler: () => void; delay: number }> = []
-    const setIntervalMock = mock((handler: () => void) => {
-      intervalHandlers.push(handler)
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-    const setTimeoutMock = mock((handler: () => void, delay?: number) => {
-      timeoutHandlers.push({ handler, delay: delay ?? 0 })
-      return { unref() {} } as unknown as ReturnType<typeof setTimeout>
-    }) as unknown as typeof setTimeout
-    let claustrumNow = 1_000_000
-    let signalCredentialGet!: () => void
-    const credentialGetStarted = new Promise<void>((resolve) => {
-      signalCredentialGet = resolve
-    })
-    let resolveCredential!: (value: unknown) => void
-    const credentialPending = new Promise<unknown>((resolve) => {
-      resolveCredential = resolve
-    })
-    let signalTokenRefresh!: () => void
-    const tokenRefreshStarted = new Promise<void>((resolve) => {
-      signalTokenRefresh = resolve
-    })
-    let tokenEndpointCalls = 0
-    globalThis.fetch = mock((input: unknown) => {
-      if (extractUrl(input as string | URL | Request) === TOKEN_URL) {
-        tokenEndpointCalls += 1
-        signalTokenRefresh()
-        return Promise.resolve(
-          Response.json({
-            access_token: 'local-refresh-access',
-            refresh_token: 'local-refresh-token',
-            expires_in: 3_600,
-          }),
-        )
-      }
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-    const calls: CredentialCall[] = []
-
-    try {
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        setInterval: setIntervalMock,
-        clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-        setTimeout: setTimeoutMock,
-        claustrumNow: () => claustrumNow,
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method !== 'credential.get') {
-            throw new Error(`unexpected method: ${method}`)
-          }
-          signalCredentialGet()
-          return credentialPending
-        }),
-      })
-      await plugin.__fallbackRefreshReady
-      await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth' as const,
-            access: 'main-access',
-            refresh: 'main-refresh',
-            expires: Date.now() + 5 * 60 * 60_000,
-          }),
-        { models: {} },
-      )
-      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const current = (await loadAccounts(path))!
-      const account = current.accounts.find(
-        (candidate) => candidate.id === 'fallback-1',
-      ) as OAuthAccount
-      account.expires = Date.now() + 60_000
-      await saveAccounts(current, path)
-      const before = await readFile(path, 'utf8')
-      const beforeStat = await stat(path)
-
-      const command = runCustodyCommand(
-        plugin,
-        'custody-timeout',
-        'custody fallback-1 on',
-      )
-      await credentialGetStarted
-      const verificationTimeout = timeoutHandlers.find(
-        (timer) => timer.delay === 15_000,
-      )
-      if (!verificationTimeout) {
-        await Promise.race([
-          command,
-          Bun.sleep(250).then(() => {
-            throw new Error(
-              'red cap: custody verification did not settle without its 15s timeout',
-            )
-          }),
-        ])
-        throw new Error('expected custody verification timeout')
-      }
-
-      claustrumNow += 15_000
-      verificationTimeout.handler()
-      const payload = await Promise.race([
-        command,
-        Bun.sleep(250).then(() => {
-          throw new Error(
-            'custody timeout did not settle after its timer fired',
-          )
-        }),
-      ])
-      expect(payload?.text).toBe('Vault unavailable: timeout. Retry.')
-      expect(
-        calls.filter((call) => call.method === 'credential.get'),
-      ).toHaveLength(1)
-      expect(await readFile(path, 'utf8')).toBe(before)
-      expect((await stat(path)).mtimeMs).toBe(beforeStat.mtimeMs)
-
-      resolveCredential(credentialResponse('vault-late-timeout', 1))
-      for (let turn = 0; turn < 20; turn++) await Promise.resolve()
-      const cache = plugin.__claustrumCredentialCache
-      expect(cache).not.toBeNull()
-      expect(cache?.peek(handle)).toBeUndefined()
-
-      expect(intervalHandlers.length).toBeGreaterThanOrEqual(1)
-      intervalHandlers[0]!()
-      await Promise.race([
-        tokenRefreshStarted,
-        Bun.sleep(250).then(() => {
-          throw new Error(
-            'background refresh did not run after custody timeout',
-          )
-        }),
-      ])
-      expect(tokenEndpointCalls).toBe(1)
-      await plugin.dispose?.()
-    } finally {
-      restoreConnection()
-    }
-  })
-
-  test('a timed-out custody verification cannot overwrite a later vault credential', async () => {
-    const handle = 'ckh_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ'
-    await useTempAccountFile(
-      fallbackWithClaustrum({ claustrumHandle: handle, enabled: true }),
-    )
-    const restoreConnection = await configureClaustrumConnection()
-    const timeoutHandlers: Array<{ handler: () => void; delay: number }> = []
-    const setTimeoutMock = mock((handler: () => void, delay?: number) => {
-      timeoutHandlers.push({ handler, delay: delay ?? 0 })
-      return { unref() {} } as unknown as ReturnType<typeof setTimeout>
-    }) as unknown as typeof setTimeout
-    let resolveFirstCredential!: (value: unknown) => void
-    const firstCredential = new Promise<unknown>((resolve) => {
-      resolveFirstCredential = resolve
-    })
-    let signalFirstCredential!: () => void
-    const firstCredentialStarted = new Promise<void>((resolve) => {
-      signalFirstCredential = resolve
-    })
-    let credentialGets = 0
-    const calls: CredentialCall[] = []
-
-    try {
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        setTimeout: setTimeoutMock,
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method !== 'credential.get') {
-            throw new Error(`unexpected method: ${method}`)
-          }
-          credentialGets += 1
-          if (credentialGets === 1) {
-            signalFirstCredential()
-            return firstCredential
-          }
-          if (credentialGets === 2) {
-            return credentialResponse('vault-newer', 2)
-          }
-          throw new Error(`unexpected credential.get #${credentialGets}`)
-        }),
-      })
-      await plugin.__fallbackRefreshReady
-
-      const timedOut = runCustodyCommand(
-        plugin,
-        'custody-timeout-old',
-        'custody fallback-1 on',
-      )
-      await firstCredentialStarted
-      const verificationTimeout = timeoutHandlers.find(
-        (timer) => timer.delay === 15_000,
-      )
-      expect(verificationTimeout).toBeDefined()
-      verificationTimeout!.handler()
-      expect((await timedOut)?.text).toBe('Vault unavailable: timeout. Retry.')
-
-      const laterOn = runCustodyCommand(
-        plugin,
-        'custody-timeout-new',
-        'custody fallback-1 on',
-      )
-      const payload = await Promise.race([
-        laterOn,
-        Bun.sleep(250).then(() => {
-          throw new Error(
-            'red cap: later custody verification did not supersede the abandoned call',
-          )
-        }),
-      ])
-      expect(payload?.text).toBe(
-        'Vault service active for fallback-1 (vault-served).',
-      )
-      const cache = plugin.__claustrumCredentialCache
-      expect(cache?.peek(handle)?.recordVersion).toBe(2)
-
-      resolveFirstCredential(credentialResponse('vault-older', 1))
-      for (let turn = 0; turn < 20; turn++) await Promise.resolve()
-      expect(cache?.peek(handle)?.recordVersion).toBe(2)
-      await plugin.dispose?.()
-    } finally {
-      restoreConnection()
-    }
-  })
-
-  test('custody off fences a pending vault tick from repopulating the resident cache', async () => {
-    const handle = 'ckh_GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG'
-    await useTempAccountFile(
-      fallbackWithClaustrum({
-        claustrumHandle: handle,
-        claustrum: { accounts: { 'fallback-1': { enabled: true } } },
-      }),
-    )
-    const restoreConnection = await configureClaustrumConnection()
-    const intervalHandlers: Array<() => void> = []
-    const setIntervalMock = mock((handler: () => void) => {
-      intervalHandlers.push(handler)
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-    let resolveCredential!: (value: unknown) => void
-    let signalCredentialGet!: () => void
-    const credentialPending = new Promise<unknown>((resolve) => {
-      resolveCredential = resolve
-    })
-    const credentialGetStarted = new Promise<void>((resolve) => {
-      signalCredentialGet = resolve
-    })
-    const calls: CredentialCall[] = []
-
-    try {
-      const plugin = await getPlugin(createMockClient(), tempConfigDir!, {
-        setInterval: setIntervalMock,
-        clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-        claustrumConnector: connectorFor(calls, (method) => {
-          if (method !== 'credential.get') {
-            throw new Error(`unexpected method: ${method}`)
-          }
-          signalCredentialGet()
-          return credentialPending
-        }),
-      })
-      await plugin.__fallbackRefreshReady
-      expect(intervalHandlers.length).toBeGreaterThanOrEqual(1)
-      for (const handler of intervalHandlers) handler()
-      await credentialGetStarted
-      expect(
-        calls.filter((call) => call.method === 'credential.get'),
-      ).toHaveLength(1)
-
-      const offPayload = await runCustodyCommand(
-        plugin,
-        'custody-off-pending-tick',
-        'custody fallback-1 off',
-      )
-      expect(offPayload?.text).toBe(
-        'Vault service inactive for fallback-1; manifest bindings are unchanged.',
-      )
-      expect(
-        (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
-      ).toBe(false)
-      expect(plugin.__claustrumCredentialCache.peek(handle)).toBeUndefined()
-
-      resolveCredential(
-        credentialResponse('vault-pending-tick-access', 1, Date.now() + 60_000),
-      )
-      for (let turn = 0; turn < 20; turn++) await Promise.resolve()
-      expect(plugin.__claustrumCredentialCache.peek(handle)).toBeUndefined()
-      expect(
-        (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
-      ).toBe(false)
-      await plugin.dispose?.()
-    } finally {
-      restoreConnection()
-    }
-  })
+    },
+  )
 
   test('treats an empty Claustrum connection setting as unset', async () => {
     const previousConnectionFile =
@@ -4040,7 +3305,7 @@ describe('fallback Claustrum credential resolution', () => {
         const { plugin } = await loadFallbackWithConnector(
           fallbackWithClaustrum({
             claustrumHandle: 'handle-empty-setting',
-            claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+            claustrum: { mode: 'claustrum' },
           } as never),
           connector,
           new Response('{}', { status: 200 }),
@@ -4062,7 +3327,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-enabled',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get')
@@ -4094,7 +3359,7 @@ describe('fallback Claustrum credential resolution', () => {
     const malformedPayload = JSON.stringify({ kind: 'opaque-credential' })
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-malformed-payload',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get') {
@@ -4128,7 +3393,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = fallbackWithClaustrum({
       routing: { mode: 'fallback-first' },
       claustrumHandle: 'handle-transient-backoff',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get') {
@@ -4160,7 +3425,7 @@ describe('fallback Claustrum credential resolution', () => {
   test('production cache construction supplies a bind identity to vault calls', async () => {
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-production-identity',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     await useTempAccountFile(storage)
     const wireCalls: Array<{
@@ -4224,7 +3489,7 @@ describe('fallback Claustrum credential resolution', () => {
         },
         mainQuotaCheckedAt: Date.now(),
       },
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'fallback-1',
@@ -4329,7 +3594,7 @@ describe('fallback Claustrum credential resolution', () => {
     const slowRefresh = deferred()
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-slow',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let credentialGets = 0
     const connector = connectorFor(calls, async (method) => {
@@ -4372,7 +3637,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'fallback-1',
@@ -4412,7 +3677,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-wedged',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, async (method) => {
       if (method === 'credential.get') await new Promise<void>(() => {})
@@ -4461,7 +3726,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-stale-marked',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let releaseWarm!: () => void
     const warmGate = new Promise<void>((resolve) => {
@@ -4519,7 +3784,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get')
@@ -4551,7 +3816,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-relay-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never) as AccountStorage
     storage.relay = {
       enabled: true,
@@ -4646,7 +3911,7 @@ describe('fallback Claustrum credential resolution', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'sticky-relay-vault': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'sticky-relay-vault',
@@ -4771,7 +4036,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-raced-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let credentialGets = 0
     const connector = connectorFor(calls, (method) => {
@@ -4829,7 +4094,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-outage',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, () => {
       throw new Error('vault unavailable')
@@ -4886,7 +4151,7 @@ describe('fallback Claustrum credential resolution', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'fallback-1',
@@ -4972,7 +4237,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-sidecar-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, () => {
       throw new Error('vault unavailable')
@@ -4998,7 +4263,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-expired-sidecar-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, () =>
       credentialResponse('vault-expiring-access', 61, 1_010),
@@ -5053,7 +4318,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'main-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { 'vault-only': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-only',
@@ -5164,7 +4429,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-stale-resident-401',
       expires: Date.now() + 5 * 60 * 60 * 1000,
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let credentialGets = 0
     let releaseRefresh!: () => void
@@ -6884,7 +6149,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -6953,7 +6218,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = sidecarRefresh
@@ -7009,7 +6274,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -7063,7 +6328,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -7148,7 +6413,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -7282,7 +6547,7 @@ describe('AnthropicAuthPlugin', () => {
     expect(connectAttempts).toBe(0)
     const storage = await loadAccounts()
     if (!storage) throw new Error('missing test storage')
-    storage.claustrum = { accounts: { [accountId]: { enabled: true } } }
+    storage.claustrum = { mode: 'claustrum' }
     await saveAccounts(storage)
     await tick()
     expect(connectAttempts).toBe(1)
@@ -7329,7 +6594,7 @@ describe('AnthropicAuthPlugin', () => {
     await plugin.__fallbackRefreshReady
     const storage = await loadAccounts()
     if (!storage) throw new Error('missing test storage')
-    storage.claustrum = { accounts: { [accountId]: { enabled: true } } }
+    storage.claustrum = { mode: 'claustrum' }
     await saveAccounts(storage)
     await tick()
     await tick()
@@ -7387,7 +6652,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = mock((input: unknown) =>
@@ -7471,7 +6736,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     const newerSnapshot = await loadAccounts()
@@ -14595,7 +13860,7 @@ describe('auth.loader', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'vault-only-sticky': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-only-sticky',
@@ -14726,7 +13991,7 @@ describe('auth.loader', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'vault-sticky': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-sticky',
@@ -20379,7 +19644,7 @@ describe('killswitch fetch gate', () => {
             failClosedOnUnknownQuota: false,
           },
           killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
-          claustrum: { accounts: { [accountId]: { enabled: true } } },
+          claustrum: { mode: 'claustrum' },
           accounts: [
             {
               id: accountId,

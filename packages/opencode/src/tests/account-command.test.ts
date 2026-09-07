@@ -158,26 +158,29 @@ describe('parseAccountCommandAction', () => {
     })
   })
 
-  test('custody on with id', async () => {
-    expect(parseAccountCommandAction('custody fallback-1 on')).toEqual({
-      type: 'custody',
-      id: 'fallback-1',
-      enabled: true,
-    })
+  test('recognizes only global mode verbs and rejects retired custody vocabulary', async () => {
+    const cases = [
+      ['claustrum', { type: 'claustrum-mode', mode: 'claustrum' }],
+      ['local', { type: 'claustrum-mode', mode: 'local' }],
+      ['custody work-alt on', { type: 'usage' }],
+      ['claustrum on', { type: 'usage' }],
+      ['on', { type: 'usage' }],
+      ['off', { type: 'usage' }],
+    ]
+
+    for (const [input, expected] of cases as Array<[string, unknown]>) {
+      expect(parseAccountCommandAction(input)).toEqual(expected as never)
+    }
   })
 
-  test('custody off with id', async () => {
-    expect(parseAccountCommandAction('custody fallback-1 off')).toEqual({
-      type: 'custody',
-      id: 'fallback-1',
-      enabled: false,
+  test('names global mode verbs for retired custody vocabulary', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: 'custody work-alt on',
+      storage: baseStorage(),
     })
-  })
 
-  test('custody with a malformed state returns usage', async () => {
-    expect(parseAccountCommandAction('custody fallback-1 maybe')).toEqual({
-      type: 'usage',
-    })
+    expect(result.text).toContain('claustrum')
+    expect(result.text).toContain('local')
   })
 
   test('remove with id', async () => {
@@ -348,12 +351,8 @@ describe('executeAccountCommand status', () => {
     expect(result.text).toContain('Disabled account')
     expect(result.text).toContain('42%')
     expect(result.text).toContain('(disabled)')
-    expect(result.text).toContain(
-      '**OpenCode anthropic** [main] 42% · manifest n/a (OpenCode-managed)',
-    )
-    expect(result.text).toContain(
-      '**Work account** [fallback] · manifest binding absent',
-    )
+    expect(result.text).toContain('**OpenCode anthropic** [main] 42% · local')
+    expect(result.text).toContain('**Work account** [fallback] · local')
   })
 
   test('renders the settled custody projection in account status text', async () => {
@@ -374,7 +373,6 @@ describe('executeAccountCommand status', () => {
             vaultServed: false,
             vaultReauth: false,
             custodyState: 'na',
-            custodyEligible: false,
           },
           {
             id: 'fallback-1',
@@ -386,16 +384,13 @@ describe('executeAccountCommand status', () => {
             vaultServed: false,
             vaultReauth: true,
             custodyState: 'on-vault-reauth',
-            custodyEligible: true,
           },
         ],
       },
     })
 
     expect(result.text).toContain('Claustrum: available')
-    expect(result.text).toContain(
-      '**Work account** [fallback] · manifest binding present · vault reauth',
-    )
+    expect(result.text).toContain('**Work account** [fallback] · vault-bound')
   })
 
   test('usage returns usage text', async () => {
@@ -406,6 +401,32 @@ describe('executeAccountCommand status', () => {
     })
     expect(result.text).toContain('Usage:')
     expect(result.text).toContain('/claude-account enable')
+  })
+})
+
+describe('executeAccountCommand global Claustrum mode', () => {
+  test('names the two accepted mode verbs in retired custody usage', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: 'claustrum on',
+      storage: baseStorage(),
+    })
+
+    expect(result.text).toContain('/claude-account claustrum')
+    expect(result.text).toContain('/claude-account local')
+  })
+
+  test('persists a requested global mode through its transition seam', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage, accountPath)
+
+    const result = await executeAccountCommand({
+      argumentsText: 'claustrum',
+      storage,
+      path: accountPath,
+    })
+
+    expect(result.text).toBe('Claustrum mode set to claustrum.')
+    expect((await loadAccounts(accountPath))?.claustrum?.mode).toBe('claustrum')
   })
 })
 
@@ -488,126 +509,6 @@ describe('executeAccountCommand enable/disable', () => {
     await setAccountEnabledPersistent('fallback-1', false, accountPath)
     const loaded = await loadAccounts(accountPath)
     expect(loaded?.accounts[0]?.enabled).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// executeAccountCommand — custody
-// ---------------------------------------------------------------------------
-describe('executeAccountCommand custody', () => {
-  test('checks account existence before rejecting the main account', async () => {
-    const result = await executeAccountCommand({
-      argumentsText: 'custody main on',
-      storage: baseStorage(),
-    })
-
-    expect(result.text).toBe('Account "main" not found.')
-    expect(result.updated).toBeUndefined()
-  })
-
-  test('rejects a stored main account after confirming it exists', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'main',
-      type: 'oauth',
-      refresh: 'refresh-main',
-      enabled: true,
-    })
-
-    const result = await executeAccountCommand({
-      argumentsText: 'custody main on',
-      storage,
-    })
-
-    expect(result.text).toBe(
-      'Vault service is not available for the main account.',
-    )
-    expect(result.updated).toBeUndefined()
-  })
-
-  test('rejects an API-key account before invoking the custody capability', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'api-fallback',
-      type: 'api',
-      apiKey: 'test-api-key',
-      baseURL: 'https://api.example.test/claude',
-      enabled: true,
-    })
-    let calls = 0
-
-    const result = await executeAccountCommand({
-      argumentsText: 'custody api-fallback on',
-      storage,
-      custody: {
-        platform: 'opencode',
-        async set() {
-          calls += 1
-          return { text: 'unexpected', changed: true }
-        },
-      },
-    })
-
-    expect(result.text).toContain('OAuth')
-    expect(result.updated).toBeUndefined()
-    expect(calls).toBe(0)
-  })
-
-  test('rejects enabling custody for a disabled OAuth account', async () => {
-    const result = await executeAccountCommand({
-      argumentsText: 'custody fallback-3 on',
-      storage: baseStorage(),
-      custody: {
-        platform: 'opencode',
-        async set() {
-          return { text: 'unexpected', changed: true }
-        },
-      },
-    })
-
-    expect(result.text).toContain('disabled')
-    expect(result.updated).toBeUndefined()
-  })
-
-  test('returns the pinned Pi text without a mutation intent when unsupported', async () => {
-    const result = await executeAccountCommand({
-      argumentsText: 'custody fallback-1 on',
-      storage: baseStorage(),
-      custody: {
-        platform: 'unsupported',
-        reason: 'Pi does not support custody',
-      },
-    })
-
-    expect(result.text).toBe(
-      'Claustrum manifest service is OpenCode-only in this version.',
-    )
-    expect(result.updated).toBeUndefined()
-  })
-
-  test('delegates custody changes to the supported host capability', async () => {
-    const storage = baseStorage()
-    let receivedEnabled: boolean | undefined
-
-    const result = await executeAccountCommand({
-      argumentsText: 'custody fallback-1 off',
-      storage,
-      custody: {
-        platform: 'opencode',
-        async set(input) {
-          receivedEnabled = input.enabled
-          return { text: 'Custody disabled.', changed: true }
-        },
-      },
-    })
-
-    expect(receivedEnabled).toBe(false)
-    expect(result.text).toBe('Custody disabled.')
-    expect(result.updated).toEqual({
-      id: 'fallback-1',
-      action: 'custody',
-      enabled: false,
-    })
   })
 })
 
@@ -910,7 +811,7 @@ describe('account command INFO logs (via plugin)', () => {
     ).toHaveLength(0)
   })
 
-  test('custody on refuses a missing handle without touching the account file', async () => {
+  test('retired custody syntax returns usage without touching the account file', async () => {
     const storage = baseStorage()
     await saveAccounts(storage, accountPath)
     const before = await readFile(accountPath, 'utf8')
@@ -921,9 +822,8 @@ describe('account command INFO logs (via plugin)', () => {
     await executeCommand(plugin, 'claude-account', 'custody fallback-1 on')
 
     const payload = drainNotifications(0, 'ses_test').at(-1)?.payload
-    expect(payload?.text).toBe(
-      'No manifest binding or legacy handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
-    )
+    expect(payload?.text).toContain('/claude-account claustrum')
+    expect(payload?.text).toContain('/claude-account local')
     expect(await readFile(accountPath, 'utf8')).toBe(before)
     expect((await stat(accountPath)).mtimeMs).toBe(beforeMtime)
   })

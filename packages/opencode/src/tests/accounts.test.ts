@@ -26,6 +26,7 @@ import {
   formatOAuthAccountTier,
   getAccountStatePath,
   getCache1hPersistentMode,
+  getClaustrumMode,
   getFallbackReauthLabels,
   getLogLevel,
   getOrCreateMainAccountId,
@@ -37,6 +38,7 @@ import {
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  isOAuthAccountVaultOwned,
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   type KillswitchThresholds,
@@ -72,7 +74,7 @@ import {
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
-  setClaustrumAccountGatePersistent,
+  setClaustrumModePersistent,
   setFastModePersistentEnabled,
   setLogLevel,
   setLogLevelPersistent,
@@ -6841,28 +6843,223 @@ describe('setAccountEnabledPersistent', () => {
   })
 })
 
-describe('setClaustrumAccountGatePersistent', () => {
-  test('refuses an API fallback without writing custody state', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'api-fallback',
-      type: 'api',
-      apiKey: 'test-api-key',
-      baseURL: 'https://example.test',
-    })
-    await saveAccounts(storage, accountPath)
-    const before = await readFile(accountPath, 'utf8')
-    const beforeStat = await stat(accountPath)
+describe('global Claustrum mode', () => {
+  test('defaults to local without config and does not infer custody from a tombstone', async () => {
+    expect(await loadAccounts(accountPath)).toBeNull()
+    expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('local')
+    expect(
+      getClaustrumMode({
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'anthropic',
+            type: 'oauth',
+            access: '',
+            refresh: 'claustrum-tombstone:v1:anthropic',
+            expires: 0,
+          },
+        ],
+      }),
+    ).toBe('local')
+  })
+
+  test('loads legacy custody gates as local and preserves them through save', async () => {
+    const legacyAccounts = { 'work-alt': { enabled: true } }
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            refresh: 'refresh-token',
+            enabled: true,
+          },
+        ],
+        claustrum: { accounts: legacyAccounts },
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect(getClaustrumMode(loaded)).toBe('local')
+    expect(
+      isOAuthAccountVaultOwned(
+        loaded!,
+        expectOAuthAccount(loaded?.accounts[0]),
+        {
+          status: 'resolved',
+          source: 'manifest',
+          handle: 'manifest-handle',
+          credentialId: 'anthropic:work-alt',
+        },
+      ),
+    ).toBe(false)
+    await saveAccounts(loaded!, accountPath)
 
     expect(
-      await setClaustrumAccountGatePersistent({
-        id: 'api-fallback',
-        enabled: true,
-        path: accountPath,
+      JSON.parse(await readFile(accountPath, 'utf8')).claustrum.accounts,
+    ).toEqual(legacyAccounts)
+  })
+
+  test('defaults invalid persisted global modes to local', async () => {
+    for (const mode of ['vault', 42, null]) {
+      await writeFile(
+        accountPath,
+        JSON.stringify({ ...baseStorage(), claustrum: { mode } }),
+        'utf8',
+      )
+      expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('local')
+    }
+  })
+
+  test('persists global mode in config and retains it through a state save', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'rotation',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1_000,
+    })
+    await saveAccounts(storage, accountPath)
+
+    expect(await setClaustrumModePersistent('claustrum', accountPath)).toBe(
+      'changed',
+    )
+    expect(await setClaustrumModePersistent('claustrum', accountPath)).toBe(
+      'unchanged',
+    )
+    expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('claustrum')
+
+    const staleStorage = (await loadAccounts(accountPath))!
+    const account = expectOAuthAccount(staleStorage.accounts[0])
+    account.access = 'rotated-access'
+    account.refresh = 'rotated-refresh'
+    account.expires = 2_000
+    await saveAccountState(staleStorage, accountPath, { accounts: true })
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(config.claustrum.mode).toBe('claustrum')
+    expect(state.claustrum?.mode).toBeUndefined()
+  })
+
+  test('serializes a mode write with another config write without losing either field', async () => {
+    await saveAccounts(baseStorage(), accountPath)
+
+    await Promise.all([
+      setClaustrumModePersistent('claustrum', accountPath),
+      setLogLevelPersistent('debug', accountPath),
+    ])
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(config.claustrum.mode).toBe('claustrum')
+    expect(config.logging.level).toBe('debug')
+  })
+
+  test('owns only enabled OAuth accounts with a resolved manifest binding in Claustrum mode', () => {
+    const binding = {
+      status: 'resolved' as const,
+      source: 'manifest' as const,
+      handle: 'manifest-handle',
+      credentialId: 'anthropic:work-alt',
+    }
+
+    for (const mode of ['local', 'claustrum'] as const) {
+      for (const enabled of [false, true]) {
+        for (const kind of ['oauth', 'api'] as const) {
+          for (const resolved of [false, true]) {
+            const account: AccountStorage['accounts'][number] =
+              kind === 'oauth'
+                ? {
+                    id: 'work-alt',
+                    type: 'oauth',
+                    refresh: 'refresh-token',
+                    enabled,
+                  }
+                : {
+                    id: 'work-alt',
+                    type: 'api',
+                    apiKey: 'api-key',
+                    baseURL: 'https://api.example.test',
+                    enabled,
+                  }
+            const storage: AccountStorage = {
+              ...baseStorage(),
+              claustrum: { mode },
+              accounts: [account],
+            }
+
+            expect(
+              isOAuthAccountVaultOwned(
+                storage,
+                account,
+                resolved ? binding : undefined,
+              ),
+            ).toBe(
+              mode === 'claustrum' && enabled && kind === 'oauth' && resolved,
+            )
+          }
+        }
+      }
+    }
+
+    const ownershipStorage = {
+      ...baseStorage(),
+      claustrum: { mode: 'claustrum' as const },
+    }
+    const ownershipAccount = {
+      id: 'work-alt',
+      type: 'oauth' as const,
+      refresh: 'refresh-token',
+      enabled: true,
+    }
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, binding),
+    ).toBe(true)
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, {
+        status: 'resolved',
+        source: 'legacy',
+        handle: 'legacy-handle',
       }),
-    ).toBe('ineligible')
-    expect(await readFile(accountPath, 'utf8')).toBe(before)
-    expect((await stat(accountPath)).mtimeMs).toBe(beforeStat.mtimeMs)
+    ).toBe(true)
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, {
+        status: 'unresolved',
+        reason: 'missing-entry',
+      }),
+    ).toBe(false)
+    expect(
+      isOAuthAccountVaultOwned(
+        {
+          ...ownershipStorage,
+          claustrum: {
+            mode: 'claustrum',
+            accounts: { 'work-alt': { enabled: true } },
+          },
+        },
+        ownershipAccount,
+        undefined,
+      ),
+    ).toBe(false)
+    expect(
+      isOAuthAccountVaultOwned(
+        {
+          ...ownershipStorage,
+          claustrum: {
+            mode: 'local',
+            accounts: { 'work-alt': { enabled: true } },
+          },
+        },
+        ownershipAccount,
+        binding,
+      ),
+    ).toBe(false)
   })
 })
 

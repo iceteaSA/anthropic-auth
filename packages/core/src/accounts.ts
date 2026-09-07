@@ -4,7 +4,10 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
-import { CustodyTombstoneRefreshError } from './claustrum.ts'
+import {
+  type CustodyHandleResolution,
+  CustodyTombstoneRefreshError,
+} from './claustrum.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
@@ -78,8 +81,12 @@ export type ClaustrumAccountGate = {
   enabled?: boolean
 }
 
+export type ClaustrumMode = 'local' | 'claustrum'
+
 export type ClaustrumConfig = {
+  mode?: ClaustrumMode
   handlesFile?: string
+  // Kept loadable so configurations remain safe to downgrade to older releases.
   accounts?: Record<string, ClaustrumAccountGate>
 }
 
@@ -897,6 +904,10 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 
 function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
   if (!isRecord(value)) return undefined
+  const mode: ClaustrumMode | undefined =
+    value.mode === 'local' || value.mode === 'claustrum'
+      ? value.mode
+      : undefined
   const handlesFile =
     typeof value.handlesFile === 'string' && value.handlesFile.trim()
       ? value.handlesFile.trim()
@@ -918,10 +929,17 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
         }),
       )
     : undefined
-  if (!handlesFile && (!accounts || Object.keys(accounts).length === 0)) {
+  if (
+    !mode &&
+    !handlesFile &&
+    (!accounts || Object.keys(accounts).length === 0) &&
+    Object.keys(value).length === 0
+  ) {
     return undefined
   }
   return {
+    ...value,
+    ...(mode && { mode }),
     ...(handlesFile && { handlesFile }),
     ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
   }
@@ -1524,45 +1542,38 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
-export function isClaustrumEnabledForAccount(
-  storage: AccountStorage,
-  accountId: string,
-): boolean {
-  return storage.claustrum?.accounts?.[accountId]?.enabled === true
+export function getClaustrumMode(
+  storage: AccountStorage | null,
+): ClaustrumMode {
+  return storage?.claustrum?.mode === 'claustrum' ? 'claustrum' : 'local'
 }
 
-export async function setClaustrumAccountGatePersistent(input: {
-  id: string
-  enabled: boolean
-  path?: string
-}): Promise<'updated' | 'unchanged' | 'missing' | 'ineligible'> {
-  const path = input.path ?? getAccountStoragePath()
+export function isOAuthAccountVaultOwned(
+  storage: AccountStorage | null,
+  account: FallbackAccount,
+  binding: CustodyHandleResolution | undefined,
+): boolean {
+  return (
+    getClaustrumMode(storage) === 'claustrum' &&
+    isOAuthAccount(account) &&
+    account.enabled !== false &&
+    // Source is provenance, not authorization; the resolver owns the binding decision.
+    binding?.status === 'resolved'
+  )
+}
+
+export async function setClaustrumModePersistent(
+  mode: ClaustrumMode,
+  path = getAccountStoragePath(),
+): Promise<'changed' | 'unchanged'> {
   return enqueueSave(async () => {
     const lock = await acquireAccountConfigWriteLock(path)
     try {
-      const storage = await loadAccounts(path)
-      if (!storage) {
-        return 'missing'
-      }
-      const account = storage.accounts.find(
-        (candidate) => candidate.id === input.id,
-      )
-      if (!account) return 'missing'
-      if (!isOAuthAccount(account)) return 'ineligible'
-      if (isClaustrumEnabledForAccount(storage, input.id) === input.enabled) {
-        return 'unchanged'
-      }
-
-      const accounts = storage.claustrum?.accounts ?? {}
-      storage.claustrum = {
-        ...storage.claustrum,
-        accounts: {
-          ...accounts,
-          [input.id]: { ...accounts[input.id], enabled: input.enabled },
-        },
-      }
+      const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+      if (getClaustrumMode(storage) === mode) return 'unchanged'
+      storage.claustrum = { ...storage.claustrum, mode }
       await saveAccountsWithConfigLock(storage, path, {})
-      return 'updated'
+      return 'changed'
     } finally {
       await lock.release()
     }
@@ -1817,6 +1828,9 @@ async function saveAccountsWithConfigLock(
   const current = await loadAccounts(path)
   const nextStorage: AccountStorage = {
     ...storage,
+    ...(storage.claustrum && {
+      claustrum: { ...current?.claustrum, ...storage.claustrum },
+    }),
     accounts: mergeAccountsForSave(
       current?.accounts ?? [],
       storage.accounts,
@@ -2230,7 +2244,6 @@ export function clearClaustrumRefreshErrorPersistent(
           !storage ||
           !account ||
           account.claustrumHandle !== handle ||
-          !isClaustrumEnabledForAccount(storage, accountId) ||
           !account.lastRefreshError
         ) {
           return false
