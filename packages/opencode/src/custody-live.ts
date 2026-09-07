@@ -55,12 +55,32 @@ function formatCustodyPreflightRefusals(
     .join('\n')
 }
 
+async function acquireLocalExitMainLock(
+  storagePath: string,
+  now: () => number,
+): Promise<Lock> {
+  for (;;) {
+    const lock = await core.acquireRefreshFileLock({
+      name: OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
+      path: storagePath,
+      ttlMs: 5 * 60_000,
+      now,
+      renew: true,
+    })
+    if (lock) return lock
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
 export async function runClaustrumTakeoverCommand(
   deps: ClaustrumTakeoverCommandDeps,
   mode: 'local' | 'claustrum',
 ): Promise<{ text: string }> {
   if (mode === 'local') {
-    const changed = await executeLocalExit({ path: deps.storagePath })
+    const lock = await acquireLocalExitMainLock(deps.storagePath, deps.now)
+    const changed = await executeLocalExit({ path: deps.storagePath }).finally(
+      () => lock.release(),
+    )
     return {
       text:
         changed === 'changed'

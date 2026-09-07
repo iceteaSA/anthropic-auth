@@ -1455,13 +1455,7 @@ function mergeAccountRuntimeState(
       expires: _expires,
       ...safe
     } = effectiveIncoming
-    return {
-      ...existingEntry,
-      ...safe,
-      access: '',
-      refresh: custodyTombstoneKey('anthropic'),
-      expires: 0,
-    }
+    return mergeAccountRuntimeState(existingEntry, safe, setClaustrumHandle)
   }
   const preferredRefreshError = (() => {
     const existingError = existingEntry.lastRefreshError
@@ -4242,7 +4236,12 @@ export class FallbackAccountManager {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       if (this.isFallbackAccountVaultEnabled(account.id, storage)) {
         if (!this.isFallbackAccountVaultServed(account.id, storage)) continue
-        if (!account.access && !account.refresh) {
+        if (
+          !account.access &&
+          !account.refresh &&
+          !storage.quota?.minimumRemaining &&
+          !isKillswitchEnabled(storage)
+        ) {
           usable.push(account)
           continue
         }

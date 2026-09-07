@@ -160,6 +160,8 @@ export function custodyStateFor(
         | ProviderAccountUuid
         | undefined)
     const credentialIdentity = cached?.accountId
+    if (persistedIdentity === undefined && credentialIdentity === undefined)
+      return 'unknown-identity'
     if (
       (persistedIdentity === undefined) !==
       (credentialIdentity === undefined)

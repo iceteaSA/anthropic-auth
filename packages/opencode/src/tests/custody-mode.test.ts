@@ -3,7 +3,10 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
-import { createLiveCustodyDeps } from '../custody-live.ts'
+import {
+  createLiveCustodyDeps,
+  runClaustrumTakeoverCommand,
+} from '../custody-live.ts'
 import {
   acquireCustodyTransitionLocks,
   CustodyLockBusyError,
@@ -11,6 +14,7 @@ import {
   CustodyStateMismatchError,
   executeClaustrumTakeover,
   executeLocalExit,
+  OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
   preflightClaustrumTakeover,
   reconcileCustodyStartup,
 } from '../custody-mode.ts'
@@ -603,6 +607,49 @@ describe('custody mode', () => {
       'manifest',
       'transition',
     ])
+  })
+
+  test('custody: local exit waits for an in-progress takeover main lock', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'custody-local-exit-lock-'))
+    const path = join(directory, 'anthropic-auth.json')
+    try {
+      await core.saveAccounts(
+        { version: 1, claustrum: { mode: 'claustrum' }, accounts: [] },
+        path,
+      )
+      const lock = await core.acquireRefreshFileLock({
+        name: OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
+        path,
+        ttlMs: 60_000,
+        renew: true,
+      })
+      expect(lock).not.toBeNull()
+      let settled = false
+      const localExit = runClaustrumTakeoverCommand(
+        {
+          storagePath: path,
+          loadStorage: () => core.loadAccounts(path),
+          getCache: async () => null,
+          now: Date.now,
+          refreshManifest: async () => {},
+        },
+        'local',
+      ).then((result) => {
+        settled = true
+        return result
+      })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+      expect((await core.loadAccounts(path))?.claustrum?.mode).toBe('claustrum')
+
+      await lock!.release()
+      await expect(localExit).resolves.toMatchObject({
+        text: expect.stringContaining('set to local'),
+      })
+      expect((await core.loadAccounts(path))?.claustrum?.mode).toBe('local')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 
   test('custody: takeover restores raw sidecars when a staged write fails', async () => {
