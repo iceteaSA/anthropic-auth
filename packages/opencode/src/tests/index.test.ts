@@ -50,6 +50,7 @@ import {
   PROFILE_TTL_MS,
   type ProviderAccountUuid,
   primeStorageFingerprint,
+  removeCustodyHandleManifestEntry,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
   resetDumpState,
@@ -685,6 +686,7 @@ type PluginRuntimeOverrides = Partial<{
   claustrumConnector: (options: unknown) => Promise<unknown>
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
+  removeCustodyHandleManifestEntry: typeof removeCustodyHandleManifestEntry
 }>
 
 type TestTimerHandler = Parameters<typeof globalThis.setTimeout>[0]
@@ -1115,6 +1117,7 @@ describe('fallback Claustrum credential resolution', () => {
         mainAccountId?: ProviderAccountUuid
         vaultAccountId?: string
         responseStatus?: number
+        responseStatuses?: number[]
         mainExpiresAt?: number
         fallbackExpiresAt?: number
       } = {},
@@ -1122,7 +1125,11 @@ describe('fallback Claustrum credential resolution', () => {
       let now = 1_000
       const calls: CredentialCall[] = []
       const authorizations: string[] = []
+      let mainSlotAccess = ''
+      let mainSlotExpires = 0
+      let mainExpiresAt = options.mainExpiresAt ?? 10_000
       const fallback = options.fallback !== false
+      const responseStatuses = [...(options.responseStatuses ?? [])]
       const checkedAt = Date.now()
       const quota = options.quota ?? {
         enabled: false,
@@ -1183,7 +1190,9 @@ describe('fallback Claustrum credential resolution', () => {
             new Headers(init?.headers).get('authorization') ?? '',
           )
           return Promise.resolve(
-            new Response('{}', { status: options.responseStatus ?? 200 }),
+            new Response('{}', {
+              status: responseStatuses.shift() ?? options.responseStatus ?? 200,
+            }),
           )
         }
         return Promise.resolve(new Response('{}', { status: 200 }))
@@ -1196,15 +1205,20 @@ describe('fallback Claustrum credential resolution', () => {
           return credentialResponse(
             isMain ? 'vault-main-access' : 'vault-fallback-access',
             isMain ? 17 : 29,
-            isMain
-              ? (options.mainExpiresAt ?? 10_000)
-              : (options.fallbackExpiresAt ?? 10_000),
+            isMain ? mainExpiresAt : (options.fallbackExpiresAt ?? 10_000),
             isMain ? options.vaultAccountId : 'fallback-provider-account',
           )
         }),
       })
       const result = await plugin.auth.loader(
-        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        () =>
+          Promise.resolve({
+            ...custodyTombstoneOAuth('anthropic'),
+            ...(mainSlotAccess && {
+              access: mainSlotAccess,
+              expires: mainSlotExpires,
+            }),
+          } as never),
         { models: {} },
       )
       return {
@@ -1215,8 +1229,42 @@ describe('fallback Claustrum credential resolution', () => {
         setNow(value: number) {
           now = value
         },
+        setMainSlotAccess(value: string) {
+          mainSlotAccess = value
+        },
+        setMainSlotExpires(value: number) {
+          mainSlotExpires = value
+        },
+        setMainExpiresAt(value: number) {
+          mainExpiresAt = value
+        },
       }
     }
+
+    test.serial(
+      'a refused vault main clears a legacy tombstone bearer before fallback routing',
+      async () => {
+        const fixture = await bootVaultMain({
+          routing: { mode: 'fallback-first' },
+          fallbackExpiresAt: 30_000,
+          responseStatuses: [429, 200],
+        })
+        fixture.setMainSlotAccess('claustrum-tombstone:v1:anthropic')
+        fixture.setMainSlotExpires(Date.now() + 30_000)
+        fixture.setMainExpiresAt(0)
+        fixture.setNow(20_000)
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(fixture.authorizations).toEqual([
+          'Bearer vault-fallback-access',
+          'Bearer vault-fallback-access',
+        ])
+        expect(response.status).toBe(200)
+        expect(fixture.authorizations).not.toContain(
+          'Bearer claustrum-tombstone:v1:anthropic',
+        )
+        await fixture.plugin.dispose?.()
+      },
+    )
 
     test.serial(
       'fallback-first sends the bound fallback credential',
@@ -3864,6 +3912,134 @@ describe('fallback Claustrum credential resolution', () => {
       await plugin.dispose?.()
     },
   )
+
+  test('publishes the served fallback account UUID when another account is disabled', async () => {
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      quota: { enabled: false, failClosedOnUnknownQuota: false },
+      storageOverrides: { quotaHeaderFeed: { enabled: true } },
+      fallbacks: [
+        {
+          label: 'unserved',
+          handle: `ckh_${'U'.repeat(43)}`,
+          access: 'vault-unserved-access',
+          account: {
+            enabled: false,
+            anthropicAccountUuid:
+              '11111111-1111-1111-1111-111111111111' as ProviderAccountUuid,
+          },
+        },
+        {
+          label: 'served',
+          handle: `ckh_${'S'.repeat(43)}`,
+          access: 'vault-served-access',
+          account: {
+            anthropicAccountUuid:
+              '22222222-2222-2222-2222-222222222222' as ProviderAccountUuid,
+          },
+        },
+      ],
+      response: new Response('{}', {
+        status: 200,
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.25',
+          'anthropic-ratelimit-unified-5h-reset': '1800000000',
+        },
+      }),
+      createFallbackStorage,
+      useTempAccountFile,
+      getPlugin: (accountStoragePath, runtimeOverrides) => {
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountStoragePath
+        return getPlugin(undefined, undefined, runtimeOverrides as never)
+      },
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
+    })
+
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(fixture.authorizations).toEqual(['Bearer vault-served-access'])
+    const entries = await waitForFeedEntries(
+      (candidate) =>
+        candidate.some(
+          (entry: any) =>
+            entry.anthropic_account_uuid ===
+            '22222222-2222-2222-2222-222222222222',
+        ),
+      'the served fallback account UUID',
+    )
+    expect(
+      entries.find((entry: any) => entry.anthropic_account_uuid !== undefined),
+    ).toMatchObject({
+      anthropic_account_uuid: '22222222-2222-2222-2222-222222222222',
+    })
+    await fixture.plugin.dispose?.()
+  })
+
+  test('uses the bootstrap UUID when a vault fallback omits account_id', async () => {
+    const bootstrapUuid = '33333333-3333-3333-3333-333333333333'
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      quota: { enabled: false, failClosedOnUnknownQuota: false },
+      storageOverrides: { quotaHeaderFeed: { enabled: true } },
+      fallbacks: [
+        {
+          label: 'bootstrap-identity',
+          handle: `ckh_${'B'.repeat(43)}`,
+          access: 'sk-ant-oat01-vault-bootstrap-identity',
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          return credentialResponse(
+            params.handle === ruledMainHandle
+              ? 'vault-main-access'
+              : 'sk-ant-oat01-vault-bootstrap-identity',
+            1,
+          )
+        }),
+      onFetch: (input) => {
+        const url = extractUrl(input as string | URL | Request)
+        if (url.includes('/claude_cli/bootstrap')) {
+          return Response.json({
+            oauth_account: { account_uuid: bootstrapUuid },
+          })
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.25',
+            'anthropic-ratelimit-unified-5h-reset': '1800000000',
+          },
+        })
+      },
+      createFallbackStorage,
+      useTempAccountFile,
+      getPlugin: (accountStoragePath, runtimeOverrides) => {
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountStoragePath
+        return getPlugin(undefined, undefined, runtimeOverrides as never)
+      },
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
+    })
+
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    const entries = await waitForFeedEntries(
+      (candidate) =>
+        candidate.some(
+          (entry: any) => entry.anthropic_account_uuid === bootstrapUuid,
+        ),
+      'the bootstrap fallback account UUID',
+    )
+    expect(
+      entries.find((entry: any) => entry.anthropic_account_uuid !== undefined),
+    ).toMatchObject({ anthropic_account_uuid: bootstrapUuid })
+    await fixture.plugin.dispose?.()
+  })
 
   test('account status inspects the configured Claustrum connection file', async () => {
     const storage = createFallbackStorage({ accounts: [] })
@@ -6878,6 +7054,102 @@ describe('AnthropicAuthPlugin', () => {
     installDefaultFetchMock()
   })
 
+  test('main acknowledge retries a transient manifest refusal', async () => {
+    const access = 'local-login-retry-access'
+    const refresh = 'local-login-retry-refresh'
+    const manifestHandle = `ckh_${'S'.repeat(43)}`
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'local' },
+        quota: { enabled: false },
+        accounts: [],
+      }),
+    )
+    const manifestPath = join(tempConfigDir!, 'handles.json')
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'main',
+                handle: manifestHandle,
+                credential_id: custodyCredentialId('main'),
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/oauth',
+        redirectUri: 'https://example.test/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        return Promise.resolve(
+          Response.json({
+            access_token: access,
+            refresh_token: refresh,
+            expires_in: 3600,
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    let removalAttempts = 0
+    const plugin = await getPlugin(undefined, undefined, {
+      authorize,
+      setTimeout: mock((handler: TestTimerHandler) => {
+        handler()
+        return { unref() {} }
+      }) as unknown as typeof setTimeout,
+      removeCustodyHandleManifestEntry: async (
+        input: Parameters<typeof removeCustodyHandleManifestEntry>[0],
+      ) => {
+        removalAttempts += 1
+        if (removalAttempts === 1)
+          return { status: 'refused', code: 'lock_busy' } as const
+        return removeCustodyHandleManifestEntry(input)
+      },
+    } as unknown as PluginRuntimeOverrides)
+    try {
+      const flow = await plugin.auth.methods[0].authorize()
+      await flow.callback('code=code&state=state')
+      await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access,
+            refresh,
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+
+      expect(removalAttempts).toBe(2)
+      expect(
+        JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+      ).toEqual([])
+    } finally {
+      await plugin.dispose?.()
+      installDefaultFetchMock()
+    }
+  })
+
   test.serial(
     'TUI fallback re-login fences the divergence marker at the served vault record version',
     async () => {
@@ -7821,6 +8093,64 @@ describe('quota header feed extended integration', () => {
     )
     expect(sidebar.main.quota?.five_hour?.usedPercent).toBe(25)
     expect(await readFeedEntries()).toEqual([])
+  })
+
+  test('sidebar quota refresh uses the rotated main host token', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        main: { type: 'opencode', provider: 'anthropic' },
+      }),
+    )
+    let currentAccess = 'sk-ant-oat01-main-access-before-rotation'
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.startsWith(MESSAGES_URL)) {
+        return Promise.resolve(
+          new Response('{}', {
+            status: 200,
+            headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+          }),
+        )
+      }
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({
+            oauth_account: {
+              account_uuid: '44444444-4444-4444-4444-444444444444',
+            },
+          }),
+        )
+      }
+      return Promise.reject(new Error(`Unexpected test fetch: ${url}`))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: currentAccess,
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    currentAccess = 'sk-ant-oat01-main-access-after-rotation'
+
+    const resolved = await (
+      plugin as {
+        __resolveSidebarQuotaAccessForTest: () => Promise<{
+          access: string | undefined
+        }>
+      }
+    ).__resolveSidebarQuotaAccessForTest()
+    expect(resolved.access).toBe('sk-ant-oat01-main-access-after-rotation')
+    await plugin.dispose?.()
   })
 
   test('deduplicates main feed observations across access-token rotation', async () => {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { constants as fsConstants } from 'node:fs'
+import { type Dirent, constants as fsConstants } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -631,12 +631,17 @@ export type CustodyHandleManifestWriteResult =
 export type CustodyHandleManifestRemovalResult =
   | 'removed'
   | 'missing'
-  | 'refused'
+  | {
+      status: 'refused'
+      code?: CustodyManifestLockErrorCode
+    }
 
 export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
 export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
 export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
 export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
+const CUSTODY_MANIFEST_STALE_LOCK_REAP_AGE_MS = 24 * 60 * 60 * 1000
+const CUSTODY_MANIFEST_STALE_LOCK_REAP_LIMIT = 32
 
 export type CustodyManifestLockTestOptions = Partial<{
   ttlMs: number
@@ -706,6 +711,41 @@ function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
     !/[\\/:*?"<>|]/.test(nonce) &&
     !/[. ]$/.test(nonce)
   )
+}
+
+async function reapStaleCustodyManifestLocks(lockPath: string): Promise<void> {
+  const parent = dirname(lockPath)
+  const prefix = `${lockPath.slice(lockPath.lastIndexOf('/') + 1)}.stale-`
+  let entries: Dirent[]
+  try {
+    entries = await fs.readdir(parent, { withFileTypes: true })
+  } catch (error) {
+    logger.debug('claustrum', 'stale manifest lock reaper failed', {
+      error: errorCode(error),
+    })
+    return
+  }
+  let reaped = 0
+  for (const entry of entries) {
+    if (reaped >= CUSTODY_MANIFEST_STALE_LOCK_REAP_LIMIT) return
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue
+    const quarantinePath = join(parent, entry.name)
+    try {
+      const stat = await fs.lstat(quarantinePath)
+      if (
+        !stat.isDirectory() ||
+        Date.now() - stat.mtimeMs < CUSTODY_MANIFEST_STALE_LOCK_REAP_AGE_MS
+      ) {
+        continue
+      }
+      await fs.rm(quarantinePath, { recursive: true, force: true })
+      reaped += 1
+    } catch (error) {
+      logger.debug('claustrum', 'stale manifest lock reaper failed', {
+        error: errorCode(error),
+      })
+    }
+  }
 }
 
 export async function withCustodyManifestLock<T>(
@@ -870,6 +910,7 @@ export async function withCustodyManifestLock<T>(
     } else {
       await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
     }
+    await reapStaleCustodyManifestLocks(lockPath)
   }
 }
 
@@ -934,10 +975,10 @@ export async function removeCustodyHandleManifestEntry(
     !isValidCustodyCredentialId(input.entry.credentialId) ||
     input.entry.credentialId !== custodyCredentialId(input.entry.label)
   ) {
-    return 'refused'
+    return { status: 'refused' }
   }
   try {
-    return await withCustodyManifestLock(
+    const result = await withCustodyManifestLock(
       input.path,
       async (assertLease, nonce) => {
         const expectedUid =
@@ -1004,16 +1045,15 @@ export async function removeCustodyHandleManifestEntry(
         if (!isOurManifestBlock(block) || !Array.isArray(block.accounts)) {
           return 'refused'
         }
-        const matchIndex = block.accounts.findIndex(
-          (account) =>
-            isRecord(account) &&
-            account.label === input.entry.label &&
-            account.handle === input.entry.handle &&
-            account.credential_id === input.entry.credentialId,
-        )
+        const matchesEntry = (account: unknown) =>
+          isRecord(account) &&
+          account.label === input.entry.label &&
+          account.handle === input.entry.handle &&
+          account.credential_id === input.entry.credentialId
+        const matchIndex = block.accounts.findIndex(matchesEntry)
         if (matchIndex === -1) return 'missing'
         const accounts = block.accounts.filter(
-          (_, index) => index !== matchIndex,
+          (account) => !matchesEntry(account),
         )
         const serialized = JSON.stringify(
           {
@@ -1068,8 +1108,12 @@ export async function removeCustodyHandleManifestEntry(
         }
       },
     )
-  } catch {
-    return 'refused'
+    return result === 'refused' ? { status: 'refused' } : result
+  } catch (error) {
+    if (error instanceof CustodyManifestLockError) {
+      return { status: 'refused', code: error.code }
+    }
+    return { status: 'refused' }
   }
 }
 
@@ -1091,6 +1135,7 @@ export async function writeCustodyHandleManifestEntryLocked(
   }
 
   let document: Record<string, unknown>
+  let corruptLabels: ReadonlySet<string> = new Set<string>()
   let handle: fs.FileHandle | undefined
   try {
     const pathStats = await fs.lstat(input.path)
@@ -1123,7 +1168,11 @@ export async function writeCustodyHandleManifestEntryLocked(
 
     if (parsed.providers.some(isOurManifestBlock)) {
       try {
-        readCustodyHandles(parsed, 'anthropic', 'anthropic-auth')
+        corruptLabels = readCustodyHandles(
+          parsed,
+          'anthropic',
+          'anthropic-auth',
+        ).corruptLabels
       } catch {
         return refusal('invalid manifest')
       }
@@ -1169,12 +1218,15 @@ export async function writeCustodyHandleManifestEntryLocked(
     if (
       matching.length === 1 &&
       matching[0]?.handle === input.entry.handle &&
-      matching[0]?.credential_id === input.entry.credentialId
+      matching[0]?.credential_id === input.entry.credentialId &&
+      !corruptLabels.has(input.entry.label)
     ) {
       return { status: 'unchanged' }
     }
     const replacement = {
-      ...(matching.find(isRecord) ?? {}),
+      ...(corruptLabels.has(input.entry.label)
+        ? {}
+        : (matching.find(isRecord) ?? {})),
       label: input.entry.label,
       handle: input.entry.handle,
       credential_id: input.entry.credentialId,

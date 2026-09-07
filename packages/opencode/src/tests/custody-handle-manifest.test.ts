@@ -535,6 +535,43 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('replaces a corrupt own-label entry with a canonical binding', async () => {
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: writerEntry.label,
+                handle: writerHandle,
+                credential_id: writerEntry.credentialId,
+                superseded: 'corrupt',
+              },
+            ],
+          },
+        ],
+      }),
+      async (path) => {
+        await expect(
+          writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toEqual({ status: 'written' })
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<{ accounts: Array<Record<string, unknown>> }>
+        }
+        expect(output.providers[0]?.accounts).toEqual([
+          {
+            label: writerEntry.label,
+            handle: writerEntry.handle,
+            credential_id: writerEntry.credentialId,
+          },
+        ])
+      },
+    )
+  })
+
   test('inserts our entry into an absent manifest file', async () => {
     await withTempDirectory(async (directory) => {
       const parent = join(directory, 'manifest')
@@ -1079,8 +1116,37 @@ describe('removeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('removes every duplicate of our manifest entry', async () => {
+    const account = {
+      label: writerEntry.label,
+      handle: writerEntry.handle,
+      credential_id: writerEntry.credentialId,
+    }
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [account, account],
+          },
+        ],
+      }),
+      async (path) => {
+        await expect(
+          removeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toBe('removed')
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<{ accounts: unknown[] }>
+        }
+        expect(output.providers[0]?.accounts).toEqual([])
+      },
+    )
+  })
+
   test.serial(
-    'returns refused when the lease is lost before rename',
+    'returns a transient refusal when the lease is lost before rename',
     async () => {
       await withManifest(fixtureText, async (path) => {
         await writeCustodyHandleManifestEntry({ path, entry: writerEntry })
@@ -1114,7 +1180,7 @@ describe('removeCustodyHandleManifestEntry', () => {
 
         await expect(
           removeCustodyHandleManifestEntry({ path, entry: writerEntry }),
-        ).resolves.toBe('refused')
+        ).resolves.toEqual({ status: 'refused', code: 'renewal_failed' })
         expect(await fs.readFile(path, 'utf8')).toBe(before)
       })
     },
@@ -1208,6 +1274,45 @@ describe('withCustodyManifestLock', () => {
           ).resolves.toBeDefined()
         })
       }
+    },
+  )
+
+  test.serial(
+    'reaps aged stale lock quarantines after releasing the lock',
+    async () => {
+      await withTempDirectory(async (directory) => {
+        const path = join(directory, 'handles.json')
+        const lockPath = `${path}.lock`
+        const ageMs = 24 * 60 * 60 * 1000
+        const now = Date.now()
+        const aged = ['one', 'two', 'three'].map(
+          (nonce) => `${lockPath}.stale-0-${nonce}`,
+        )
+        const fresh = `${lockPath}.stale-0-fresh`
+        for (const quarantine of aged) {
+          await fs.mkdir(quarantine)
+          await fs.utimes(
+            quarantine,
+            (now - ageMs - 1) / 1000,
+            (now - ageMs - 1) / 1000,
+          )
+        }
+        await fs.mkdir(fresh)
+        await fs.utimes(
+          fresh,
+          (now - ageMs + 60 * 60 * 1000) / 1000,
+          (now - ageMs + 60 * 60 * 1000) / 1000,
+        )
+
+        await expect(
+          withCustodyManifestLock(path, async () => 'acquired'),
+        ).resolves.toBe('acquired')
+        for (const quarantine of aged)
+          await expect(fs.lstat(quarantine)).rejects.toMatchObject({
+            code: 'ENOENT',
+          })
+        await expect(fs.lstat(fresh)).resolves.toBeDefined()
+      })
     },
   )
 

@@ -28,8 +28,10 @@ type TuiAccountDialogAccount = Omit<
 type TuiAccountDialogPayload = {
   accounts: TuiAccountDialogAccount[]
   claustrumDetection: string
-  custodyMode?: 'local' | 'claustrum'
+  custodyMode?: TuiCustodyMode
 }
+
+type TuiCustodyMode = 'local' | 'claustrum' | `mismatch: ${string}`
 
 type AccountDialogOption = {
   title: string
@@ -68,6 +70,12 @@ export function buildKillswitchThresholdSeed(
     seedParts.push(`${id}:${t.fh},${t.sd},${t.scoped}`)
   }
   return seedParts.join(' ')
+}
+
+function normalizeTuiCustodyMode(value: string): TuiCustodyMode {
+  return value === 'local' || value === 'claustrum'
+    ? value
+    : `mismatch: ${value}`
 }
 
 export function normalizeAccountDialogPayload(
@@ -125,10 +133,9 @@ export function normalizeAccountDialogPayload(
     }
     return [normalized]
   })
-  const custodyMode =
-    payload.custodyModeKnown === true &&
-    (payload.custodyMode === 'local' || payload.custodyMode === 'claustrum')
-      ? payload.custodyMode
+  const custodyMode: TuiCustodyMode | undefined =
+    payload.custodyModeKnown === true && typeof payload.custodyMode === 'string'
+      ? normalizeTuiCustodyMode(payload.custodyMode)
       : undefined
   return {
     accounts,
@@ -196,15 +203,16 @@ export function buildAccountDialogL1(value: unknown): {
   modeAction?: { command: 'claude-account'; arguments: 'local' | 'claustrum' }
 } {
   const payload = normalizeAccountDialogPayload(value)
-  const modeAction = payload.custodyMode
-    ? {
-        command: 'claude-account' as const,
-        arguments:
-          payload.custodyMode === 'local'
-            ? ('claustrum' as const)
-            : ('local' as const),
-      }
-    : undefined
+  const modeAction =
+    payload.custodyMode === 'local' || payload.custodyMode === 'claustrum'
+      ? {
+          command: 'claude-account' as const,
+          arguments:
+            payload.custodyMode === 'local'
+              ? ('claustrum' as const)
+              : ('local' as const),
+        }
+      : undefined
   return {
     header: payload.custodyMode
       ? `Custody mode: ${payload.custodyMode}`
