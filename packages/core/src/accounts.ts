@@ -9,6 +9,7 @@ import {
   assertNotCustodyTombstone,
   type CustodyHandleResolution,
   CustodyTombstoneRefreshError,
+  custodyTombstoneKey,
 } from './claustrum.ts'
 import {
   CACHE_1H_MODES,
@@ -1426,6 +1427,33 @@ function mergeAccountRuntimeState(
           ),
         }
       : incomingForMerge
+  if (
+    existingEntry.refresh === custodyTombstoneKey('anthropic') &&
+    ((typeof effectiveIncoming.access === 'string' &&
+      effectiveIncoming.access.length > 0) ||
+      (typeof effectiveIncoming.refresh === 'string' &&
+        effectiveIncoming.refresh !== custodyTombstoneKey('anthropic'))) &&
+    (!effectiveIncoming.authLineageId ||
+      effectiveIncoming.authLineageId === existingEntry.authLineageId)
+  ) {
+    logger.warn(
+      'accounts',
+      'discarded stale credential write over a custody tombstone',
+    )
+    const {
+      access: _access,
+      refresh: _refresh,
+      expires: _expires,
+      ...safe
+    } = effectiveIncoming
+    return {
+      ...existingEntry,
+      ...safe,
+      access: '',
+      refresh: custodyTombstoneKey('anthropic'),
+      expires: 0,
+    }
+  }
   const preferredRefreshError = (() => {
     const existingError = existingEntry.lastRefreshError
     const incomingError = effectiveIncoming.lastRefreshError
