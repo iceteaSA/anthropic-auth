@@ -71,6 +71,7 @@ import {
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
+  getAccountStatePath,
   getAccountStoragePath,
   getCache1hMode,
   getCache1hPersistentMode,
@@ -229,6 +230,15 @@ import {
   LANE_START_REQUEST_HEADER,
   LaneStartTracker,
 } from './lane-start.ts'
+import {
+  acknowledgeLocalOAuthLogin,
+  acknowledgeLocalOAuthLoginFromStorage,
+  assertLocalLoginObservationAvailable,
+  type CompletedLocalLogin,
+  lastVaultServedRecordVersion,
+  localAuthFingerprint,
+  persistCustodyDivergenceState,
+} from './local-login.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
@@ -1919,6 +1929,63 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  async function acknowledgeMainLocalLogin(
+    getAuth: NonNullable<typeof latestGetAuth>,
+  ): Promise<void> {
+    const completion = completedLocalLogin
+    if (!completion) return
+    const storage = await loadAccounts(accountStoragePath)
+    if (getClaustrumMode(storage) !== 'local') return
+    const account = mainCustodyAccount(await getAuth().catch(() => ({})))
+    const resolution = storage
+      ? resolveAccountCustodyHandle(account, storage)
+      : { status: 'unresolved' as const, reason: 'missing-entry' as const }
+    if (resolution.status !== 'resolved' || resolution.source !== 'manifest') {
+      completedLocalLogin = undefined
+      return
+    }
+    const maxAttempts = 20
+    const intervalMs = 100
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const observed = await getAuth().catch(() => undefined)
+      const result = await acknowledgeLocalOAuthLogin(completion, observed, {
+        manifestPath: custodyHandleManifestPath,
+        entry: {
+          label: 'main',
+          handle: resolution.handle,
+          credentialId: resolution.credentialId ?? custodyCredentialId('main'),
+        },
+        beforeRemove: async () => {
+          await persistCustodyDivergenceState(
+            getAccountStatePath(accountStoragePath),
+            completion.credentialId,
+            claustrumLastReportedVersion.get(resolution.handle) ?? 0,
+            Date.now(),
+          )
+        },
+      })
+      if (result === 'cleared' || result === 'refused') {
+        completedLocalLogin = undefined
+        if (result === 'cleared') await refreshCustodyHandleManifest()
+        return
+      }
+      if (attempt + 1 < maxAttempts) {
+        await new Promise<void>((resolve) => {
+          const timer = runtimeTimers.setTimeout(resolve, intervalMs)
+          if (typeof timer === 'object' && timer && 'unref' in timer)
+            timer.unref()
+        })
+      }
+    }
+    completedLocalLogin = undefined
+    logger.warn('claustrum', 'local login observation exhausted', {
+      accountId: completion.accountId,
+      credentialId: completion.credentialId,
+      attempts: maxAttempts,
+      intervalMs,
+    })
+  }
+
   function hasClaustrumIdentityMismatch(
     account: OAuthAccount,
     credential: ClaustrumCredential | undefined,
@@ -3532,6 +3599,7 @@ const anthropicAuthPlugin = async (
         expires?: number
       }>)
     | null = null
+  let completedLocalLogin: CompletedLocalLogin | undefined
   let mainAccountId: string | undefined
   let mainQuotaAccountId: string | undefined
   let mainServedAccessToken: string | undefined
@@ -4318,6 +4386,49 @@ const anthropicAuthPlugin = async (
           lastRefreshedAt: now,
         }
         await addAccountPersistent(account, accountStoragePath)
+        const freshStorage = await loadAccounts(accountStoragePath)
+        const fallbackBinding = freshStorage
+          ? resolveAccountCustodyHandle(account, freshStorage)
+          : { status: 'unresolved' as const, reason: 'missing-entry' as const }
+        const fallbackHandle =
+          fallbackBinding.status === 'resolved' &&
+          fallbackBinding.source === 'manifest'
+            ? fallbackBinding.handle
+            : undefined
+        await acknowledgeLocalOAuthLoginFromStorage(
+          {
+            accountId: account.id,
+            credentialId: custodyCredentialId(account.label ?? account.id),
+            authFingerprint: localAuthFingerprint(
+              result.access,
+              result.refresh,
+            ),
+            completedAt: now,
+          },
+          {
+            accountStoragePath,
+            manifestPath: custodyHandleManifestPath,
+            divergence: {
+              statePath: getAccountStatePath(accountStoragePath),
+              lastVaultServedRecordVersion: lastVaultServedRecordVersion({
+                accountId: account.id,
+                servedVersion: fallbackHandle
+                  ? claustrumLastReportedVersion.get(fallbackHandle)
+                  : undefined,
+                cacheVersion: fallbackHandle
+                  ? claustrumCredentialCache?.peek(fallbackHandle)
+                      ?.recordVersion
+                  : undefined,
+                warn: (accountId) =>
+                  logger.warn(
+                    'claustrum',
+                    'fallback login had no served vault record',
+                    { accountId },
+                  ),
+              }),
+            },
+          },
+        )
         logger.info('commands', 'account added', {
           id: account.id,
           label: account.label,
@@ -5030,6 +5141,7 @@ const anthropicAuthPlugin = async (
       ) {
         latestGetAuth = getAuth
         const auth = await getAuth()
+        if (completedLocalLogin) await acknowledgeMainLocalLogin(getAuth)
         if (auth.type === 'oauth') {
           const custodyStorage = await loadAccounts(accountStoragePath)
           const mainCustody = mainCustodyAccount(auth)
@@ -5107,12 +5219,8 @@ const anthropicAuthPlugin = async (
                       },
                     )
                     return createStrippedStream(response, {
-                      onRelayUpstreamError: ({ status, source }) => {
-                        if (status !== 401) return
-                        const served = claustrumServedCredentials.get(response)
-                        if (served)
-                          void reportClaustrumAuthFailure(served, source)
-                      },
+                      onRelayUpstreamError:
+                        createClaustrum401RelayHook(response),
                     })
                   }
                   return claustrumMainRefusal(
@@ -5952,6 +6060,20 @@ const anthropicAuthPlugin = async (
               if (claustrumAuthFailureReports.get(key) === report) {
                 claustrumAuthFailureReports.delete(key)
               }
+            }
+          }
+
+          function createClaustrum401RelayHook(response: Response) {
+            return ({
+              status,
+              source,
+            }: {
+              status: number
+              source: ClaustrumReporterSource
+            }) => {
+              if (status !== 401) return
+              const served = claustrumServedCredentials.get(response)
+              if (served) void reportClaustrumAuthFailure(served, source)
             }
           }
 
@@ -7052,11 +7174,7 @@ const anthropicAuthPlugin = async (
                           responseMode: 'json' as const,
                         }
                     : {}),
-                  onRelayUpstreamError: ({ status, source }) => {
-                    if (status !== 401) return
-                    const served = claustrumServedCredentials.get(response)
-                    if (served) void reportClaustrumAuthFailure(served, source)
-                  },
+                  onRelayUpstreamError: createClaustrum401RelayHook(response),
                   contentFilterModel: fablePlan?.requestedModel,
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
@@ -8251,18 +8369,31 @@ const anthropicAuthPlugin = async (
                 'Exit Claustrum mode first: /claude-account local',
               )
             }
+            assertLocalLoginObservationAvailable(process.env)
             const result = await authorizeImpl('max')
             return {
               url: result.url,
               instructions: 'Paste the authorization code here:',
               method: 'code',
               callback: async (code: string) => {
-                return exchange(
+                const exchanged = await exchange(
                   code,
                   result.verifier,
                   result.redirectUri,
                   result.state,
                 )
+                if (exchanged.type === 'success') {
+                  completedLocalLogin = {
+                    accountId: 'main',
+                    credentialId: custodyCredentialId('main'),
+                    authFingerprint: localAuthFingerprint(
+                      exchanged.access,
+                      exchanged.refresh,
+                    ),
+                    completedAt: Date.now(),
+                  }
+                }
+                return exchanged
               },
             }
           },

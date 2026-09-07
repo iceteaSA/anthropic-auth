@@ -31,6 +31,7 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   CustodyHandleManifestReader,
+  CustodyTombstoneLoginError,
   CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
@@ -671,6 +672,7 @@ function fireConcurrentFetches(result: { fetch: typeof fetch }) {
 }
 
 type PluginRuntimeOverrides = Partial<{
+  authorize: typeof import('@cortexkit/anthropic-auth-core').authorize
   setTimeout: typeof globalThis.setTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
@@ -6461,6 +6463,437 @@ describe('package metadata', () => {
 })
 
 describe('AnthropicAuthPlugin', () => {
+  test('fixed auth content refuses before creating the main OAuth URL', async () => {
+    await useTempAccountFile({ version: 1, accounts: [] })
+    const previous = process.env.OPENCODE_AUTH_CONTENT
+    process.env.OPENCODE_AUTH_CONTENT = '{}'
+    try {
+      const authorize = mock(() =>
+        Promise.resolve({
+          url: 'https://example.test/oauth',
+          redirectUri: 'https://example.test/callback',
+          state: 'state',
+          verifier: 'verifier',
+        }),
+      )
+      const plugin = await getPlugin(undefined, undefined, { authorize })
+      await expect(plugin.auth.methods[0].authorize()).rejects.toMatchObject({
+        code: 'custody_login_observation_unavailable',
+      })
+      expect(authorize).not.toHaveBeenCalled()
+      const state = JSON.parse(
+        await readFile(
+          getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+          'utf8',
+        ),
+      )
+      expect(state.accounts).toEqual({})
+      await plugin.dispose?.()
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_AUTH_CONTENT
+      else process.env.OPENCODE_AUTH_CONTENT = previous
+    }
+  })
+
+  test('main acknowledge consumes the completion record after a refusal', async () => {
+    const access = 'local-login-access'
+    const refresh = 'local-login-refresh'
+    const manifestHandle = `ckh_${'R'.repeat(43)}`
+    const manifest = JSON.stringify({
+      version: 1,
+      providers: [
+        {
+          provider: 'anthropic',
+          serve: 'anthropic-auth',
+          accounts: [
+            {
+              label: 'main',
+              handle: manifestHandle,
+              credential_id: custodyCredentialId('main'),
+            },
+          ],
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'local' },
+        quota: { enabled: false },
+        accounts: [],
+      }),
+    )
+    const manifestPath = join(tempConfigDir!, 'handles.json')
+    await writeFile(manifestPath, manifest)
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/oauth',
+        redirectUri: 'https://example.test/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        return Promise.resolve(
+          Response.json({
+            access_token: access,
+            refresh_token: refresh,
+            expires_in: 3600,
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, { authorize })
+    const flow = await plugin.auth.methods[0].authorize()
+    await flow.callback('code=code&state=state')
+
+    let refuseRename = true
+    __setCustodyManifestLockTestOptions({
+      beforeRename: async () => {
+        if (!refuseRename) return
+        refuseRename = false
+        throw new Error('forced manifest refusal')
+      },
+    })
+    let reads = 0
+    const getAuth = mock(async () => {
+      reads += 1
+      if (reads === 1) {
+        return {
+          type: 'oauth',
+          access: 'different-access',
+          refresh: 'different-refresh',
+          expires: Date.now() + 100_000,
+        }
+      }
+      return {
+        type: 'oauth',
+        access,
+        refresh,
+        expires: Date.now() + 100_000,
+      }
+    })
+    await plugin.auth.loader(getAuth, { models: {} })
+    __setCustodyManifestLockTestOptions()
+
+    expect(
+      JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+    ).toHaveLength(1)
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access,
+          refresh,
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const retainedManifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    expect(retainedManifest.providers[0].accounts).toHaveLength(1)
+    await plugin.dispose?.()
+    installDefaultFetchMock()
+  })
+
+  test.serial(
+    'TUI fallback re-login fences the divergence marker at the served vault record version',
+    async () => {
+      const label = 'a'
+      const handle = `ckh_${'A'.repeat(43)}`
+      const token = 'relogin-a-access'
+      const refresh = 'relogin-a-refresh'
+      const calls: CredentialCall[] = []
+      await useTempAccountFile(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          quota: { enabled: false, failClosedOnUnknownQuota: false },
+          claustrum: { mode: 'claustrum' },
+          accounts: [
+            {
+              id: 'fallback-a',
+              label,
+              type: 'oauth',
+              access: 'sidecar-a-access',
+              refresh: 'sidecar-a-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              claustrumHandle: handle,
+            },
+          ],
+        }),
+      )
+      const manifestPath = join(tempConfigDir!, 'handles.json')
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 1,
+          providers: [
+            {
+              provider: 'anthropic',
+              serve: 'anthropic-auth',
+              accounts: [
+                {
+                  label,
+                  handle,
+                  credential_id: custodyCredentialId(label),
+                },
+              ],
+            },
+          ],
+        }),
+      )
+      await chmod(manifestPath, 0o600)
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+
+      const authorize = mock(() =>
+        Promise.resolve({
+          url: 'https://example.test/oauth?state=state',
+          redirectUri: 'https://example.test/callback',
+          state: 'state',
+          verifier: 'verifier',
+        }),
+      )
+      const authorizations: string[] = []
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const url = extractUrl(input as string | URL | Request)
+        if (url === TOKEN_URL) {
+          return Promise.resolve(
+            Response.json({
+              access_token: token,
+              refresh_token: refresh,
+              expires_in: 3600,
+            }),
+          )
+        }
+        if (url.includes('/v1/messages')) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch
+
+      const client = createMockClient()
+      let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
+      try {
+        plugin = await getPlugin(client, undefined, {
+          authorize,
+          claustrumConnector: async () =>
+            ({
+              call: async (
+                _moduleId: string,
+                method: string,
+                params: unknown,
+              ) => {
+                calls.push({
+                  method,
+                  params: (params ?? {}) as Record<string, unknown>,
+                })
+                if (method !== 'credential.get') return { result: {} }
+                return {
+                  result: {
+                    payload: Array.from(
+                      new TextEncoder().encode(
+                        JSON.stringify({ access_token: 'vault-a-access' }),
+                      ),
+                    ),
+                    expires_at_ms: Date.now() + 60_000,
+                    record_version: 9,
+                  },
+                }
+              },
+              close: () => {},
+            }) as never,
+        })
+        await plugin.__fallbackRefreshReady
+        const result = await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth' as const,
+              access: 'main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 100_000,
+            }),
+          { models: {} },
+        )
+        const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        await response.text()
+        expect(authorizations).toContain('Bearer vault-a-access')
+        expect(
+          calls.some(
+            (call) =>
+              call.method === 'credential.get' && call.params.handle === handle,
+          ),
+        ).toBe(true)
+
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: 'local',
+            sessionID: 'tui-fallback-relogin',
+          }),
+        )
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: 'add-oauth-start',
+            sessionID: 'tui-fallback-relogin',
+          }),
+        )
+        expect(client.session.promptAsync.mock.calls.at(-1)?.[0]).toEqual(
+          expect.objectContaining({
+            body: expect.objectContaining({
+              parts: [
+                expect.objectContaining({
+                  text: expect.stringContaining('state=state'),
+                }),
+              ],
+            }),
+          }),
+        )
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: 'add-oauth-finish code#state --label a',
+            sessionID: 'tui-fallback-relogin',
+          }),
+        )
+
+        const stored = await loadAccounts()
+        expect(
+          stored?.accounts.find((account) => account.label === label),
+        ).toEqual(expect.objectContaining({ access: token, refresh }))
+        const state = JSON.parse(
+          await readFile(
+            getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+            'utf8',
+          ),
+        )
+        expect(
+          state.claustrumDivergence[custodyCredentialId(label)]
+            .minimumRecordVersion,
+        ).toBe(10)
+      } finally {
+        await plugin?.dispose?.()
+        installDefaultFetchMock()
+      }
+    },
+  )
+
+  test('fresh install under local with a tombstoned slot', async () => {
+    const access = 'fresh-local-access'
+    const refresh = 'fresh-local-refresh'
+    const manifestHandle = `ckh_${'F'.repeat(43)}`
+    const manifest = JSON.stringify({
+      version: 1,
+      providers: [
+        {
+          provider: 'anthropic',
+          serve: 'anthropic-auth',
+          accounts: [
+            {
+              label: 'main',
+              handle: manifestHandle,
+              credential_id: custodyCredentialId('main'),
+            },
+          ],
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'local' },
+        quota: { enabled: false },
+        accounts: [],
+      }),
+    )
+    const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+    const statePath = getAccountStatePath(accountPath)
+    await rm(statePath, { force: true })
+    const manifestPath = join(tempConfigDir!, 'handles.json')
+    await writeFile(manifestPath, manifest)
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/oauth',
+        redirectUri: 'https://example.test/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    const plugin = await getPlugin(undefined, undefined, { authorize })
+
+    await expect(
+      plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      ),
+    ).rejects.toBeInstanceOf(CustodyTombstoneLoginError)
+    await expect(readFile(statePath, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+    const restored = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'restored-access',
+          refresh: 'restored-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await restored.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(
+      JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+    ).toHaveLength(1)
+
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        return Promise.resolve(
+          Response.json({
+            access_token: access,
+            refresh_token: refresh,
+            expires_in: 3600,
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const flow = await plugin.auth.methods[0].authorize()
+    await flow.callback('code=code&state=state')
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access,
+          refresh,
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+
+    expect(
+      JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+    ).toHaveLength(0)
+    const stored = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(stored.mainAccountId).toBeString()
+    expect(stored.claustrum.mode).toBe('local')
+    await plugin.dispose?.()
+    installDefaultFetchMock()
+  })
+
   test('returns an object with auth properties', async () => {
     const plugin = await getPlugin()
     expect(plugin.auth).toBeDefined()
