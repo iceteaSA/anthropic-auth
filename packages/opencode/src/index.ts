@@ -212,14 +212,17 @@ import {
   summarizeCacheTtl,
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
-import { createLiveCustodyDeps } from './custody-live.ts'
 import {
-  CustodyPreflightRefusedError,
+  custodyStateFor,
+  fallbackCustodyDimensions,
+  isFallbackAccountVaultServed,
+  mainCustodyDimension,
+} from './custody-dimensions.ts'
+import { runClaustrumTakeoverCommand } from './custody-live.ts'
+import {
   CustodyStateMismatchError,
-  executeClaustrumTakeover,
-  executeLocalExit,
+  type MainCustodyRefusal,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
-  preflightClaustrumTakeover,
   reconcileCustodyStartup,
 } from './custody-mode.ts'
 import {
@@ -2010,9 +2013,7 @@ const anthropicAuthPlugin = async (
     )
   }
 
-  function claustrumMainRefusal(
-    state: 'cold' | 'reauth' | 'takeover-incomplete' | 'identity-mismatch',
-  ): Response {
+  function claustrumMainRefusal(state: MainCustodyRefusal): Response {
     const error =
       state === 'reauth'
         ? {
@@ -2090,169 +2091,30 @@ const anthropicAuthPlugin = async (
     )
   }
 
-  function fallbackCustodyDimensions(
-    storage: AccountStorage | null,
-    construction = false,
-  ) {
-    const constructionEvidence = construction ? ('unknown' as const) : undefined
-    if (!storage)
-      return {
-        fallbacks: 'T' as const,
-        evidence: constructionEvidence ?? ('V' as const),
-      }
-    const accounts = storage.accounts.filter(
-      (account): account is OAuthAccount =>
-        account.enabled !== false && isOAuthAccount(account),
-    )
-    if (!accounts.length)
-      return {
-        fallbacks:
-          getClaustrumMode(storage) === 'claustrum'
-            ? ('T' as const)
-            : ('R' as const),
-        evidence: constructionEvidence ?? ('V' as const),
-      }
-    const fallbacks = accounts.every((account) =>
-      isCustodyTombstoneOAuth(
-        { type: 'oauth', access: account.access, refresh: account.refresh },
-        'anthropic',
-      ),
-    )
-      ? ('T' as const)
-      : ('R' as const)
-    if (getClaustrumMode(storage) !== 'claustrum')
-      return { fallbacks, evidence: constructionEvidence ?? ('V' as const) }
-    const bindings = accounts.map((account) =>
-      resolveAccountCustodyHandle(account, storage),
-    )
-    if (bindings.some((binding) => binding.status !== 'resolved'))
-      return {
-        fallbacks: 'M' as const,
-        evidence: constructionEvidence ?? ('N' as const),
-      }
-    if (construction) return { fallbacks, evidence: 'unknown' as const }
-    const evidence = bindings.every((binding) => {
-      if (binding.status !== 'resolved') return false
-      return Boolean(
-        usableClaustrumAccessToken(
-          claustrumCredentialCache?.peek(binding.handle),
-          claustrumNow(),
-        ),
-      )
-    })
-      ? ('V' as const)
-      : ('N' as const)
-    return { fallbacks, evidence }
-  }
-
-  function mainCustodyDimension(auth: {
-    type: string
-    access?: string
-    refresh?: string
-  }) {
-    if (isCustodyTombstoneOAuth(auth, 'anthropic')) return 'T' as const
-    if (auth.type === 'oauth' && auth.access && auth.refresh)
-      return 'R' as const
-    return 'X' as const
-  }
-
-  const isFallbackAccountVaultServed = (
-    accountId: string,
-    storage: Awaited<ReturnType<typeof loadAccounts>>,
-  ): boolean => {
-    if (!storage || claustrumBlockedAccounts.has(accountId)) return false
-    const account = storage.accounts.find(
-      (candidate): candidate is OAuthAccount =>
-        candidate.id === accountId && isOAuthAccount(candidate),
-    )
-    if (!account) return false
-    const resolved = resolveAccountCustodyHandle(account, storage)
-    if (!isOAuthAccountVaultOwned(storage, account, resolved)) return false
-    if (resolved.status !== 'resolved') return false
-    const handle = resolved.handle
-    const cached = claustrumCredentialCache?.peek(handle)
-    if (hasClaustrumIdentityMismatch(account, cached)) return false
-    return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
-  }
-
-  const custodyStateFor = (
-    account: { id: string; role: 'main' | 'fallback' },
-    storage: Awaited<ReturnType<typeof loadAccounts>>,
-    vaultServed = isFallbackAccountVaultServed(account.id, storage),
-  ): CustodyStatusState => {
-    if (account.role === 'main') {
-      if (!storage || getClaustrumMode(storage) !== 'claustrum') return 'na'
-      const mainHandle = custodyHandleManifest?.accounts.find(
-        (entry) => entry.label === 'main',
-      )?.handle
-      const cached = mainHandle
-        ? claustrumCredentialCache?.peek(mainHandle)
-        : undefined
-      const persistedIdentity =
-        storage.main?.profile?.providerAccountUuid ??
-        (storage.main?.profile?.accountIdentity as
-          | ProviderAccountUuid
-          | undefined)
-      const credentialIdentity = cached?.accountId
-      if (
-        (persistedIdentity === undefined) !==
-        (credentialIdentity === undefined)
-      )
-        return 'unknown-identity'
-      if (
-        persistedIdentity !== undefined &&
-        credentialIdentity !== undefined &&
-        persistedIdentity !== credentialIdentity
-      )
-        return 'on-identity-mismatch'
-      if (claustrumReauthAccounts.has('main')) return 'on-vault-reauth'
-      if (cached && usableClaustrumAccessToken(cached, claustrumNow()))
-        return 'on-vault-served'
-      return 'on-cold'
-    }
-    if (!storage) return 'off'
-    const stored = storage.accounts.find(
-      (candidate): candidate is OAuthAccount =>
-        candidate.id === account.id && isOAuthAccount(candidate),
-    )
-    if (!stored) return 'off'
-    const resolution = resolveAccountCustodyHandle(stored, storage)
-    if (
-      resolution.status === 'unresolved' &&
-      resolution.reason === 'corrupt-binding'
-    )
-      return 'on-corrupt-binding'
-    if (
-      resolution.status === 'unresolved' &&
-      resolution.reason === 'unknown-identity'
-    )
-      return 'on-identity-mismatch'
-    if (!isOAuthAccountVaultOwned(storage, stored, resolution)) return 'off'
-    const handle =
-      resolution.status === 'resolved' ? resolution.handle : undefined
-    if (
-      handle &&
-      hasClaustrumIdentityMismatch(
-        stored,
-        claustrumCredentialCache?.peek(handle),
-      )
-    )
-      return 'on-identity-mismatch'
-    if (claustrumReauthAccounts.has(account.id)) return 'on-vault-reauth'
-    if (vaultServed) {
-      return 'on-vault-served'
-    }
-    return 'on-cold'
+  const custodyDimensionsDeps = {
+    getCache: () => claustrumCredentialCache,
+    now: () => claustrumNow(),
+    resolveAccountCustodyHandle,
+    usableAccessToken: usableClaustrumAccessToken,
+    hasIdentityMismatch: hasClaustrumIdentityMismatch,
+    isBlocked: (accountId: string) => claustrumBlockedAccounts.has(accountId),
+    isReauth: (accountId: string) => claustrumReauthAccounts.has(accountId),
+    getManifest: () => custodyHandleManifest,
   }
 
   const fallbackCustodyStateFor = (
     accountId: string,
     storage: Awaited<ReturnType<typeof loadAccounts>>,
-    vaultServed = isFallbackAccountVaultServed(accountId, storage),
+    vaultServed = isFallbackAccountVaultServed(
+      accountId,
+      storage,
+      custodyDimensionsDeps,
+    ),
   ): Exclude<CustodyStatusState, 'na'> => {
     const state = custodyStateFor(
       { id: accountId, role: 'fallback' },
       storage,
+      custodyDimensionsDeps,
       vaultServed,
     )
     return state === 'na' ? 'off' : state
@@ -2365,7 +2227,8 @@ const anthropicAuthPlugin = async (
 
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
-    isFallbackAccountVaultServed,
+    isFallbackAccountVaultServed: (accountId, storage) =>
+      isFallbackAccountVaultServed(accountId, storage, custodyDimensionsDeps),
     resolveFallbackAccessToken,
     isFallbackAccountVaultEnabled: (accountId, storage) => {
       const account = storage.accounts.find(
@@ -2716,7 +2579,10 @@ const anthropicAuthPlugin = async (
       claustrumCredentialCache = null
     }
   }
-  const fallbackDimensions = fallbackCustodyDimensions(initialStorage, true)
+  const fallbackDimensions = fallbackCustodyDimensions(initialStorage, {
+    ...custodyDimensionsDeps,
+    construction: true,
+  })
   const provisionalCustody = reconcileCustodyStartup({
     mode: getClaustrumMode(initialStorage) === 'claustrum' ? 'C' : 'L',
     mainSlot: 'unknown',
@@ -3541,7 +3407,11 @@ const anthropicAuthPlugin = async (
             account.enabled !== false && isOAuthAccount(account),
         )
         .map((account) => {
-          const vaultServed = isFallbackAccountVaultServed(account.id, storage)
+          const vaultServed = isFallbackAccountVaultServed(
+            account.id,
+            storage,
+            custodyDimensionsDeps,
+          )
           const custodyState = fallbackCustodyStateFor(
             account.id,
             storage,
@@ -4638,74 +4508,20 @@ const anthropicAuthPlugin = async (
                 : { status: 'unresolved', reason: 'missing-entry' }
           : undefined,
       transition: async (mode) => {
-        if (mode === 'local') {
-          const changed = await executeLocalExit({
-            path: accountStoragePath,
-          })
-          return {
-            text:
-              changed === 'changed'
-                ? 'Claustrum mode set to local. Bound credentials remain inert until verified login.'
-                : 'Claustrum mode already local. Bound credentials remain inert until verified login.',
-          }
-        }
-        if (!latestGetAuth) {
-          return { text: 'Custody takeover refused: main auth is unavailable.' }
-        }
-        const currentStorage =
-          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
-        const cache =
-          claustrumCredentialCache ?? (await ensureClaustrumCredentialCache())
-        if (!cache) {
-          return { text: 'Custody takeover refused: Claustrum is unavailable.' }
-        }
-        const live = createLiveCustodyDeps({
-          storagePath: accountStoragePath,
-          storage: currentStorage,
-          cache,
-          latestGetAuth,
-          now: claustrumNow,
-          fallbackManager,
-          debug: (message) => logger.debug('claustrum', message),
-        })
-        try {
-          const plan = await preflightClaustrumTakeover(
-            await live.preflightInput(
-              { id: 'main', label: 'main', enabled: true },
-              currentStorage.accounts,
-            ),
-          )
-          const changed = await executeClaustrumTakeover(
-            plan,
-            live.takeoverDeps(plan),
-          )
-          await refreshCustodyHandleManifest()
-          const labels = plan.accounts
-            .map((account) => account.label)
-            .join(', ')
-          return {
-            text:
-              changed === 'changed'
-                ? `Claustrum custody committed for: ${labels}.`
-                : `Claustrum custody already committed for: ${labels}.`,
-          }
-        } catch (error) {
-          if (error instanceof CustodyPreflightRefusedError) {
-            const refusals = [
-              ...error.refusals.filter((refusal) => refusal.guidance),
-              ...error.refusals.filter((refusal) => !refusal.guidance),
-            ]
-            return {
-              text: `Custody takeover refused:\n${refusals
-                .map(
-                  ({ label, reason, guidance }) =>
-                    `${label}: ${reason}${guidance ? ` — ${guidance}` : ''}`,
-                )
-                .join('\n')}`,
-            }
-          }
-          throw error
-        }
+        return runClaustrumTakeoverCommand(
+          {
+            storagePath: accountStoragePath,
+            loadStorage: () => loadAccounts(accountStoragePath),
+            getCache: async () =>
+              claustrumCredentialCache ?? ensureClaustrumCredentialCache(),
+            latestGetAuth: latestGetAuth ?? undefined,
+            now: claustrumNow,
+            fallbackManager,
+            refreshManifest: refreshCustodyHandleManifest,
+            debug: (message) => logger.debug('claustrum', message),
+          },
+          mode,
+        )
       },
     })
 
@@ -4832,7 +4648,11 @@ const anthropicAuthPlugin = async (
               )
             ? ('on' as const)
             : ('off' as const)
-      const custodyState = custodyStateFor(account, storage)
+      const custodyState = custodyStateFor(
+        account,
+        storage,
+        custodyDimensionsDeps,
+      )
       return {
         id: account.id,
         label: account.label,
@@ -5362,7 +5182,10 @@ const anthropicAuthPlugin = async (
         }
         const custodyMode = getClaustrumMode(custodyStorage)
         const main = mainCustodyDimension(auth)
-        const fallbackDimensions = fallbackCustodyDimensions(custodyStorage)
+        const fallbackDimensions = fallbackCustodyDimensions(
+          custodyStorage,
+          custodyDimensionsDeps,
+        )
         const mainAccount = mainCustodyAccount(auth)
         const mainBinding =
           custodyMode === 'claustrum' && custodyStorage
@@ -7539,9 +7362,7 @@ const anthropicAuthPlugin = async (
               }
               let requestMainClaustrum: ClaustrumAccessResolution | undefined
               let requestMainRefusal:
-                | 'cold'
-                | 'reauth'
-                | 'identity-mismatch'
+                | Exclude<MainCustodyRefusal, 'takeover-incomplete'>
                 | undefined
               if (claustrumMainRoute) {
                 const { account, handle } = claustrumMainRoute

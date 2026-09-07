@@ -42,18 +42,37 @@ export type ClaustrumTakeoverPlan = {
   toString: () => string
 }
 
+export type CustodyPreflightRefusalReason =
+  | 'TAKEOVER_INCOMPLETE_MAIN_REAL'
+  | 'TAKEOVER_INCOMPLETE_MAIN_BINDING'
+  | 'binding_missing'
+  | 'credential_revoked'
+  | 'credential_reauth'
+  | 'credential_timeout'
+  | 'credential_unusable'
+  | 'credential_identity_mismatch'
+  | 'divergence_fenced'
+  | 'TAKEOVER_INCOMPLETE_MAIN_SLOT'
+  | 'local_credential_unavailable'
+
 export type CustodyPreflightRefusal = {
   label: string
-  reason: string
+  reason: CustodyPreflightRefusalReason
   guidance?: string
 }
+
+export type MainCustodyRefusal =
+  | 'cold'
+  | 'reauth'
+  | 'takeover-incomplete'
+  | 'identity-mismatch'
 
 export class CustodyPreflightRefusedError extends Error {
   readonly code = 'custody_preflight_refused'
 
   constructor(
     readonly accountId: string,
-    readonly reason: string,
+    readonly reason: CustodyPreflightRefusalReason,
     readonly refusals: CustodyPreflightRefusal[] = [
       { label: accountId, reason },
     ],
@@ -221,7 +240,10 @@ export async function preflightClaustrumTakeover(
     getRefreshBeforeExpiryMs(input.storage as never) + 30 * 60_000
   const accounts: ClaustrumTakeoverPlan['accounts'] = []
   const refusals: CollectedPreflightRefusal[] = []
-  const refuse = (route: PreflightRoute, reason: string) => {
+  const refuse = (
+    route: PreflightRoute,
+    reason: CustodyPreflightRefusalReason,
+  ) => {
     refusals.push({
       accountId: route.id,
       label: route.label ?? route.id,
@@ -271,7 +293,7 @@ export async function preflightClaustrumTakeover(
       refuse(route, 'credential_unusable')
       continue
     }
-    // Without a vault id, a same-account wrong-record response remains possible; C5's account_id-vs-persisted-anthropicAccountUuid fence is the live protection.
+    // Without a vault id, a same-account wrong-record response remains possible; the vault `account_id` vs persisted `anthropicAccountUuid` fence is the live protection.
     if (credential.credentialId === undefined)
       input.debug?.(
         'custody identity check skipped: vault supplied no credential id',
@@ -541,10 +563,6 @@ export type ExecuteClaustrumTakeoverDeps = {
   restoreSidecars: (snapshot: CustodySidecarSnapshot) => Promise<void>
   verifyRollback: (snapshot: CustodySidecarSnapshot) => Promise<boolean>
   setMode: (mode: 'claustrum' | 'local') => Promise<'changed' | 'unchanged'>
-}
-
-export function commitClaustrumMode(path: string) {
-  return setClaustrumModePersistent('claustrum', path)
 }
 
 export async function executeClaustrumTakeover(
