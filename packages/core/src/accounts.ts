@@ -53,6 +53,7 @@ export type AccountBase = {
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
+  anthropicAccountUuid?: string
   claustrumHandle?: string
   access?: string
   refresh: string
@@ -561,6 +562,11 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     authLineageId:
       typeof value.authLineageId === 'string' && value.authLineageId.trim()
         ? value.authLineageId
+        : undefined,
+    anthropicAccountUuid:
+      typeof value.anthropicAccountUuid === 'string' &&
+      value.anthropicAccountUuid.trim()
+        ? value.anthropicAccountUuid.trim()
         : undefined,
     claustrumHandle:
       typeof value.claustrumHandle === 'string' && value.claustrumHandle.trim()
@@ -1228,6 +1234,7 @@ function accountRuntimeState(account: FallbackAccount) {
   }
   return objectWithDefinedEntries({
     authLineageId: account.authLineageId,
+    anthropicAccountUuid: account.anthropicAccountUuid,
     claustrumHandle: account.claustrumHandle,
     access: account.access,
     refresh: account.refresh,
@@ -4119,21 +4126,19 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (
+        this.isFallbackAccountVaultEnabled(account.id, storage) &&
+        !this.isFallbackAccountVaultServed(account.id, storage)
+      ) {
+        continue
+      }
       let next = account
       try {
         if (
           tokenNeedsRefresh(next, storage, this.now()) &&
-          (!this.isFallbackAccountVaultEnabled(next.id, storage) ||
-            next.expires === undefined ||
-            next.expires <= this.now()) &&
+          !this.isFallbackAccountVaultEnabled(next.id, storage) &&
           !this.isFallbackAccountVaultServed(next.id, storage)
         ) {
-          if (this.isFallbackAccountVaultEnabled(next.id, storage)) {
-            logger.warn('refresh', 'vault service: local fallback refresh', {
-              accountId: next.id,
-              reason: 'vault credential unavailable',
-            })
-          }
           const refreshError = next.lastRefreshError
           if (
             refreshError &&
@@ -4431,7 +4436,11 @@ export class FallbackAccountManager {
     storage: AccountStorage,
     options: { force?: boolean; persistError?: boolean } = {},
   ): Promise<OAuthAccount> {
-    if (this.isFallbackAccountVaultServed(account.id, storage)) return account
+    if (
+      this.isFallbackAccountVaultServed(account.id, storage) ||
+      this.isFallbackAccountVaultEnabled(account.id, storage)
+    )
+      return account
     const existing = this.refreshPromises.get(account.id)
     if (existing) {
       const refreshed = await existing

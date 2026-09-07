@@ -32,6 +32,7 @@ import {
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
   type ClaustrumConnector,
+  type ClaustrumCredential,
   type ClaustrumCredentialCache,
   ClaustrumCredentialError,
   type ClaustrumReporterSource,
@@ -1190,6 +1191,27 @@ const anthropicAuthPlugin = async (
     await saveAccountState(storage, accountStoragePath, { mainQuota: true })
   }
 
+  async function persistFallbackAnthropicAccountUuid(
+    accountId: string,
+    anthropicAccountUuid: string,
+  ): Promise<void> {
+    const storage = await loadAccounts(accountStoragePath)
+    const account = storage?.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === accountId && isOAuthAccount(candidate),
+    )
+    if (
+      !storage ||
+      !account ||
+      account.anthropicAccountUuid === anthropicAccountUuid
+    )
+      return
+    account.anthropicAccountUuid = anthropicAccountUuid
+    await saveAccountState(storage, accountStoragePath, {
+      accounts: [accountId],
+    })
+  }
+
   async function resolveMainQuotaAccountIdentity(
     accessToken: string,
     model?: string,
@@ -1791,6 +1813,62 @@ const anthropicAuthPlugin = async (
     return resolution
   }
 
+  function mainCustodyAccount(auth: {
+    access?: string
+    refresh?: string
+    expires?: number
+  }): OAuthAccount {
+    return {
+      id: 'main',
+      label: 'main',
+      type: 'oauth',
+      refresh: auth.refresh ?? '',
+      access: auth.access,
+      expires: auth.expires,
+    }
+  }
+
+  function hasClaustrumIdentityMismatch(
+    account: OAuthAccount,
+    credential: ClaustrumCredential | undefined,
+  ): boolean {
+    return Boolean(
+      account.anthropicAccountUuid &&
+        credential?.accountId &&
+        account.anthropicAccountUuid !== credential.accountId,
+    )
+  }
+
+  function claustrumMainRefusal(
+    state: 'cold' | 'reauth' | 'takeover-incomplete',
+  ): Response {
+    const error =
+      state === 'reauth'
+        ? {
+            code: 'claustrum_main_reauth',
+            message:
+              'Claustrum main credential requires re-import; run ck auth import --replace.',
+          }
+        : state === 'takeover-incomplete'
+          ? {
+              code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
+              message:
+                'Claustrum main binding is not active while local main material remains; run ck auth migrate-plugin --allow-main.',
+            }
+          : {
+              code: 'claustrum_main_unavailable',
+              message:
+                'Claustrum main credential is cold; run /claude-account local to leave custody and sign in again.',
+            }
+    return new Response(
+      JSON.stringify({ type: 'error', error: { type: 'api_error', ...error } }),
+      {
+        status: 503,
+        headers: { 'content-type': 'application/json' },
+      },
+    )
+  }
+
   async function clearManifestResolvedLegacyHandle(
     account: OAuthAccount,
     resolution: CustodyHandleResolution,
@@ -1846,6 +1924,7 @@ const anthropicAuthPlugin = async (
     if (resolved.status !== 'resolved') return false
     const handle = resolved.handle
     const cached = claustrumCredentialCache?.peek(handle)
+    if (hasClaustrumIdentityMismatch(account, cached)) return false
     return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
   }
 
@@ -1860,15 +1939,29 @@ const anthropicAuthPlugin = async (
       (candidate): candidate is OAuthAccount =>
         candidate.id === account.id && isOAuthAccount(candidate),
     )
+    if (!stored) return 'off'
+    const resolution = resolveAccountCustodyHandle(stored, storage)
     if (
-      !stored ||
-      !isOAuthAccountVaultOwned(
-        storage,
+      resolution.status === 'unresolved' &&
+      resolution.reason === 'corrupt-binding'
+    )
+      return 'on-corrupt-binding'
+    if (
+      resolution.status === 'unresolved' &&
+      resolution.reason === 'unknown-identity'
+    )
+      return 'on-identity-mismatch'
+    if (!isOAuthAccountVaultOwned(storage, stored, resolution)) return 'off'
+    const handle =
+      resolution.status === 'resolved' ? resolution.handle : undefined
+    if (
+      handle &&
+      hasClaustrumIdentityMismatch(
         stored,
-        resolveAccountCustodyHandle(stored, storage),
+        claustrumCredentialCache?.peek(handle),
       )
     )
-      return 'off'
+      return 'on-identity-mismatch'
     if (claustrumReauthAccounts.has(account.id)) return 'on-vault-reauth'
     if (vaultServed) {
       return 'on-vault-served'
@@ -1908,6 +2001,7 @@ const anthropicAuthPlugin = async (
     const custodyHandle = resolveAccountCustodyHandle(account, storage)
     const handle =
       custodyHandle.status === 'resolved' ? custodyHandle.handle : undefined
+    if (getClaustrumMode(storage) === 'claustrum' && !handle) return {}
     if (
       !handle ||
       !isOAuthAccountVaultOwned(storage, account, custodyHandle) ||
@@ -1917,18 +2011,10 @@ const anthropicAuthPlugin = async (
     }
 
     const cache = claustrumCredentialCache
-    if (!cache) {
-      if (
-        account.access &&
-        account.expires !== undefined &&
-        account.expires > claustrumNow()
-      ) {
-        return { accessToken: account.access }
-      }
-      return {}
-    }
+    if (!cache) return {}
 
     const cached = cache.peek(handle)
+    if (hasClaustrumIdentityMismatch(account, cached)) return {}
     const cachedAccess = usableClaustrumAccessToken(cached, claustrumNow())
     if (cached && cachedAccess) {
       // Claustrum record_version is monotonic per handle: refresh_commit and
@@ -1954,13 +2040,6 @@ const anthropicAuthPlugin = async (
     // A cold vault cache must warm off-path; a usage poll cannot wait for IPC.
     if (options?.warm !== false && !claustrumWarmBackoffActive(handle)) {
       scheduleClaustrumWarm(account.id, handle)
-    }
-    if (
-      account.access &&
-      account.expires !== undefined &&
-      account.expires > claustrumNow()
-    ) {
-      return { accessToken: account.access }
     }
     return {}
   }
@@ -2016,16 +2095,15 @@ const anthropicAuthPlugin = async (
         (candidate): candidate is OAuthAccount =>
           candidate.id === accountId && isOAuthAccount(candidate),
       )
-      return Boolean(
-        account &&
-          isOAuthAccountVaultOwned(
-            storage,
-            account,
-            resolveAccountCustodyHandle(account, storage),
-          ),
+      if (!account) return false
+      const binding = resolveAccountCustodyHandle(account, storage)
+      return (
+        binding.status === 'resolved' &&
+        (getClaustrumMode(storage) === 'claustrum' ||
+          binding.source === 'manifest')
       )
     },
-    onBackgroundRefresh: refreshVaultBackedFallbacks,
+    onBackgroundRefresh: refreshVaultBackedOAuthAccounts,
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     onFallbackStorageChanged: () => {
@@ -2140,13 +2218,41 @@ const anthropicAuthPlugin = async (
     }
   }
 
-  async function refreshVaultBackedFallbacks(initial = false): Promise<void> {
+  async function refreshVaultBackedOAuthAccounts(
+    initial = false,
+  ): Promise<void> {
     await refreshCustodyHandleManifest()
     let cache = claustrumCredentialCache
     const storage = await loadAccounts(accountStoragePath)
     if (!storage) return
     const minTtlMs = getRefreshBeforeExpiryMs(storage) + 30 * 60_000
     let sidebarChanged = false
+
+    const mainAuth =
+      getClaustrumMode(storage) === 'claustrum' && latestGetAuth
+        ? await latestGetAuth().catch(() => undefined)
+        : undefined
+    if (mainAuth?.type === 'oauth') {
+      const main = mainCustodyAccount(mainAuth)
+      const mainBinding = resolveAccountCustodyHandle(main, storage)
+      if (isOAuthAccountVaultOwned(storage, main, mainBinding)) {
+        const handle =
+          mainBinding.status === 'resolved' ? mainBinding.handle : undefined
+        if (handle) {
+          if (!cache) cache = await ensureClaustrumCredentialCache()
+          if (cache) {
+            try {
+              const credential = await cache.get(handle, minTtlMs)
+              if (usableClaustrumAccessToken(credential, claustrumNow())) {
+                await markClaustrumCredentialReady('main', handle)
+              }
+            } catch (error) {
+              handleClaustrumCredentialError('main', error, handle)
+            }
+          }
+        }
+      }
+    }
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
@@ -2167,47 +2273,7 @@ const anthropicAuthPlugin = async (
         }
         continue
       }
-      const sidecarNearExpiry =
-        !account.access ||
-        !account.expires ||
-        account.expires - claustrumNow() <= getRefreshBeforeExpiryMs(storage)
-      const custodyOverrideRefresh = async (reason: string) => {
-        if (
-          refreshBackoffActive(
-            account.lastRefreshError,
-            account.id,
-            claustrumNow(),
-            account.refresh ? tokenFingerprint(account.refresh) : undefined,
-          )
-        ) {
-          return
-        }
-        logger.warn('refresh', 'vault service: local fallback refresh', {
-          accountId: account.id,
-          reason,
-        })
-        await fallbackManager
-          .refreshAccount(account, storage, { persistError: true })
-          .catch((error) => {
-            logger.warn('refresh', 'vault service local refresh failed', {
-              accountId: account.id,
-              error: error instanceof Error ? error.message : String(error),
-            })
-          })
-      }
-      if (!cache) {
-        if (sidecarNearExpiry) {
-          await custodyOverrideRefresh('vault unavailable')
-        }
-        continue
-      }
-      if (initial && !cache.peek(handle)) {
-        if (sidecarNearExpiry) {
-          await custodyOverrideRefresh('vault warmup pending')
-          sidebarChanged = true
-        }
-        continue
-      }
+      if (!cache) continue
       try {
         const credential = await cache.get(handle, minTtlMs)
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
@@ -2215,9 +2281,6 @@ const anthropicAuthPlugin = async (
             id: account.id,
             reason: 'unusable',
           })
-          if (sidecarNearExpiry) {
-            await custodyOverrideRefresh('vault credential unavailable')
-          }
         } else {
           try {
             await clearManifestResolvedLegacyHandle(account, custodyHandle)
@@ -2230,13 +2293,6 @@ const anthropicAuthPlugin = async (
       } catch (error) {
         handleClaustrumCredentialError(account.id, error, handle)
         sidebarChanged = true
-        const action =
-          error instanceof ClaustrumCredentialError ? error.action : 'retry'
-        if (action === 'reauth' || sidecarNearExpiry) {
-          await custodyOverrideRefresh(
-            action === 'reauth' ? 'vault reauth' : 'vault unavailable',
-          )
-        }
       }
     }
     if (sidebarChanged) void refreshSidebarQuota().catch(() => {})
@@ -4837,15 +4893,65 @@ const anthropicAuthPlugin = async (
         latestGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type === 'oauth') {
+          const custodyStorage = await loadAccounts(accountStoragePath)
+          const mainBinding =
+            getClaustrumMode(custodyStorage) === 'claustrum' && custodyStorage
+              ? resolveAccountCustodyHandle(
+                  mainCustodyAccount(auth),
+                  custodyStorage,
+                )
+              : undefined
+          if (
+            mainBinding?.status === 'resolved' &&
+            !isCustodyTombstoneOAuth(auth, 'anthropic')
+          ) {
+            return {
+              fetch: async () => claustrumMainRefusal('takeover-incomplete'),
+            }
+          }
           if (isCustodyTombstoneOAuth(auth, 'anthropic')) {
-            if (
-              getClaustrumMode(await loadAccounts(accountStoragePath)) ===
-              'claustrum'
-            ) {
+            if (getClaustrumMode(custodyStorage) === 'claustrum') {
+              await refreshVaultBackedOAuthAccounts(true)
+              const handle =
+                mainBinding?.status === 'resolved'
+                  ? mainBinding.handle
+                  : undefined
               return {
-                fetch: async () => {
-                  throw new Error(
-                    'CUSTODY_SERVE: main vault serving is not yet available',
+                fetch: async (
+                  input: string | URL | Request,
+                  init?: RequestInit,
+                ) => {
+                  const cache = claustrumCredentialCache
+                  const cached = handle ? cache?.peek(handle) : undefined
+                  const accessToken = usableClaustrumAccessToken(
+                    cached,
+                    claustrumNow(),
+                  )
+                  if (accessToken && cached && handle) {
+                    return sendWithAccessToken(
+                      input,
+                      init,
+                      accessToken,
+                      undefined,
+                      'main',
+                      custodyStorage,
+                      'main',
+                      undefined,
+                      undefined,
+                      false,
+                      undefined,
+                      {
+                        accessToken,
+                        served: {
+                          accountId: 'main',
+                          handle,
+                          recordVersion: cached.recordVersion,
+                        },
+                      },
+                    )
+                  }
+                  return claustrumMainRefusal(
+                    claustrumReauthAccounts.has('main') ? 'reauth' : 'cold',
                   )
                 },
               }
@@ -5750,6 +5856,22 @@ const anthropicAuthPlugin = async (
               modelForIdentity,
               oauthAccountId === 'main' ? mainAccountId : oauthAccountId,
             )
+            if (oauthAccountId !== 'main' && identity.accountUuid) {
+              void persistFallbackAnthropicAccountUuid(
+                oauthAccountId,
+                identity.accountUuid,
+              ).catch((error) => {
+                logger.warn(
+                  'claustrum',
+                  'failed to persist fallback identity',
+                  {
+                    accountId: oauthAccountId,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  },
+                )
+              })
+            }
             trace?.mark('resolve_claude_code_identity', {
               route,
               ms: roundMs(nowMs() - identityStart),
@@ -6106,6 +6228,18 @@ const anthropicAuthPlugin = async (
             }
           }
 
+          function isLocalManifestBoundFallback(
+            account: OAuthAccount,
+            storage: AccountStorage,
+          ): boolean {
+            const custodyBinding = resolveAccountCustodyHandle(account, storage)
+            return (
+              getClaustrumMode(storage) === 'local' &&
+              custodyBinding.status === 'resolved' &&
+              custodyBinding.source === 'manifest'
+            )
+          }
+
           async function getRoutableFallbackAccounts(
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
             options: { includeApiRoutes?: boolean; modelId?: string } = {},
@@ -6119,8 +6253,9 @@ const anthropicAuthPlugin = async (
             )
             const usable: Array<OAuthAccount | ApiKeyAccount> = []
             for (const account of storageArg?.accounts ?? []) {
-              if (isOAuthAccount(account)) {
+              if (storageArg && isOAuthAccount(account)) {
                 if (claustrumBlockedAccounts.has(account.id)) continue
+                if (isLocalManifestBoundFallback(account, storageArg)) continue
                 const usableAccount = usableOAuthById.get(account.id)
                 if (usableAccount) {
                   usable.push(usableAccount)
@@ -6196,9 +6331,6 @@ const anthropicAuthPlugin = async (
               })
             const latestStorage =
               (await loadAccounts(accountStoragePath)) ?? input.storage
-            const usableById = new Map(
-              usableFallbacks.map((account) => [account.id, account]),
-            )
             const allRoutes: StickyOAuthRoute[] = []
             if (
               !isPermanentRefreshError(
@@ -6220,7 +6352,15 @@ const anthropicAuthPlugin = async (
             ).entries()) {
               if (stored.enabled === false || !isOAuthAccount(stored)) continue
               if (claustrumBlockedAccounts.has(stored.id)) continue
-              const account = usableById.get(stored.id) ?? stored
+              if (
+                latestStorage &&
+                isLocalManifestBoundFallback(stored, latestStorage)
+              )
+                continue
+              const account =
+                usableFallbacks.find(
+                  (candidate) => candidate.id === stored.id,
+                ) ?? stored
               const credential = resolveClaustrumAccess(account, latestStorage)
               const servedByClaustrum = Boolean(credential.served)
               if (

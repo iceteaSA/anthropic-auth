@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   assertNotCustodyTombstone,
   buildRefreshOperationError,
@@ -367,7 +367,7 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
-  test('rejects malformed handle accounts while tolerating unknown fields', () => {
+  test('marks malformed account entries as corrupt while retaining valid entries', () => {
     const fixture = structuredClone(handlesFixture) as {
       providers: Array<{
         provider: string
@@ -390,9 +390,36 @@ describe('Claustrum custody tombstones', () => {
       { ...account, extra: 'ignored' },
     ]
 
-    expect(() =>
-      readCustodyHandles(fixture, oauthFixture.provider, 'anthropic-auth'),
-    ).toThrow('invalid account label')
+    const parsed = readCustodyHandles(
+      fixture,
+      oauthFixture.provider,
+      'anthropic-auth',
+    )
+    expect(parsed.corruptLabels).toEqual(new Set([String(account.label)]))
+    expect(parsed.accounts).toHaveLength(1)
+  })
+
+  test('marks non-canonical credential IDs as corrupt bindings', () => {
+    const fixture = structuredClone(handlesFixture) as {
+      providers: Array<{
+        provider: string
+        accounts: Array<Record<string, unknown>>
+      }>
+    }
+    const anthropic = fixture.providers.find(
+      (provider) => provider.provider === oauthFixture.provider,
+    )
+    if (!anthropic) throw new Error('missing anthropic fixture')
+    const account = anthropic.accounts[0]
+    if (!account) throw new Error('missing anthropic account fixture')
+    anthropic.accounts = [{ ...account, credential_id: 'wrong' }]
+
+    const parsed = readCustodyHandles(
+      fixture,
+      oauthFixture.provider,
+      'anthropic-auth',
+    )
+    expect(parsed.corruptLabels).toEqual(new Set([String(account.label)]))
   })
 
   test('throws when the requested provider is absent', () => {
@@ -523,7 +550,7 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
-  test('loads a main tombstone under claustrum and directs local mode to /login', async () => {
+  test('returns a typed cold refusal for a manifest-resolved main tombstone', async () => {
     const fetchCalls: string[] = []
     globalThis.fetch = mock((input: unknown) => {
       fetchCalls.push(extractUrl(input as string | URL | Request))
@@ -539,7 +566,29 @@ describe('Claustrum custody tombstones', () => {
       accounts: [],
     })
 
-    await createTempStorage(makeStorage('claustrum'), async () => {
+    await createTempStorage(makeStorage('claustrum'), async (path) => {
+      const handlesPath = join(dirname(path), 'handles.json')
+      await writeFile(
+        handlesPath,
+        JSON.stringify({
+          version: 1,
+          providers: [
+            {
+              provider: 'anthropic',
+              serve: 'anthropic-auth',
+              accounts: [
+                {
+                  label: 'main',
+                  handle: `ckh_${'M'.repeat(43)}`,
+                  credential_id: 'oauth:anthropic:main',
+                },
+              ],
+            },
+          ],
+        }),
+      )
+      await chmod(handlesPath, 0o600)
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = handlesPath
       const timers = disabledTimerOverrides()
       const plugin = (await AnthropicAuthPlugin(
         // @ts-expect-error: minimal mock for testing
@@ -551,13 +600,53 @@ describe('Claustrum custody tombstones', () => {
           mock: { calls: unknown[] }
         }
       ).mock.calls.length
-      await expect(
-        plugin.auth.loader(
-          () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
-          { models: {} } as never,
-        ),
-      ).resolves.toHaveProperty('fetch')
+      const loaded = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            ...custodyTombstoneOAuth(oauthFixture.provider),
+            access: 'contaminated-local-access',
+          }),
+        { models: {} } as never,
+      )
+      const response = await loaded.fetch(
+        'https://api.anthropic.com/v1/messages',
+        { method: 'POST', body: '{}' },
+      )
+      expect(response.status).toBe(503)
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: 'claustrum_main_unavailable',
+          message: expect.stringContaining('/claude-account local'),
+        },
+      })
       expect(timers.setInterval).toHaveBeenCalledTimes(intervalsBeforeLoader)
+      expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
+      expect(fetchCalls).toHaveLength(0)
+
+      const realLoaded = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'real-local-access',
+            refresh: 'real-local-refresh',
+            expires: Date.now() + 60_000,
+          }),
+        { models: {} } as never,
+      )
+      const realResponse = await realLoaded.fetch(
+        'https://api.anthropic.com/v1/messages',
+        { method: 'POST', body: '{}' },
+      )
+      expect(realResponse.status).toBe(503)
+      await expect(realResponse.json()).resolves.toMatchObject({
+        error: {
+          code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
+          message: expect.stringContaining(
+            'ck auth migrate-plugin --allow-main',
+          ),
+        },
+      })
+      expect(fetchCalls).toHaveLength(0)
       await plugin.dispose?.()
     })
 

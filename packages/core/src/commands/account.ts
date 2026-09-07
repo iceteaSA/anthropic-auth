@@ -161,19 +161,25 @@ export type CustodyStatusState =
   | 'on-vault-served'
   | 'on-vault-reauth'
   | 'on-cold'
+  | 'on-identity-mismatch'
+  | 'on-corrupt-binding'
 
 export function custodyStatusLabel(state: CustodyStatusState): string {
   switch (state) {
     case 'na':
       return 'n/a (OpenCode-managed)'
     case 'off':
-      return 'binding absent'
+      return 'not enrolled'
     case 'on-vault-served':
-      return 'binding present · vault-served'
+      return 'vault-served'
     case 'on-vault-reauth':
-      return 'binding present · vault reauth'
+      return 'vault reauth'
     case 'on-cold':
-      return 'binding present · cold'
+      return 'vault cold'
+    case 'on-identity-mismatch':
+      return 'identity mismatch'
+    case 'on-corrupt-binding':
+      return 'corrupt binding'
   }
 }
 
@@ -282,14 +288,13 @@ export async function executeAccountCommand(input: {
       const binding = storedAccount
         ? input.resolveCustodyBinding?.(storedAccount)
         : undefined
-      const custody =
-        a.id !== mainId &&
-        storedAccount &&
-        isOAuthAccountVaultOwned(input.storage, storedAccount, binding)
-          ? 'vault-bound'
-          : projected?.claustrumGate === 'on'
-            ? 'vault-bound'
-            : 'local'
+      const custody = projected
+        ? custodyStatusLabel(projected.custodyState)
+        : a.id !== mainId &&
+            storedAccount &&
+            isOAuthAccountVaultOwned(input.storage, storedAccount, binding)
+          ? 'vault cold'
+          : 'local'
       lines.push(
         `- **${a.label}** [${a.role}]${tier}${status}${pct} · ${custody}`,
       )
