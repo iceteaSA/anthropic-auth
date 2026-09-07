@@ -231,7 +231,7 @@ The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-
 
 `quotaHeaderFeed.enabled` is an OpenCode-only, restart-required opt-in. It publishes only allowlisted quota-window values, an opaque account reference, an observation timestamp, and the configured OAuth-account count; it never publishes tokens, raw headers, request bodies, model IDs, or refresh errors. Per-process lease files use owner-only permissions under `$TMPDIR/opencode-anthropic-auth/quota-header-feed`, expire after three minutes, and can be redirected with `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR`.
 
-`claustrum.accounts.<fallback-account-id>.enabled` is a per-account opt-in for fallback credential custody. It is inert unless that account's capability handle has been provisioned in `anthropic-auth-state.json`; handles are bearer credentials and must not be copied into the public config file.
+`claustrum.accounts` remains loadable only so configurations can safely downgrade to older releases; it does not gate custody per account. Capability handles are bearer credentials and must not be copied into the public config file.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
@@ -287,7 +287,7 @@ If Anthropic reports `invalid_grant`, that account must be logged in again. `/cl
 
 In global Claustrum mode, `/claude-account claustrum` serves OAuth routes that have a binding present in the Claustrum handle manifest; `/claude-account local` returns authority to local OAuth refresh. The vault serves credentials, and the plugin discovers only its own provider block.
 
-The request path reads only a resident in-memory credential. Startup warming and periodic reconciliation perform vault I/O and keep idle credentials refreshed; a cold or unavailable vault falls back to the sidecar credential path. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the account modal show manifest-binding presence, current vault service, and vault reauthentication state without exposing capability handles.
+The request path reads only a resident in-memory credential. Startup warming and periodic reconciliation perform vault I/O and keep idle credentials refreshed. In Claustrum mode, a cold or unavailable vault must return a typed provider-unavailable response; it does not fall back to the sidecar credential path. That cold-route behavior lands with the dedicated cold-route task. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the account modal show manifest-binding presence, current vault service, and vault reauthentication state without exposing capability handles.
 
 If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state. API-key routes are unaffected.
 

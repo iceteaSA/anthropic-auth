@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
 import {
+  assertNotCustodyTombstone,
   type CustodyHandleResolution,
   CustodyTombstoneRefreshError,
 } from './claustrum.ts'
@@ -932,13 +933,11 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
   if (
     !mode &&
     !handlesFile &&
-    (!accounts || Object.keys(accounts).length === 0) &&
-    Object.keys(value).length === 0
+    (!accounts || Object.keys(accounts).length === 0)
   ) {
     return undefined
   }
   return {
-    ...value,
     ...(mode && { mode }),
     ...(handlesFile && { handlesFile }),
     ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
@@ -1572,7 +1571,9 @@ export async function setClaustrumModePersistent(
       const storage = (await loadAccounts(path)) ?? createEmptyStorage()
       if (getClaustrumMode(storage) === mode) return 'unchanged'
       storage.claustrum = { ...storage.claustrum, mode }
-      await saveAccountsWithConfigLock(storage, path, {})
+      await saveAccountsWithConfigLock(storage, path, {
+        writeClaustrumMode: true,
+      })
       return 'changed'
     } finally {
       await lock.release()
@@ -1676,6 +1677,8 @@ export interface SaveAccountsOptions {
   /** Preserve disk order when a stale snapshot is missing newer accounts. */
   preserveExistingAccountOrder?: boolean
   setClaustrumHandleAccountIds?: readonly string[]
+  /** Internal marker for the sole persistent custody-mode writer. */
+  writeClaustrumMode?: boolean
 }
 
 function sameAccountIdentity(
@@ -1829,8 +1832,20 @@ async function saveAccountsWithConfigLock(
   const nextStorage: AccountStorage = {
     ...storage,
     ...(storage.claustrum && {
-      claustrum: { ...current?.claustrum, ...storage.claustrum },
+      claustrum: {
+        ...current?.claustrum,
+        ...storage.claustrum,
+        ...(options.writeClaustrumMode
+          ? { mode: storage.claustrum.mode }
+          : current?.claustrum?.mode
+            ? { mode: current.claustrum.mode }
+            : {}),
+      },
     }),
+    ...(!storage.claustrum &&
+      current?.claustrum && {
+        claustrum: current.claustrum,
+      }),
     accounts: mergeAccountsForSave(
       current?.accounts ?? [],
       storage.accounts,
@@ -1839,6 +1854,7 @@ async function saveAccountsWithConfigLock(
   }
   const existing = await loadExistingTopLevelFields(path)
   const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+  if (!nextStorage.claustrum) delete nextConfig.claustrum
   await writeJsonAtomic(path, nextConfig)
   // Config precedes state everywhere both locks are needed; reversing this
   // order can deadlock profile mutations against full account saves.
@@ -3789,6 +3805,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   fetchImpl?: typeof fetch
   now?: () => number
 }): Promise<OAuthQuotaSnapshot> {
+  assertNotCustodyTombstone(input.accessToken, 'anthropic')
   const fetchImpl = input.fetchImpl ?? fetch
   const response = await fetchImpl(QUOTA_URL, {
     method: 'GET',
