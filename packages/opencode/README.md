@@ -676,6 +676,12 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | Variable | Description |
 | --- | --- |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
+| `ANTHROPIC_CUSTOM_HEADERS` | Add or override headers on API-key and proxy routes. Ignored for OAuth requests. |
+| `ANTHROPIC_MODEL` | Default proxy alias for any `claude-*` model. Ignored for OAuth requests. |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Proxy alias for `claude-sonnet-*` models. |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Proxy alias for `claude-opus-*` models. |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Proxy alias for `claude-haiku-*` models. |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Proxy alias for `claude-fable-*` and `claude-mythos-*` models. |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to bypass Anthropic's server policy and use deterministic 10-response client recovery exclusively. The default tries server-side safety fallback first and uses client recovery as a backstop. |
@@ -683,6 +689,10 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `PI_AGENT_DIR` | Override Pi's agent directory when deriving the default sidecar path. |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID used by relay setup. |
+
+`ANTHROPIC_CUSTOM_HEADERS` and the model-alias variables apply only to API-key and proxy routes. OAuth requests keep the Claude Code header and model identity unchanged. Custom headers accept either a JSON object or comma/newline-separated `name: value` entries. Invalid values are ignored with one warning.
+
+An `ANTHROPIC_BASE_URL` path is preserved. For example, `https://proxy.example/anthropic` sends requests to `/anthropic/v1/messages`. The `/v1` path repair applies only while a base-URL override is active.
 
 ## Request rewriting
 
