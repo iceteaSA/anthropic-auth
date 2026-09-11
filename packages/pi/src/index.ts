@@ -17,7 +17,10 @@ import type {
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
-import { collectPiEffortHistory } from './effort-history.ts'
+import {
+  buildContextEntries,
+  collectPiEffortHistory,
+} from './effort-history.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
 
 async function loginAnthropic(
@@ -72,7 +75,10 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId()
     if (!sessionId) return
     const transitions = collectPiEffortHistory(
-      ctx.sessionManager.buildContextEntries(),
+      buildContextEntries(
+        ctx.sessionManager.getEntries(),
+        ctx.sessionManager.getLeafId?.() ?? null,
+      ),
       ctx.sessionManager.getBranch(),
     )
     effortHistoryBySession.delete(sessionId)

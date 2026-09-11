@@ -88,3 +88,54 @@ export function collectPiEffortHistory(
 
   return transitions
 }
+
+type SessionEntryWithParent = SessionEntryLike & {
+  id: string
+  parentId?: string | null
+  firstKeptEntryId?: unknown
+}
+
+/**
+ * Compaction-aware active entry list, mirroring the host SDK's
+ * buildContextEntries: latest compaction plus kept entries replace the
+ * summarized prefix. Implemented locally because some Pi-compatible hosts
+ * (oh-my-pi) lack the SDK method while sharing the entry model.
+ */
+export function buildContextEntries(
+  entries: readonly SessionEntryWithParent[],
+  leafId?: string | null,
+): SessionEntryWithParent[] {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]))
+  let leaf: SessionEntryWithParent | undefined
+  if (leafId !== null) {
+    if (leafId) leaf = byId.get(leafId)
+    leaf ??= entries.at(-1)
+  }
+  if (!leaf) return []
+  const path: SessionEntryWithParent[] = []
+  let current: SessionEntryWithParent | undefined = leaf
+  while (current) {
+    path.push(current)
+    current = current.parentId ? byId.get(current.parentId) : undefined
+  }
+  path.reverse()
+
+  let compaction: SessionEntryWithParent | undefined
+  for (const entry of path) {
+    if (entry.type === 'compaction') compaction = entry
+  }
+  if (!compaction) return path
+
+  const compactionIndex = path.findIndex((entry) => entry.id === compaction.id)
+  if (compactionIndex < 0) return path
+  const contextEntries: SessionEntryWithParent[] = [compaction]
+  let foundFirstKept = false
+  for (let index = 0; index < compactionIndex; index++) {
+    const entry = path[index]
+    if (!entry) continue
+    if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true
+    if (foundFirstKept) contextEntries.push(entry)
+  }
+  contextEntries.push(...path.slice(compactionIndex + 1))
+  return contextEntries
+}
