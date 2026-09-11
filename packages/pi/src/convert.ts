@@ -75,6 +75,14 @@ export type AnthropicRequestBody = {
 function sanitize(text: string): string {
   return text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
 }
+function extractSystemPromptTexts(systemPrompt: unknown): string[] {
+  const values = Array.isArray(systemPrompt) ? systemPrompt : [systemPrompt]
+  return values.flatMap((value) => {
+    if (typeof value !== 'string') return []
+    const text = value.trim()
+    return text ? [text] : []
+  })
+}
 
 /**
  * Detect lone (unpaired) UTF-16 surrogates. With the `u` flag the character
@@ -494,7 +502,11 @@ export async function buildAnthropicRequest(
     },
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
-  if (context.systemPrompt?.trim()) {
+  if (Array.isArray(context.systemPrompt)) {
+    for (const text of extractSystemPromptTexts(context.systemPrompt)) {
+      system.push({ type: 'text', text: sanitize(text) })
+    }
+  } else if (context.systemPrompt?.trim()) {
     // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
     // its documentation paragraph (the docs/*.md enumeration and the "follow .md
     // cross-references" instruction) are each independently sufficient to make

@@ -343,6 +343,63 @@ describe('convertMessages — empty base64 image guard', () => {
     expect(content[1]?.type).toBe('image')
   })
 })
+describe('buildAnthropicRequest — system prompt arrays', () => {
+  test('adds each non-empty prompt string as a separate text block', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-4-20250514',
+      {
+        messages: [userMsg('hello')],
+        systemPrompt: [' first prompt ', 'second prompt'],
+        tools: [],
+      } as unknown as Parameters<typeof buildAnthropicRequest>[1],
+      undefined,
+      defaultCache,
+    )
+
+    expect(body.system).toHaveLength(4)
+    expect(body.system?.map((block) => block.type)).toEqual([
+      'text',
+      'text',
+      'text',
+      'text',
+    ])
+    expect(body.system?.slice(2).map((block) => block.text)).toEqual([
+      'first prompt',
+      'second prompt',
+    ])
+  })
+
+  test('skips empty and whitespace-only prompt strings', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-4-20250514',
+      {
+        messages: [userMsg('hello')],
+        systemPrompt: ['', '  ', 'valid'],
+        tools: [],
+      } as unknown as Parameters<typeof buildAnthropicRequest>[1],
+      undefined,
+      defaultCache,
+    )
+
+    expect(body.system).toHaveLength(3)
+    expect(body.system?.[2]?.text).toBe('valid')
+  })
+
+  test('does not add prompt blocks for an empty prompt array', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-sonnet-4-20250514',
+      {
+        messages: [userMsg('hello')],
+        systemPrompt: [],
+        tools: [],
+      } as unknown as Parameters<typeof buildAnthropicRequest>[1],
+      undefined,
+      defaultCache,
+    )
+
+    expect(body.system).toHaveLength(2)
+  })
+})
 
 describe('buildAnthropicRequest — Claude Code system[] shape', () => {
   // Anthropic rejects Pi's documentation paragraph inside the top-level
