@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
+  __setLogTestSink,
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyCustomHeaders,
@@ -305,19 +306,50 @@ describe('Claude Code fingerprint helpers', () => {
     expect(compatibility.accountUuid).toBe('account-b')
   })
 
-  test('applies ANTHROPIC_CUSTOM_HEADERS after generated Claude Code headers', () => {
+  test('keeps Claude Code OAuth identity headers unchanged when custom headers are configured', () => {
     const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
+    const identity: ClaudeCodeIdentity = {
+      deviceId: 'a'.repeat(64),
+      accountUuid: '11111111-2222-4333-8444-555555555555',
+      sessionId: '66666666-7777-4888-9999-aaaaaaaaaaaa',
+    }
+    const body = {
+      model: 'claude-sonnet-4-6',
+      messages: [],
+      system: [],
+      tools: [],
+    }
+    const normalizedHeaders = (headers: Headers) => {
+      const entries = [...headers.entries()]
+        .filter(([key]) => key !== 'x-client-request-id')
+        .sort(([left], [right]) => left.localeCompare(right))
+      return new Headers(entries)
+    }
+
+    delete process.env.ANTHROPIC_CUSTOM_HEADERS
+    const baseline = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+      body,
+      identity,
+    })
+
     process.env.ANTHROPIC_CUSTOM_HEADERS = JSON.stringify({
-      'x-provider-api-key': 'provider-key',
-      'anthropic-version': '2024-01-01',
-      'x-list': ['a', 'b'],
+      authorization: 'Bearer user-controlled',
+      'user-agent': 'Mozilla/5.0',
+      'x-app': 'not-cli',
+      'anthropic-beta': 'not-a-beta',
+      'anthropic-version': '1999-01-01',
+      'x-claude-code-session-id': '00000000-0000-4000-8000-000000000000',
+      'x-api-key': 'user-controlled',
     })
     try {
-      const headers = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test')
+      const headers = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+        body,
+        identity,
+      })
 
-      expect(headers.get('x-provider-api-key')).toBe('provider-key')
-      expect(headers.get('anthropic-version')).toBe('2024-01-01')
-      expect(headers.get('x-list')).toBe('a, b')
+      expect([...normalizedHeaders(headers).entries()]).toEqual([
+        ...normalizedHeaders(baseline).entries(),
+      ])
     } finally {
       if (previous === undefined) {
         delete process.env.ANTHROPIC_CUSTOM_HEADERS
@@ -353,10 +385,28 @@ describe('Claude Code fingerprint helpers', () => {
     expect(headers.get('x-three')).toBe('value:with:colon')
   })
 
-  test('rejects non-object custom headers configuration', () => {
-    expect(() => applyCustomHeaders(new Headers(), '[]')).toThrow(
-      'ANTHROPIC_CUSTOM_HEADERS must be a JSON object',
-    )
+  test('ignores malformed custom headers after one warning without changing headers', () => {
+    const records: Array<{ level: string; channel: string; message: string }> =
+      []
+    const malformed = '{"x-a":'
+    __setLogTestSink((record) => records.push(record))
+    try {
+      const headers = new Headers({ 'x-existing': 'unchanged' })
+
+      expect(() => applyCustomHeaders(headers, malformed)).not.toThrow()
+      expect(() => applyCustomHeaders(headers, malformed)).not.toThrow()
+      expect(headers).toEqual(new Headers({ 'x-existing': 'unchanged' }))
+      expect(
+        records.filter(
+          (record) =>
+            record.level === 'warn' &&
+            record.channel === 'custom-headers' &&
+            record.message === 'ignoring malformed ANTHROPIC_CUSTOM_HEADERS',
+        ),
+      ).toHaveLength(1)
+    } finally {
+      __setLogTestSink(null)
+    }
   })
 
   test('orders serialized body fields like captured Claude Code requests', () => {
