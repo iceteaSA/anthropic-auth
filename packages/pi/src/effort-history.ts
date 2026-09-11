@@ -95,11 +95,27 @@ type SessionEntryWithParent = SessionEntryLike & {
   firstKeptEntryId?: unknown
 }
 
+type SessionManagerLeaf = {
+  getLeafId?: () => string | null
+  [key: string]: unknown
+}
+
+export function resolveSessionLeafId(
+  sessionManager: SessionManagerLeaf,
+): string | null | undefined {
+  return sessionManager.getLeafId?.()
+}
+
 /**
  * Compaction-aware active entry list, mirroring the host SDK's
  * buildContextEntries: latest compaction plus kept entries replace the
  * summarized prefix. Implemented locally because some Pi-compatible hosts
  * (oh-my-pi) lack the SDK method while sharing the entry model.
+ *
+ * `undefined` means the leaf is unknown and selects the latest entry; `null`
+ * means an explicit no-leaf state and returns an empty list; a string selects
+ * that leaf. Callers must preserve the distinction and not coalesce an absent
+ * leaf method into `null`.
  */
 export function buildContextEntries(
   entries: readonly SessionEntryWithParent[],
@@ -107,10 +123,9 @@ export function buildContextEntries(
 ): SessionEntryWithParent[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry]))
   let leaf: SessionEntryWithParent | undefined
-  if (leafId !== null) {
-    if (leafId) leaf = byId.get(leafId)
-    leaf ??= entries.at(-1)
-  }
+  if (leafId === null) return []
+  if (leafId) leaf = byId.get(leafId)
+  leaf ??= entries.at(-1)
   if (!leaf) return []
   const path: SessionEntryWithParent[] = []
   let current: SessionEntryWithParent | undefined = leaf

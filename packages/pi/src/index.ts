@@ -20,6 +20,7 @@ import { registerCommands } from './commands.ts'
 import {
   buildContextEntries,
   collectPiEffortHistory,
+  resolveSessionLeafId,
 } from './effort-history.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
 
@@ -77,7 +78,7 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
     const transitions = collectPiEffortHistory(
       buildContextEntries(
         ctx.sessionManager.getEntries(),
-        ctx.sessionManager.getLeafId?.() ?? null,
+        resolveSessionLeafId(ctx.sessionManager),
       ),
       ctx.sessionManager.getBranch(),
     )
