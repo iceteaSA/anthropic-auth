@@ -15,7 +15,6 @@ import { getRpcDir } from '../rpc/rpc-dir'
 import type { RpcServerHandle } from '../rpc/rpc-server'
 
 type RpcGlobal = typeof globalThis & {
-  __anthropicAuthRpcServer?: RpcServerHandle
   __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
 }
 
@@ -25,6 +24,7 @@ let previousAccountFile: string | undefined
 let previousSidebarStateFile: string | undefined
 let previousCacheKeepRegistryDir: string | undefined
 let previousQuotaFeedDir: string | undefined
+let startedRpcDirs: Set<string>
 
 const disabledPluginRuntimeOverrides = {
   setInterval: mock(
@@ -54,6 +54,7 @@ async function getPlugin(
     ctx: Parameters<typeof AnthropicAuthPlugin>[0],
     runtimeOverrides: typeof disabledPluginRuntimeOverrides,
   ) => ReturnType<typeof AnthropicAuthPlugin>
+  startedRpcDirs.add(getRpcDir(directory))
   return plugin(
     {
       // @ts-expect-error: minimal mock for testing
@@ -87,22 +88,17 @@ async function applyViaRpc(
 async function stopRpcServers() {
   const rpcGlobal = globalThis as RpcGlobal
   const servers = rpcGlobal.__anthropicAuthRpcServers
-  const handles = new Set<RpcServerHandle>([
-    ...(servers?.values() ?? []),
-    ...(rpcGlobal.__anthropicAuthRpcServer
-      ? [rpcGlobal.__anthropicAuthRpcServer]
-      : []),
-  ])
+  const handles = new Set<RpcServerHandle>(servers?.values() ?? [])
   await Promise.all([...handles].map((server) => server.stop()))
   if (servers) {
     servers.clear()
     rpcGlobal.__anthropicAuthRpcServers = undefined
   }
-  rpcGlobal.__anthropicAuthRpcServer = undefined
 }
 
 beforeEach(async () => {
   testRoot = await mkdtemp(join(tmpdir(), 'aa-rpc-multi-project-'))
+  startedRpcDirs = new Set()
   previousRpcDir = process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
   previousAccountFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   previousSidebarStateFile =
@@ -132,6 +128,12 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await stopRpcServers()
+  for (const rpcDir of startedRpcDirs) {
+    expect(
+      (globalThis as RpcGlobal).__anthropicAuthRpcServers?.get(rpcDir),
+    ).toBeUndefined()
+    expect(await discoverPortFile(rpcDir)).toBeNull()
+  }
   if (previousRpcDir === undefined) {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
   } else {
@@ -316,6 +318,9 @@ describe('RPC server lifecycle', () => {
     expect(rpcGlobal.__anthropicAuthRpcServers?.get(rpcDir)).toBe(
       successorHandle,
     )
+    // Dispose refused to stop D1 by design; the spy wraps the real stop, so
+    // invoking it clears the dangling server and its port file before afterEach.
+    await stopSpy()
   })
 
   test('a disposed project can start a discoverable RPC server again', async () => {

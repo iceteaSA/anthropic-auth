@@ -2809,7 +2809,6 @@ const anthropicAuthPlugin = async (
   let rpcDir: string | null = null
   if (ctx.directory) {
     const rpcGlobal = globalThis as {
-      __anthropicAuthRpcServer?: RpcServerHandle
       __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
     }
     rpcDir = getRpcDir(ctx.directory)
@@ -2820,9 +2819,6 @@ const anthropicAuthPlugin = async (
     if (previousRpcServer) {
       await previousRpcServer.stop().catch(() => {})
       rpcServers.delete(rpcDir)
-      if (rpcGlobal.__anthropicAuthRpcServer === previousRpcServer) {
-        rpcGlobal.__anthropicAuthRpcServer = undefined
-      }
     }
     try {
       rpcServer = await startRpcServer({
@@ -2831,7 +2827,6 @@ const anthropicAuthPlugin = async (
         apply: applyCommand,
       })
       rpcServers.set(rpcDir, rpcServer)
-      rpcGlobal.__anthropicAuthRpcServer = rpcServer
     } catch (error) {
       logger.warn('rpc', 'failed to start', {
         error: error instanceof Error ? error.message : String(error),
