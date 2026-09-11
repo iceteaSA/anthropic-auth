@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { type Dirent, constants as fsConstants } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import {
   type BindIdentity,
   type CatalogEntry,
@@ -713,9 +713,16 @@ function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
   )
 }
 
+export function __deriveCustodyManifestStaleLockPrefix(
+  lockPath: string,
+  pathBasename: (path: string) => string,
+): string {
+  return `${pathBasename(lockPath)}.stale-`
+}
+
 async function reapStaleCustodyManifestLocks(lockPath: string): Promise<void> {
   const parent = dirname(lockPath)
-  const prefix = `${lockPath.slice(lockPath.lastIndexOf('/') + 1)}.stale-`
+  const prefix = __deriveCustodyManifestStaleLockPrefix(lockPath, basename)
   let entries: Dirent[]
   try {
     entries = await fs.readdir(parent, { withFileTypes: true })
