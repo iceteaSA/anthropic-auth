@@ -181,7 +181,7 @@ import {
   stickyRouteFamilyForModel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import type { Plugin } from '@opencode-ai/plugin'
+import type { Hooks, Plugin } from '@opencode-ai/plugin'
 
 import {
   applyCacheDiagnosticsOptIn,
@@ -2806,23 +2806,64 @@ const anthropicAuthPlugin = async (
   }
 
   let rpcServer: RpcServerHandle | null = null
+  let rpcDir: string | null = null
   if (ctx.directory) {
     const rpcGlobal = globalThis as {
       __anthropicAuthRpcServer?: RpcServerHandle
+      __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
     }
-    if (rpcGlobal.__anthropicAuthRpcServer) {
-      await rpcGlobal.__anthropicAuthRpcServer.stop().catch(() => {})
-      rpcGlobal.__anthropicAuthRpcServer = undefined
+    rpcDir = getRpcDir(ctx.directory)
+    const rpcServers =
+      rpcGlobal.__anthropicAuthRpcServers ?? new Map<string, RpcServerHandle>()
+    rpcGlobal.__anthropicAuthRpcServers = rpcServers
+    const previousRpcServer = rpcServers.get(rpcDir)
+    if (previousRpcServer) {
+      await previousRpcServer.stop().catch(() => {})
+      rpcServers.delete(rpcDir)
+      if (rpcGlobal.__anthropicAuthRpcServer === previousRpcServer) {
+        rpcGlobal.__anthropicAuthRpcServer = undefined
+      }
     }
     try {
       rpcServer = await startRpcServer({
-        dir: getRpcDir(ctx.directory),
+        dir: rpcDir,
         drain: drainNotifications,
         apply: applyCommand,
       })
+      rpcServers.set(rpcDir, rpcServer)
       rpcGlobal.__anthropicAuthRpcServer = rpcServer
     } catch (error) {
       logger.warn('rpc', 'failed to start', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  const dispose: NonNullable<Hooks['dispose']> = async () => {
+    try {
+      await quotaHeaderFeedRegistry?.dispose()
+    } catch (error) {
+      logger.warn('quota-header-feed', 'failed to dispose', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
+      claustrumCredentialCache?.close()
+    } catch (error) {
+      logger.warn('claustrum', 'failed to close credential cache', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    const rpcServers = (
+      globalThis as {
+        __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
+      }
+    ).__anthropicAuthRpcServers
+    if (!rpcServer || !rpcDir || rpcServers?.get(rpcDir) !== rpcServer) return
+    try {
+      await rpcServer.stop()
+      if (rpcServers.get(rpcDir) === rpcServer) rpcServers.delete(rpcDir)
+    } catch (error) {
+      logger.warn('rpc', 'failed to stop', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -7600,10 +7641,6 @@ const anthropicAuthPlugin = async (
 
         return {}
       },
-      dispose: async () => {
-        await quotaHeaderFeedRegistry?.dispose()
-        claustrumCredentialCache?.close()
-      },
       methods: [
         {
           label: 'Claude Pro/Max',
@@ -7664,6 +7701,7 @@ const anthropicAuthPlugin = async (
         },
       ],
     },
+    dispose,
     __primeManager: primeManager,
     __quotaManager: quotaManager,
     __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,

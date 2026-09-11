@@ -7,6 +7,7 @@ import {
   pushNotification,
   resetNotificationsForTest,
 } from '../rpc/notifications'
+import { discoverPortFile } from '../rpc/port-file'
 import { startRpcServer } from '../rpc/rpc-server'
 
 let stop: (() => Promise<void>) | null = null
@@ -173,5 +174,27 @@ describe('rpc-server', () => {
     await new Promise((r) => setTimeout(r, 50))
     process.removeListener('uncaughtException', onUnhandled)
     expect(unhandledError).toBeNull()
+  })
+
+  test('stopping a stale server preserves its successor port file', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'aa-rpcsrv-'))
+    const first = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    const second = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    stop = second.stop
+
+    await first.stop()
+
+    expect((await discoverPortFile(dir))?.port).toBe(second.port)
+    expect((await fetch(`http://127.0.0.1:${second.port}/health`)).status).toBe(
+      200,
+    )
   })
 })

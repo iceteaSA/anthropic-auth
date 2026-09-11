@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { unlink } from 'node:fs/promises'
+import { readFile, unlink } from 'node:fs/promises'
 import {
   createServer,
   type IncomingMessage,
@@ -115,9 +115,16 @@ export async function startRpcServer(
     token,
     async stop() {
       await new Promise<void>((resolve) => server.close(() => resolve()))
-      await unlink(join(options.dir, `port-${process.pid}.json`)).catch(
-        () => {},
-      )
+      try {
+        const portFile = join(options.dir, `port-${process.pid}.json`)
+        const current = JSON.parse(await readFile(portFile, 'utf8')) as {
+          port?: unknown
+          pid?: unknown
+        }
+        if (current.port === port && current.pid === process.pid) {
+          await unlink(portFile)
+        }
+      } catch {}
     },
   }
 }
