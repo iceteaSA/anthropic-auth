@@ -7,6 +7,7 @@ import {
   FAST_MODE_BETA,
   USER_AGENT,
 } from './constants.ts'
+import { applyCustomHeaders } from './custom-headers.ts'
 
 export type ClaudeCodeIdentity = {
   deviceId: string
@@ -465,6 +466,7 @@ export function applyClaudeCodeHeaders(
   )
   headers.set('x-stainless-timeout', '600')
   headers.delete('x-api-key')
+  applyCustomHeaders(headers)
   return headers
 }
 

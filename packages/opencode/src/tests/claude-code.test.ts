@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
+  applyCustomHeaders,
   CLAUDE_CODE_FULL_AGENT_BETAS,
   type ClaudeCodeIdentity,
   getClaudeCodeIdentity,
   orderClaudeCodeBody,
+  parseCustomHeaders,
   REQUIRED_BETAS,
   resetClaudeCodeIdentityCachesForTest,
   resolveClaudeCodeIdentity,
@@ -301,6 +303,60 @@ describe('Claude Code fingerprint helpers', () => {
       'main-slot',
     )
     expect(compatibility.accountUuid).toBe('account-b')
+  })
+
+  test('applies ANTHROPIC_CUSTOM_HEADERS after generated Claude Code headers', () => {
+    const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
+    process.env.ANTHROPIC_CUSTOM_HEADERS = JSON.stringify({
+      'x-provider-api-key': 'provider-key',
+      'anthropic-version': '2024-01-01',
+      'x-list': ['a', 'b'],
+    })
+    try {
+      const headers = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test')
+
+      expect(headers.get('x-provider-api-key')).toBe('provider-key')
+      expect(headers.get('anthropic-version')).toBe('2024-01-01')
+      expect(headers.get('x-list')).toBe('a, b')
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ANTHROPIC_CUSTOM_HEADERS
+      } else {
+        process.env.ANTHROPIC_CUSTOM_HEADERS = previous
+      }
+    }
+  })
+
+  test('parses custom headers from JSON object values', () => {
+    const headers = parseCustomHeaders(
+      JSON.stringify({
+        'x-string': 'value',
+        'x-number': 123,
+        'x-bool': true,
+        'x-skip': null,
+      }),
+    )
+
+    expect(headers.get('x-string')).toBe('value')
+    expect(headers.get('x-number')).toBe('123')
+    expect(headers.get('x-bool')).toBe('true')
+    expect(headers.get('x-skip')).toBeNull()
+  })
+
+  test('parses custom headers from colon-separated env values', () => {
+    const headers = parseCustomHeaders(
+      'x-one: one,x-two: two\nx-three: value:with:colon',
+    )
+
+    expect(headers.get('x-one')).toBe('one')
+    expect(headers.get('x-two')).toBe('two')
+    expect(headers.get('x-three')).toBe('value:with:colon')
+  })
+
+  test('rejects non-object custom headers configuration', () => {
+    expect(() => applyCustomHeaders(new Headers(), '[]')).toThrow(
+      'ANTHROPIC_CUSTOM_HEADERS must be a JSON object',
+    )
   })
 
   test('orders serialized body fields like captured Claude Code requests', () => {

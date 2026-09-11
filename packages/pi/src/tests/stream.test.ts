@@ -423,6 +423,35 @@ describe('Pi API fallback routing helpers', () => {
     expect(events.some((event) => event.type === 'error')).toBe(true)
   })
 
+  test('applies ANTHROPIC_CUSTOM_HEADERS to API fallback routes', () => {
+    const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
+    process.env.ANTHROPIC_CUSTOM_HEADERS = JSON.stringify({
+      'x-provider-api-key': 'provider-key',
+      'anthropic-version': '2024-01-01',
+    })
+    try {
+      const headers = configureApiRouteHeaders(
+        {
+          id: 'provider-route',
+          type: 'api',
+          apiKey: 'provider-key',
+          baseURL: 'https://provider.example/anthropic',
+          authHeader: 'x-api-key',
+        },
+        false,
+      )
+
+      expect(headers.get('x-provider-api-key')).toBe('provider-key')
+      expect(headers.get('anthropic-version')).toBe('2024-01-01')
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ANTHROPIC_CUSTOM_HEADERS
+      } else {
+        process.env.ANTHROPIC_CUSTOM_HEADERS = previous
+      }
+    }
+  })
+
   test('sticky-balanced keeps repeated Pi session requests on the quota-selected account', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-routing-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')

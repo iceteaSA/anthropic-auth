@@ -4,6 +4,7 @@ import {
   type ApiKeyAccount,
   acquireRefreshFileLock,
   addAccountPersistent,
+  applyCustomHeaders,
   authorize,
   buildAccountList,
   buildClaudeQuotaSummary,
@@ -150,6 +151,7 @@ import {
   quotaSnapshotPassesPolicy,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
+  remapModelId,
   removeAccountPersistent,
   reorderAccountsPersistent,
   resolveClaudeCodeIdentity,
@@ -5175,6 +5177,7 @@ const anthropicAuthPlugin = async (
               headers.set('Authorization', `Bearer ${account.apiKey ?? ''}`)
             }
             headers.set('Content-Type', 'application/json')
+            applyCustomHeaders(headers)
           }
 
           async function sendWithApiAccount(
@@ -6581,7 +6584,27 @@ const anthropicAuthPlugin = async (
                 hasAccess: Boolean(auth.access),
               })
               if (auth.type !== 'oauth') {
-                const response = await fetch(input, init)
+                const rewritten = rewriteUrl(input)
+                const passthroughHeaders = mergeHeaders(input, init)
+                applyCustomHeaders(passthroughHeaders)
+                let passthroughBody = init?.body
+                if (typeof passthroughBody === 'string') {
+                  try {
+                    const parsed = JSON.parse(passthroughBody)
+                    if (typeof parsed.model === 'string') {
+                      const remapped = remapModelId(parsed.model)
+                      if (remapped !== parsed.model) {
+                        parsed.model = remapped
+                        passthroughBody = JSON.stringify(parsed)
+                      }
+                    }
+                  } catch {}
+                }
+                const response = await fetch(rewritten.input, {
+                  ...init,
+                  body: passthroughBody,
+                  headers: passthroughHeaders,
+                })
                 trace.done('non_oauth_passthrough', { status: response.status })
                 return response
               }

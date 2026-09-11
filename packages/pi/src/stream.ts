@@ -1,6 +1,7 @@
 import {
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
+  applyCustomHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
@@ -308,6 +309,7 @@ export function configureApiRouteHeaders(
       mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
     )
   }
+  applyCustomHeaders(headers)
   return headers
 }
 

@@ -27,6 +27,7 @@ import {
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
+  remapRequestBodyModel,
   selectClaudeCodeBetas,
   signRequestBody,
   TEXT_REPLACEMENTS,
@@ -340,11 +341,30 @@ export function rewriteUrl(
     ? parseBaseUrl(options.baseURL)
     : resolveBaseUrl()
   if (baseUrl) {
+    const basePath = baseUrl.pathname.replace(/\/$/, '')
     requestUrl.protocol = baseUrl.protocol
     requestUrl.host = baseUrl.host
-    if (options.baseURL) {
-      requestUrl.pathname = `${baseUrl.pathname.replace(/\/$/, '')}${requestUrl.pathname}`
+    if (
+      basePath &&
+      requestUrl.pathname !== basePath &&
+      !requestUrl.pathname.startsWith(`${basePath}/`)
+    ) {
+      requestUrl.pathname = `${basePath}${requestUrl.pathname}`
     }
+  }
+
+  // Normalise path: when ANTHROPIC_BASE_URL replaces the full base (not just
+  // origin), the /v1 segment from the default api.anthropic.com/v1 path is lost.
+  // The @ai-sdk/anthropic provider sends to {baseURL}/messages, producing
+  // e.g. /proxy/messages instead of /proxy/v1/messages. Insert /v1 if missing.
+  if (
+    requestUrl.pathname.endsWith('/messages') &&
+    !requestUrl.pathname.endsWith('/v1/messages')
+  ) {
+    requestUrl.pathname = requestUrl.pathname.replace(
+      /\/messages$/,
+      '/v1/messages',
+    )
   }
 
   if (
@@ -1249,6 +1269,9 @@ export async function rewriteRequestBody(
       ...countRewriteShape(parsed),
     })
 
+    // Remap model ID for proxy backends (ANTHROPIC_DEFAULT_*_MODEL)
+    const modelRemapped = remapRequestBodyModel(parsed)
+
     const trailingStart = rewriteNowMs()
     const messagesBeforeStrip = Array.isArray(parsed.messages)
       ? parsed.messages.length
@@ -1281,6 +1304,7 @@ export async function rewriteRequestBody(
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
+      modelRemapped,
       fableMythosThinkingDisplay: fableMythosThinking
         ? 'summarized'
         : undefined,

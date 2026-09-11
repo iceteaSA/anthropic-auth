@@ -180,3 +180,9 @@ process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
   testDir,
   'quota-header-feed',
 )
+// User-level Anthropic overrides are valid runtime configuration, but they make
+// request-transform tests depend on the developer machine. Tests set these
+// explicitly when they exercise override behavior.
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith('ANTHROPIC_')) delete process.env[key]
+}
