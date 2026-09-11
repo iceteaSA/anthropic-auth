@@ -907,6 +907,32 @@ describe('rewriteUrl', () => {
     expect(url.searchParams.has('beta')).toBe(false)
   })
 
+  test('preserves a root /messages path without a base URL override', () => {
+    const { input } = rewriteUrl('https://api.anthropic.com/messages')
+    const url = new URL(input.toString())
+    expect(url.pathname).toBe('/messages')
+    expect(url.searchParams.has('beta')).toBe(false)
+  })
+
+  test('normalizes a root /messages path under ANTHROPIC_BASE_URL', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic'
+    const { input } = rewriteUrl('https://api.anthropic.com/messages')
+    const url = new URL(input.toString())
+    expect(url.origin).toBe('https://proxy.example.test')
+    expect(url.pathname).toBe('/anthropic/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
+  })
+
+  test('normalizes a root /messages path under a per-account base URL', () => {
+    const { input } = rewriteUrl('https://api.anthropic.com/messages', {
+      baseURL: 'https://api.kie.ai/claude',
+    })
+    const url = new URL(input.toString())
+    expect(url.origin).toBe('https://api.kie.ai')
+    expect(url.pathname).toBe('/claude/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
+  })
+
   test('overrides origin when ANTHROPIC_BASE_URL is set', () => {
     process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080'
     const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')

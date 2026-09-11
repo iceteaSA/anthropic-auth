@@ -351,20 +351,18 @@ export function rewriteUrl(
     ) {
       requestUrl.pathname = `${basePath}${requestUrl.pathname}`
     }
-  }
 
-  // Normalise path: when ANTHROPIC_BASE_URL replaces the full base (not just
-  // origin), the /v1 segment from the default api.anthropic.com/v1 path is lost.
-  // The @ai-sdk/anthropic provider sends to {baseURL}/messages, producing
-  // e.g. /proxy/messages instead of /proxy/v1/messages. Insert /v1 if missing.
-  if (
-    requestUrl.pathname.endsWith('/messages') &&
-    !requestUrl.pathname.endsWith('/v1/messages')
-  ) {
-    requestUrl.pathname = requestUrl.pathname.replace(
-      /\/messages$/,
-      '/v1/messages',
-    )
+    // The SDK sends {baseURL}/messages, so proxy overrides need the missing
+    // version segment restored without rewriting an unconfigured endpoint.
+    if (
+      requestUrl.pathname.endsWith('/messages') &&
+      !requestUrl.pathname.endsWith('/v1/messages')
+    ) {
+      requestUrl.pathname = requestUrl.pathname.replace(
+        /\/messages$/,
+        '/v1/messages',
+      )
+    }
   }
 
   if (
