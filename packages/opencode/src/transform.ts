@@ -1256,6 +1256,7 @@ export async function rewriteRequestBody(
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
+    modelRemapEnabled?: boolean
     laneStart?: boolean
     cacheDiagnosticsPreviousMessageId?: string | null
   } = {},
@@ -1268,9 +1269,6 @@ export async function rewriteRequestBody(
       inputBytes: body.length,
       ...countRewriteShape(parsed),
     })
-
-    // Remap model ID for proxy backends (ANTHROPIC_DEFAULT_*_MODEL)
-    const modelRemapped = remapRequestBodyModel(parsed)
 
     const trailingStart = rewriteNowMs()
     const messagesBeforeStrip = Array.isArray(parsed.messages)
@@ -1304,7 +1302,6 @@ export async function rewriteRequestBody(
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
-      modelRemapped,
       fableMythosThinkingDisplay: fableMythosThinking
         ? 'summarized'
         : undefined,
@@ -1411,6 +1408,7 @@ export async function rewriteRequestBody(
     })
 
     const prefixStart = rewriteNowMs()
+    if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const prefixed = prefixToolNames(parsed)
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),

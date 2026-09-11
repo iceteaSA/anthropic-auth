@@ -3981,13 +3981,57 @@ describe('rewriteRequestBody', () => {
 
     afterEach(() => restoreEnv())
 
+    test('keeps Fable OAuth requests on their original model and thinking shape', async () => {
+      setEnv({ ANTHROPIC_MODEL: 'claude-sonnet-4-6' })
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-fable-5-1',
+            thinking: { type: 'adaptive' },
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+        ),
+      )
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'token', { body: result })
+
+      expect(result.model).toBe('claude-fable-5-1')
+      expect(result.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      })
+      expect(headers.get('anthropic-beta')).toContain('oauth-2025-04-20')
+    })
+
+    test('remaps API-key Fable requests after source-model normalization', async () => {
+      setEnv({ ANTHROPIC_MODEL: 'claude-sonnet-4-6' })
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-fable-5-1',
+            thinking: { type: 'adaptive' },
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+          { modelRemapEnabled: true },
+        ),
+      )
+
+      expect(result.model).toBe('claude-sonnet-4-6')
+      expect(result.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      })
+    })
+
     test('remaps sonnet model using ANTHROPIC_DEFAULT_SONNET_MODEL', async () => {
       setEnv({ ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6' })
       const body = JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         messages: [{ role: 'user', content: 'hi' }],
       })
-      const result = JSON.parse(await rewriteRequestBody(body))
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
       expect(result.model).toBe('claude-sonnet-4-6')
     })
 
@@ -3997,7 +4041,9 @@ describe('rewriteRequestBody', () => {
         model: 'claude-opus-4-20250514',
         messages: [{ role: 'user', content: 'hi' }],
       })
-      const result = JSON.parse(await rewriteRequestBody(body))
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
       expect(result.model).toBe('claude-opus-4-8')
     })
 
@@ -4007,7 +4053,9 @@ describe('rewriteRequestBody', () => {
         model: 'claude-haiku-4-5',
         messages: [{ role: 'user', content: 'hi' }],
       })
-      const result = JSON.parse(await rewriteRequestBody(body))
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
       expect(result.model).toBe('claude-haiku-4-5-20251001')
     })
 
@@ -4017,7 +4065,9 @@ describe('rewriteRequestBody', () => {
         model: 'claude-mythos-5',
         messages: [{ role: 'user', content: 'hi' }],
       })
-      const result = JSON.parse(await rewriteRequestBody(body))
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
       expect(result.model).toBe('claude-fable-5')
     })
 
@@ -4030,7 +4080,9 @@ describe('rewriteRequestBody', () => {
         model: 'claude-sonnet-4-5',
         messages: [{ role: 'user', content: 'hi' }],
       })
-      const result = JSON.parse(await rewriteRequestBody(body))
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
       expect(result.model).toBe('claude-sonnet-4-6')
     })
 
@@ -4040,7 +4092,9 @@ describe('rewriteRequestBody', () => {
         model: 'claude-unknown-99',
         messages: [{ role: 'user', content: 'hi' }],
       })
-      const result = JSON.parse(await rewriteRequestBody(body))
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
       expect(result.model).toBe('claude-default-proxy')
     })
 

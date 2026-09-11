@@ -4,7 +4,8 @@
  *
  * LiteLLM/proxy backends often use shorter model aliases
  * (e.g. `claude-sonnet-4-6` instead of `claude-sonnet-4-20250514`).
- * These env vars follow the Claude Code convention:
+ * These proxy-route variables follow the Claude Code convention, except
+ * ANTHROPIC_DEFAULT_FABLE_MODEL, which is plugin-specific:
  *
  *   ANTHROPIC_MODEL                  — default for any claude-* model
  *   ANTHROPIC_DEFAULT_SONNET_MODEL   — models matching claude-sonnet-*

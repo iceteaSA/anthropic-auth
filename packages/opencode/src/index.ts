@@ -151,7 +151,7 @@ import {
   quotaSnapshotPassesPolicy,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
-  remapModelId,
+  remapRequestBodyModel,
   removeAccountPersistent,
   reorderAccountsPersistent,
   resolveClaudeCodeIdentity,
@@ -5230,6 +5230,7 @@ const anthropicAuthPlugin = async (
                   sessionId: directAffinity || undefined,
                   midConversationEffortEnabled: false,
                   midConversationEffortPlan: effortPlanHeader,
+                  modelRemapEnabled: true,
                   perf: (stage, data) =>
                     trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
                 })
@@ -6591,12 +6592,8 @@ const anthropicAuthPlugin = async (
                 if (typeof passthroughBody === 'string') {
                   try {
                     const parsed = JSON.parse(passthroughBody)
-                    if (typeof parsed.model === 'string') {
-                      const remapped = remapModelId(parsed.model)
-                      if (remapped !== parsed.model) {
-                        parsed.model = remapped
-                        passthroughBody = JSON.stringify(parsed)
-                      }
+                    if (remapRequestBodyModel(parsed)) {
+                      passthroughBody = JSON.stringify(parsed)
                     }
                   } catch {}
                 }
