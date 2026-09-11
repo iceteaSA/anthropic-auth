@@ -344,7 +344,7 @@ describe('convertMessages — empty base64 image guard', () => {
   })
 })
 describe('buildAnthropicRequest — system prompt arrays', () => {
-  test('adds each non-empty prompt string as a separate text block', async () => {
+  test('normalizes non-empty prompt strings before relocation', async () => {
     const { body } = await buildAnthropicRequest(
       'claude-sonnet-4-20250514',
       {
@@ -356,16 +356,18 @@ describe('buildAnthropicRequest — system prompt arrays', () => {
       defaultCache,
     )
 
-    expect(body.system).toHaveLength(4)
-    expect(body.system?.map((block) => block.type)).toEqual([
-      'text',
-      'text',
-      'text',
-      'text',
-    ])
-    expect(body.system?.slice(2).map((block) => block.text)).toEqual([
-      'first prompt',
-      'second prompt',
+    expect(body.system).toHaveLength(2)
+    expect(body.messages[0]?.content).toEqual([
+      {
+        type: 'text',
+        text: 'first prompt\n\nsecond prompt',
+        cache_control: { type: 'ephemeral' },
+      },
+      {
+        type: 'text',
+        text: 'hello',
+        cache_control: { type: 'ephemeral' },
+      },
     ])
   })
 
@@ -381,8 +383,19 @@ describe('buildAnthropicRequest — system prompt arrays', () => {
       defaultCache,
     )
 
-    expect(body.system).toHaveLength(3)
-    expect(body.system?.[2]?.text).toBe('valid')
+    expect(body.system).toHaveLength(2)
+    expect(body.messages[0]?.content).toEqual([
+      {
+        type: 'text',
+        text: 'valid',
+        cache_control: { type: 'ephemeral' },
+      },
+      {
+        type: 'text',
+        text: 'hello',
+        cache_control: { type: 'ephemeral' },
+      },
+    ])
   })
 
   test('does not add prompt blocks for an empty prompt array', async () => {
@@ -398,6 +411,54 @@ describe('buildAnthropicRequest — system prompt arrays', () => {
     )
 
     expect(body.system).toHaveLength(2)
+  })
+
+  test('routes array prompts through documentation relocation', async () => {
+    const segments = [
+      'KEEP ONE: you are an assistant.',
+      'KEEP TWO: available tools.',
+      'Pi documentation (read only when the user asks about pi itself):\n- MOVE THIS',
+    ]
+    const stringBody = (
+      await buildAnthropicRequest(
+        'claude-sonnet-4-20250514',
+        {
+          messages: [userMsg('hello')],
+          systemPrompt: segments.join('\n\n'),
+          tools: [],
+        } as any,
+        undefined,
+        defaultCache,
+      )
+    ).body
+    const arrayBody = (
+      await buildAnthropicRequest(
+        'claude-sonnet-4-20250514',
+        {
+          messages: [userMsg('hello')],
+          systemPrompt: segments,
+          tools: [],
+        } as unknown as Parameters<typeof buildAnthropicRequest>[1],
+        undefined,
+        defaultCache,
+      )
+    ).body
+    const arraySystemText = JSON.stringify(arrayBody.system)
+    const firstUserContent = arrayBody.messages[0]?.content as Array<
+      Record<string, unknown>
+    >
+
+    expect(arraySystemText).not.toContain('MOVE THIS')
+    expect(firstUserContent[0]).toMatchObject({
+      type: 'text',
+      text: segments[2],
+      cache_control: { type: 'ephemeral' },
+    })
+    expect(arrayBody.system?.slice(2).map((block) => block.text)).toEqual([
+      'KEEP ONE: you are an assistant.\n\nKEEP TWO: available tools.',
+    ])
+    expect(arrayBody.system).toEqual(stringBody.system)
+    expect(arrayBody.messages).toEqual(stringBody.messages)
   })
 })
 

@@ -75,13 +75,8 @@ export type AnthropicRequestBody = {
 function sanitize(text: string): string {
   return text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
 }
-function extractSystemPromptTexts(systemPrompt: unknown): string[] {
-  const values = Array.isArray(systemPrompt) ? systemPrompt : [systemPrompt]
-  return values.flatMap((value) => {
-    if (typeof value !== 'string') return []
-    const text = value.trim()
-    return text ? [text] : []
-  })
+function isNonEmptyText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
 }
 
 /**
@@ -502,11 +497,18 @@ export async function buildAnthropicRequest(
     },
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
-  if (Array.isArray(context.systemPrompt)) {
-    for (const text of extractSystemPromptTexts(context.systemPrompt)) {
-      system.push({ type: 'text', text: sanitize(text) })
-    }
-  } else if (context.systemPrompt?.trim()) {
+  // Pi's host type permits prompt segments even though pi-ai declares a string.
+  const systemPrompt = context.systemPrompt as unknown as
+    | string
+    | readonly string[]
+    | undefined
+  const normalizedSystemPrompt = Array.isArray(systemPrompt)
+    ? systemPrompt
+        .filter(isNonEmptyText)
+        .map((text) => text.trim())
+        .join('\n\n')
+    : systemPrompt
+  if (isNonEmptyText(normalizedSystemPrompt)) {
     // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
     // its documentation paragraph (the docs/*.md enumeration and the "follow .md
     // cross-references" instruction) are each independently sufficient to make
@@ -531,7 +533,7 @@ export async function buildAnthropicRequest(
     // cache_control is set explicitly because addEphemeralCacheControl's
     // message-level breakpoint only fires for array content on the *last* user
     // message, which is not this one after the first turn.
-    const prompt = splitPiSystemPrompt(context.systemPrompt)
+    const prompt = splitPiSystemPrompt(normalizedSystemPrompt)
     if (prompt.systemText) {
       system.push({ type: 'text', text: prompt.systemText })
     }
